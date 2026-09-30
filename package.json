@@ -1,0 +1,42 @@
+{
+  "name": "@expert-agents/root",
+  "version": "0.1.0",
+  "private": true,
+  "license": "MIT",
+  "type": "module",
+  "workspaces": ["packages/*"],
+  "openclaw": {
+    "extensions": ["./dist/plugin.js"]
+  },
+  "scripts": {
+    "boundaries": "bun scripts/verify-boundaries.ts",
+    "typecheck": "bun scripts/verify-package-scripts.ts && tsc --noEmit -p tsconfig.json && bun run --filter '@expert-agents/*' typecheck",
+    "test": "bun test ./test && bun run --filter '@expert-agents/*' test",
+    "build": "bun run --filter '@expert-agents/*' build && bun build ./src/native-plugin.ts --target node --format esm --outfile ./dist/plugin.js && bun build ./scripts/expert-factory.ts --target bun --packages bundle --outfile ./dist/factory.js",
+    "library:materialize": "bun scripts/materialize-scope.ts",
+    "library:annotate": "bun scripts/annotate-library.ts",
+    "library:partition": "bun scripts/partition-for-import.ts",
+    "worker:domain-expert": "bun packages/runtime/dist/server.js",
+    "parity:battery": "bun scripts/parity-battery.ts",
+    "plugin:ownership": "bun scripts/plugin-ownership-fingerprint.ts",
+    "retrieval:eval": "bun scripts/retrieval-eval.ts",
+    "expert:create": "bun scripts/expert-create.ts",
+    "expert:factory": "bun scripts/expert-factory.ts",
+    "expert:bindings": "bun scripts/expert-bindings.ts",
+    "expert:status": "bun scripts/expert-status.ts",
+    "expert:release": "bun scripts/expert-release.ts",
+    "expert:ingest": "bun scripts/expert-ingest.ts",
+    "expert:library": "bun scripts/expert-library.ts",
+    "expert:learning": "bun scripts/expert-learning.ts",
+    "expert:telegram-provision": "bun scripts/expert-telegram-provision.ts",
+    "package:plugin": "bun scripts/package-plugin.ts",
+    "package:deploy": "bun scripts/package-deploy.ts",
+    "verify:artifacts": "bun scripts/verify-built-artifacts.ts",
+    "verify": "bun run boundaries && bun run typecheck && bun run test && bun run build && bun run package:plugin && bun run package:deploy && bun run verify:artifacts"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.3.14",
+    "@types/node": "^22",
+    "typescript": "^5.7.0"
+  }
+}

@@ -1,0 +1,22 @@
+{
+  "name": "@expert-agents/provisioning",
+  "version": "0.1.0",
+  "private": true,
+  "license": "MIT",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "bun test test",
+    "build": "bun build ./src/index.ts --outfile ./dist/index.js --target bun --packages external"
+  },
+  "dependencies": {
+    "@expert-agents/library": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.3.14",
+    "@types/node": "^22.0.0"
+  }
+}

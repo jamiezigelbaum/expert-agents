@@ -1,0 +1,10 @@
+{
+  "schemaVersion": 1,
+  "pluginId": "expert-agents",
+  "skills": [
+    "domain-research",
+    "expert-agent-workshop",
+    "expert-annas-archive-acquisition",
+    "soul-workshop"
+  ]
+}

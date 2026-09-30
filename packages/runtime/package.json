@@ -1,0 +1,24 @@
+{
+  "name": "@expert-agents/runtime",
+  "version": "0.1.0",
+  "private": true,
+  "license": "MIT",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./domain-expert": "./src/core/domain-expert.ts",
+    "./worker": "./src/workers/domain-expert/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "bun test test",
+    "build": "bun build ./src/index.ts --outfile ./dist/index.js --target bun --packages external && bun build ./src/workers/domain-expert/server.ts --outfile ./dist/server.js --target bun --packages external"
+  },
+  "dependencies": {
+    "@expert-agents/library": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.3.14",
+    "@types/node": "^22.0.0"
+  }
+}

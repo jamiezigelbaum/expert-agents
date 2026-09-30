@@ -1,0 +1,24 @@
+# The build context is the repository; only what package:deploy needs goes in.
+.git
+.github
+node_modules
+**/node_modules
+dist
+**/dist
+.env
+.env.*
+*.db
+*.db-journal
+archive
+migration
+docs
+receipts
+skills
+test
+packages/*/test
+src
+cache
+data
+episodes
+out
+*.tsbuildinfo

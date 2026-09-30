@@ -1,0 +1,36 @@
+name: verify
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+      - name: Clean install
+        run: bun install --frozen-lockfile
+      - name: Full verification
+        run: bun run verify
+
+  # The worker image is a deploy artifact in its own right: build it from this
+  # exact commit and prove it boots and answers health with networking
+  # disabled (scripts/docker-smoke.sh). Static Dockerfile invariants are part
+  # of `bun run verify`; this job is the half that needs Docker.
+  docker-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the worker image and smoke it with networking disabled
+        run: bash scripts/docker-smoke.sh expert-agents-domain-expert:ci

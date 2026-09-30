@@ -1,0 +1,15 @@
+node_modules/
+.next/
+dist/
+**/dist/
+*.db
+*.db-journal
+.env
+.env.local
+out/
+cache/
+data/
+episodes/
+
+# TypeScript incremental build cache
+*.tsbuildinfo

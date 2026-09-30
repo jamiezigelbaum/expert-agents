@@ -1,0 +1,80 @@
+{
+  "id": "expert-agents",
+  "name": "Expert Agents",
+  "version": "0.1.0",
+  "skills": ["./skills"],
+  "description": "Independent expert-agent planning, grounded research, managed corpus, document, and approved acquisition tools for OpenClaw.",
+  "activation": {
+    "onStartup": true,
+    "onCapabilities": ["tool"]
+  },
+  "contracts": {
+    "tools": [
+      "domain_agent",
+      "domain_ask",
+      "domain_source",
+      "rag_corpus",
+      "domain_doc",
+      "annas_archive_search",
+      "annas_archive_import",
+      "expert_factory"
+    ]
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "factory": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Owner-only creation authority. Disabled by default. Paths and credentials are deployment settings, never tool arguments.",
+        "properties": {
+          "enabled": { "type": "boolean" },
+          "rootDir": { "type": "string", "description": "Pre-created private 0700 root for agent repositories and operation state, outside the machinery repository." },
+          "tokenDirectory": { "type": "string", "description": "Pre-created 0700 credential directory, disjoint from rootDir." },
+          "managerTokenFile": { "type": "string", "description": "Private token file for a dedicated Telegram manager with Bot Management Mode enabled and no other update consumer." },
+          "ownerTelegramUserId": { "type": "integer", "minimum": 1 },
+          "libraryBucket": { "type": "string", "description": "Existing approved GCS library bucket; must match the worker registration allowlist." },
+          "libraryPrefix": { "type": "string", "description": "Approved GCS prefix. Each new agent receives its own descendant prefix." },
+          "openclawBin": { "type": "string", "description": "Absolute path to the deployment's OpenClaw CLI." },
+          "bunBin": { "type": "string", "description": "Absolute path to Bun 1.3+ for the bundled factory." },
+          "model": { "type": "string", "description": "Optional deployment-approved model for newly created agents." },
+          "activationCommand": { "type": "string", "description": "Optional absolute path to an owner-approved no-argument activation wrapper. It must enforce the deployment's restart protocol. At most one attempt per creation." },
+          "remoteUrlTemplate": { "type": "string", "description": "Optional https://, ssh:// or file:/// remote URL containing {agentId} exactly once. The factory pushes each new agent's initial commit there and records the resolved remote." },
+          "remoteCreateCommand": { "type": "string", "description": "Optional absolute path to a deployment-owned executable that creates the remote repository idempotently. It receives the agent id and the resolved remote URL as its only arguments." }
+        }
+      },
+      "domainExpert": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": { "type": "boolean" },
+          "baseUrl": { "type": "string", "description": "Bounded Expert Agents worker URL." },
+          "requestTimeoutSeconds": { "type": "number", "minimum": 1, "maximum": 300 },
+          "authToken": {
+            "description": "Bearer credential for the bounded worker: either a literal string or a SecretRef the gateway resolves. Do not commit raw values.",
+            "anyOf": [
+              { "type": "string", "minLength": 1 },
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "source": { "type": "string", "enum": ["env", "file", "exec"] },
+                  "provider": { "type": "string", "minLength": 1 },
+                  "id": { "type": "string", "minLength": 1 }
+                },
+                "required": ["source", "provider", "id"]
+              }
+            ]
+          },
+          "defaultDomainId": { "type": "string", "description": "Domain id supplied for worker requests that omit one. This deployment's default expert; the tenant-neutral worker routes no default domain of its own. An explicit domain_id is never overridden." }
+        }
+      }
+    }
+  },
+  "configContracts": {
+    "secretInputs": {
+      "paths": [{ "path": "domainExpert.authToken", "expected": "string" }]
+    }
+  }
+}
