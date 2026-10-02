@@ -270,6 +270,10 @@ describe('ported retrieval regressions', () => {
     // unbounded think truncated the constrained JSON mid-string in production.
     expect(config.thinkingConfig).toEqual({ thinkingBudget: 128 });
     expect(config.maxOutputTokens).toBeGreaterThanOrEqual(1024);
+    // Current Gemini models are served from `global` only; generation must not
+    // follow the corpus location.
+    expect(reformulationCall!.url).toMatch(
+      /^https:\/\/aiplatform\.googleapis\.com\/v1\/projects\/[^/]+\/locations\/global\/publishers\/google\/models\/gemini-3\.8-flash:generateContent$/);
   });
 
   test('ported: reformulation failure falls back to one retrieval query', async () => {

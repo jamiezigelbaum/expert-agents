@@ -136,6 +136,9 @@ export interface DomainExpertGoogleConfig {
   metadataServerToken?: boolean;
   scopes?: string[];
   model?: string;
+  // Location that serves generateContent. Current Gemini models are served
+  // from `global` only, so generation no longer follows the corpus location.
+  generateLocation?: string;
   transcribeModel?: string;
   retrievalTopK?: number;
   answerContextLimit?: number;
@@ -4427,7 +4430,11 @@ class GoogleRuntimeClient {
   }
 
   model(): string {
-    return this.config.model ?? 'gemini-2.5-pro';
+    return this.config.model ?? 'gemini-3.8-flash';
+  }
+
+  generateLocation(): string {
+    return this.config.generateLocation?.trim() || 'global';
   }
 
   transcribeModel(): string {
@@ -4692,16 +4699,16 @@ class GoogleRuntimeClient {
       `Question: ${options.question}`,
     ].join('\n');
     const response = await this.googleJson(
-      `${vertexBase(options.location)}/v1/projects/${options.project}/locations/${options.location}/publishers/google/models/${encodeURIComponent(options.model)}:generateContent`,
+      `${vertexBase(this.generateLocation())}/v1/projects/${options.project}/locations/${this.generateLocation()}/publishers/google/models/${encodeURIComponent(options.model)}:generateContent`,
       {
         method: 'POST',
         body: JSON.stringify({
           contents: [{ role: 'user', parts: [{ text: prompt }] }],
           generationConfig: {
             temperature: 0.2,
-            // gemini-2.5 thinking tokens count toward maxOutputTokens, and an
-            // unbounded think can starve the output, truncating the JSON
-            // mid-string. 128 is 2.5-pro's floor; reformulation needs no more.
+            // Thinking tokens count toward maxOutputTokens, and an unbounded
+            // think can starve the output, truncating the JSON mid-string.
+            // Reformulation needs no more than this small budget.
             thinkingConfig: { thinkingBudget: 128 },
             maxOutputTokens: 1024,
             // JSON mime type alone still let prose through; the schema
@@ -4753,7 +4760,7 @@ class GoogleRuntimeClient {
       `Context:\n${contextText}`,
     ].join('\n');
     const response = await this.googleJson(
-      `${vertexBase(options.location)}/v1/projects/${options.project}/locations/${options.location}/publishers/google/models/${encodeURIComponent(options.model)}:generateContent`,
+      `${vertexBase(this.generateLocation())}/v1/projects/${options.project}/locations/${this.generateLocation()}/publishers/google/models/${encodeURIComponent(options.model)}:generateContent`,
       {
         method: 'POST',
         body: JSON.stringify({
@@ -4775,7 +4782,7 @@ class GoogleRuntimeClient {
   }): Promise<string> {
     requireGoogleProject(options.project);
     const response = await this.googleJson(
-      `${vertexBase(options.location)}/v1/projects/${options.project}/locations/${options.location}/publishers/google/models/${encodeURIComponent(options.model)}:generateContent`,
+      `${vertexBase(this.generateLocation())}/v1/projects/${options.project}/locations/${this.generateLocation()}/publishers/google/models/${encodeURIComponent(options.model)}:generateContent`,
       {
         method: 'POST',
         body: JSON.stringify({
@@ -5293,6 +5300,7 @@ export function domainExpertGoogleConfigFromEnv(env: Record<string, string | und
       ? { metadataServerToken: true }
       : {}),
     ...(env.EXPERT_AGENTS_DOMAIN_EXPERT_GENERATE_MODEL ? { model: env.EXPERT_AGENTS_DOMAIN_EXPERT_GENERATE_MODEL } : {}),
+    ...(env.EXPERT_AGENTS_DOMAIN_EXPERT_GENERATE_LOCATION ? { generateLocation: env.EXPERT_AGENTS_DOMAIN_EXPERT_GENERATE_LOCATION } : {}),
     ...(env.EXPERT_AGENTS_DOMAIN_EXPERT_TRANSCRIBE_MODEL ? { transcribeModel: env.EXPERT_AGENTS_DOMAIN_EXPERT_TRANSCRIBE_MODEL } : {}),
     retrievalTopK: env.EXPERT_AGENTS_DOMAIN_EXPERT_RETRIEVAL_TOP_K
       ? normalizePositiveInteger(env.EXPERT_AGENTS_DOMAIN_EXPERT_RETRIEVAL_TOP_K, DOMAIN_ASK_RETRIEVAL_DEFAULTS.candidateTopK)
@@ -6284,6 +6292,7 @@ function defaultCorpusId(manifest: ReturnType<typeof domainManifest>): string {
 }
 
 function vertexBase(location: string): string {
+  if (location === 'global') return 'https://aiplatform.googleapis.com';
   return `https://${location}-aiplatform.googleapis.com`;
 }
 
