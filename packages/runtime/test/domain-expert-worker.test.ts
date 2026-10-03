@@ -519,6 +519,52 @@ describe('ported retrieval regressions', () => {
     expect(reciprocalRankFuse([[corpusA], [corpusB]])).toEqual([corpusA]);
   });
 
+  test('domain_ask searches every serving shelf in parallel and survives one failing shelf', async () => {
+    const calls: CapturedCall[] = [];
+    const agentRouting = validateAgentRoutingConfig({
+      research: {
+        library: TEST_AGENT_ROUTING.research!.library,
+        targetCorpusDisplayName: 'research-library',
+        servingCorpusDisplayNames: ['research-shelf-a', 'research-shelf-b'],
+        retrieval: { reranker: 'off', multiQuery: false },
+      },
+    });
+    const shelfA = 'projects/fixture-project/locations/us-central1/ragCorpora/2001';
+    const shelfB = 'projects/fixture-project/locations/us-central1/ragCorpora/2002';
+    const inner = fakeGoogleFetch(calls, {
+      ragCorpora: [{ name: shelfA, displayName: 'research-shelf-a' }, { name: shelfB, displayName: 'research-shelf-b' }],
+    });
+    let inFlight = 0;
+    let maxInFlight = 0;
+    let failShelfB = false;
+    const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input instanceof Request ? input.url : input);
+      if (!url.endsWith(':retrieveContexts')) return inner(input, init);
+      inFlight += 1;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      inFlight -= 1;
+      if (failShelfB && String(init?.body).includes(shelfB)) {
+        calls.push({ url, method: 'POST', body: String(init?.body), headers: {} });
+        return jsonResponse({ error: { message: 'fixture shelf failure' } }, 400);
+      }
+      return inner(input, init);
+    }) as typeof fetch;
+    const worker = createDomainExpertWorker({ agentRouting, google: { accessToken: 'fixture-google-token', fetchImpl } });
+
+    const result = await postDomain(worker, 'domain_ask', { question: 'shelved question', output: 'passages' });
+    const searched = calls.filter((call) => call.url.endsWith(':retrieveContexts'))
+      .map((call) => JSON.parse(call.body).vertexRagStore.ragResources[0].ragCorpus);
+    expect(new Set(searched)).toEqual(new Set([shelfA, shelfB]));
+    expect(maxInFlight).toBe(2);
+    expect(result.retrieval_plan.corpora).toEqual(['research-shelf-a', 'research-shelf-b']);
+
+    failShelfB = true;
+    const degraded = await postDomain(worker, 'domain_ask', { question: 'shelved question', output: 'passages' });
+    expect(degraded.passages.length).toBeGreaterThan(0);
+    expect(degraded.warnings).toContainEqual({ kind: 'rag_retrieval_query_failed', corpus_id: 'research-shelf-b' });
+  });
+
   test('citations and retrieved counts share the 24-context synthesis cap', async () => {
     const calls: CapturedCall[] = [];
     const agentRouting = validateAgentRoutingConfig({

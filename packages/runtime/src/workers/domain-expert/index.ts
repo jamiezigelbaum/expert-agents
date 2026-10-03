@@ -1247,31 +1247,35 @@ export class DomainExpertService {
     }
     const rankedLists: Array<Array<Record<string, unknown> & { corpus_id: string }>> = [];
     const usedCorpora = new Map<string, ResolvedRagCorpus>();
-    for (const corpus of resolvedCorpora) {
-      let currentCorpus = corpus;
-      for (const [queryIndex, query] of queries.entries()) {
-        let retrieval: Awaited<ReturnType<typeof this.withRagCorpusRetry<Array<Record<string, unknown>>>>>;
-        try {
-          retrieval = await this.withRagCorpusRetry(manifest, currentCorpus, (candidate) => this.google.retrieveContexts({
-            project: manifest.gcp_project,
-            location: manifest.rag_location,
-            corpusName: candidate.resourceName,
-            query,
-            topK,
-            ...(retrievalOverrides?.reranker ? { reranker: retrievalOverrides.reranker } : {}),
-          }));
-        } catch (error) {
-          if (queryIndex === 0) throw error;
+    // Every corpus x query retrieval runs at once; results are consumed in
+    // corpus then query order so fusion stays deterministic.
+    const settled = await Promise.all(resolvedCorpora.map((corpus) => Promise.all(queries.map((query) =>
+      this.withRagCorpusRetry(manifest, corpus, (candidate) => this.google.retrieveContexts({
+        project: manifest.gcp_project,
+        location: manifest.rag_location,
+        corpusName: candidate.resourceName,
+        query,
+        topK,
+        ...(retrievalOverrides?.reranker ? { reranker: retrievalOverrides.reranker } : {}),
+      })).then((value) => ({ ok: true as const, value }), (error: unknown) => ({ ok: false as const, error }))))));
+    // A corpus whose original question fails is lost to this answer. With one
+    // corpus that fails the request; with shelves, the others still answer and
+    // the loss is reported, so one bad shelf cannot take a library down.
+    let firstFatal: unknown;
+    for (const [corpusIndex, results] of settled.entries()) {
+      const corpus = resolvedCorpora[corpusIndex]!;
+      for (const [queryIndex, result] of results.entries()) {
+        if (!result.ok) {
+          if (queryIndex === 0) firstFatal ??= result.error;
           const warning: RagRetrievalQueryFailedWarning = {
             kind: 'rag_retrieval_query_failed',
-            corpus_id: currentCorpus.requested,
+            corpus_id: corpus.requested,
           };
           warnings.push(warning);
           console.warn(JSON.stringify(warning));
           continue;
         }
-        const { value: contexts, resolved, warnings: retryWarnings } = retrieval;
-        currentCorpus = resolved;
+        const { value: contexts, resolved, warnings: retryWarnings } = result.value;
         usedCorpora.set(resolved.requested, resolved);
         warnings.push(...retryWarnings);
         rankedLists.push(contexts.map((context) => ({
@@ -1280,6 +1284,7 @@ export class DomainExpertService {
         })));
       }
     }
+    if (firstFatal !== undefined && (resolvedCorpora.length === 1 || rankedLists.length === 0)) throw firstFatal;
     if (preference && ![...usedCorpora.values()].some((corpus) => corpus.resourceName === preference.profile.corpus)) {
       throw new DomainExpertWorkerError(409, 'retrieval_preferences_corpus_mismatch',
         'Configured retrieval preferences do not match the retrieved corpus.');
