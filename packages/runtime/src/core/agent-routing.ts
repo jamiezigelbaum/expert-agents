@@ -32,6 +32,12 @@ export interface AgentRoutingEntry {
   displayName?: string;
   library: LibraryLocationConfig;
   targetCorpusDisplayName: string;
+  /**
+   * Optional. The corpora domain_ask searches, in order. Absent, it searches
+   * only targetCorpusDisplayName. A library that outgrows one corpus is split
+   * into shelves listed here and searched in parallel.
+   */
+  servingCorpusDisplayNames?: string[];
   scopeManifestPath?: string;
   retrieval?: AgentRoutingRetrievalConfig;
   ingestion?: AgentRoutingIngestionConfig;
@@ -97,7 +103,7 @@ function validateRoutingEntry(domainId: string, value: unknown): AgentRoutingEnt
   const entry = requireRecord(value, 'an entry must be an object');
   requireExactKeys(
     entry,
-    ['displayName', 'library', 'targetCorpusDisplayName', 'scopeManifestPath', 'retrieval', 'ingestion', 'disclosure'],
+    ['displayName', 'library', 'targetCorpusDisplayName', 'servingCorpusDisplayNames', 'scopeManifestPath', 'retrieval', 'ingestion', 'disclosure'],
     'an entry',
   );
   if (!('library' in entry) || !('targetCorpusDisplayName' in entry)) {
@@ -113,6 +119,9 @@ function validateRoutingEntry(domainId: string, value: unknown): AgentRoutingEnt
 
   const displayName = optionalNonEmptyString(entry.displayName, 'an entry displayName');
   const scopeManifestPath = optionalNonEmptyString(entry.scopeManifestPath, 'an entry scopeManifestPath');
+  const servingCorpusDisplayNames = entry.servingCorpusDisplayNames === undefined
+    ? undefined
+    : validateServingCorpora(entry.servingCorpusDisplayNames);
   const retrieval = entry.retrieval === undefined
     ? undefined
     : validateRetrieval(entry.retrieval);
@@ -135,11 +144,23 @@ function validateRoutingEntry(domainId: string, value: unknown): AgentRoutingEnt
       entry.targetCorpusDisplayName,
       'an entry targetCorpusDisplayName',
     ),
+    ...(servingCorpusDisplayNames ? { servingCorpusDisplayNames } : {}),
     ...(scopeManifestPath ? { scopeManifestPath } : {}),
     ...(retrieval ? { retrieval } : {}),
     ...(ingestion ? { ingestion } : {}),
     ...(disclosure ? { disclosure } : {}),
   };
+}
+
+function validateServingCorpora(value: unknown): string[] {
+  if (!Array.isArray(value) || value.length === 0 || value.length > 10) {
+    throw new AgentRoutingConfigError('an entry servingCorpusDisplayNames must list 1 to 10 corpora');
+  }
+  const names = value.map((name) => requireNonEmptyString(name, 'an entry servingCorpusDisplayNames item'));
+  if (new Set(names).size !== names.length) {
+    throw new AgentRoutingConfigError('an entry servingCorpusDisplayNames has duplicates');
+  }
+  return Object.freeze(names) as string[];
 }
 
 function validateRetrieval(value: unknown): AgentRoutingRetrievalConfig {

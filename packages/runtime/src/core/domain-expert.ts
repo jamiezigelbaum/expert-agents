@@ -350,7 +350,8 @@ export function domainManifest(
       : { configured: false, source_env: AGENT_ROUTING_ENV_VAR },
     rag_backend: RAG_BACKEND,
     corpora: routing
-      ? [{ id: routing.targetCorpusDisplayName, description: 'Configured materialized library view' }]
+      ? (routing.servingCorpusDisplayNames ?? [routing.targetCorpusDisplayName])
+        .map((id) => ({ id, description: 'Configured materialized library view' }))
       : [],
     // No corpus-creation path sends ragEmbeddingModelConfig, so every corpus
     // takes the API default. The manifest names the model the corpora actually

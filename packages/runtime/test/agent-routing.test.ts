@@ -42,6 +42,9 @@ describe('agent routing config', () => {
       { history: { library: { bucket: 'fixture-bucket', prefix: 'v1' }, targetCorpusDisplayName: 'primary', retrieval: { topK: 0 } } },
       { history: { library: { bucket: 'fixture-bucket', prefix: 'v1' }, targetCorpusDisplayName: 'primary', retrieval: { topK: 101 } } },
       { history: { library: { bucket: 'fixture-bucket', prefix: 'v1' }, targetCorpusDisplayName: 'primary', retrieval: { multiQuery: 'yes' } } },
+      { history: { library: { bucket: 'fixture-bucket', prefix: 'v1' }, targetCorpusDisplayName: 'primary', servingCorpusDisplayNames: [] } },
+      { history: { library: { bucket: 'fixture-bucket', prefix: 'v1' }, targetCorpusDisplayName: 'primary', servingCorpusDisplayNames: ['a', 'a'] } },
+      { history: { library: { bucket: 'fixture-bucket', prefix: 'v1' }, targetCorpusDisplayName: 'primary', servingCorpusDisplayNames: [sensitiveValue, ''] } },
     ];
 
     for (const invalid of invalidCases) {
