@@ -565,6 +565,59 @@ describe('ported retrieval regressions', () => {
     expect(degraded.warnings).toContainEqual({ kind: 'rag_retrieval_query_failed', corpus_id: 'research-shelf-b' });
   });
 
+  test('shelves are ranked as one pool: rank-service across corpora, else vector distance', async () => {
+    const shelfA = 'projects/fixture-project/locations/us-central1/ragCorpora/3001';
+    const shelfB = 'projects/fixture-project/locations/us-central1/ragCorpora/3002';
+    const contextsFor = (body: string) => body.includes(shelfA)
+      ? [{ id: 'a-weak', text: 'weak evidence', sourceUri: 'gs://fixture/a.md', sourceDisplayName: 'A', score: 0.45 }]
+      : [{ id: 'b-strong', text: 'strong evidence', sourceUri: 'gs://fixture/b.md', sourceDisplayName: 'B', score: 0.2 },
+         { id: 'b-weak', text: 'other evidence', sourceUri: 'gs://fixture/b2.md', sourceDisplayName: 'B2', score: 0.5 }];
+    const run = async (reranker: 'off' | 'rank-service') => {
+      const calls: CapturedCall[] = [];
+      const inner = fakeGoogleFetch(calls, {
+        ragCorpora: [{ name: shelfA, displayName: 'research-shelf-a' }, { name: shelfB, displayName: 'research-shelf-b' }],
+      });
+      const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
+        const url = String(input instanceof Request ? input.url : input);
+        if (url.endsWith(':retrieveContexts')) {
+          calls.push({ url, method: 'POST', body: String(init?.body), headers: {} });
+          return jsonResponse({ contexts: { contexts: contextsFor(String(init?.body)) } });
+        }
+        if (url.includes('discoveryengine.googleapis.com') && url.endsWith(':rank')) {
+          calls.push({ url, method: 'POST', body: String(init?.body), headers: {} });
+          const request = JSON.parse(String(init?.body));
+          // The ranker prefers the shelf-A passage, contrary to vector distance.
+          const order = request.records.map((record: { id: string; content: string }) => record)
+            .sort((left: { content: string }, right: { content: string }) => Number(right.content === 'weak evidence') - Number(left.content === 'weak evidence'));
+          return jsonResponse({ records: order.map((record: { id: string }, index: number) => ({ id: record.id, score: 1 - index / 10 })) });
+        }
+        return inner(input, init);
+      }) as typeof fetch;
+      const agentRouting = validateAgentRoutingConfig({
+        research: {
+          library: TEST_AGENT_ROUTING.research!.library,
+          targetCorpusDisplayName: 'research-library',
+          servingCorpusDisplayNames: ['research-shelf-a', 'research-shelf-b'],
+          retrieval: { reranker, multiQuery: false },
+        },
+      });
+      const worker = createDomainExpertWorker({ agentRouting, google: { accessToken: 'fixture-google-token', fetchImpl } });
+      const result = await postDomain(worker, 'domain_ask', { question: 'pooled question', output: 'passages' });
+      return { order: result.passages.map((passage: { text: string }) => passage.text), calls };
+    };
+
+    const byDistance = await run('off');
+    expect(byDistance.order).toEqual(['strong evidence', 'weak evidence', 'other evidence']);
+    expect(byDistance.calls.some((call) => call.url.endsWith(':rank'))).toBe(false);
+
+    const ranked = await run('rank-service');
+    expect(ranked.order[0]).toBe('weak evidence');
+    const rankCall = ranked.calls.find((call) => call.url.endsWith(':rank'))!;
+    expect(rankCall.url).toBe('https://discoveryengine.googleapis.com/v1/projects/fixture-project/locations/global/rankingConfigs/default_ranking_config:rank');
+    expect(JSON.parse(rankCall.body)).toMatchObject({ model: 'semantic-ranker-default@latest', query: 'pooled question' });
+    expect(JSON.parse(rankCall.body).records).toHaveLength(3);
+  });
+
   test('citations and retrieved counts share the 24-context synthesis cap', async () => {
     const calls: CapturedCall[] = [];
     const agentRouting = validateAgentRoutingConfig({
