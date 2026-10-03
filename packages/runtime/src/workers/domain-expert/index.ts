@@ -1245,7 +1245,8 @@ export class DomainExpertService {
         }));
       }
     }
-    const rankedLists: Array<Array<Record<string, unknown> & { corpus_id: string }>> = [];
+    let rankedLists: Array<Array<Record<string, unknown> & { corpus_id: string }>> = [];
+    const queryLists: Array<Array<Record<string, unknown> & { corpus_id: string }>> = queries.map(() => []);
     const usedCorpora = new Map<string, ResolvedRagCorpus>();
     // Every corpus x query retrieval runs at once; results are consumed in
     // corpus then query order so fusion stays deterministic.
@@ -1278,13 +1279,34 @@ export class DomainExpertService {
         const { value: contexts, resolved, warnings: retryWarnings } = result.value;
         usedCorpora.set(resolved.requested, resolved);
         warnings.push(...retryWarnings);
-        rankedLists.push(contexts.map((context) => ({
+        const tagged = contexts.map((context) => ({
           ...context,
           corpus_id: resolved.requested,
-        })));
+        }));
+        rankedLists.push(tagged);
+        queryLists[queryIndex]!.push(...tagged);
       }
     }
     if (firstFatal !== undefined && (resolvedCorpora.length === 1 || rankedLists.length === 0)) throw firstFatal;
+    // Shelves of one library are ranked as one pool per query. Fusing each
+    // shelf's list by rank would give a shelf's weak top hits the same weight
+    // as another shelf's strong ones.
+    if (resolvedCorpora.length > 1) {
+      rankedLists = await Promise.all(queries.map((query, queryIndex) => this.google.rankAcrossCorpora({
+        project: manifest.gcp_project,
+        query,
+        contexts: queryLists[queryIndex]!,
+        topN: topK,
+        ...(retrievalOverrides?.reranker ? { reranker: retrievalOverrides.reranker } : {}),
+      }).catch((error: unknown) => {
+        console.warn(JSON.stringify({
+          kind: 'domain_expert_cross_corpus_rank_fallback',
+          reason: sanitizeWebImportProvenanceText(error instanceof Error ? error.message : 'rank failed').slice(0, 300),
+        }));
+        return byVectorDistance(queryLists[queryIndex]!);
+      })));
+      rankedLists = rankedLists.filter((list) => list.length > 0);
+    }
     if (preference && ![...usedCorpora.values()].some((corpus) => corpus.resourceName === preference.profile.corpus)) {
       throw new DomainExpertWorkerError(409, 'retrieval_preferences_corpus_mismatch',
         'Configured retrieval preferences do not match the retrieved corpus.');
@@ -4650,6 +4672,44 @@ class GoogleRuntimeClient {
         body: JSON.stringify({ importRagFilesConfig }),
       },
     );
+  }
+
+  /**
+   * Orders one query's candidates from several corpora as a single pool: the
+   * Discovery Engine ranker when rank-service reranking is configured, else
+   * vector distance, which is comparable because every corpus uses the same
+   * embedding model.
+   */
+  async rankAcrossCorpora<T extends Record<string, unknown>>(options: {
+    project: string;
+    query: string;
+    contexts: T[];
+    topN: number;
+    reranker?: DomainExpertReranker;
+  }): Promise<T[]> {
+    const pool = dedupeContexts(options.contexts);
+    if ((options.reranker ?? this.reranker()) !== 'rank-service' || pool.length === 0) return byVectorDistance(pool).slice(0, options.topN);
+    requireGoogleProject(options.project);
+    const records = pool.slice(0, 200).map((context, index) => ({
+      id: String(index),
+      content: String(context.text ?? '').slice(0, 8000),
+      ...(typeof context.sourceDisplayName === 'string' ? { title: context.sourceDisplayName } : {}),
+    })).filter((record) => record.content.length > 0);
+    const response = await this.googleJson(
+      `https://discoveryengine.googleapis.com/v1/projects/${options.project}/locations/global/rankingConfigs/default_ranking_config:rank`,
+      {
+        method: 'POST',
+        headers: { 'x-goog-user-project': options.project },
+        body: JSON.stringify({
+          model: this.rerankerModel('rank-service'),
+          query: options.query,
+          records,
+          topN: Math.min(options.topN, records.length),
+        }),
+      },
+    );
+    const ranked = ((response as Record<string, any>).records ?? []) as Array<{ id?: unknown }>;
+    return ranked.map((record) => pool[Number(record.id)]).filter((context): context is T => context !== undefined);
   }
 
   async retrieveContexts(options: {
@@ -8090,6 +8150,22 @@ function normalizeRetrievedContextSource(context: Record<string, unknown>): Reco
     ...(!stringValue(context.sourceDisplayName) ? optionalField('sourceDisplayName', retrievedContextDisplayName(context)) : {}),
     ...(!stringValue(context.sourceUri) ? optionalField('sourceUri', retrievedContextSourceUri(context)) : {}),
   };
+}
+
+function dedupeContexts<T extends Record<string, unknown>>(contexts: T[]): T[] {
+  const seen = new Set<string>();
+  return contexts.filter((context) => {
+    const key = retrievedContextDedupeKey(context);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+// Vertex reports vector distance as `score`: lower is closer.
+function byVectorDistance<T extends Record<string, unknown>>(contexts: T[]): T[] {
+  const distance = (context: T) => (typeof context.score === 'number' ? context.score : Number.POSITIVE_INFINITY);
+  return dedupeContexts(contexts).sort((left, right) => distance(left) - distance(right));
 }
 
 export function reciprocalRankFuse<T extends Record<string, unknown>>(rankedLists: T[][], limit = Number.POSITIVE_INFINITY): T[] {
