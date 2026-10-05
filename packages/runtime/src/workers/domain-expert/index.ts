@@ -704,7 +704,9 @@ export class DomainExpertService {
   private annasDownloadTimeoutMs: number;
   // Member session for Anna Archive HTML search. Held in memory only, never
   // returned, logged, or written to the audit trail.
-  private annasMemberSession?: { cookie: string; expiresAt: number };
+  private annasMemberSession?: AnnasMemberSession;
+  private annasMemberSignIn?: Promise<AnnasMemberSession | undefined>;
+  private annasMemberSignInBlockedUntil = 0;
   private resolveHostImpl: ResolveHostImpl;
   private ytDlpBin?: string;
   private summarizeBin: string;
@@ -2926,29 +2928,46 @@ export class DomainExpertService {
   /**
    * Anna Archive serves its HTML search behind a DDoS-Guard browser check for
    * anonymous visitors (2026-09-17 onward) but not for signed-in members. When a
-   * search is refused, sign in once with the member key and retry with the
-   * session cookie; the session is reused until it expires or is refused.
+   * search is refused with 403, sign in with the member key and retry with the
+   * session cookie; the session is reused until it expires or is refused. A
+   * sign-in that does not get search through backs off before the key is sent
+   * again, and concurrent refusals share one sign-in.
    */
   private async annasSearchResponse(url: string, apiKey: string): Promise<Response> {
-    const attempt = async (cookie?: string) => (await fetchAnnasCredentialed(this.fetchImpl, url, {
+    const attempt = async (session?: AnnasMemberSession) => (await fetchAnnasCredentialed(this.fetchImpl, url, {
       config: this.annas,
       apiKey,
       purpose: 'search',
-      ...(cookie ? { cookie } : {}),
+      ...(session ? { cookie: session.cookie, sensitiveValues: [session.value] } : {}),
     })).response;
     const cached = this.annasMemberSession && this.annasMemberSession.expiresAt > Date.now()
-      ? this.annasMemberSession.cookie
+      ? this.annasMemberSession
       : undefined;
     const first = await attempt(cached);
-    if (first.ok) return first;
+    if (first.ok || first.status !== 403 || Date.now() < this.annasMemberSignInBlockedUntil) return first;
     await first.body?.cancel().catch(() => {});
-    this.annasMemberSession = undefined;
-    const session = await annasMemberSignIn(this.fetchImpl, new URL(url).origin, this.annas, apiKey).catch(() => undefined);
+    const refused = () => new DomainExpertWorkerError(first.status, 'annas_archive_error', 'Anna Archive search failed.');
+    if (this.annasMemberSession === cached) this.annasMemberSession = undefined;
+    this.annasMemberSignIn ??= annasMemberSignIn(this.fetchImpl, new URL(url).origin, this.annas, apiKey)
+      .catch(() => undefined)
+      .finally(() => { this.annasMemberSignIn = undefined; });
+    const session = this.annasMemberSession ?? await this.annasMemberSignIn;
     if (!session) {
-      throw new DomainExpertWorkerError(first.status, 'annas_archive_error', 'Anna Archive search failed.');
+      this.annasMemberSignInBlockedUntil = Date.now() + ANNAS_MEMBER_SIGN_IN_BACKOFF_MS;
+      throw refused();
     }
     this.annasMemberSession = session;
-    return attempt(session.cookie);
+    let retried: Response;
+    try {
+      retried = await attempt(session);
+    } catch {
+      throw refused();
+    }
+    if (!retried.ok) {
+      this.annasMemberSession = undefined;
+      this.annasMemberSignInBlockedUntil = Date.now() + ANNAS_MEMBER_SIGN_IN_BACKOFF_MS;
+    }
+    return retried;
   }
 
   /** Uncredentialed HTML search against the configured Library Genesis origin. */
@@ -6557,6 +6576,7 @@ async function fetchAnnasCredentialed(
     apiKey: string;
     purpose: 'download' | 'search';
     cookie?: string;
+    sensitiveValues?: string[];
   },
 ): Promise<{ response: Response; url: string }> {
   let current = requireAllowedAnnasCredentialUrl(rawUrl, options.config, options.purpose);
@@ -6579,7 +6599,7 @@ async function fetchAnnasCredentialed(
     upstreamResponseContexts.set(response, {
       signal,
       timeoutError: annasRequestTimeoutError,
-      sensitiveValues: options.cookie ? [options.apiKey, options.cookie] : [options.apiKey],
+      sensitiveValues: [options.apiKey, ...(options.cookie ? [options.cookie] : []), ...(options.sensitiveValues ?? [])],
     });
     if (!isRedirectStatus(response.status)) {
       return { response, url: current.toString() };
@@ -6597,6 +6617,13 @@ async function fetchAnnasCredentialed(
 const ANNAS_MEMBER_COOKIE = 'aa_account_id2';
 const ANNAS_MEMBER_SESSION_DEFAULT_MS = 24 * 60 * 60 * 1000;
 const ANNAS_MEMBER_SESSION_MAX_MS = 30 * 24 * 60 * 60 * 1000;
+const ANNAS_MEMBER_SIGN_IN_BACKOFF_MS = 10 * 60 * 1000;
+
+interface AnnasMemberSession {
+  cookie: string;
+  value: string;
+  expiresAt: number;
+}
 
 /**
  * Signs in to the configured Anna Archive origin the way its account form does
@@ -6608,7 +6635,7 @@ async function annasMemberSignIn(
   origin: string,
   config: DomainExpertAnnasConfig,
   apiKey: string,
-): Promise<{ cookie: string; expiresAt: number } | undefined> {
+): Promise<AnnasMemberSession | undefined> {
   const url = requireAllowedAnnasCredentialUrl(`${origin}/account/`, config, 'search');
   const signal = AbortSignal.timeout(ANNAS_ARCHIVE_REQUEST_TIMEOUT_MS);
   let response: Response;
@@ -6633,7 +6660,7 @@ async function annasMemberSignIn(
     if (!pair || separator < 0 || pair.slice(0, separator).trim() !== ANNAS_MEMBER_COOKIE) continue;
     const value = pair.slice(separator + 1).trim();
     if (!value) return undefined;
-    return { cookie: `${ANNAS_MEMBER_COOKIE}=${value}`, expiresAt: Date.now() + annasMemberSessionLifetimeMs(attributes) };
+    return { cookie: `${ANNAS_MEMBER_COOKIE}=${value}`, value, expiresAt: Date.now() + annasMemberSessionLifetimeMs(attributes) };
   }
   return undefined;
 }

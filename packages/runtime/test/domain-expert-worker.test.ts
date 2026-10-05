@@ -2622,7 +2622,7 @@ ${LIBGEN_ROW_HTML}
 
     // Plays the upstream: anonymous searches hit the browser check, the account
     // form issues a session for the member key, and a session cookie unlocks search.
-    function memberGatedFetch(calls: CapturedCall[], options: { issueSession?: boolean; acceptSession?: () => boolean } = {}): typeof fetch {
+    function memberGatedFetch(calls: CapturedCall[], options: { issueSession?: boolean; acceptSession?: () => boolean; resultsHtml?: string; signInLocation?: string; searchAfterSignIn?: () => Response } = {}): typeof fetch {
       return (async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
         const url = input instanceof Request ? input.url : String(input);
         const headers = headersRecord(init?.headers);
@@ -2632,13 +2632,14 @@ ${LIBGEN_ROW_HTML}
           if (options.issueSession === false) return new Response('', { status: 200 });
           return new Response('', {
             status: 302,
-            headers: { location: '/account/', 'set-cookie': `aa_account_id2=${MEMBER_SESSION}; Domain=annas.example; Max-Age=7776000; Secure; HttpOnly; Path=/; SameSite=Lax` },
+            headers: { location: options.signInLocation ?? '/account/', 'set-cookie': `aa_account_id2=${MEMBER_SESSION}; Domain=annas.example; Max-Age=7776000; Secure; HttpOnly; Path=/; SameSite=Lax` },
           });
         }
         if (url.startsWith('https://annas.example/search')) {
-          const accepted = headers.cookie === `aa_account_id2=${MEMBER_SESSION}` && (options.acceptSession?.() ?? true);
-          return accepted
-            ? new Response(RESULTS_HTML, { status: 200, headers: { 'content-type': 'text/html' } })
+          const signedIn = headers.cookie === `aa_account_id2=${MEMBER_SESSION}`;
+          if (signedIn && options.searchAfterSignIn) return options.searchAfterSignIn();
+          return signedIn && (options.acceptSession?.() ?? true)
+            ? new Response(options.resultsHtml ?? RESULTS_HTML, { status: 200, headers: { 'content-type': 'text/html' } })
             : new Response('<html>check</html>', { status: 403, headers: { 'content-type': 'text/html' } });
         }
         throw new Error(`unexpected fetch ${url}`);
@@ -2707,19 +2708,65 @@ ${LIBGEN_ROW_HTML}
       expect(result.warnings).toEqual([expect.stringContaining('HTTP 403')]);
     });
 
-    test('the member key is never posted to an origin other than the configured one', async () => {
+    test('a redirect in reply to the sign-in is never followed, so the key stays on the configured origin', async () => {
+      const calls: CapturedCall[] = [];
+      const worker = createDomainExpertWorker({ annas, fetchImpl: memberGatedFetch(calls, { signInLocation: 'https://impostor.example/account/' }) });
+      const result = await postDomain(worker, 'annas_archive_search', { query: 'bounded rationality' });
+      expect(calls.every((call) => call.url.startsWith('https://annas.example/'))).toBe(true);
+      expect(calls.filter((call) => call.method === 'POST').map((call) => call.url)).toEqual(['https://annas.example/account/']);
+      expect(result).toMatchObject({ search: { backend: 'annas_archive' } });
+    });
+
+    test('the bare session value is redacted when the upstream echoes it', async () => {
+      const worker = createDomainExpertWorker({
+        annas,
+        fetchImpl: memberGatedFetch([], { resultsHtml: annasSearchPageHtml([{ md5: '11111111111111111111111111111111', title: `Echo ${MEMBER_SESSION}`, author: 'Example, Ada', metadata: 'English [en] · EPUB · 1.5MB · 2011 · Book (non-fiction)' }]) }),
+      });
+      const result = await postDomain(worker, 'annas_archive_search', { query: 'bounded rationality' });
+      expect(result).toMatchObject({ search: { backend: 'annas_archive' } });
+      expect(JSON.stringify(result)).not.toContain(MEMBER_SESSION);
+    });
+
+    test('only a 403 triggers a sign-in; other failures go straight to the fallback', async () => {
       const calls: CapturedCall[] = [];
       const worker = createDomainExpertWorker({
         annas,
         fetchImpl: routedFetch(calls, {
-          'https://annas.example': () => new Response('', { status: 302, headers: { location: 'https://impostor.example/search?q=x' } }),
+          'https://annas.example': () => new Response('', { status: 500 }),
           'https://libgen.example': () => new Response(LIBGEN_PAGE_HTML, { status: 200, headers: { 'content-type': 'text/html' } }),
         }),
       });
       const result = await postDomain(worker, 'annas_archive_search', { query: 'bounded rationality' });
-      expect(calls.some((call) => call.url.startsWith('https://impostor.example'))).toBe(false);
       expect(calls.filter((call) => call.method === 'POST')).toEqual([]);
+      expect(result.warnings).toEqual([expect.stringContaining('HTTP 500')]);
+    });
+
+    test('after a sign-in that does not get search through, the key is not sent again until the backoff passes', async () => {
+      const calls: CapturedCall[] = [];
+      const worker = createDomainExpertWorker({ annas, fetchImpl: memberGatedFetch(calls, { issueSession: false }) });
+      await postDomain(worker, 'annas_archive_search', { query: 'bounded rationality' });
+      calls.length = 0;
+      const result = await postDomain(worker, 'annas_archive_search', { query: 'bounded rationality' });
+      expect(calls.map((call) => `${call.method} ${new URL(call.url).origin}`)).toEqual(['GET https://annas.example', 'GET https://libgen.example']);
       expect(result).toMatchObject({ search: { backend: 'libgen_fallback' } });
+    });
+
+    test('a retry that throws still reports the original refusal', async () => {
+      const worker = createDomainExpertWorker({
+        annas,
+        fetchImpl: memberGatedFetch([], { searchAfterSignIn: () => { throw new TypeError('fetch failed'); } }),
+      });
+      const result = await postDomain(worker, 'annas_archive_search', { query: 'bounded rationality' });
+      expect(result).toMatchObject({ search: { backend: 'libgen_fallback' } });
+      expect(result.warnings).toEqual([expect.stringContaining('HTTP 403')]);
+    });
+
+    test('concurrent refused searches share one sign-in', async () => {
+      const calls: CapturedCall[] = [];
+      const worker = createDomainExpertWorker({ annas, fetchImpl: memberGatedFetch(calls) });
+      const results = await Promise.all([1, 2, 3].map(() => postDomain(worker, 'annas_archive_search', { query: 'bounded rationality' })));
+      expect(calls.filter((call) => call.method === 'POST')).toHaveLength(1);
+      for (const result of results) expect(result).toMatchObject({ search: { backend: 'annas_archive' } });
     });
   });
 
