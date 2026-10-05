@@ -2948,25 +2948,30 @@ export class DomainExpertService {
     await first.body?.cancel().catch(() => {});
     const refused = () => new DomainExpertWorkerError(first.status, 'annas_archive_error', 'Anna Archive search failed.');
     if (this.annasMemberSession === cached) this.annasMemberSession = undefined;
-    this.annasMemberSignIn ??= annasMemberSignIn(this.fetchImpl, new URL(url).origin, this.annas, apiKey)
-      .catch(() => undefined)
-      .finally(() => { this.annasMemberSignIn = undefined; });
+    // Another search may already have signed in while this one waited on its refusal.
+    if (!this.annasMemberSession) {
+      this.annasMemberSignIn ??= annasMemberSignIn(this.fetchImpl, new URL(url).origin, this.annas, apiKey)
+        .catch(() => undefined)
+        .finally(() => { this.annasMemberSignIn = undefined; });
+    }
     const session = this.annasMemberSession ?? await this.annasMemberSignIn;
     if (!session) {
       this.annasMemberSignInBlockedUntil = Date.now() + ANNAS_MEMBER_SIGN_IN_BACKOFF_MS;
       throw refused();
     }
     this.annasMemberSession = session;
+    const backOff = () => {
+      if (this.annasMemberSession === session) this.annasMemberSession = undefined;
+      this.annasMemberSignInBlockedUntil = Date.now() + ANNAS_MEMBER_SIGN_IN_BACKOFF_MS;
+    };
     let retried: Response;
     try {
       retried = await attempt(session);
     } catch {
+      backOff();
       throw refused();
     }
-    if (!retried.ok) {
-      this.annasMemberSession = undefined;
-      this.annasMemberSignInBlockedUntil = Date.now() + ANNAS_MEMBER_SIGN_IN_BACKOFF_MS;
-    }
+    if (!retried.ok) backOff();
     return retried;
   }
 

@@ -2761,6 +2761,33 @@ ${LIBGEN_ROW_HTML}
       expect(result.warnings).toEqual([expect.stringContaining('HTTP 403')]);
     });
 
+    test('a search refused after another search already signed in uses that session instead of signing in again', async () => {
+      const calls: CapturedCall[] = [];
+      let releaseSlow!: () => void;
+      const slowRefusal = new Promise<void>((resolve) => { releaseSlow = resolve; });
+      let first = true;
+      const gated = memberGatedFetch(calls);
+      const worker = createDomainExpertWorker({
+        annas,
+        fetchImpl: (async (input: string | URL | Request, init?: RequestInit) => {
+          const url = input instanceof Request ? input.url : String(input);
+          if (first && url.startsWith('https://annas.example/search')) {
+            first = false;
+            await slowRefusal;
+            calls.push({ url, method: 'GET', body: '', headers: headersRecord(init?.headers) });
+            return new Response('<html>check</html>', { status: 403 });
+          }
+          return gated(input, init);
+        }) as typeof fetch,
+      });
+      const slow = postDomain(worker, 'annas_archive_search', { query: 'bounded rationality' });
+      await postDomain(worker, 'annas_archive_search', { query: 'bounded rationality' });
+      releaseSlow();
+      const result = await slow;
+      expect(calls.filter((call) => call.method === 'POST')).toHaveLength(1);
+      expect(result).toMatchObject({ search: { backend: 'annas_archive' } });
+    });
+
     test('concurrent refused searches share one sign-in', async () => {
       const calls: CapturedCall[] = [];
       const worker = createDomainExpertWorker({ annas, fetchImpl: memberGatedFetch(calls) });
