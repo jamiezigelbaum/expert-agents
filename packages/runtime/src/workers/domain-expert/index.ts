@@ -897,7 +897,8 @@ export class DomainExpertService {
           || (requested.project !== manifest.gcp_project && !/^[1-9][0-9]*$/.test(requested.project))) {
           throw new LibraryReadError('library_source_not_available', 'The source is not available in this library scope.', 404);
         }
-        const resolved = await this.resolveRagCorpus(manifest, requested.corpusId);
+        const resolved = await this.resolveRagCorpus(manifest,
+          corpusResourceNameFromParts(manifest.gcp_project, manifest.rag_location, requested.corpusId));
         // Always address the configured project. Its authenticated GetRagFile
         // response proves Google's numeric spelling without a warm list cache.
         const canonicalName = `${resolved.resourceName}/ragFiles/${requested.fileId}`;

@@ -229,6 +229,26 @@ describe('direct library reading', () => {
 });
 
 describe('domain_read HTTP surface', () => {
+  test('a numeric display name cannot authorize a different corpus with that numeric ID', async () => {
+    const f = fixture();
+    writeFileSync(f.scopePath, serializeScopeManifest({ ...f.scope, targetCorpusDisplayName: '10' }));
+    let metadataReads = 0; let corpusLookups = 0; let sourceReads = 0;
+    const worker = createDomainExpertWorker({ gcpProject: 'fixture-project', dataDir: join(f.directory, 'runtime'),
+      agentRouting: validateAgentRoutingConfig({ research: { ...f.route, targetCorpusDisplayName: '10' } }),
+      google: { accessToken: 'fixture-token', fetchImpl: (async (input: string | URL | Request) => {
+        const url = String(input);
+        if (url.includes('/ragFiles/')) { metadataReads++; return Response.json({ name: 'projects/fixture-project/locations/us-central1/ragCorpora/10/ragFiles/20', gcsSource: { uris: ['gs://fixture-bucket/library/staged/foreign.md'] } }); }
+        if (url.includes('/ragCorpora')) { corpusLookups++; return Response.json({ ragCorpora: [{ name: 'projects/fixture-project/locations/us-central1/ragCorpora/99', displayName: '10' }] }); }
+        const objectName = decodeURIComponent(new URL(url).pathname.split('/o/')[1]!);
+        if (objectName.endsWith('master.json')) return new Response(new Uint8Array(f.stored.get(objectName)!));
+        sourceReads++; return new Response('Foreign source');
+      }) as typeof fetch } });
+    const response = await worker.fetch(new Request('http://worker/v1/domain', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ tool: 'domain_read', params: { domain_id: 'research', action: 'read', rag_file_name: 'projects/fixture-project/locations/us-central1/ragCorpora/10/ragFiles/20' } }) }));
+    expect(response.status).not.toBe(200);
+    expect(corpusLookups).toBe(1);
+    expect(metadataReads).toBe(0);
+    expect(sourceReads).toBe(0);
+  });
   test('cold reads prove numeric project aliases through the configured project without trusting caller aliases', async () => {
     const f = fixture();
     const corpus = 'projects/fixture-project/locations/us-central1/ragCorpora/10';
