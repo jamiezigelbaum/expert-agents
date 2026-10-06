@@ -31,6 +31,8 @@ export interface AgentRoutingEntry {
   domainId: string;
   displayName?: string;
   library: LibraryLocationConfig;
+  /** Existing source locations usable only for authorized RAG-file reads, never ingestion. */
+  readOnlySourceRoots?: LibraryLocationConfig[];
   targetCorpusDisplayName: string;
   /**
    * Optional. The corpora domain_ask searches, in order. Absent, it searches
@@ -103,7 +105,7 @@ function validateRoutingEntry(domainId: string, value: unknown): AgentRoutingEnt
   const entry = requireRecord(value, 'an entry must be an object');
   requireExactKeys(
     entry,
-    ['displayName', 'library', 'targetCorpusDisplayName', 'servingCorpusDisplayNames', 'scopeManifestPath', 'retrieval', 'ingestion', 'disclosure'],
+    ['displayName', 'library', 'readOnlySourceRoots', 'targetCorpusDisplayName', 'servingCorpusDisplayNames', 'scopeManifestPath', 'retrieval', 'ingestion', 'disclosure'],
     'an entry',
   );
   if (!('library' in entry) || !('targetCorpusDisplayName' in entry)) {
@@ -118,6 +120,18 @@ function validateRoutingEntry(domainId: string, value: unknown): AgentRoutingEnt
   }
 
   const displayName = optionalNonEmptyString(entry.displayName, 'an entry displayName');
+  let readOnlySourceRoots: LibraryLocationConfig[] | undefined;
+  if (entry.readOnlySourceRoots !== undefined) {
+    if (!Array.isArray(entry.readOnlySourceRoots) || entry.readOnlySourceRoots.length < 1 || entry.readOnlySourceRoots.length > 16) {
+      throw new AgentRoutingConfigError('readOnlySourceRoots must list 1 to 16 non-root locations');
+    }
+    try { readOnlySourceRoots = entry.readOnlySourceRoots.map(value => Object.freeze(validateLibraryLocationConfig(value))); }
+    catch { throw new AgentRoutingConfigError('a readOnlySourceRoots location is invalid'); }
+    if (new Set(readOnlySourceRoots.map(root => `${root.bucket}/${root.prefix}`)).size !== readOnlySourceRoots.length) {
+      throw new AgentRoutingConfigError('readOnlySourceRoots contains duplicates');
+    }
+    Object.freeze(readOnlySourceRoots);
+  }
   const scopeManifestPath = optionalNonEmptyString(entry.scopeManifestPath, 'an entry scopeManifestPath');
   const servingCorpusDisplayNames = entry.servingCorpusDisplayNames === undefined
     ? undefined
@@ -140,6 +154,7 @@ function validateRoutingEntry(domainId: string, value: unknown): AgentRoutingEnt
     domainId,
     ...(displayName ? { displayName } : {}),
     library,
+    ...(readOnlySourceRoots ? { readOnlySourceRoots } : {}),
     targetCorpusDisplayName: requireNonEmptyString(
       entry.targetCorpusDisplayName,
       'an entry targetCorpusDisplayName',

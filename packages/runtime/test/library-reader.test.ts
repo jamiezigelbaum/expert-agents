@@ -8,6 +8,7 @@ import {
   type LibraryObject, type Sha256Id,
 } from '@expert-agents/library';
 import { validateAgentRoutingConfig } from '../src/core/agent-routing.ts';
+import { domainManifest } from '../src/core/domain-expert.ts';
 import { createDomainExpertWorker } from '../src/workers/domain-expert/index.ts';
 import { LibraryReader, parseLibraryReadParams, LIBRARY_READ_MAX_BYTES } from '../src/workers/domain-expert/library-reader.ts';
 
@@ -41,6 +42,61 @@ function fixture(text = '# Sample Book\nBody\n\n# References\n' + 'Example Autho
 }
 
 describe('direct library reading', () => {
+  test('explicit prior source roots remain read-only and domain-specific', async () => {
+    const f = fixture();
+    const routes = validateAgentRoutingConfig({ research: { ...f.route, readOnlySourceRoots: [{ bucket: 'prior-library', prefix: 'staged/research' }] } });
+    expect(domainManifest('research', undefined, { agentRouting: routes, env: { EXPERT_AGENTS_GCP_PROJECT: 'fixture-project' } }).allowed_gcs_prefixes).toEqual(['gs://fixture-bucket/library']);
+    const calls: string[] = [];
+    const reader = new LibraryReader({ download: async (bucket, name) => {
+      calls.push(`${bucket}/${name}`);
+      return bucket === 'fixture-bucket' ? f.stored.get(name) ?? null : Buffer.from('Prior source text.');
+    } });
+    const params = { action: 'read' as const, rag_file_name: 'projects/fixture/locations/us-central1/ragCorpora/1/ragFiles/2' };
+    const resolver = async () => ({ uri: 'gs://prior-library/staged/research/source.md' });
+    expect(await reader.run(routes.research!, params, resolver)).toMatchObject({ text: 'Prior source text.' });
+    expect(calls).toContain('prior-library/staged/research/source.md');
+    calls.length = 0;
+    await expect(reader.run(f.route, params, resolver)).rejects.toMatchObject({ code: 'library_source_not_available' });
+    expect(calls).toEqual(['fixture-bucket/library/manifest/master.json']);
+    for (const roots of [[], [{ bucket: 'prior-library', prefix: '' }], [{ bucket: 'prior-library', prefix: '../private' }], Array(17).fill({ bucket: 'prior-library', prefix: 'staged/research' })]) {
+      expect(() => validateAgentRoutingConfig({ research: { ...f.route, readOnlySourceRoots: roots } })).toThrow();
+    }
+  });
+  test('reads existing legacy imports with fresh membership checks and pinned continuation', async () => {
+    const f = fixture();
+    const text = '# References\n' + 'An older reference entry.\n'.repeat(1000);
+    f.stored.set('library/book-imports/research/old.md', Buffer.from(text));
+    const name = 'projects/fixture-project/locations/us-central1/ragCorpora/10/ragFiles/20';
+    let calls = 0;
+    const resolve = async () => { calls++; return { uri: 'gs://fixture-bucket/library/book-imports/research/old.md', title: 'Older Book' }; };
+    const first = await f.reader.run(f.route, { action: 'read', rag_file_name: name, limit: 24000 }, resolve) as any;
+    const second = await f.reader.run(f.route, { action: 'read', rag_file_name: name, offset: first.next_offset, text_revision: first.text_revision }, resolve) as any;
+    expect(first.text + second.text).toBe(text);
+    expect(calls).toBe(2);
+    expect(first.rag_file_name).toBe(name);
+    expect(first).not.toHaveProperty('object_id');
+    expect(second.complete).toBeTrue();
+    f.stored.set('library/book-imports/research/old.md', Buffer.from(text + 'changed'));
+    await expect(f.reader.run(f.route, { action: 'read', rag_file_name: name, offset: first.next_offset, text_revision: first.text_revision }, resolve)).rejects.toMatchObject({ code: 'library_text_revision_changed' });
+  });
+
+  test('legacy references cannot escape the root or bypass canonical selection and tombstones', async () => {
+    const f = fixture();
+    const params = { action: 'read' as const, rag_file_name: 'projects/fixture/locations/us-central1/ragCorpora/1/ragFiles/2' };
+    const resolve = (uri: string) => async () => ({ uri });
+    await expect(f.reader.run(f.route, params, resolve('gs://other-bucket/library/private.txt'))).rejects.toMatchObject({ code: 'library_source_not_available' });
+    await expect(f.reader.run(f.route, params, resolve('gs://fixture-bucket/library-other/private.txt'))).rejects.toMatchObject({ code: 'library_source_not_available' });
+    f.updateScope([]);
+    await expect(f.reader.run(f.route, params, resolve(`gs://fixture-bucket/library/${f.object.relativePath}`))).rejects.toMatchObject({ code: 'library_source_not_available' });
+    expect(f.downloads.every(name => name.endsWith('master.json'))).toBeTrue();
+    f.stored.set('library/staged/alias.md', f.bytes);
+    await expect(f.reader.run(f.route, params, resolve('gs://fixture-bucket/library/staged/alias.md'))).rejects.toMatchObject({ code: 'library_source_not_available' });
+    f.stored.set('library/manifest/master.json', Buffer.from(serializeMasterManifest(finalizeMasterManifest({
+      schemaVersion: 1, revision: 2, ingestionCursor: null, objects: [], tombstones: [{ objectId: f.id, revision: 2, reason: 'removed' }],
+    }))));
+    await expect(f.reader.run(f.route, params, resolve('gs://fixture-bucket/library/staged/alias.md'))).rejects.toMatchObject({ code: 'library_source_not_available' });
+    await expect(f.reader.run({ ...f.route, disclosure: {} }, params, async () => { throw new Error('Must not resolve'); })).rejects.toMatchObject({ code: 'library_read_disclosure_restricted' });
+  });
   test('catalog identifies exact objects; sequential reads cover a full reference section and whole book', async () => {
     const f = fixture();
     const catalog = await f.reader.run(f.route, { action: 'catalog', query: 'sample' });
@@ -173,6 +229,41 @@ describe('direct library reading', () => {
 });
 
 describe('domain_read HTTP surface', () => {
+  test('legacy file access verifies corpus identity, current existence, and source root through the handler', async () => {
+    const f = fixture();
+    const corpus = 'projects/fixture-project/locations/us-central1/ragCorpora/10';
+    const name = corpus + '/ragFiles/20';
+    const text = 'A legacy reference list not in the master manifest.';
+    let removed = false;
+    let uri = 'gs://fixture-bucket/library/book-imports/research/old.md';
+    const fileCalls: string[] = [];
+    let sourceReads = 0;
+    const worker = createDomainExpertWorker({ gcpProject: 'fixture-project', dataDir: join(f.directory, 'runtime'),
+      agentRouting: validateAgentRoutingConfig({ research: f.route }),
+      google: { accessToken: 'fixture-token', fetchImpl: (async (input: string | URL | Request) => {
+        const url = String(input);
+        if (url.includes('/ragFiles/')) { fileCalls.push(url); return removed ? new Response('{}', { status: 404 }) : Response.json({ name, gcsSource: { uris: [uri] }, displayName: 'Older Book' }); }
+        if (url.includes('/ragCorpora')) return Response.json({ ragCorpora: [{ name: corpus, displayName: 'research-library' }] });
+        const objectName = decodeURIComponent(new URL(url).pathname.split('/o/')[1]!);
+        if (objectName.endsWith('master.json')) return new Response(new Uint8Array(f.stored.get(objectName)!));
+        sourceReads++;
+        if (objectName !== 'library/book-imports/research/old.md') throw new Error('Foreign source reached transport');
+        return new Response(text);
+      }) as typeof fetch } });
+    const request = (ragFile = name) => worker.fetch(new Request('http://worker/v1/domain', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ tool: 'domain_read', params: { domain_id: 'research', action: 'read', rag_file_name: ragFile } }) }));
+    expect(await (await request()).json()).toMatchObject({ text, rag_file_name: name, complete: true });
+    expect(sourceReads).toBe(1);
+    for (const foreign of [name.replace('ragCorpora/10', 'ragCorpora/99'), name.replace('fixture-project', 'foreign-project'), name.replace('us-central1', 'europe-west1')]) {
+      expect((await request(foreign)).status).not.toBe(200);
+    }
+    expect(fileCalls).toHaveLength(1);
+    expect(sourceReads).toBe(1);
+    removed = true;
+    expect((await request()).status).toBe(404);
+    removed = false; uri = 'gs://foreign-bucket/library/private.md';
+    expect((await request()).status).toBe(404);
+    expect(sourceReads).toBe(1);
+  });
   test('reads through the real worker handler with GCS only and the bounded policy stamp', async () => {
     const f = fixture();
     const calls: string[] = [];

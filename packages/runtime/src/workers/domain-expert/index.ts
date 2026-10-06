@@ -891,7 +891,21 @@ export class DomainExpertService {
       const manifest = this.manifest(optionalStringField(params.domain_id, 'domainId').domainId);
       requireConfiguredAgent(manifest, 'domain_read');
       const route = this.agentRouting[manifest.domain_id]!;
-      const result = await this.libraryReader.run(route, parsed);
+      const result = await this.libraryReader.run(route, parsed, async (name) => {
+        const corpus = name.slice(0, name.lastIndexOf('/ragFiles/'));
+        const resolved = await this.resolveRagCorpus(manifest, corpus);
+        this.assertRagFileBelongsToResolvedCorpus(manifest, name, resolved);
+        const file = await this.google.getRagFile(name);
+        if (typeof file.name !== 'string' || file.name.split('/').at(-1) !== name.split('/').at(-1)) {
+          throw new LibraryReadError('library_source_not_available', 'The source is not available in this library scope.', 404);
+        }
+        this.assertRagFileBelongsToResolvedCorpus(manifest, file.name, resolved);
+        const uris = file.gcsSource?.uris ?? file.ragFileSource?.gcsSource?.uris ?? (file.sourceUri ? [file.sourceUri] : []);
+        if (!Array.isArray(uris) || uris.length !== 1 || typeof uris[0] !== 'string') {
+          throw new LibraryReadError('library_source_not_available', 'The source is not available in this library scope.', 404);
+        }
+        return { uri: uris[0], ...(typeof file.displayName === 'string' ? { title: file.displayName } : {}) };
+      });
       return { kind: 'domain_read_result', domain_id: manifest.domain_id, ...result, policy: domainPolicy() };
     } catch (error) {
       if (error instanceof LibraryReadError) throw new DomainExpertWorkerError(error.status, error.code, error.message);
@@ -4609,6 +4623,15 @@ class GoogleRuntimeClient {
       files,
       ...(nextPageToken ? { nextPageToken } : {}),
     };
+  }
+
+  async getRagFile(name: string): Promise<Record<string, any>> {
+    try {
+      return await this.googleJson(`${vertexBase(name.split('/')[3]!)}/v1/${name}`) as Record<string, any>;
+    } catch (error) {
+      if (isGoogleNotFoundError(error)) throw new LibraryReadError('library_source_not_available', 'The source is not available in this library scope.', 404);
+      throw error;
+    }
   }
 
   async deleteRagFile(options: {

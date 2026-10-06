@@ -51,6 +51,23 @@ bun run expert:library -- read --domain research --action read --object "sha256:
 
 ## Source and extraction coverage
 
+Older imports under staging or acquisition paths need no copy or reimport.
+Enumerate `rag_corpus list_files` for every configured serving shelf, then pass
+its exact `name` as `rag_file_name` instead of `object_id` to open/find/read.
+The worker rechecks corpus authorization and the current file record on every
+call, and only reads a source URI under the configured cloud-library root.
+Removed files fail closed. Canonical selection and tombstones also apply to
+aliases of canonical bytes. Responses carry the source hash and text revision;
+continuation rejects changed text. CLI equivalent: `--rag-file <resource>`.
+The direct catalog explicitly covers only canonical scope, so its absence result
+alone never establishes that a title is missing from the complete library.
+
+An operator may declare `readOnlySourceRoots: [{"bucket":"prior-library","prefix":"staged/research"}]`
+on the agent route for its existing sources retained in a prior bucket. Each root
+must have a non-root prefix. These locations apply only after current RAG-file
+membership is verified; they never widen ingestion destinations, canonical
+catalog selection, or any other agent's route. No caller can supply a root.
+
 Supported canonical representations are UTF-8 plain text and Markdown, HTML
 converted with the existing deterministic converter, and PDFs with a readable
 text layer. PDF extraction uses Poppler `pdftotext -layout`, without a model or

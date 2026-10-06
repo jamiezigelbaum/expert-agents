@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   allowlistedExtractionEnv, parseMasterManifest, parseScopeManifest, planReconciliation,
-  xhtmlToMarkdown, type LibraryLocationConfig,
+  xhtmlToMarkdown, type LibraryLocationConfig, type LibraryObject, type Sha256Id,
 } from '@expert-agents/library';
 import { navigateText, TextNavigationError } from './text-navigation.ts';
 
@@ -20,6 +20,7 @@ export class LibraryReadError extends Error {
 
 export interface LibraryReadRoute {
   library: LibraryLocationConfig;
+  readOnlySourceRoots?: LibraryLocationConfig[];
   scopeManifestPath?: string;
   targetCorpusDisplayName: string;
   disclosure?: unknown;
@@ -33,6 +34,7 @@ export interface LibraryReadDependencies {
 export interface LibraryReadParams {
   action: 'catalog' | 'open' | 'find' | 'read';
   object_id?: string;
+  rag_file_name?: string;
   text_revision?: string;
   offset?: number;
   end?: number;
@@ -42,17 +44,21 @@ export interface LibraryReadParams {
 }
 
 export function parseLibraryReadParams(value: Record<string, unknown>): LibraryReadParams {
-  const allowed = ['domain_id', 'action', 'object_id', 'text_revision', 'offset', 'end', 'section', 'query', 'limit'];
+  const allowed = ['domain_id', 'action', 'object_id', 'rag_file_name', 'text_revision', 'offset', 'end', 'section', 'query', 'limit'];
   if (Object.keys(value).some(key => !allowed.includes(key))) invalid();
-  if (!['catalog', 'open', 'find', 'read'].includes(String(value.action))) invalid();
+  if (typeof value.action !== 'string' || !['catalog', 'open', 'find', 'read'].includes(value.action)) invalid();
   const actionFields: Record<string, string[]> = {
-    catalog: ['query', 'offset', 'limit'], open: ['object_id', 'text_revision', 'offset', 'limit'],
-    find: ['object_id', 'text_revision', 'query', 'offset', 'limit'],
-    read: ['object_id', 'text_revision', 'offset', 'end', 'section', 'limit'],
+    catalog: ['query', 'offset', 'limit'], open: ['object_id', 'rag_file_name', 'text_revision', 'offset', 'limit'],
+    find: ['object_id', 'rag_file_name', 'text_revision', 'query', 'offset', 'limit'],
+    read: ['object_id', 'rag_file_name', 'text_revision', 'offset', 'end', 'section', 'limit'],
   };
   if (Object.keys(value).some(key => !['action', 'domain_id', ...actionFields[String(value.action)]!].includes(key))) invalid();
   if (value.section !== undefined && value.end !== undefined) invalid();
-  if (value.action !== 'catalog' && (typeof value.object_id !== 'string' || !/^sha256:[a-f0-9]{64}$/.test(value.object_id))) invalid();
+  if (value.action !== 'catalog') {
+    if ((value.object_id === undefined) === (value.rag_file_name === undefined)) invalid();
+    if (value.object_id !== undefined && (typeof value.object_id !== 'string' || !/^sha256:[a-f0-9]{64}$/.test(value.object_id))) invalid();
+    if (value.rag_file_name !== undefined && (typeof value.rag_file_name !== 'string' || !/^projects\/[a-z0-9-]+\/locations\/[a-z0-9-]+\/ragCorpora\/[0-9]+\/ragFiles\/[a-zA-Z0-9_-]+$/.test(value.rag_file_name))) invalid();
+  }
   for (const key of ['offset', 'end', 'section', 'limit']) {
     if (value[key] !== undefined && (!Number.isSafeInteger(value[key]) || (value[key] as number) < 0)) invalid();
   }
@@ -70,7 +76,8 @@ export class LibraryReader {
 
   constructor(private readonly dependencies: LibraryReadDependencies) {}
 
-  async run(route: LibraryReadRoute, params: LibraryReadParams): Promise<Record<string, unknown>> {
+  async run(route: LibraryReadRoute, params: LibraryReadParams,
+    resolveFile?: (name: string) => Promise<{ uri: string; title?: string }>): Promise<Record<string, unknown>> {
     // A bounded public-serving route must never gain a reconstruction surface.
     if (route.disclosure !== undefined) {
       throw new LibraryReadError('library_read_disclosure_restricted', 'Direct reading is unavailable on a disclosure-bounded deployment. Use domain_ask.', 403);
@@ -81,7 +88,7 @@ export class LibraryReader {
     if (this.active >= 2) throw new LibraryReadError('library_read_busy', 'Direct reading is busy. Retry shortly.', 429);
     this.active++;
     try {
-      return await this.read(route, params);
+      return await this.read(route, params, resolveFile);
     } catch (error) {
       if (error instanceof LibraryReadError) throw error;
       if (error instanceof TextNavigationError) throw new LibraryReadError('invalid_params', error.message);
@@ -89,7 +96,8 @@ export class LibraryReader {
     } finally { this.active--; }
   }
 
-  private async read(route: LibraryReadRoute, params: LibraryReadParams): Promise<Record<string, unknown>> {
+  private async read(route: LibraryReadRoute, params: LibraryReadParams,
+    resolveFile?: (name: string) => Promise<{ uri: string; title?: string }>): Promise<Record<string, unknown>> {
     const scope = parseScopeManifest(await readFile(route.scopeManifestPath!, 'utf8'));
     if (scope.targetCorpusDisplayName !== route.targetCorpusDisplayName) {
       throw new LibraryReadError('library_read_scope_mismatch', 'The library scope does not match the configured corpus.', 403);
@@ -110,21 +118,54 @@ export class LibraryReader {
       const limit = params.limit ?? 100;
       if (offset > matches.length || limit < 1 || limit > 200) invalid();
       const end = Math.min(matches.length, offset + limit);
-      return { action: 'catalog', library_revision: master.revision, total_objects: matches.length,
+      return { action: 'catalog', catalog_scope: 'canonical_scope',
+        other_holdings: 'Older imports may only appear in rag_corpus list_files. Enumerate all configured shelves before concluding a title is missing; use their name as rag_file_name to read them.',
+        library_revision: master.revision, total_objects: matches.length,
         objects: matches.slice(offset, end).map(object => ({ object_id: object.id, title: boundedMetadata(object.title),
           creator: boundedMetadata(object.creator), media_type: object.mediaType, byte_size: object.byteSize, derivative_kind: object.derivativeKind })),
         complete: end === matches.length, next_offset: end === matches.length ? null : end };
     }
-    const object = objects.find(object => object.id === params.object_id);
+    let object: (Pick<LibraryObject, 'title' | 'creator' | 'mediaType' | 'byteSize' | 'relativePath' | 'derivativeKind'> & { id?: Sha256Id }) | undefined = objects.find(object => object.id === params.object_id);
+    let legacy: { uri: string; title?: string } | undefined;
+    let objectName: string | undefined;
+    let readBucket = bucket;
+    if (params.rag_file_name) {
+      if (!resolveFile) throw new LibraryReadError('library_source_not_available', 'The source is not available in this library scope.', 404);
+      legacy = await resolveFile(params.rag_file_name);
+      const location = [route.library, ...(route.readOnlySourceRoots ?? [])]
+        .find(location => legacy!.uri.startsWith(`gs://${location.bucket}/${location.prefix}/`));
+      if (!location) throw new LibraryReadError('library_source_not_available', 'The source is not available in this library scope.', 404);
+      const root = `gs://${location.bucket}/${location.prefix}/`;
+      const relativePath = legacy.uri.slice(root.length);
+      if (!relativePath || relativePath.split('/').some(part => !part || part === '.' || part === '..') || /[\u0000-\u001f\\]/.test(relativePath)) invalid();
+      // A RAG-file spelling is not a bypass around canonical selection/tombstones.
+      const canonical = location.bucket === bucket && location.prefix === prefix
+        ? master.objects.find(entry => entry.relativePath === relativePath) : undefined;
+      if (canonical && selected.has(canonical.id)) object = canonical;
+      else if (canonical || relativePath.startsWith('objects/')) throw new LibraryReadError('library_source_not_available', 'The source is not available in this library scope.', 404);
+      else {
+        const extension = relativePath.split('.').at(-1)?.toLowerCase() ?? '';
+        const mediaType = ({ pdf: 'application/pdf', md: 'text/markdown', markdown: 'text/markdown', txt: 'text/plain', html: 'text/html', htm: 'text/html' } as Record<string, string>)[extension];
+        if (!mediaType) throw new LibraryReadError('library_source_format_unsupported', 'The source needs a text, Markdown, HTML, or PDF representation before direct reading.', 422);
+        object = { title: legacy.title, mediaType, byteSize: 0, relativePath, derivativeKind: null };
+      }
+      objectName = `${location.prefix}/${relativePath}`;
+      readBucket = location.bucket;
+    }
     if (!object) throw new LibraryReadError('library_source_not_available', 'The source is not available in this library scope.', 404);
     if (object.byteSize > LIBRARY_READ_MAX_BYTES) throw new LibraryReadError('library_source_too_large', 'The source exceeds the direct-reading size limit.', 413);
     const mediaType = object.mediaType.split(';')[0]!.trim().toLowerCase();
     if (!['text/plain', 'text/markdown', 'text/html', 'application/xhtml+xml', 'application/pdf'].includes(mediaType)) {
       throw new LibraryReadError('library_source_format_unsupported', 'The source needs a text, Markdown, HTML, or PDF representation before direct reading.', 422);
     }
-    const bytes = await this.dependencies.download(bucket, `${prefix}/${object.relativePath}`, LIBRARY_READ_MAX_BYTES, READ_TIMEOUT_MS);
-    if (!bytes || bytes.byteLength !== object.byteSize || `sha256:${hash(bytes)}` !== object.id) {
+    const bytes = await this.dependencies.download(readBucket, objectName ?? `${prefix}/${object.relativePath}`, LIBRARY_READ_MAX_BYTES, READ_TIMEOUT_MS);
+    const sourceId = bytes ? `sha256:${hash(bytes)}` as Sha256Id : undefined;
+    if (!bytes || (object.id && (bytes.byteLength !== object.byteSize || sourceId !== object.id))) {
       throw new LibraryReadError('library_source_integrity_failed', 'The stored source does not match its library identity.', 502);
+    }
+    if (!object.id && (master.tombstones.some(entry => entry.objectId === sourceId)
+      || (master.objects.some(entry => entry.id === sourceId) && !selected.has(sourceId!)))) {
+      throw new LibraryReadError('library_source_not_available', 'The source is not available in this library scope.', 404);
     }
     let text: string;
     let method: string;
@@ -144,9 +185,10 @@ export class LibraryReader {
       throw new LibraryReadError('library_text_revision_changed', 'The text representation changed. Open the source again before continuing.', 409);
     }
     const navigation = navigateText(text, params);
-    return { ...navigation, action: params.action, object_id: object.id, title: boundedMetadata(object.title), creator: boundedMetadata(object.creator),
+    const identity = params.rag_file_name ? { rag_file_name: params.rag_file_name } : { object_id: object.id };
+    return { ...navigation, action: params.action, ...identity, source_sha256: sourceId, title: boundedMetadata(object.title), creator: boundedMetadata(object.creator),
       library_revision: master.revision, text_revision: revision, derivative_kind: object.derivativeKind,
-      citation: { object_id: object.id, text_revision: revision, offset_unit: 'utf16' },
+      citation: { ...identity, text_revision: revision, offset_unit: 'utf16' },
       extraction: { method, original_completeness: 'unverified',
         coverage_basis: 'stored_representation', ...(method === 'pdf_text_layer' ? pdfCoverage(text, navigation) : {}) } };
   }
