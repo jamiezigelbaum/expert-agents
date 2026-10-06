@@ -892,14 +892,24 @@ export class DomainExpertService {
       requireConfiguredAgent(manifest, 'domain_read');
       const route = this.agentRouting[manifest.domain_id]!;
       const result = await this.libraryReader.run(route, parsed, async (name) => {
-        const corpus = name.slice(0, name.lastIndexOf('/ragFiles/'));
-        const resolved = await this.resolveRagCorpus(manifest, corpus);
-        this.assertRagFileBelongsToResolvedCorpus(manifest, name, resolved);
-        const file = await this.google.getRagFile(name);
-        if (typeof file.name !== 'string' || file.name.split('/').at(-1) !== name.split('/').at(-1)) {
+        const requested = parseRagFileResourceName(name)!;
+        if (requested.location !== manifest.rag_location
+          || (requested.project !== manifest.gcp_project && !/^[1-9][0-9]*$/.test(requested.project))) {
           throw new LibraryReadError('library_source_not_available', 'The source is not available in this library scope.', 404);
         }
-        this.assertRagFileBelongsToResolvedCorpus(manifest, file.name, resolved);
+        const resolved = await this.resolveRagCorpus(manifest,
+          corpusResourceNameFromParts(manifest.gcp_project, manifest.rag_location, requested.corpusId));
+        // Always address the configured project. Its authenticated GetRagFile
+        // response proves Google's numeric spelling without a warm list cache.
+        const canonicalName = `${resolved.resourceName}/ragFiles/${requested.fileId}`;
+        const file = await this.google.getRagFile(canonicalName);
+        const returned = typeof file.name === 'string' ? parseRagFileResourceName(file.name) : undefined;
+        if (!returned || returned.location !== requested.location || returned.corpusId !== requested.corpusId
+          || returned.fileId !== requested.fileId
+          || (returned.project !== manifest.gcp_project && !/^[1-9][0-9]*$/.test(returned.project))
+          || (requested.project !== manifest.gcp_project && requested.project !== returned.project)) {
+          throw new LibraryReadError('library_source_not_available', 'The source is not available in this library scope.', 404);
+        }
         const uris = file.gcsSource?.uris ?? file.ragFileSource?.gcsSource?.uris ?? (file.sourceUri ? [file.sourceUri] : []);
         if (!Array.isArray(uris) || uris.length !== 1 || typeof uris[0] !== 'string') {
           throw new LibraryReadError('library_source_not_available', 'The source is not available in this library scope.', 404);
