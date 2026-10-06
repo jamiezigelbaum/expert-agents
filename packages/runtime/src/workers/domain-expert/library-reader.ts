@@ -20,6 +20,7 @@ export class LibraryReadError extends Error {
 
 export interface LibraryReadRoute {
   library: LibraryLocationConfig;
+  readOnlySourceRoots?: LibraryLocationConfig[];
   scopeManifestPath?: string;
   targetCorpusDisplayName: string;
   disclosure?: unknown;
@@ -127,15 +128,19 @@ export class LibraryReader {
     let object: (Pick<LibraryObject, 'title' | 'creator' | 'mediaType' | 'byteSize' | 'relativePath' | 'derivativeKind'> & { id?: Sha256Id }) | undefined = objects.find(object => object.id === params.object_id);
     let legacy: { uri: string; title?: string } | undefined;
     let objectName: string | undefined;
+    let readBucket = bucket;
     if (params.rag_file_name) {
       if (!resolveFile) throw new LibraryReadError('library_source_not_available', 'The source is not available in this library scope.', 404);
       legacy = await resolveFile(params.rag_file_name);
-      const root = `gs://${bucket}/${prefix}/`;
-      if (!legacy.uri.startsWith(root)) throw new LibraryReadError('library_source_not_available', 'The source is not available in this library scope.', 404);
+      const location = [route.library, ...(route.readOnlySourceRoots ?? [])]
+        .find(location => legacy!.uri.startsWith(`gs://${location.bucket}/${location.prefix}/`));
+      if (!location) throw new LibraryReadError('library_source_not_available', 'The source is not available in this library scope.', 404);
+      const root = `gs://${location.bucket}/${location.prefix}/`;
       const relativePath = legacy.uri.slice(root.length);
       if (!relativePath || relativePath.split('/').some(part => !part || part === '.' || part === '..') || /[\u0000-\u001f\\]/.test(relativePath)) invalid();
       // A RAG-file spelling is not a bypass around canonical selection/tombstones.
-      const canonical = master.objects.find(entry => entry.relativePath === relativePath);
+      const canonical = location.bucket === bucket && location.prefix === prefix
+        ? master.objects.find(entry => entry.relativePath === relativePath) : undefined;
       if (canonical && selected.has(canonical.id)) object = canonical;
       else if (canonical || relativePath.startsWith('objects/')) throw new LibraryReadError('library_source_not_available', 'The source is not available in this library scope.', 404);
       else {
@@ -144,7 +149,8 @@ export class LibraryReader {
         if (!mediaType) throw new LibraryReadError('library_source_format_unsupported', 'The source needs a text, Markdown, HTML, or PDF representation before direct reading.', 422);
         object = { title: legacy.title, mediaType, byteSize: 0, relativePath, derivativeKind: null };
       }
-      objectName = `${prefix}/${relativePath}`;
+      objectName = `${location.prefix}/${relativePath}`;
+      readBucket = location.bucket;
     }
     if (!object) throw new LibraryReadError('library_source_not_available', 'The source is not available in this library scope.', 404);
     if (object.byteSize > LIBRARY_READ_MAX_BYTES) throw new LibraryReadError('library_source_too_large', 'The source exceeds the direct-reading size limit.', 413);
@@ -152,7 +158,7 @@ export class LibraryReader {
     if (!['text/plain', 'text/markdown', 'text/html', 'application/xhtml+xml', 'application/pdf'].includes(mediaType)) {
       throw new LibraryReadError('library_source_format_unsupported', 'The source needs a text, Markdown, HTML, or PDF representation before direct reading.', 422);
     }
-    const bytes = await this.dependencies.download(bucket, objectName ?? `${prefix}/${object.relativePath}`, LIBRARY_READ_MAX_BYTES, READ_TIMEOUT_MS);
+    const bytes = await this.dependencies.download(readBucket, objectName ?? `${prefix}/${object.relativePath}`, LIBRARY_READ_MAX_BYTES, READ_TIMEOUT_MS);
     const sourceId = bytes ? `sha256:${hash(bytes)}` as Sha256Id : undefined;
     if (!bytes || (object.id && (bytes.byteLength !== object.byteSize || sourceId !== object.id))) {
       throw new LibraryReadError('library_source_integrity_failed', 'The stored source does not match its library identity.', 502);

@@ -62,6 +62,12 @@ continuation rejects changed text. CLI equivalent: `--rag-file <resource>`.
 The direct catalog explicitly covers only canonical scope, so its absence result
 alone never establishes that a title is missing from the complete library.
 
+An operator may declare `readOnlySourceRoots: [{"bucket":"prior-library","prefix":"staged/research"}]`
+on the agent route for its existing sources retained in a prior bucket. Each root
+must have a non-root prefix. These locations apply only after current RAG-file
+membership is verified; they never widen ingestion destinations, canonical
+catalog selection, or any other agent's route. No caller can supply a root.
+
 Supported canonical representations are UTF-8 plain text and Markdown, HTML
 converted with the existing deterministic converter, and PDFs with a readable
 text layer. PDF extraction uses Poppler `pdftotext -layout`, without a model or

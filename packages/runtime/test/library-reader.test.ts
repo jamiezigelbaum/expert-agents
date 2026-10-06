@@ -8,6 +8,7 @@ import {
   type LibraryObject, type Sha256Id,
 } from '@expert-agents/library';
 import { validateAgentRoutingConfig } from '../src/core/agent-routing.ts';
+import { domainManifest } from '../src/core/domain-expert.ts';
 import { createDomainExpertWorker } from '../src/workers/domain-expert/index.ts';
 import { LibraryReader, parseLibraryReadParams, LIBRARY_READ_MAX_BYTES } from '../src/workers/domain-expert/library-reader.ts';
 
@@ -41,6 +42,26 @@ function fixture(text = '# Sample Book\nBody\n\n# References\n' + 'Example Autho
 }
 
 describe('direct library reading', () => {
+  test('explicit prior source roots remain read-only and domain-specific', async () => {
+    const f = fixture();
+    const routes = validateAgentRoutingConfig({ research: { ...f.route, readOnlySourceRoots: [{ bucket: 'prior-library', prefix: 'staged/research' }] } });
+    expect(domainManifest('research', undefined, { agentRouting: routes, env: { EXPERT_AGENTS_GCP_PROJECT: 'fixture-project' } }).allowed_gcs_prefixes).toEqual(['gs://fixture-bucket/library']);
+    const calls: string[] = [];
+    const reader = new LibraryReader({ download: async (bucket, name) => {
+      calls.push(`${bucket}/${name}`);
+      return bucket === 'fixture-bucket' ? f.stored.get(name) ?? null : Buffer.from('Prior source text.');
+    } });
+    const params = { action: 'read' as const, rag_file_name: 'projects/fixture/locations/us-central1/ragCorpora/1/ragFiles/2' };
+    const resolver = async () => ({ uri: 'gs://prior-library/staged/research/source.md' });
+    expect(await reader.run(routes.research!, params, resolver)).toMatchObject({ text: 'Prior source text.' });
+    expect(calls).toContain('prior-library/staged/research/source.md');
+    calls.length = 0;
+    await expect(reader.run(f.route, params, resolver)).rejects.toMatchObject({ code: 'library_source_not_available' });
+    expect(calls).toEqual(['fixture-bucket/library/manifest/master.json']);
+    for (const roots of [[], [{ bucket: 'prior-library', prefix: '' }], [{ bucket: 'prior-library', prefix: '../private' }], Array(17).fill({ bucket: 'prior-library', prefix: 'staged/research' })]) {
+      expect(() => validateAgentRoutingConfig({ research: { ...f.route, readOnlySourceRoots: roots } })).toThrow();
+    }
+  });
   test('reads existing legacy imports with fresh membership checks and pinned continuation', async () => {
     const f = fixture();
     const text = '# References\n' + 'An older reference entry.\n'.repeat(1000);
