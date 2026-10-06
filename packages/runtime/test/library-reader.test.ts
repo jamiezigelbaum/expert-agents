@@ -229,6 +229,37 @@ describe('direct library reading', () => {
 });
 
 describe('domain_read HTTP surface', () => {
+  test('cold reads prove numeric project aliases through the configured project without trusting caller aliases', async () => {
+    const f = fixture();
+    const corpus = 'projects/fixture-project/locations/us-central1/ragCorpora/10';
+    const numericName = 'projects/123456789/locations/us-central1/ragCorpora/10/ragFiles/20';
+    let sourceReads = 0;
+    let returnedName = numericName;
+    const requests: string[] = [];
+    const worker = createDomainExpertWorker({ gcpProject: 'fixture-project', dataDir: join(f.directory, 'runtime'),
+      agentRouting: validateAgentRoutingConfig({ research: f.route }),
+      google: { accessToken: 'fixture-token', fetchImpl: (async (input: string | URL | Request) => {
+        const url = String(input); requests.push(url);
+        if (url.includes('/ragFiles/')) {
+          expect(url).toBe('https://us-central1-aiplatform.googleapis.com/v1/' + corpus + '/ragFiles/20');
+          return Response.json({ name: returnedName, gcsSource: { uris: ['gs://fixture-bucket/library/staged/research/older.md'] } });
+        }
+        if (url.includes('/ragCorpora')) return Response.json({ ragCorpora: [{ name: corpus, displayName: 'research-library' }] });
+        const objectName = decodeURIComponent(new URL(url).pathname.split('/o/')[1]!);
+        if (objectName.endsWith('master.json')) return new Response(new Uint8Array(f.stored.get(objectName)!));
+        sourceReads++; return new Response('Verified legacy text.');
+      }) as typeof fetch } });
+    const request = (name = numericName) => worker.fetch(new Request('http://worker/v1/domain', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ tool: 'domain_read', params: { domain_id: 'research', action: 'read', rag_file_name: name } }) }));
+    expect(await (await request()).json()).toMatchObject({ text: 'Verified legacy text.' });
+    expect(await (await request(corpus + '/ragFiles/20')).json()).toMatchObject({ text: 'Verified legacy text.' });
+    expect((await request(numericName.replace('123456789', '999999999'))).status).toBe(404);
+    returnedName = numericName.replace('/10/', '/99/');
+    expect((await request()).status).toBe(404);
+    returnedName = numericName.replace('123456789', 'foreign-project');
+    expect((await request()).status).toBe(404);
+    expect(sourceReads).toBe(2);
+    expect(requests.some(url => url.includes('/projects/123456789/') || url.includes('/projects/999999999/'))).toBeFalse();
+  });
   test('legacy file access verifies corpus identity, current existence, and source root through the handler', async () => {
     const f = fixture();
     const corpus = 'projects/fixture-project/locations/us-central1/ragCorpora/10';
