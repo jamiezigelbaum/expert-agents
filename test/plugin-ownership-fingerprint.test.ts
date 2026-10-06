@@ -26,12 +26,12 @@ afterEach(async () => {
 });
 
 describe('captured response validation', () => {
-  test('rejects a tool name outside the seven and names what it got', () => {
+  test('rejects an unknown tool name and names what it got', () => {
     expect(() => parseCapturedResponses(JSON.stringify({ domain_summarize: ourResponse() }))).toThrow(
-      'Invalid captured responses at $: "domain_summarize" is not one of the seven gateway tool names.',
+      'Invalid captured responses at $: "domain_summarize" is not a gateway tool name.',
     );
     expect(() => parseCapturedResponses(JSON.stringify([{ tool: 'olympus_ask', response: ourResponse() }]))).toThrow(
-      'Invalid captured responses at $[0].tool: "olympus_ask" is not one of the seven gateway tool names.',
+      'Invalid captured responses at $[0].tool: "olympus_ask" is not a gateway tool name.',
     );
   });
 
@@ -61,12 +61,12 @@ describe('captured response validation', () => {
 });
 
 describe('ownership classification', () => {
-  test('passes when every one of the seven names carries our control-plane stamp', () => {
+  test('passes when every tool carries our control-plane stamp', () => {
     const fingerprint = createOwnershipFingerprint(allOurs());
 
-    expect(fingerprint.tools).toHaveLength(7);
+    expect(fingerprint.tools).toHaveLength(GATEWAY_TOOL_NAMES.length);
     expect(fingerprint.tools.every((entry) => entry.verdict === 'expert-agents')).toBeTrue();
-    expect(fingerprint.counts['expert-agents']).toBe(7);
+    expect(fingerprint.counts['expert-agents']).toBe(GATEWAY_TOOL_NAMES.length);
     expect(fingerprint.verdict).toEqual({ owned_by_expert_agents: true, missing_tools: [], unowned_tools: [] });
     expect(pluginOwnershipExitCode(fingerprint)).toBe(0);
   });
@@ -92,7 +92,7 @@ describe('ownership classification', () => {
 
     const fingerprint = createOwnershipFingerprint(captured);
 
-    expect(fingerprint.tools).toHaveLength(7);
+    expect(fingerprint.tools).toHaveLength(GATEWAY_TOOL_NAMES.length);
     expect(entryFor(fingerprint, 'rag_corpus')).toEqual({
       tool: 'rag_corpus',
       verdict: 'missing',
@@ -161,7 +161,7 @@ describe('ownership fingerprint CLI', () => {
     const result = await runPluginOwnershipFingerprintCli([path]);
 
     expect(pluginOwnershipExitCode(result.fingerprint)).toBe(0);
-    expect(result.output).toContain('7/7 gateway tool names answered by expert-agents.');
+    expect(result.output).toContain(`${GATEWAY_TOOL_NAMES.length}/${GATEWAY_TOOL_NAMES.length} gateway tool names answered by expert-agents.`);
     expect(result.output).toContain('expert_agents_control_plane_only=true  olympus_control_plane_only=false');
     expect(result.output).toContain('Verdict: PASSED.');
   });
@@ -189,7 +189,7 @@ describe('ownership fingerprint CLI', () => {
     expect(receipt.sha256).toBe(result.fingerprint.sha256);
     expect(receipt.sha256).toMatch(/^[0-9a-f]{64}$/);
     expect(receipt.counts).toEqual({
-      'expert-agents': 7,
+      'expert-agents': GATEWAY_TOOL_NAMES.length,
       olympus: 0,
       ambiguous: 0,
       unknown: 0,

@@ -31,6 +31,7 @@ describe('Expert Agents OpenClaw plugin', () => {
     expect(names).toEqual([
       'domain_agent',
       'domain_ask',
+      'domain_read',
       'domain_source',
       'rag_corpus',
       'domain_doc',

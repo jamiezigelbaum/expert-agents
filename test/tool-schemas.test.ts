@@ -11,6 +11,7 @@ import { validateAgentRoutingConfig } from '../packages/runtime/src/core/agent-r
 // default-domain compatibility. Checking only whether a schema exists would
 // let the previous empty object schema pass without teaching a model anything.
 const examples: Array<{ tool: DomainExpertTool; params: Record<string, unknown> }> = [
+  { tool: 'domain_read', params: { action: 'read', object_id: `sha256:${'a'.repeat(64)}`, text_revision: 'b'.repeat(64), section: 2, offset: 15000, limit: 12000 } },
   { tool: 'domain_agent', params: { action: 'register', domain_id: 'new-expert', display_name: 'New Expert', library: { bucket: 'fixture-library', prefix: 'shared/new-expert' }, target_corpus_display_name: 'new-expert-library', dry_run: true } },
   { tool: 'domain_ask', params: { question: 'What evidence supports this claim?', corpora: ['research-library'], max_results: 12, retrieval_mode: 'history', output: 'passages', session_id: 'fixture-session' } },
   { tool: 'domain_source', params: { action: 'add', domain_id: 'research', kind: 'pdf', title: 'Fixture Paper', relative_path: 'inbox/paper.pdf', copyright_posture: 'owner-provided', dry_run: true } },
