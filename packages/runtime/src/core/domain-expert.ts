@@ -409,6 +409,7 @@ export function planDomainAgent(
       operating_skill: operatingSkillForDomain(manifest.domain_id),
       scoped_tools: [
         'domain_ask',
+        'domain_read',
         'domain_source',
         'rag_corpus',
         'domain_doc',

@@ -183,6 +183,15 @@ describe("expert:library worker target and token handling", () => {
 });
 
 describe("expert:library worker commands", () => {
+  test("read preserves source identity, revision and continuation fields", async () => {
+    const captured = capture();
+    const fetchImpl = fetchStub(captured, () => jsonResponse({ kind: "domain_read_result", text: "Reference", next_offset: 120, complete: false }));
+    const id = "sha256:" + "a".repeat(64);
+    const revision = "b".repeat(64);
+    expect(await runExpertLibraryCli(["read", "--domain", "example", "--worker", WORKER, "--action", "read", "--object", id, "--revision", revision, "--section", "3", "--offset", "100", "--limit", "20"], workerDependencies(captured, fetchImpl))).toBe(0);
+    expect(captured.calls[0]!.body).toEqual({ tool: "domain_read", params: { domain_id: "example", action: "read", object_id: id, text_revision: revision, section: 3, offset: 100, limit: 20 } });
+    expect(JSON.parse(captured.out[0]!)).toMatchObject({ text: "Reference", next_offset: 120, complete: false });
+  });
   test("ask sends domain_ask and prints the cited answer", async () => {
     const captured = capture();
     const fetchImpl = fetchStub(captured, () => jsonResponse({

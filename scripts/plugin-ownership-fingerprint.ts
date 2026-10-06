@@ -2,12 +2,13 @@ import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import type { DomainExpertTool } from '../packages/runtime/src/core/domain-expert-client.ts';
 
-// The seven names this plugin registers on the gateway. Typed against
+// The research tool names this plugin registers on the gateway. Typed against
 // DomainExpertTool so a tool added to the client union fails typecheck here
 // until the fingerprint covers it too.
 const GATEWAY_TOOLS = {
   domain_agent: true,
   domain_ask: true,
+  domain_read: true,
   domain_source: true,
   rag_corpus: true,
   domain_doc: true,
@@ -31,7 +32,7 @@ const OWNER_STAMPS = {
 export type PluginOwner = keyof typeof OWNER_STAMPS;
 
 // `missing` is not a classification of a response; it is the absence of one.
-// It exists so every one of the seven names occupies a row in the report and
+// It exists so every research tool occupies a row in the report and
 // silence can never be read as ownership.
 export type OwnershipVerdict = PluginOwner | 'ambiguous' | 'unknown' | 'missing';
 
@@ -281,7 +282,7 @@ function ownershipDigest(tools: ToolOwnership[]): string {
 
 function requireGatewayTool(value: string, path: string): DomainExpertTool {
   if (!GATEWAY_TOOL_NAMES.includes(value as DomainExpertTool)) {
-    throw new Error(`Invalid captured responses at ${path}: ${boundedName(value)} is not one of the seven gateway tool names.`);
+    throw new Error(`Invalid captured responses at ${path}: ${boundedName(value)} is not a gateway tool name.`);
   }
   return value as DomainExpertTool;
 }
