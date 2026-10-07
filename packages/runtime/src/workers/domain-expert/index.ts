@@ -149,6 +149,11 @@ export interface DomainExpertGoogleConfig {
   // the literal 'default' disables the parser. See resolveRagParserModel.
   ragParserModel?: string;
   multiQuery?: boolean;
+  // Most VertexRagDataService requests (corpus, rag file and operation reads,
+  // imports, deletes) this worker sends in any rolling minute. The project
+  // quota is regional and shared with every other caller; requests past this
+  // pace wait their turn instead of drawing 429s. Unset means unpaced.
+  vertexRagRequestsPerMinute?: number;
   fetchImpl?: typeof fetch;
 }
 
@@ -497,6 +502,9 @@ const ANNAS_ARCHIVE_DOWNLOAD_TIMEOUT_MS = 15_000;
 const ANNAS_ARCHIVE_REQUEST_TIMEOUT_MS = 15_000;
 const ANNAS_ARCHIVE_MAX_REDIRECTS = 5;
 const GOOGLE_API_REQUEST_TIMEOUT_MS = 30_000;
+// Under the 60/min VertexRagDataService default, leaving headroom for operator
+// tools that call the API directly. Raise with the quota.
+const DEFAULT_VERTEX_RAG_REQUESTS_PER_MINUTE = 45;
 // Answer synthesis and media transcription are long generateContent calls: a
 // thinking model routinely runs past the metadata deadline (live 504 on
 // 2026-07-31 minutes after the 30s cap shipped), and the gateway allows 300s
@@ -4837,12 +4845,14 @@ class GoogleRuntimeClient {
   private config: DomainExpertGoogleConfig;
   private tokenCache?: { token: string; expiresAtMs: number };
   private projectNumbers = new Map<string, string>();
+  private ragDataPacer?: RollingWindowPacer;
 
   constructor(config: DomainExpertGoogleConfig) {
     this.config = {
       ...config,
       scopes: config.scopes ?? DEFAULT_SCOPES,
     };
+    if (config.vertexRagRequestsPerMinute) this.ragDataPacer = new RollingWindowPacer(config.vertexRagRequestsPerMinute, 60_000);
   }
 
   async configurationStatus(): Promise<GoogleConfigurationStatus> {
@@ -5478,6 +5488,9 @@ class GoogleRuntimeClient {
     init: RequestInit = {},
     timeoutMs: number = GOOGLE_API_REQUEST_TIMEOUT_MS,
   ): Promise<Response> {
+    // Paced before the timeout starts, so waiting for a slot never eats the
+    // request's own budget.
+    if (this.ragDataPacer && isVertexRagDataRequest(url)) await this.ragDataPacer.acquire();
     const token = await this.accessToken();
     const signal = AbortSignal.timeout(timeoutMs);
     try {
@@ -5892,6 +5905,10 @@ export function domainExpertGoogleConfigFromEnv(env: Record<string, string | und
       env.EXPERT_AGENTS_DOMAIN_EXPERT_MULTI_QUERY,
       DOMAIN_ASK_RETRIEVAL_DEFAULTS.multiQuery,
       'EXPERT_AGENTS_DOMAIN_EXPERT_MULTI_QUERY',
+    ),
+    vertexRagRequestsPerMinute: normalizePositiveInteger(
+      env.EXPERT_AGENTS_DOMAIN_EXPERT_VERTEX_RAG_REQUESTS_PER_MINUTE,
+      DEFAULT_VERTEX_RAG_REQUESTS_PER_MINUTE,
     ),
   };
 }
@@ -9065,6 +9082,49 @@ function retryAfterMs(value: string | null): number {
   if (Number.isFinite(seconds) && seconds >= 0) return Math.min(seconds * 1000, 5_000);
   const dateMs = Date.parse(value);
   return Number.isNaN(dateMs) ? 250 : Math.min(Math.max(0, dateMs - Date.now()), 5_000);
+}
+
+// VertexRagDataService: anything under a ragCorpora resource (corpus, rag file
+// and operation reads, imports, deletes) and the corpus collection itself.
+// retrieveContexts is a location-level method on its own quota and is not paced.
+function isVertexRagDataRequest(url: string): boolean {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return false;
+  }
+  return parsed.hostname.endsWith('aiplatform.googleapis.com') && /\/ragCorpora(?:[/:?]|$)/.test(parsed.pathname);
+}
+
+// At most `limit` acquisitions in any rolling window. Callers queue in order;
+// one waiting for a slot sleeps until the oldest acquisition ages out.
+export class RollingWindowPacer {
+  private stamps: number[] = [];
+  private tail: Promise<void> = Promise.resolve();
+
+  constructor(
+    private readonly limit: number,
+    private readonly windowMs: number,
+    private readonly now: () => number = Date.now,
+    private readonly sleep: (ms: number) => Promise<void> = sleepMs,
+  ) {}
+
+  acquire(): Promise<void> {
+    const turn = this.tail.then(async () => {
+      for (;;) {
+        const at = this.now();
+        while (this.stamps.length && this.stamps[0]! <= at - this.windowMs) this.stamps.shift();
+        if (this.stamps.length < this.limit) {
+          this.stamps.push(at);
+          return;
+        }
+        await this.sleep(this.stamps[0]! + this.windowMs - at);
+      }
+    });
+    this.tail = turn.catch(() => undefined);
+    return turn;
+  }
 }
 
 function sleepMs(ms: number): Promise<void> {
