@@ -3530,7 +3530,13 @@ export class DomainExpertService {
       if ('blocked' in submission) {
         return { status: 'blocked', ...corpusTarget, gcs_uri: gcsUri, ...conversion, error: submission.blocked };
       }
-      const outcome = await this.awaitRagImportOutcome(manifest, submission.result, artifact.format, deadline);
+      const outcome = await this.annasSkippedImportAsPresent(
+        manifest,
+        corpusId,
+        submission.result,
+        gcsUri,
+        await this.awaitRagImportOutcome(manifest, submission.result, artifact.format, deadline),
+      );
       return {
         status: outcome.status,
         ...corpusTarget,
@@ -3550,6 +3556,31 @@ export class DomainExpertService {
           : { code: 'rag_ingest_error', message: error instanceof Error ? error.message : String(error) },
       };
     }
+  }
+
+  // A retried acquisition re-imports an object Vertex already holds, and Vertex
+  // answers skippedRagFilesCount=1. On 2026-10-07 an agent read three such skips
+  // of a book already in its corpus as failed ingests. When the object's
+  // ragFile is ACTIVE the book is in the library, so it is reported imported.
+  private async annasSkippedImportAsPresent(
+    manifest: ReturnType<typeof domainManifest>,
+    corpusId: string,
+    importResult: Record<string, unknown>,
+    gcsUri: string,
+    outcome: { status: AnnasImportOutcomeStatus; detail: Record<string, unknown> },
+  ): Promise<{ status: AnnasImportOutcomeStatus; detail: Record<string, unknown> }> {
+    if (outcome.status !== 'import_empty' || ragImportCount(outcome.detail.skipped_rag_files_count) < 1) return outcome;
+    const resourceName = asOptionalRecord(importResult.resolved_corpus)?.resource_name;
+    if (typeof resourceName !== 'string') return outcome;
+    let files: Array<Record<string, unknown>>;
+    try {
+      files = await this.ragFilesForImportedUris(manifest, { requested: corpusId, corpusId, resourceName }, [gcsUri]);
+    } catch {
+      return outcome;
+    }
+    if (!files.every((file) => file.state === 'ACTIVE')) return outcome;
+    const { hint: _hint, ...detail } = outcome.detail;
+    return { status: 'imported', detail: { ...detail, already_present: true, rag_files: files } };
   }
 
   // What actually gets uploaded for a downloaded artifact: the PDF itself, a
@@ -3589,7 +3620,7 @@ export class DomainExpertService {
           refusal: {
             code: 'ebook_conversion_failed',
             message: `The EPUB could not be converted to text (${detail}). ${onDisk}`,
-            suggestion: 'Acquire another edition (a PDF, or an EPUB that opens in a reader); annas_archive_search with ingest_intent: true ranks ingestible formats first.',
+            suggestion: 'Acquire another edition (an EPUB that opens in a reader, or a PDF when no EPUB is offered); annas_archive_search with ingest_intent: true ranks EPUB first.',
           },
         };
       }
@@ -3601,7 +3632,7 @@ export class DomainExpertService {
           refusal: {
             code: 'unsupported_ingest_format',
             message: `DJVU ingest needs ${this.annasDjvutxtBin} (djvulibre) on the worker host, and it is not installed. ${onDisk}`,
-            suggestion: 'Install djvulibre on the worker host, or acquire a PDF or EPUB edition instead.',
+            suggestion: 'Install djvulibre on the worker host, or acquire an EPUB edition instead (a PDF when no EPUB is offered).',
           },
         };
       }
@@ -3613,7 +3644,7 @@ export class DomainExpertService {
           refusal: {
             code: 'ebook_conversion_failed',
             message: `djvutxt could not extract text from the DJVU (${error instanceof Error ? error.message : String(error)}). ${onDisk}`,
-            suggestion: 'The scan may carry no text layer. Acquire a PDF or EPUB edition instead.',
+            suggestion: 'The scan may carry no text layer. Acquire an EPUB edition instead (a PDF when no EPUB is offered).',
           },
         };
       }
@@ -3622,7 +3653,7 @@ export class DomainExpertService {
           refusal: {
             code: 'ebook_conversion_failed',
             message: `djvutxt produced no text for the DJVU; the scan has no text layer. ${onDisk}`,
-            suggestion: 'Acquire a PDF or EPUB edition instead, or OCR the scan outside the worker and ingest the result.',
+            suggestion: 'Acquire an EPUB edition instead (a PDF when no EPUB is offered), or OCR the scan outside the worker and ingest the result.',
           },
         };
       }
@@ -3633,7 +3664,7 @@ export class DomainExpertService {
       refusal: {
         code: 'unsupported_ingest_format',
         message: `Vertex RAG does not parse ${format.toUpperCase()} and the worker has no converter for it. ${onDisk}`,
-        suggestion: 'Acquire a PDF or EPUB edition of the same work; annas_archive_search with ingest_intent: true ranks ingestible formats first.',
+        suggestion: 'Acquire an EPUB edition of the same work (a PDF when no EPUB is offered); annas_archive_search with ingest_intent: true ranks EPUB first.',
       },
     };
   }
@@ -7547,9 +7578,13 @@ function scoreAnnasCandidate(candidate: Omit<NormalizedAnnasCandidate, 'score' |
   return { ...candidate, score, rationale: rationale.length ? rationale : ['candidate metadata returned by Anna Archive'] };
 }
 
+// EPUB first, PDF when no EPUB is offered (owner ruling 2026-10-07): an EPUB
+// converts to clean Markdown, while a PDF may be a scan or a mislabelled
+// edition. The margin outweighs the flat metadata points so a same-work PDF
+// never outranks its EPUB.
 function annasFormatIngestibility(format: string): { score: number; rationale: string } {
-  if (ANNAS_NATIVE_INGEST_FORMATS.has(format)) return { score: 6, rationale: `ingestible: ${format.toUpperCase()} imports into Vertex RAG as uploaded` };
-  if (format === 'epub') return { score: 6, rationale: 'ingestible: EPUB is converted to Markdown before import' };
+  if (format === 'epub') return { score: 10, rationale: 'preferred: EPUB is converted to Markdown before import' };
+  if (ANNAS_NATIVE_INGEST_FORMATS.has(format)) return { score: 6, rationale: `ingestible: ${format.toUpperCase()} imports into Vertex RAG as uploaded; use it when no EPUB is offered` };
   if (format === 'djvu') return { score: 2, rationale: 'ingestible only when djvutxt is installed on the worker host' };
   return { score: 0, rationale: `not ingestible: ${format.toUpperCase()} is neither parsed by Vertex RAG nor converted by the worker` };
 }
