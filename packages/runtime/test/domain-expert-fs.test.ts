@@ -351,6 +351,8 @@ describe('domain expert filesystem hardening', () => {
           allowOverwrite: true,
         }],
         google: { accessToken: 'fixture-token', fetchImpl: googleCorpusFetch() },
+        // The fixture operation never finishes; do not wait for an outcome.
+        annas: { importPollTimeoutMs: 0 },
         resolveHostImpl: async () => ['93.184.216.34'],
         webImportFetchImpl: async () => new Response(
           '<html><head><title>Private Fixture</title></head><body>private fixture body</body></html>',

@@ -1890,6 +1890,10 @@ export class DomainExpertService {
         operation,
       };
     }
+    // A plain import is registered only when it names the source it ingests;
+    // annas_archive_import calls this without one and registers its own record.
+    const sourceRootPath = params.sourceId ? await checkedRootPath(this.rootFor(manifest.workspace_root_id)) : undefined;
+    const registeredSource = sourceRootPath ? await this.registeredImportSource(manifest, sourceRootPath, params.sourceId) : undefined;
     const importResultSink = params.gcsUri && this.agentRouting[manifest.domain_id]?.ingestion?.importResultSink !== 'client'
       ? importResultSinkUri(manifest.allowed_gcs_prefixes, manifest.domain_id)
       : undefined;
@@ -1907,6 +1911,18 @@ export class DomainExpertService {
         llmParserEligible: llmParserEligibleUris(params.gcsUri ? [params.gcsUri] : []),
       });
     });
+    const verified = sourceRootPath && registeredSource
+      ? await this.verifyAndRegisterRagImport({
+        manifest,
+        rootPath: sourceRootPath,
+        resolved: usedResolved,
+        submissionReceipt: submission.submissionReceipt,
+        operation: submission.operation,
+        gcsUris: params.gcsUri ? [params.gcsUri] : [],
+        action: 'import',
+        source: registeredSource,
+      })
+      : {};
     return {
       kind: 'rag_corpus_result',
       status: 'import_requested',
@@ -1921,6 +1937,7 @@ export class DomainExpertService {
       ...(importResultSink ? { import_result_sink: importResultSink } : {}),
       ...([...resolutionWarnings, ...warnings].length ? { warnings: [...resolutionWarnings, ...warnings] } : {}),
       operation: submission.operation,
+      ...verified,
       policy: domainPolicy(),
     };
   }
@@ -1995,17 +2012,41 @@ export class DomainExpertService {
         ...base,
       };
     }
+    const registeredSource = await this.registeredImportSource(manifest, rootPath, params.sourceId);
     const { stagedFiles, operation, warnings, resolved, importResultSink, submissionReceipt } = await this.executeStageImport(stage);
+    const importResolvedCorpus = resolvedCorpusRecord(resolved);
+    const verified = await this.verifyAndRegisterRagImport({
+      manifest,
+      rootPath,
+      resolved,
+      submissionReceipt,
+      operation,
+      gcsUris: stagedFiles.map((file) => String(file.gcs_uri)),
+      action: 'stage_import',
+      batchRecord: {
+        source_id: `${manifest.domain_id}-stage-import-${batchId}`,
+        domain_id: manifest.domain_id,
+        kind: 'stage_import',
+        batch_id: batchId,
+        corpus: importResolvedCorpus,
+        staged_file_count: stagedFiles.length,
+        workspace_relative_path: workspaceRelativePath,
+        target_corpus_id: importResolvedCorpus.requested,
+        trust_posture: manifest.trust_posture,
+      },
+      ...(registeredSource ? { source: registeredSource } : {}),
+    });
     return {
       kind: 'rag_corpus_stage_import_result',
       status: 'staged_and_import_requested',
       ...base,
-      resolved_corpus: resolvedCorpusRecord(resolved),
+      resolved_corpus: importResolvedCorpus,
       staged_files: stagedFiles,
       ...(importResultSink ? { import_result_sink: importResultSink } : {}),
       submission_receipt: submissionReceipt,
       ...([...resolutionWarnings, ...warnings].length ? { warnings: [...resolutionWarnings, ...warnings] } : {}),
       operation,
+      ...verified,
     };
   }
 
@@ -2040,6 +2081,7 @@ export class DomainExpertService {
     const transcriptMode = params.transcriptMode ?? 'auto';
     const root = this.rootFor(manifest.workspace_root_id);
     const rootPath = await checkedRootPath(root);
+    const registeredSource = dryRun ? undefined : await this.registeredImportSource(manifest, rootPath, params.sourceId);
     const batchId = normalizeStageBatchId(params.batchId ?? randomUUID());
     const importWorkspaceRelativePath = `${manifest.workspace_relative_path}/sources/web-imports/${batchId}`;
     const importPath = await resolveWritePathInside(rootPath, importWorkspaceRelativePath);
@@ -2191,14 +2233,27 @@ export class DomainExpertService {
     }
     const { stagedFiles, operation, warnings, resolved: importResolved, importResultSink, submissionReceipt } = await this.executeStageImport(stage);
     const importResolvedCorpus = resolvedCorpusRecord(importResolved);
-    await this.appendWebImportRegistryRecord({
+    const verified = await this.verifyAndRegisterRagImport({
       manifest,
       rootPath,
-      urls,
-      batchId,
-      importWorkspaceRelativePath,
-      resolvedCorpus: importResolvedCorpus,
-      stagedFileCount: stagedFiles.length,
+      resolved: importResolved,
+      submissionReceipt,
+      operation,
+      gcsUris: stagedFiles.map((file) => String(file.gcs_uri)),
+      action: 'web_import',
+      batchRecord: {
+        source_id: `${manifest.domain_id}-web-import-${batchId}`,
+        domain_id: manifest.domain_id,
+        kind: 'web_import',
+        urls: urls.map(webImportProvenanceUrl),
+        batch_id: batchId,
+        corpus: importResolvedCorpus,
+        staged_file_count: stagedFiles.length,
+        workspace_relative_path: importWorkspaceRelativePath,
+        target_corpus_id: importResolvedCorpus.requested,
+        trust_posture: manifest.trust_posture,
+      },
+      ...(registeredSource ? { source: registeredSource } : {}),
     });
     return {
       kind: 'rag_corpus_web_import_result',
@@ -2210,6 +2265,7 @@ export class DomainExpertService {
       submission_receipt: submissionReceipt,
       ...([...resolutionWarnings, ...warnings].length ? { warnings: [...resolutionWarnings, ...warnings] } : {}),
       operation,
+      ...verified,
     };
   }
 
@@ -2345,6 +2401,7 @@ export class DomainExpertService {
     }
     const root = this.rootFor(manifest.workspace_root_id);
     const rootPath = await checkedRootPath(root);
+    const registeredSource = await this.registeredImportSource(manifest, rootPath, params.sourceId);
     const importPath = await resolveWritePathInside(rootPath, importWorkspaceRelativePath);
     const retrievedAt = new Date().toISOString();
     const markdownFiles: NotionMarkdownDerivative[] = [];
@@ -2445,14 +2502,28 @@ export class DomainExpertService {
     }
     const { stagedFiles, operation, warnings, resolved: importResolved, importResultSink, submissionReceipt } = await this.executeStageImport(stage);
     const importResolvedCorpus = resolvedCorpusRecord(importResolved);
-    await this.appendNotionImportRegistryRecord({
+    const verified = await this.verifyAndRegisterRagImport({
       manifest,
       rootPath,
-      sources,
-      batchId,
-      importWorkspaceRelativePath,
-      resolvedCorpus: importResolvedCorpus,
-      stagedFileCount: stagedFiles.length,
+      resolved: importResolved,
+      submissionReceipt,
+      operation,
+      gcsUris: stagedFiles.map((file) => String(file.gcs_uri)),
+      action: 'notion_import',
+      batchRecord: {
+        source_id: `${manifest.domain_id}-notion-import-${batchId}`,
+        domain_id: manifest.domain_id,
+        kind: 'notion_import',
+        notion_object_ids: sources.map((source) => source.id),
+        urls: sources.map((source) => source.url).filter((url): url is string => typeof url === 'string'),
+        batch_id: batchId,
+        corpus: importResolvedCorpus,
+        staged_file_count: stagedFiles.length,
+        workspace_relative_path: importWorkspaceRelativePath,
+        target_corpus_id: importResolvedCorpus.requested,
+        trust_posture: manifest.trust_posture,
+      },
+      ...(registeredSource ? { source: registeredSource } : {}),
     });
     return {
       kind: 'rag_corpus_notion_import_result',
@@ -2467,6 +2538,7 @@ export class DomainExpertService {
       submission_receipt: submissionReceipt,
       ...([...resolutionWarnings, ...warnings].length ? { warnings: [...resolutionWarnings, ...warnings] } : {}),
       operation,
+      ...verified,
     };
   }
 
@@ -2696,59 +2768,179 @@ export class DomainExpertService {
     }
   }
 
-  private async appendWebImportRegistryRecord(input: {
-    manifest: ReturnType<typeof domainManifest>;
-    rootPath: string;
-    urls: string[];
-    batchId: string;
-    importWorkspaceRelativePath: string;
-    resolvedCorpus: Record<string, unknown>;
-    stagedFileCount: number;
-  }): Promise<void> {
-    const urls = input.urls.map(webImportProvenanceUrl);
-    const registryPath = resolveInside(input.rootPath, `${input.manifest.workspace_relative_path}/references/source-registry.jsonl`);
-    await mkdir(dirname(registryPath), { recursive: true });
-    await this.appendRegistryJsonLine(registryPath, {
-      source_id: `${input.manifest.domain_id}-web-import-${input.batchId}`,
-      domain_id: input.manifest.domain_id,
-      kind: 'web_import',
-      urls,
-      batch_id: input.batchId,
-      corpus: input.resolvedCorpus,
-      staged_file_count: input.stagedFileCount,
-      workspace_relative_path: input.importWorkspaceRelativePath,
-      target_corpus_id: input.resolvedCorpus.requested,
-      trust_posture: input.manifest.trust_posture,
-      ingest_status: 'import_requested',
-      timestamp: new Date().toISOString(),
-    });
+  // The domain_source record an import names by source_id, read before anything
+  // is staged or submitted so a mistyped id fails the call instead of leaving
+  // the source it meant still reading not_ingested.
+  private async registeredImportSource(
+    manifest: ReturnType<typeof domainManifest>,
+    rootPath: string,
+    sourceId: string | undefined,
+  ): Promise<Record<string, unknown> | undefined> {
+    const id = sourceId?.trim();
+    if (!id) return undefined;
+    const registryRelativePath = `${manifest.workspace_relative_path}/references/source-registry.jsonl`;
+    const registry = await readDomainSourceRegistry(resolveInside(rootPath, registryRelativePath));
+    const history = registry.records.filter((entry) => entry.sourceId === id);
+    const current = history.length ? latestDomainSourceRecord(history) : undefined;
+    if (!current || current.removed) {
+      throw new DomainExpertWorkerError(
+        404,
+        'domain_source_not_found',
+        `Source ${id} was not found in ${registryRelativePath}.`,
+        'Register the source with domain_source add first, or omit source_id.',
+      );
+    }
+    return current.record;
   }
 
-  private async appendNotionImportRegistryRecord(input: {
+  // Submission is not ingestion, for any import. On 2026-10-07 every web and
+  // staged import in a live domain registry still read import_requested or
+  // not_ingested although Vertex had imported each one, because nothing wrote
+  // the outcome back; three were corrected by hand. An import is now recorded
+  // twice: import_requested with the operation name as soon as Vertex accepts
+  // it, so a worker restart mid-poll still leaves a checkable record, then the
+  // outcome Vertex reports, with the ragFile it produced. The batch record and
+  // the source named by source_id are both updated. A registry write that fails
+  // is reported, never allowed to fail an import Vertex already accepted.
+  private async verifyAndRegisterRagImport(input: {
     manifest: ReturnType<typeof domainManifest>;
     rootPath: string;
-    sources: NotionImportSource[];
-    batchId: string;
-    importWorkspaceRelativePath: string;
-    resolvedCorpus: Record<string, unknown>;
-    stagedFileCount: number;
-  }): Promise<void> {
+    resolved: ResolvedRagCorpus;
+    submissionReceipt: Record<string, unknown>;
+    operation: unknown;
+    gcsUris: string[];
+    action: string;
+    batchRecord?: Record<string, unknown>;
+    source?: Record<string, unknown>;
+  }): Promise<{ import_outcome: Record<string, unknown>; source_registry: Record<string, unknown> }> {
+    const operationName = typeof input.submissionReceipt.operation_name === 'string' ? input.submissionReceipt.operation_name : undefined;
+    const registryErrors: string[] = [];
+    const record = async (fields: Record<string, unknown>) => {
+      try {
+        return await this.appendRagImportRegistryRecords(input, fields);
+      } catch (error) {
+        registryErrors.push(error instanceof DomainExpertWorkerError
+          ? `${error.code}: ${error.message}`
+          : sanitizeWebImportProvenanceText(error instanceof Error ? error.message : String(error)).slice(0, 300));
+        return [];
+      }
+    };
+    await record({
+      ingest_status: 'import_requested',
+      ...(operationName ? { rag_operation_name: operationName } : {}),
+      ...ragImportFileFields(input.gcsUris.map((gcsUri) => ({ gcs_uri: gcsUri }))),
+    });
+
+    const outcome = await this.awaitRagImportOutcome(input.manifest, {
+      submission_receipt: input.submissionReceipt,
+      resolved_corpus: { resource_name: input.resolved.resourceName },
+      operation: input.operation,
+    }, ragImportFormatLabel(input.gcsUris), Date.now() + this.annasImportPollTimeoutMs);
+    let status: string = outcome.status;
+    let detail = outcome.detail;
+    let files: Array<Record<string, unknown>> = input.gcsUris.map((gcsUri) => ({ gcs_uri: gcsUri }));
+    if (status === 'imported' && input.gcsUris.length > 0) {
+      try {
+        files = await this.ragFilesForImportedUris(input.manifest, input.resolved, input.gcsUris);
+      } catch (error) {
+        detail = {
+          ...detail,
+          rag_file_lookup_error: error instanceof DomainExpertWorkerError
+            ? `${error.code}: ${error.message}`
+            : sanitizeWebImportProvenanceText(error instanceof Error ? error.message : String(error)).slice(0, 300),
+        };
+      }
+      // Vertex counts a file it then failed to embed; the ragFile's own state
+      // is the last word on whether it is in the library.
+      const states = files.map((file) => file.state).filter((state) => state !== undefined);
+      if (states.length > 0 && !states.includes('ACTIVE') && states.includes('ERROR')) {
+        status = 'import_failed';
+        detail = {
+          ...detail,
+          hint: `Vertex counted the import, but its ragFile is in ERROR state: ${files.map((file) => file.error_status).filter(Boolean).join('; ') || 'no reason given'}.`,
+        };
+      }
+    }
+    const verifiedAt = new Date().toISOString();
+    const written = await record({
+      ingest_status: status,
+      ...(operationName ? { rag_operation_name: operationName } : {}),
+      ...ragImportFileFields(files),
+      ...(status === 'imported'
+        ? { verification: ragImportVerification(detail, files, verifiedAt) }
+        : { ingest_reason: ragImportReason(detail) }),
+    });
+    const registryRelativePath = `${input.manifest.workspace_relative_path}/references/source-registry.jsonl`;
+    return {
+      import_outcome: {
+        status,
+        ...detail,
+        ...(input.gcsUris.length > 0 ? { rag_files: files } : {}),
+      },
+      source_registry: registryErrors.length > 0
+        ? { status: 'failed', reason: registryErrors.join('; '), registry_relative_path: registryRelativePath }
+        : { status: 'recorded', source_ids: written, ingest_status: status, registry_relative_path: registryRelativePath },
+    };
+  }
+
+  private async appendRagImportRegistryRecords(
+    input: { manifest: ReturnType<typeof domainManifest>; rootPath: string; action: string; batchRecord?: Record<string, unknown>; source?: Record<string, unknown> },
+    fields: Record<string, unknown>,
+  ): Promise<string[]> {
     const registryPath = resolveInside(input.rootPath, `${input.manifest.workspace_relative_path}/references/source-registry.jsonl`);
     await mkdir(dirname(registryPath), { recursive: true });
-    await this.appendRegistryJsonLine(registryPath, {
-      source_id: `${input.manifest.domain_id}-notion-import-${input.batchId}`,
-      domain_id: input.manifest.domain_id,
-      kind: 'notion_import',
-      notion_object_ids: input.sources.map((source) => source.id),
-      urls: input.sources.map((source) => source.url).filter((url): url is string => typeof url === 'string'),
-      batch_id: input.batchId,
-      corpus: input.resolvedCorpus,
-      staged_file_count: input.stagedFileCount,
-      workspace_relative_path: input.importWorkspaceRelativePath,
-      target_corpus_id: input.resolvedCorpus.requested,
-      trust_posture: input.manifest.trust_posture,
-      ingest_status: 'import_requested',
-      timestamp: new Date().toISOString(),
+    const registeredAt = new Date().toISOString();
+    const written: string[] = [];
+    if (input.batchRecord) {
+      await this.appendRegistryJsonLine(registryPath, { ...input.batchRecord, ...fields, registered_at: registeredAt });
+      written.push(String(input.batchRecord.source_id));
+    }
+    if (input.source) {
+      // The source keeps its catalogue fields (title, author, posture); the
+      // previous import's outcome fields are replaced, not carried forward.
+      const carried = Object.fromEntries(Object.entries(input.source).filter(([key]) => !RAG_IMPORT_OUTCOME_FIELDS.has(key)));
+      await this.appendRegistryJsonLine(registryPath, {
+        ...carried,
+        ...fields,
+        ...(input.batchRecord ? { import_batch_source_id: input.batchRecord.source_id } : {}),
+        registered_at: registeredAt,
+      });
+      written.push(String(input.source.source_id));
+    }
+    const logPath = resolveInside(input.rootPath, `${input.manifest.workspace_relative_path}/references/ingest-log.md`);
+    await appendFile(logPath, `- ${registeredAt} ${String(fields.ingest_status)} ${written.join(', ')} (rag_corpus ${input.action})\n`, 'utf8');
+    return written;
+  }
+
+  // One entry per imported object: the ragFile Vertex made from it and that
+  // file's state. An object with no listed ragFile keeps only its URI.
+  private async ragFilesForImportedUris(
+    manifest: ReturnType<typeof domainManifest>,
+    resolved: ResolvedRagCorpus,
+    gcsUris: string[],
+  ): Promise<Array<Record<string, unknown>>> {
+    const listed: Array<Record<string, unknown>> = [];
+    let pageToken: string | undefined;
+    do {
+      const page = await this.google.listRagFiles({
+        project: manifest.gcp_project,
+        location: manifest.rag_location,
+        corpusName: resolved.resourceName,
+        ...(pageToken ? { pageToken } : {}),
+      });
+      listed.push(...page.files.filter((file) => ragFileMatchesTargets(file, gcsUris)));
+      pageToken = page.nextPageToken;
+    } while (pageToken);
+    return gcsUris.map((gcsUri) => {
+      const matches = listed.filter((file) => ragFileMatchesTargets(file, [gcsUri]));
+      const file = matches.find((candidate) => candidate.state === 'ACTIVE') ?? matches[0];
+      if (!file) return { gcs_uri: gcsUri };
+      return {
+        gcs_uri: gcsUri,
+        rag_file_name: String(file.name),
+        ...(typeof file.state === 'string' ? { state: file.state } : {}),
+        ...(file.errorStatus !== undefined ? { error_status: typeof file.errorStatus === 'string' ? file.errorStatus : JSON.stringify(file.errorStatus) } : {}),
+      };
     });
   }
 
@@ -3297,7 +3489,7 @@ export class DomainExpertService {
       if ('blocked' in submission) {
         return { status: 'blocked', ...corpusTarget, gcs_uri: gcsUri, ...conversion, error: submission.blocked };
       }
-      const outcome = await this.awaitAnnasImportOutcome(manifest, submission.result, artifact.format, deadline);
+      const outcome = await this.awaitRagImportOutcome(manifest, submission.result, artifact.format, deadline);
       return {
         status: outcome.status,
         ...corpusTarget,
@@ -3444,7 +3636,7 @@ export class DomainExpertService {
   // what happened to the file, and the status names that outcome; only a poll
   // that runs out of budget still says import_requested, with the operation
   // name so the caller can finish the check.
-  private async awaitAnnasImportOutcome(
+  private async awaitRagImportOutcome(
     manifest: ReturnType<typeof domainManifest>,
     importResult: Record<string, unknown>,
     uploadedFormat: string,
@@ -7578,6 +7770,54 @@ function classifyRagImportOperation(
         : `Vertex finished without importing, failing or skipping anything, which is what it does for a format it does not parse (uploaded as ${uploadedFormat}). Vertex RAG parses PDF, text, Markdown and HTML only.`,
     },
   };
+}
+
+// Registry fields that describe one import's outcome. A source record carried
+// into a new import drops them, so a re-import never inherits the last one's
+// ragFile or verification.
+const RAG_IMPORT_OUTCOME_FIELDS = new Set([
+  'ingest_status', 'rag_operation_name', 'rag_file_name', 'rag_files', 'gcs_uri',
+  'verification', 'ingest_reason', 'import_batch_source_id', 'registered_at',
+]);
+
+// One imported object is recorded flat, the shape the hand-corrected records
+// use; a batch of several keeps a rag_files list.
+function ragImportFileFields(files: Array<Record<string, unknown>>): Record<string, unknown> {
+  if (files.length === 0) return {};
+  if (files.length > 1) return { rag_files: files.map(({ gcs_uri, rag_file_name }) => ({ gcs_uri, ...(rag_file_name ? { rag_file_name } : {}) })) };
+  const [file] = files;
+  return { ...(file!.rag_file_name ? { rag_file_name: file!.rag_file_name } : {}), gcs_uri: file!.gcs_uri };
+}
+
+function ragImportFormatLabel(gcsUris: string[]): string {
+  const formats = [...new Set(gcsUris.map((uri) => extname(uri).slice(1).toLowerCase()).filter(Boolean))];
+  return formats.length ? formats.join(', ') : 'an unknown format';
+}
+
+function ragImportVerification(detail: Record<string, unknown>, files: Array<Record<string, unknown>>, verifiedAt: string): string {
+  const parts = [`importedRagFilesCount=${String(detail.imported_rag_files_count)}`];
+  if (Number(detail.failed_rag_files_count) > 0) parts.push(`failedRagFilesCount=${String(detail.failed_rag_files_count)}`);
+  if (Number(detail.skipped_rag_files_count) > 0) parts.push(`skippedRagFilesCount=${String(detail.skipped_rag_files_count)}`);
+  const states = files.map((file) => (typeof file.state === 'string' ? file.state : 'not listed'));
+  if (states.length === 1) {
+    parts.push(states[0] === 'not listed' ? 'ragFile not listed' : `ragFile ${states[0]}`);
+  } else if (states.length > 1) {
+    const counts = new Map<string, number>();
+    for (const state of states) counts.set(state, (counts.get(state) ?? 0) + 1);
+    parts.push(`ragFiles ${[...counts].map(([state, count]) => `${count} ${state}`).join(', ')}`);
+  }
+  if (typeof detail.rag_file_lookup_error === 'string') parts.push(`ragFile lookup failed: ${detail.rag_file_lookup_error}`);
+  parts.push(`worker verified ${verifiedAt}`);
+  return parts.join('; ');
+}
+
+function ragImportReason(detail: Record<string, unknown>): string {
+  const vertexError = asOptionalRecord(detail.vertex_error);
+  const pollError = asOptionalRecord(detail.poll_error);
+  if (typeof vertexError?.message === 'string') return `Vertex error: ${vertexError.message}`;
+  if (typeof detail.hint === 'string') return detail.hint;
+  if (typeof pollError?.message === 'string') return `Operation read failed: ${pollError.message}`;
+  return typeof detail.reason === 'string' ? detail.reason : 'No reason reported.';
 }
 
 // djvulibre's djvutxt prints the text layer of every page to stdout. It runs

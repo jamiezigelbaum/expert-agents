@@ -4841,3 +4841,297 @@ describe('acquisition ingest registers the imported source', () => {
     }
   });
 });
+
+// On 2026-10-07 every web and staged import in a live domain registry still
+// read import_requested or not_ingested although Vertex had imported each one.
+// A rag_corpus import now records what Vertex reports once the operation
+// finishes, in the shape the hand-corrected records used.
+describe('rag_corpus imports record their verified outcome in the source registry', () => {
+  const CORPUS = 'projects/fixture-project/locations/us-central1/ragCorpora/1234567890123456789';
+  const OPERATION = `${CORPUS}/operations/import-1`;
+  const stagedUri = (batch: string, file: string) => `gs://fixture-shared-library/v1/staged/research/${batch}/${file}`;
+
+  function importFixture(google: Parameters<typeof fakeGoogleFetch>[1] = {}, overrides: Partial<DomainExpertWorkerOptions> = {}) {
+    const fixture = workspaceFixture();
+    const calls: CapturedCall[] = [];
+    const sourceDir = join(fixture.workspaceRoot, 'experts', 'research', 'sources', 'batch');
+    mkdirSync(sourceDir, { recursive: true });
+    writeFileSync(join(sourceDir, 'note.md'), 'staged');
+    const worker = createDomainExpertWorker({
+      roots: [rootPolicy(fixture.workspaceRoot)],
+      dataDir: join(fixture.base, 'data'),
+      annas: { importPollIntervalMs: 1, importPollTimeoutMs: 2_000 },
+      google: { accessToken: 'fixture-google-token', fetchImpl: fakeGoogleFetch(calls, google) },
+      ...overrides,
+    });
+    const registryPath = join(fixture.workspaceRoot, 'experts/research/references/source-registry.jsonl');
+    const readRegistry = () => readFileSync(registryPath, 'utf8').split('\n').filter(Boolean).map((line) => JSON.parse(line) as Record<string, any>);
+    const stageImport = (params: Record<string, unknown> = {}) => postDomainResponse(worker, 'rag_corpus', {
+      action: 'stage_import',
+      corpus_id: '1234567890123456789',
+      workspace_relative_path: 'experts/research/sources/batch',
+      batch_id: 'verified-batch',
+      dry_run: false,
+      ...params,
+    });
+    return { worker, calls, readRegistry, stageImport, cleanup: fixture.cleanup };
+  }
+
+  test('a staged import that Vertex imports is recorded imported with its ragFile and operation', async () => {
+    const ragFileName = `${CORPUS}/ragFiles/active-1`;
+    const f = importFixture({
+      ragFiles: [{ name: ragFileName, gcsSource: { uris: [stagedUri('verified-batch', 'note.md')] }, fileStatus: { state: 'ACTIVE' } }],
+    });
+    try {
+      const response = await f.stageImport();
+      expect(response.status).toBe(200);
+      const result = await response.json() as Record<string, any>;
+      expect(result.status).toBe('staged_and_import_requested');
+      expect(result.import_outcome).toMatchObject({
+        status: 'imported',
+        operation_name: OPERATION,
+        imported_rag_files_count: 1,
+        rag_files: [{ gcs_uri: stagedUri('verified-batch', 'note.md'), rag_file_name: ragFileName, state: 'ACTIVE' }],
+      });
+      expect(result.source_registry).toMatchObject({
+        status: 'recorded',
+        source_ids: ['research-stage-import-verified-batch'],
+        ingest_status: 'imported',
+      });
+
+      const records = f.readRegistry();
+      // Accepted first, so a restart mid-poll still leaves the operation to check.
+      expect(records).toHaveLength(2);
+      expect(records[0]).toMatchObject({
+        source_id: 'research-stage-import-verified-batch',
+        kind: 'stage_import',
+        batch_id: 'verified-batch',
+        ingest_status: 'import_requested',
+        rag_operation_name: OPERATION,
+        gcs_uri: stagedUri('verified-batch', 'note.md'),
+      });
+      expect(records[1]).toMatchObject({
+        source_id: 'research-stage-import-verified-batch',
+        workspace_relative_path: 'experts/research/sources/batch',
+        target_corpus_id: '1234567890123456789',
+        ingest_status: 'imported',
+        rag_operation_name: OPERATION,
+        rag_file_name: ragFileName,
+        gcs_uri: stagedUri('verified-batch', 'note.md'),
+      });
+      expect(records[1]!.verification).toStartWith('importedRagFilesCount=1; ragFile ACTIVE; worker verified ');
+      expect(typeof records[1]!.registered_at).toBe('string');
+
+      const status = await postDomain(f.worker, 'domain_source', {
+        action: 'status', domain_id: 'research', source_id: 'research-stage-import-verified-batch',
+      });
+      expect(status.current).toMatchObject({ ingest_status: 'imported', rag_file_name: ragFileName });
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  test('an import naming a source_id updates that source, keeping its catalogue fields', async () => {
+    const ragFileName = `${CORPUS}/ragFiles/active-2`;
+    const f = importFixture({
+      ragFiles: [{ name: ragFileName, gcsSource: { uris: [stagedUri('verified-batch', 'note.md')] }, fileStatus: { state: 'ACTIVE' } }],
+    });
+    try {
+      await postDomain(f.worker, 'domain_source', {
+        action: 'add',
+        domain_id: 'research',
+        source_id: 'source-paper',
+        kind: 'pdf',
+        title: 'Fixture Paper',
+        author: 'Example Author',
+        url: 'https://example.com/paper.pdf',
+        copyright_posture: 'approved_fixture_use',
+        dry_run: false,
+      });
+
+      const response = await f.stageImport({ source_id: 'source-paper' });
+      expect(response.status).toBe(200);
+      const result = await response.json() as Record<string, any>;
+      expect(result.source_registry.source_ids).toEqual(['research-stage-import-verified-batch', 'source-paper']);
+
+      const status = await postDomain(f.worker, 'domain_source', { action: 'status', domain_id: 'research', source_id: 'source-paper' });
+      expect(status.history.map((record: Record<string, unknown>) => record.ingest_status))
+        .toEqual(['not_ingested', 'import_requested', 'imported']);
+      expect(status.current).toMatchObject({
+        source_id: 'source-paper',
+        kind: 'pdf',
+        title: 'Fixture Paper',
+        author: 'Example Author',
+        canonical_url: 'https://example.com/paper.pdf',
+        copyright_posture: 'approved_fixture_use',
+        ingest_status: 'imported',
+        rag_file_name: ragFileName,
+        gcs_uri: stagedUri('verified-batch', 'note.md'),
+        rag_operation_name: OPERATION,
+        import_batch_source_id: 'research-stage-import-verified-batch',
+      });
+      expect(status.current.verification).toContain('ragFile ACTIVE');
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  test('an unregistered source_id is refused before anything is staged or submitted', async () => {
+    const f = importFixture();
+    try {
+      const response = await f.stageImport({ source_id: 'missing-source' });
+      expect(response.status).toBe(404);
+      expect(await response.json()).toMatchObject({ error: { code: 'domain_source_not_found' } });
+      expect(f.calls.filter((call) => call.url.includes('/upload/') || call.url.endsWith('/ragFiles:import'))).toHaveLength(0);
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  test('a plain import with source_id updates the source record with the imported object', async () => {
+    const gcsUri = 'gs://fixture-shared-library/v1/objects/paper.pdf';
+    const ragFileName = `${CORPUS}/ragFiles/active-3`;
+    const f = importFixture({
+      ragFiles: [{ name: ragFileName, gcsSource: { uris: [gcsUri] }, fileStatus: { state: 'ACTIVE' } }],
+    });
+    try {
+      await postDomain(f.worker, 'domain_source', {
+        action: 'add', domain_id: 'research', source_id: 'source-plain', kind: 'pdf', title: 'Plain Paper', url: 'https://example.com/plain.pdf', dry_run: false,
+      });
+      const result = await postDomain(f.worker, 'rag_corpus', {
+        action: 'import', domain_id: 'research', corpus_id: '1234567890123456789', gcs_uri: gcsUri, source_id: 'source-plain', dry_run: false,
+      });
+      expect(result.status).toBe('import_requested');
+      expect(result.import_outcome).toMatchObject({ status: 'imported' });
+      expect(result.source_registry).toMatchObject({ status: 'recorded', source_ids: ['source-plain'] });
+      const records = f.readRegistry();
+      expect(records.map((record) => record.ingest_status)).toEqual(['not_ingested', 'import_requested', 'imported']);
+      expect(records[2]).toMatchObject({ source_id: 'source-plain', title: 'Plain Paper', gcs_uri: gcsUri, rag_file_name: ragFileName });
+      expect(records[2]).not.toHaveProperty('import_batch_source_id');
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  test('a plain import without source_id writes no registry record', async () => {
+    const f = importFixture();
+    try {
+      const result = await postDomain(f.worker, 'rag_corpus', {
+        action: 'import', domain_id: 'research', corpus_id: '1234567890123456789', gcs_uri: 'gs://fixture-shared-library/v1/objects/paper.pdf', dry_run: false,
+      });
+      expect(result).not.toHaveProperty('source_registry');
+      expect(() => f.readRegistry()).toThrow();
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  test.each([
+    {
+      name: 'a Vertex error',
+      operation: { done: true, error: { code: 3, message: 'fixture parse failure' } },
+      status: 'import_failed',
+      reason: 'Vertex error: fixture parse failure',
+    },
+    {
+      name: 'a failed file count',
+      operation: { done: true, response: { failedRagFilesCount: '1' } },
+      status: 'import_failed',
+      reason: 'Vertex reported the file as failed.',
+    },
+    {
+      name: 'zero counts',
+      operation: { done: true, response: {} },
+      status: 'import_empty',
+      reason: 'Vertex finished without importing',
+    },
+  ])('an import finishing with $name is recorded $status with the reason', async ({ operation, status, reason }) => {
+    const f = importFixture({ importOperation: (name) => ({ name, ...operation }) });
+    try {
+      const response = await f.stageImport();
+      expect(response.status).toBe(200);
+      const result = await response.json() as Record<string, any>;
+      expect(result.import_outcome.status).toBe(status);
+      const latest = f.readRegistry().at(-1)!;
+      expect(latest).toMatchObject({ ingest_status: status, rag_operation_name: OPERATION });
+      expect(latest.ingest_reason).toContain(reason);
+      expect(latest).not.toHaveProperty('verification');
+      expect(latest).not.toHaveProperty('rag_file_name');
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  test('a counted import whose ragFile is in ERROR is recorded import_failed', async () => {
+    const f = importFixture({
+      ragFiles: [{
+        name: `${CORPUS}/ragFiles/errored`,
+        gcsSource: { uris: [stagedUri('verified-batch', 'note.md')] },
+        fileStatus: { state: 'ERROR', errorStatus: 'failed to insert chunks' },
+      }],
+    });
+    try {
+      const result = await (await f.stageImport()).json() as Record<string, any>;
+      expect(result.import_outcome.status).toBe('import_failed');
+      const latest = f.readRegistry().at(-1)!;
+      expect(latest.ingest_status).toBe('import_failed');
+      expect(latest.ingest_reason).toContain('failed to insert chunks');
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  test('an operation still running when the budget ends stays import_requested with the operation to check', async () => {
+    const f = importFixture(
+      { importOperation: (name) => ({ name, done: false }) },
+      { annas: { importPollIntervalMs: 1, importPollTimeoutMs: 20 } },
+    );
+    try {
+      const result = await (await f.stageImport()).json() as Record<string, any>;
+      expect(result.import_outcome).toMatchObject({ status: 'import_requested', operation_name: OPERATION });
+      const latest = f.readRegistry().at(-1)!;
+      expect(latest).toMatchObject({ ingest_status: 'import_requested', rag_operation_name: OPERATION });
+      expect(latest.ingest_reason).toContain('had not finished the import');
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  test('a web_import batch record settles to imported instead of staying import_requested', async () => {
+    const ragFileName = `${CORPUS}/ragFiles/web-1`;
+    const f = importFixture({
+      ragFiles: [{ name: ragFileName, gcsSource: { uris: [stagedUri('web-batch', 'fixture-page.md')] }, fileStatus: { state: 'ACTIVE' } }],
+    }, {
+      resolveHostImpl: async () => ['93.184.216.34'],
+      webImportFetchImpl: async () => new Response(
+        '<html><head><title>Fixture Page</title></head><body><main><p>Converted page paragraph.</p></main></body></html>',
+        { status: 200, headers: { 'content-type': 'text/html' } },
+      ),
+      summarizeBin: '/neutral/bin/summarize',
+    });
+    try {
+      const result = await postDomain(f.worker, 'rag_corpus', {
+        action: 'web_import',
+        corpus_id: '1234567890123456789',
+        urls: ['https://example.com/article'],
+        batch_id: 'web-batch',
+        dry_run: false,
+      });
+      expect(result.import_outcome).toMatchObject({ status: 'imported' });
+      const records = f.readRegistry();
+      expect(records.map((record) => [record.source_id, record.ingest_status])).toEqual([
+        ['research-web-import-web-batch', 'import_requested'],
+        ['research-web-import-web-batch', 'imported'],
+      ]);
+      expect(records[1]).toMatchObject({
+        kind: 'web_import',
+        urls: ['https://example.com/article'],
+        rag_file_name: ragFileName,
+        gcs_uri: stagedUri('web-batch', 'fixture-page.md'),
+        rag_operation_name: OPERATION,
+      });
+    } finally {
+      f.cleanup();
+    }
+  });
+});

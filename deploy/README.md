@@ -184,6 +184,16 @@ only when the poll timed out (with `operation_name`). A busy corpus
 (`FAILED_PRECONDITION`, other operations running) or a 429 is retried with
 backoff inside that budget before reporting `blocked`.
 
+`rag_corpus` `stage_import`, `web_import`, `notion_import`, and `import` with
+`source_id` poll the same way, within the same interval and timeout, and
+write the outcome to the domain's `references/source-registry.jsonl`: an
+`import_requested` record with `rag_operation_name` when Vertex accepts the
+import, then `imported` (with `rag_file_name`, `gcs_uri`, `verification`),
+`import_failed` or `import_empty` (with `ingest_reason`) once it settles. The
+batch record and the source named by `source_id` are both updated; an unknown
+`source_id` is refused before anything is staged. The tool result keeps its
+submission `status` and adds `import_outcome` and `source_registry`.
+
 PDFs above 100,000,000 bytes are currently rejected. The accepted 1 GB original
 PDF target requires a durable background ingestion subsystem rather than a
 larger in-memory cap: stream the original into a content-addressed spool;
