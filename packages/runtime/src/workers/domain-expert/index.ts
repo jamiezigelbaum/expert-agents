@@ -6668,9 +6668,21 @@ function normalizeStageBatchId(value: string): string {
 }
 
 function safeGcsRelativePath(value: string): string {
-  const segments = value.split('/').filter(Boolean).map((segment) => safeObjectName(segment));
-  if (segments.length === 0) throw new DomainExpertWorkerError(400, 'invalid_stage_path', 'stage_import file path is empty.');
-  return segments.join('/');
+  const parts = value.split('/').filter(Boolean);
+  if (parts.length === 0) throw new DomainExpertWorkerError(400, 'invalid_stage_path', 'stage_import file path is empty.');
+  const directories = parts.slice(0, -1).map((segment) => safeObjectName(segment));
+  return [...directories, safeObjectFileName(parts[parts.length - 1]!)].join('/');
+}
+
+// Vertex picks a parser from the staged object's extension, so a long file
+// name must lose characters from its stem, never its extension: a plain
+// 80-character cut turned `...writings.md` into `...writings.m`, which Vertex
+// silently skipped.
+function safeObjectFileName(value: string): string {
+  const sanitized = sanitizeObjectName(value);
+  const extension = extname(sanitized);
+  if (sanitized.length <= SAFE_OBJECT_NAME_MAX_LENGTH || !/^\.[a-z0-9]{1,10}$/.test(extension)) return safeObjectName(value);
+  return `${sanitized.slice(0, SAFE_OBJECT_NAME_MAX_LENGTH - extension.length)}${extension}`;
 }
 
 function extractRagCorpusResourceName(value: unknown): string | undefined {
@@ -8301,8 +8313,14 @@ function annasSourceKind(format: string): 'pdf' | 'epub' | 'book' {
   return 'book';
 }
 
+const SAFE_OBJECT_NAME_MAX_LENGTH = 80;
+
 function safeObjectName(value: string): string {
-  return value.toLowerCase().replace(/[^a-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 80) || randomUUID();
+  return sanitizeObjectName(value).slice(0, SAFE_OBJECT_NAME_MAX_LENGTH) || randomUUID();
+}
+
+function sanitizeObjectName(value: string): string {
+  return value.toLowerCase().replace(/[^a-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '');
 }
 
 function notionImportSources(params: RagCorpusParams): NotionImportSource[] {
