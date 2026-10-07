@@ -350,6 +350,8 @@ function extractionWorker(
       headers: { 'content-type': 'text/html' },
     }),
     summarizeBin: '/fixture/bin/summarize',
+    // The fixture corpus never lists the imported file; keep the listing retries short.
+    annas: { importPollIntervalMs: 1 },
     ...overrides,
   });
 }

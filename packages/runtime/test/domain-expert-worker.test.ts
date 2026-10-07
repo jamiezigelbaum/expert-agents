@@ -754,6 +754,7 @@ describe('RAG ingestion configuration', () => {
         roots: [rootPolicy(fixture.workspaceRoot)],
         google: { accessToken: 'fixture-google-token', fetchImpl: fakeGoogleFetch(calls) },
         dataDir: join(fixture.base, 'data'),
+        annas: { importPollIntervalMs: 1 },
       });
 
       const result = await postDomain(worker, 'rag_corpus', {
@@ -907,6 +908,7 @@ describe('RAG ingestion configuration', () => {
           }),
         },
         dataDir: join(fixture.base, 'data'),
+        annas: { importPollIntervalMs: 1 },
       });
 
       const result = await postDomain(worker, 'rag_corpus', {
@@ -1148,6 +1150,8 @@ describe('web_import extraction through summarize', () => {
       }),
       summarizeBin: NEUTRAL_SUMMARIZE_BINARY,
       ytDlpBin: NEUTRAL_YTDLP_BINARY,
+      // The fixture corpus never lists the imported file; keep the listing retries short.
+      annas: { importPollIntervalMs: 1 },
       ...overrides,
     };
   }
@@ -3895,7 +3899,8 @@ function fakeGoogleFetch(
     retrievalStatus?: (query: string) => number | undefined;
     ragCorpora?: Array<{ name: string; displayName: string }>;
     gcsObjects?: Record<string, string>;
-    ragFiles?: Array<Record<string, unknown>>;
+    /** The corpus listing, or a function of how many listings followed the import submission. */
+    ragFiles?: Array<Record<string, unknown>> | ((listingsAfterImport: number) => Array<Record<string, unknown>>);
     /** Scripted import operation: called with poll 0 at submission, then once per read-back. */
     importOperation?: (name: string, poll: number) => Record<string, unknown>;
     /** Scripted import submission failures, keyed by attempt number. */
@@ -3904,6 +3909,7 @@ function fakeGoogleFetch(
 ): typeof fetch {
   let operationPolls = 0;
   let importAttempts = 0;
+  let listingsAfterImport = 0;
   return (async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
     const url = input instanceof Request ? input.url : String(input);
     const method = init?.method ?? (input instanceof Request ? input.method : 'GET');
@@ -3977,6 +3983,10 @@ function fakeGoogleFetch(
     // A live import lists the corpus first, to clear ERROR records that would
     // otherwise make the re-import a silent no-op.
     if (method === 'GET' && new URL(url).pathname.endsWith('/ragFiles')) {
+      if (typeof options.ragFiles === 'function') {
+        if (importAttempts > 0) listingsAfterImport += 1;
+        return jsonResponse({ ragFiles: options.ragFiles(listingsAfterImport) });
+      }
       return jsonResponse({ ragFiles: options.ragFiles ?? [] });
     }
     if (method === 'DELETE' && new URL(url).pathname.includes('/ragFiles/')) {
@@ -5151,6 +5161,89 @@ describe('rag_corpus imports record their verified outcome in the source registr
       const latest = f.readRegistry().at(-1)!;
       expect(latest).toMatchObject({ ingest_status: 'import_requested', rag_operation_name: OPERATION });
       expect(latest.ingest_reason).toContain('had not finished the import');
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  test('a re-import Vertex skips as a duplicate is recorded imported when its ragFile is ACTIVE', async () => {
+    const ragFileName = `${CORPUS}/ragFiles/already-present`;
+    const f = importFixture({
+      importOperation: (name) => ({ name, done: true, response: { skippedRagFilesCount: '1' } }),
+      ragFiles: [{ name: ragFileName, gcsSource: { uris: [stagedUri('verified-batch', 'note.md')] }, fileStatus: { state: 'ACTIVE' } }],
+    });
+    try {
+      const result = await (await f.stageImport()).json() as Record<string, any>;
+      expect(result.import_outcome).toMatchObject({
+        status: 'imported',
+        imported_rag_files_count: 0,
+        skipped_rag_files_count: 1,
+        already_present: true,
+        rag_files: [{ gcs_uri: stagedUri('verified-batch', 'note.md'), rag_file_name: ragFileName, state: 'ACTIVE' }],
+      });
+      expect(result.import_outcome).not.toHaveProperty('hint');
+      const records = f.readRegistry();
+      expect(records.map((record) => record.ingest_status)).toEqual(['import_requested', 'imported']);
+      expect(records[1]).toMatchObject({ ingest_status: 'imported', rag_file_name: ragFileName, rag_operation_name: OPERATION });
+      expect(records[1]!.verification).toStartWith(
+        'importedRagFilesCount=0; skippedRagFilesCount=1; ragFile ACTIVE; already present, skipped as duplicate; worker verified ',
+      );
+      expect(records[1]).not.toHaveProperty('ingest_reason');
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  test('a skipped re-import whose ragFile is not ACTIVE stays import_empty', async () => {
+    const f = importFixture({
+      importOperation: (name) => ({ name, done: true, response: { skippedRagFilesCount: '1' } }),
+      ragFiles: [{ name: `${CORPUS}/ragFiles/errored`, gcsSource: { uris: [stagedUri('verified-batch', 'note.md')] }, fileStatus: { state: 'ERROR' } }],
+    });
+    try {
+      const result = await (await f.stageImport()).json() as Record<string, any>;
+      expect(result.import_outcome.status).toBe('import_empty');
+      const latest = f.readRegistry().at(-1)!;
+      expect(latest.ingest_status).toBe('import_empty');
+      expect(latest.ingest_reason).toContain('already present under the same source URI');
+      expect(latest).not.toHaveProperty('rag_file_name');
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  test('an imported ragFile missing from the first listing is found on the next and recorded', async () => {
+    const ragFileName = `${CORPUS}/ragFiles/lagging`;
+    const f = importFixture({
+      ragFiles: (listing) => listing <= 1
+        ? []
+        : [{ name: ragFileName, gcsSource: { uris: [stagedUri('verified-batch', 'note.md')] }, fileStatus: { state: 'ACTIVE' } }],
+    });
+    try {
+      const result = await (await f.stageImport()).json() as Record<string, any>;
+      expect(result.import_outcome).toMatchObject({
+        status: 'imported',
+        rag_file_listings: 2,
+        rag_files: [{ gcs_uri: stagedUri('verified-batch', 'note.md'), rag_file_name: ragFileName, state: 'ACTIVE' }],
+      });
+      const latest = f.readRegistry().at(-1)!;
+      expect(latest).toMatchObject({ ingest_status: 'imported', rag_file_name: ragFileName });
+      expect(latest.verification).toStartWith('importedRagFilesCount=1; ragFile ACTIVE; worker verified ');
+      const listings = f.calls.filter((call) => call.method === 'GET' && new URL(call.url).pathname.endsWith('/ragFiles'));
+      expect(listings.length).toBeGreaterThanOrEqual(2);
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  test('an imported ragFile never listed is recorded not listed after the retries', async () => {
+    const f = importFixture({ ragFiles: () => [] });
+    try {
+      const result = await (await f.stageImport()).json() as Record<string, any>;
+      expect(result.import_outcome).toMatchObject({ status: 'imported', rag_file_listings: 4 });
+      const latest = f.readRegistry().at(-1)!;
+      expect(latest.ingest_status).toBe('imported');
+      expect(latest).not.toHaveProperty('rag_file_name');
+      expect(latest.verification).toContain('ragFile not listed; after 4 listings');
     } finally {
       f.cleanup();
     }

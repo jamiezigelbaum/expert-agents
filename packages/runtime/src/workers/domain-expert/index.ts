@@ -524,6 +524,7 @@ const ANNAS_DJVUTXT_MAX_OUTPUT_BYTES = 64 * 1024 * 1024;
 const DEFAULT_ANNAS_IMPORT_POLL_INTERVAL_MS = 5_000;
 const DEFAULT_ANNAS_IMPORT_POLL_TIMEOUT_MS = 600_000;
 const ANNAS_IMPORT_BACKOFF_MAX_MS = 60_000;
+const RAG_FILE_LISTING_RETRIES = 3;
 // Formats Vertex RAG Engine parses natively (as uploaded), and the ebook
 // formats the worker converts to Markdown before upload. Anything else is a
 // typed refusal that leaves the download on disk.
@@ -2831,17 +2832,20 @@ export class DomainExpertService {
       ...ragImportFileFields(input.gcsUris.map((gcsUri) => ({ gcs_uri: gcsUri }))),
     });
 
+    const deadline = Date.now() + this.annasImportPollTimeoutMs;
     const outcome = await this.awaitRagImportOutcome(input.manifest, {
       submission_receipt: input.submissionReceipt,
       resolved_corpus: { resource_name: input.resolved.resourceName },
       operation: input.operation,
-    }, ragImportFormatLabel(input.gcsUris), Date.now() + this.annasImportPollTimeoutMs);
+    }, ragImportFormatLabel(input.gcsUris), deadline);
     let status: string = outcome.status;
     let detail = outcome.detail;
     let files: Array<Record<string, unknown>> = input.gcsUris.map((gcsUri) => ({ gcs_uri: gcsUri }));
-    if (status === 'imported' && input.gcsUris.length > 0) {
+    const lookUpRagFiles = async (): Promise<Array<Record<string, unknown>> | undefined> => {
       try {
-        files = await this.ragFilesForImportedUris(input.manifest, input.resolved, input.gcsUris);
+        const listed = await this.ragFilesForImportedUrisSettled(input.manifest, input.resolved, input.gcsUris, deadline);
+        detail = { ...detail, rag_file_listings: listed.listings };
+        return listed.files;
       } catch (error) {
         detail = {
           ...detail,
@@ -2849,7 +2853,11 @@ export class DomainExpertService {
             ? `${error.code}: ${error.message}`
             : sanitizeWebImportProvenanceText(error instanceof Error ? error.message : String(error)).slice(0, 300),
         };
+        return undefined;
       }
+    };
+    if (status === 'imported' && input.gcsUris.length > 0) {
+      files = (await lookUpRagFiles()) ?? files;
       // Vertex counts a file it then failed to embed; the ragFile's own state
       // is the last word on whether it is in the library.
       const states = files.map((file) => file.state).filter((state) => state !== undefined);
@@ -2859,6 +2867,15 @@ export class DomainExpertService {
           ...detail,
           hint: `Vertex counted the import, but its ragFile is in ERROR state: ${files.map((file) => file.error_status).filter(Boolean).join('; ') || 'no reason given'}.`,
         };
+      }
+    } else if (status === 'import_empty' && ragImportCount(detail.skipped_rag_files_count) >= 1 && input.gcsUris.length > 0) {
+      // A re-import of an object already in the corpus is skipped, not
+      // imported. When its ragFile is ACTIVE the source is in the library.
+      const listed = await lookUpRagFiles();
+      if (listed && listed.every((file) => file.state === 'ACTIVE')) {
+        files = listed;
+        status = 'imported';
+        detail = { ...Object.fromEntries(Object.entries(detail).filter(([key]) => key !== 'hint')), already_present: true };
       }
     }
     const verifiedAt = new Date().toISOString();
@@ -2910,6 +2927,30 @@ export class DomainExpertService {
     const logPath = resolveInside(input.rootPath, `${input.manifest.workspace_relative_path}/references/ingest-log.md`);
     await appendFile(logPath, `- ${registeredAt} ${String(fields.ingest_status)} ${written.join(', ')} (rag_corpus ${input.action})\n`, 'utf8');
     return written;
+  }
+
+  // The ragFile listing can lag a finished import (seen 2026-10-07: missing
+  // right after, ACTIVE minutes later), so an object missing from the first
+  // listing is looked for again a few times inside the poll budget before it
+  // is reported as not listed.
+  private async ragFilesForImportedUrisSettled(
+    manifest: ReturnType<typeof domainManifest>,
+    resolved: ResolvedRagCorpus,
+    gcsUris: string[],
+    deadline: number,
+  ): Promise<{ files: Array<Record<string, unknown>>; listings: number }> {
+    let files = await this.ragFilesForImportedUris(manifest, resolved, gcsUris);
+    let listings = 1;
+    while (
+      listings <= RAG_FILE_LISTING_RETRIES
+      && files.some((file) => file.rag_file_name === undefined)
+      && Date.now() + this.annasImportPollIntervalMs <= deadline
+    ) {
+      await sleepMs(this.annasImportPollIntervalMs);
+      files = await this.ragFilesForImportedUris(manifest, resolved, gcsUris);
+      listings += 1;
+    }
+    return { files, listings };
   }
 
   // One entry per imported object: the ragFile Vertex made from it and that
@@ -7818,6 +7859,8 @@ function ragImportVerification(detail: Record<string, unknown>, files: Array<Rec
     for (const state of states) counts.set(state, (counts.get(state) ?? 0) + 1);
     parts.push(`ragFiles ${[...counts].map(([state, count]) => `${count} ${state}`).join(', ')}`);
   }
+  if (states.includes('not listed') && Number(detail.rag_file_listings) > 1) parts.push(`after ${String(detail.rag_file_listings)} listings`);
+  if (detail.already_present === true) parts.push('already present, skipped as duplicate');
   if (typeof detail.rag_file_lookup_error === 'string') parts.push(`ragFile lookup failed: ${detail.rag_file_lookup_error}`);
   parts.push(`worker verified ${verifiedAt}`);
   return parts.join('; ');
