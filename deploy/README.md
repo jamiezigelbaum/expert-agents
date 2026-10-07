@@ -176,9 +176,10 @@ an overwrite); a DJVU is converted through `djvutxt` when
 `EXPERT_AGENTS_DOMAIN_EXPERT_ANNAS_DJVUTXT_BIN` (default `djvutxt`, from
 djvulibre) resolves on PATH; MOBI/AZW3 are refused with
 `unsupported_ingest_format` and the download stays on disk. After submission
-the worker polls the Vertex operation every
-`EXPERT_AGENTS_DOMAIN_EXPERT_ANNAS_IMPORT_POLL_INTERVAL_MS` (default 5000) for
-up to `EXPERT_AGENTS_DOMAIN_EXPERT_ANNAS_IMPORT_POLL_TIMEOUT_MS` (default
+the worker polls the Vertex operation, starting at
+`EXPERT_AGENTS_DOMAIN_EXPERT_ANNAS_IMPORT_POLL_INTERVAL_MS` (default 5000) and
+growing ×1.5 per read up to 30 s while the import runs (each read counts
+against the 60/min VertexRagDataService regional quota), for up to `EXPERT_AGENTS_DOMAIN_EXPERT_ANNAS_IMPORT_POLL_TIMEOUT_MS` (default
 600000, shared with submission backoff) and reports `rag_ingest.status` as
 `imported`, `import_failed` (with Vertex's message), `import_empty` (finished
 with zero counts, the signature of an unparsed format), or `import_requested`
