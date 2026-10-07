@@ -522,6 +522,8 @@ const ANNAS_DJVUTXT_MAX_OUTPUT_BYTES = 64 * 1024 * 1024;
 // minutes. Ten minutes covers a queued single-file import without letting a
 // tool call hang indefinitely.
 const DEFAULT_ANNAS_IMPORT_POLL_INTERVAL_MS = 5_000;
+const RAG_IMPORT_POLL_GROWTH = 1.5;
+const RAG_IMPORT_POLL_MAX_MS = 30_000;
 const DEFAULT_ANNAS_IMPORT_POLL_TIMEOUT_MS = 600_000;
 const ANNAS_IMPORT_BACKOFF_MAX_MS = 60_000;
 const RAG_FILE_LISTING_RETRIES = 3;
@@ -3745,7 +3747,11 @@ export class DomainExpertService {
       polls += 1;
       try {
         operation = await this.google.getRagImportOperation(scope, operationName);
-        delay = this.annasImportPollIntervalMs;
+        // A running import is read back less often the longer it runs. Every
+        // read is a VertexRagDataService request against a 60/min regional
+        // quota shared with agent retrieval; on 2026-10-07 a 7-minute book
+        // import took 86 reads at a flat 5 s and starved concurrent reads.
+        delay = Math.min(Math.ceil(delay * RAG_IMPORT_POLL_GROWTH), Math.max(this.annasImportPollIntervalMs, RAG_IMPORT_POLL_MAX_MS));
       } catch (error) {
         const transient = error instanceof DomainExpertWorkerError && error.code === 'google_api_error' && (error.status === 429 || error.status >= 500);
         if (transient) {

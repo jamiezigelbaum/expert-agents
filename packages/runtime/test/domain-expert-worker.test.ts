@@ -2387,6 +2387,9 @@ describe('acquisition ingest converts ebooks and verifies the import outcome', (
         },
       });
       expect(response.rag_ingest.import_outcome.polls).toBeGreaterThan(0);
+      // Reads of a still-running operation back off (1 ms growing ×1.5), so a
+      // 300 ms budget takes a dozen or so reads, not one per millisecond.
+      expect(response.rag_ingest.import_outcome.polls).toBeLessThan(25);
       expect(response.rag_ingest.import_outcome.hint).toContain('Read the operation');
     } finally {
       gate.cleanup();
