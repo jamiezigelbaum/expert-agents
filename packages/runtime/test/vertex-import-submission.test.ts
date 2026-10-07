@@ -32,6 +32,9 @@ describe('runtime import submission custody', () => {
     let registered = !options.dynamic;
     const createWorker = () => createDomainExpertWorker({
       dataDir, gcpProject: 'neutral-project',
+      // These tests pin submission custody; a zero poll budget reports the
+      // accepted operation without reading it back for an outcome.
+      annas: { importPollTimeoutMs: 0 },
       ...(options.dynamic ? { registrationLibrary: { bucket: 'neutral-library', prefix: 'shared' } } : {}),
       roots: [{ rootId: 'expert_agents_workspace', path: root, maxWriteBytes: 1_000_000, allowOverwrite: false }],
       agentRouting: validateAgentRoutingConfig(options.dynamic ? {} : { research: {
