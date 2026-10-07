@@ -51,10 +51,13 @@ Vertex RAG parses PDF, plain text, Markdown and HTML only. Before an ingest
 upload the runtime converts an EPUB to Markdown itself, converts a DJVU
 through `djvutxt` when the worker host has it, and refuses MOBI/AZW3 (and a
 DJVU on a host without `djvutxt`) with `unsupported_ingest_format` — the
-download stays on disk and the refusal names the path. When the owner intends
-to ingest, search with `ingest_intent: true`: PDF and EPUB rank first, DJVU
-below them, MOBI/AZW3 last with the rationale "not ingestible". Without the
-flag the reading preference alone decides.
+download stays on disk and the refusal names the path.
+
+**Always acquire the EPUB; take a PDF only when no EPUB of the work is
+offered** (owner ruling). When the owner intends to ingest, search with
+`ingest_intent: true`: EPUB ranks first, PDF next, DJVU below them, MOBI/AZW3
+last with the rationale "not ingestible". Without the flag the reading
+preference alone decides.
 
 After submitting an import the runtime reads the Vertex operation back and
 reports `rag_ingest.status` as what actually happened:
@@ -62,8 +65,11 @@ reports `rag_ingest.status` as what actually happened:
 - `imported` — Vertex counted the file; the book is in the library.
 - `import_failed` — the operation errored or Vertex reported the file failed;
   the Vertex message is in `import_outcome`.
+- `imported` with `import_outcome.already_present: true` — Vertex skipped a
+  re-import because the same object is already in the corpus and ACTIVE. The
+  book is in the library; do not retry it.
 - `import_empty` — the operation finished having imported nothing (the
-  format was not parsed, or the file was skipped as already present).
+  format was not parsed, or a skipped object has no ACTIVE ragFile).
 - `import_requested` — only when the poll ran out of budget;
   `import_outcome.operation_name` names the operation to check.
 - `blocked` — nothing was imported; `error.code` says why (a busy corpus or

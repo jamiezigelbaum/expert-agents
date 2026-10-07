@@ -2291,6 +2291,44 @@ describe('acquisition ingest converts ebooks and verifies the import outcome', (
     }
   });
 
+  test('a retried import Vertex skips as already present is reported imported when its ragFile is ACTIVE', async () => {
+    const gcsUri = 'gs://fixture-shared-library/v1/book-imports/research/example-author---the-fixture-book-2005.pdf';
+    const ragFileName = `${ROUTED_CORPUS_RESOURCE}/ragFiles/already-present`;
+    const gate = outcomeFixture(PDF, {
+      importOperation: (name) => ({ name, done: true, response: { skippedRagFilesCount: '1' } }),
+      ragFiles: [{ name: ragFileName, gcsSource: { uris: [gcsUri] }, fileStatus: { state: 'ACTIVE' } }],
+    });
+    try {
+      const response = await postDomain(gate.worker, 'annas_archive_import', { ...PARAMS, format: 'pdf' });
+
+      expect(response.status).toBe('downloaded');
+      expect(response.rag_ingest).toMatchObject({
+        status: 'imported',
+        gcs_uri: gcsUri,
+        import_outcome: { skipped_rag_files_count: 1, already_present: true, rag_files: [{ gcs_uri: gcsUri, rag_file_name: ragFileName, state: 'ACTIVE' }] },
+      });
+      expect(response.rag_ingest.import_outcome).not.toHaveProperty('hint');
+    } finally {
+      gate.cleanup();
+    }
+  });
+
+  test('a skipped import whose object has no ACTIVE ragFile stays import_empty', async () => {
+    const gate = outcomeFixture(PDF, {
+      importOperation: (name) => ({ name, done: true, response: { skippedRagFilesCount: '1' } }),
+      ragFiles: [],
+    });
+    try {
+      const response = await postDomain(gate.worker, 'annas_archive_import', { ...PARAMS, format: 'pdf' });
+
+      expect(response.status).toBe('downloaded_ingest_failed');
+      expect(response.rag_ingest.status).toBe('import_empty');
+      expect(response.rag_ingest.import_outcome.hint).toContain('already present under the same source URI');
+    } finally {
+      gate.cleanup();
+    }
+  });
+
   test('an operation error is import_failed and carries the Vertex message', async () => {
     const gate = outcomeFixture(PDF, {
       importOperation: (name) => ({ name, done: true, error: { code: 3, message: 'Vertex fixture: parser rejected the file' } }),
@@ -2424,7 +2462,7 @@ describe('search ranks for ingestibility when the caller intends to ingest', () 
     });
   }
 
-  test('with ingest_intent, PDF and EPUB lead, DJVU trails them, MOBI is last and says why', async () => {
+  test('with ingest_intent, EPUB leads, PDF follows, DJVU trails them, MOBI is last and says why', async () => {
     const result = await postDomain(searchWorker(), 'annas_archive_search', {
       query: 'ranking fixture',
       format_preference: 'text_rag',
@@ -2433,13 +2471,13 @@ describe('search ranks for ingestibility when the caller intends to ingest', () 
 
     expect(result.search).toMatchObject({ format_preference: 'text_rag', ingest_intent: true });
     const byFormat = Object.fromEntries(result.candidates.map((candidate: Record<string, any>) => [candidate.format, candidate]));
-    expect(byFormat.pdf.score).toBe(byFormat.epub.score);
-    expect(byFormat.epub.score).toBeGreaterThan(byFormat.djvu.score);
+    expect(byFormat.epub.score).toBeGreaterThan(byFormat.pdf.score);
+    expect(byFormat.pdf.score).toBeGreaterThan(byFormat.djvu.score);
     expect(byFormat.djvu.score).toBeGreaterThan(byFormat.mobi.score);
-    expect(result.candidates.slice(0, 2).map((candidate: Record<string, any>) => candidate.format).sort()).toEqual(['epub', 'pdf']);
+    expect(result.candidates.slice(0, 2).map((candidate: Record<string, any>) => candidate.format)).toEqual(['epub', 'pdf']);
     expect(result.candidates[3].format).toBe('mobi');
     expect(byFormat.mobi.rationale).toContain('not ingestible: MOBI is neither parsed by Vertex RAG nor converted by the worker');
-    expect(byFormat.epub.rationale).toContain('ingestible: EPUB is converted to Markdown before import');
+    expect(byFormat.epub.rationale).toContain('preferred: EPUB is converted to Markdown before import');
     expect(byFormat.djvu.rationale.some((line: string) => line.includes('djvutxt'))).toBe(true);
   });
 
