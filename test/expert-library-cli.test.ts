@@ -263,7 +263,7 @@ describe("expert:library worker commands", () => {
     ], workerDependencies(captured, fetchImpl))).toBe(0);
     expect(captured.calls[0]!.body).toEqual({
       tool: "annas_archive_search",
-      params: { domain_id: "example", query: "yoga sutras", author: "Patanjali", top_n: 2, format_preference: "text_rag" },
+      params: { domain_id: "example", query: "yoga sutras", author: "Patanjali", top_n: 2, format_preference: "text_rag", ingest_intent: true },
     });
     const text = captured.out.join("\n");
     expect(captured.out[0]).toBe("backend: libgen_fallback");

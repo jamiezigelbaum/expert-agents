@@ -544,7 +544,7 @@ async function runWorkerCommand(
         ...(parsed.title === undefined ? {} : { title: parsed.title }),
         ...(parsed.language === undefined ? {} : { language: parsed.language }),
         ...(parsed.top === undefined ? {} : { top_n: parsed.top }),
-        ...(parsed.ingestIntent ? { format_preference: "text_rag" } : {}),
+        ...(parsed.ingestIntent ? { format_preference: "text_rag", ingest_intent: true } : {}),
       }, fetchImpl);
       if (!outcome.ok) return failWorker(outcome, emitter);
       printSearch(outcome.body, emitter);
