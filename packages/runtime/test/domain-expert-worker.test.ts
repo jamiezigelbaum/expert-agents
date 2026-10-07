@@ -880,6 +880,65 @@ describe('RAG ingestion configuration', () => {
     }
   });
 
+  test('a long staged file name is shortened in its stem and keeps its real extension', async () => {
+    const fixture = workspaceFixture();
+    const calls: CapturedCall[] = [];
+    const longStem = `${'games-and-puzzles-as-computational-systems-'.repeat(2)}essay-writings`;
+    const stagedPrefix = 'v1/staged/research/long-names/';
+    const stagedErrorFile = 'projects/fixture-project/locations/us-central1/ragCorpora/1234567890123456789/ragFiles/long-error';
+    try {
+      const sourceDir = join(fixture.workspaceRoot, 'experts', 'research', 'sources', 'long');
+      mkdirSync(sourceDir, { recursive: true });
+      writeFileSync(join(sourceDir, `${longStem}.md`), '# essay');
+      writeFileSync(join(sourceDir, `${longStem}.pdf`), syntheticPdfBytes(1));
+      writeFileSync(join(sourceDir, 'short.md'), 'short');
+      const worker = createDomainExpertWorker({
+        roots: [rootPolicy(fixture.workspaceRoot)],
+        google: {
+          accessToken: 'fixture-google-token',
+          fetchImpl: fakeGoogleFetch(calls, {
+            ragFiles: [{
+              // A failed record from an earlier attempt at this batch, staged
+              // under the old mangled name: cleanup still matches it by prefix.
+              name: stagedErrorFile,
+              gcsSource: { uris: [`gs://fixture-shared-library/${stagedPrefix}${longStem.slice(0, 79)}.m`] },
+              fileStatus: { state: 'ERROR' },
+            }],
+          }),
+        },
+        dataDir: join(fixture.base, 'data'),
+      });
+
+      const result = await postDomain(worker, 'rag_corpus', {
+        action: 'stage_import',
+        corpus_id: '1234567890123456789',
+        workspace_relative_path: 'experts/research/sources/long',
+        batch_id: 'long-names',
+        dry_run: false,
+      });
+
+      // The old 80-character cut left `...writings.m` and `...writings.p`,
+      // which Vertex skipped without an error.
+      const uploaded = uploadedObjectNames(calls);
+      expect(uploaded.sort()).toEqual([
+        `${stagedPrefix}${longStem.slice(0, 77)}.md`,
+        `${stagedPrefix}${longStem.slice(0, 76)}.pdf`,
+        `${stagedPrefix}short.md`,
+      ].sort());
+      for (const name of uploaded) expect(name.slice(stagedPrefix.length).length).toBeLessThanOrEqual(80);
+      expect((result.staged_files as Array<{ gcs_uri: string }>).map((file) => file.gcs_uri).sort())
+        .toEqual(uploaded.map((name) => `gs://fixture-shared-library/${name}`));
+      // The import and the ERROR cleanup both work on the batch directory, so
+      // shortening a file name never moves a file out of their reach.
+      const importConfig = JSON.parse(calls.find((call) => call.url.endsWith('/ragFiles:import'))!.body).importRagFilesConfig;
+      expect(importConfig.gcsSource.uris).toEqual([`gs://fixture-shared-library/${stagedPrefix}`]);
+      expect(calls.filter((call) => call.method === 'DELETE').map((call) => call.url))
+        .toEqual([`https://us-central1-aiplatform.googleapis.com/v1/${stagedErrorFile}`]);
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
   test('the manifest describes the ingestion the import paths actually perform', () => {
     const manifest = domainManifest('history', undefined, { agentRouting: TEST_AGENT_ROUTING, env: {} });
 
