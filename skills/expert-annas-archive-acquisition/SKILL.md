@@ -72,13 +72,18 @@ reports `rag_ingest.status` as what actually happened:
   format was not parsed, or a skipped object has no ACTIVE ragFile).
 - `import_requested` — only when the poll ran out of budget;
   `import_outcome.operation_name` names the operation to check.
+- `import_in_progress` — the import outlasted the call's response budget and
+  is still running on the worker. The source is already in the registry as
+  `import_requested`, and the worker records the real outcome there when
+  Vertex finishes. Check `domain_source status` for the source later; do not
+  re-import it or substitute another copy while it is in progress.
 - `blocked` — nothing was imported; `error.code` says why (a busy corpus or
   quota is retried with backoff first and reports `rag_corpus_busy` or
   `rag_import_quota_exhausted` only after the budget).
 
 Report these verbatim. Only `imported` means the book is in the library;
-never describe `import_requested`, `import_empty`, `import_failed` or
-`blocked` as success.
+never describe `import_requested`, `import_in_progress`, `import_empty`,
+`import_failed` or `blocked` as success.
 
 An `imported` acquisition is also recorded automatically in the domain's
 source registry, keyed by its md5 (`annas:<md5>`) with title, author and

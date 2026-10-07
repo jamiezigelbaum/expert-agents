@@ -185,6 +185,12 @@ export interface DomainExpertAnnasConfig {
   // import_requested with the operation name instead of a verified outcome.
   importPollIntervalMs?: number;
   importPollTimeoutMs?: number;
+  // How long an ingesting annas_archive_import call holds its HTTP response.
+  // Past it, the call answers import_in_progress, the source is registered as
+  // import_requested, and the import finishes in the background and records
+  // its outcome. Must sit under the calling client's request timeout. 0 waits
+  // for the whole ingest.
+  responseBudgetMs?: number;
 }
 
 export interface DomainExpertNotionConfig {
@@ -533,6 +539,8 @@ const DEFAULT_ANNAS_IMPORT_POLL_INTERVAL_MS = 5_000;
 const RAG_IMPORT_POLL_GROWTH = 1.5;
 const RAG_IMPORT_POLL_MAX_MS = 30_000;
 const DEFAULT_ANNAS_IMPORT_POLL_TIMEOUT_MS = 600_000;
+// Under the plugin's 300 s request timeout with room for upload and network.
+const DEFAULT_ANNAS_RESPONSE_BUDGET_MS = 240_000;
 const ANNAS_IMPORT_BACKOFF_MAX_MS = 60_000;
 const RAG_FILE_LISTING_RETRIES = 3;
 // Formats Vertex RAG Engine parses natively (as uploaded), and the ebook
@@ -710,6 +718,7 @@ export class DomainExpertService {
   private annasDjvutxtBin: string;
   private annasImportPollIntervalMs: number;
   private annasImportPollTimeoutMs: number;
+  private annasResponseBudgetMs: number;
   private notion: NotionRuntimeClient;
   private dataDir: string;
   private fetchImpl: typeof fetch;
@@ -761,6 +770,7 @@ export class DomainExpertService {
     this.annasDjvutxtBin = options.annas?.djvutxtBin?.trim() || DEFAULT_ANNAS_DJVUTXT_BIN;
     this.annasImportPollIntervalMs = normalizePositiveInteger(options.annas?.importPollIntervalMs, DEFAULT_ANNAS_IMPORT_POLL_INTERVAL_MS);
     this.annasImportPollTimeoutMs = normalizeNonNegativeInteger(options.annas?.importPollTimeoutMs, DEFAULT_ANNAS_IMPORT_POLL_TIMEOUT_MS);
+    this.annasResponseBudgetMs = normalizeNonNegativeInteger(options.annas?.responseBudgetMs, 0);
     this.notion = new NotionRuntimeClient({
       ...(options.notion ?? {}),
       fetchImpl: options.notion?.fetchImpl ?? options.fetchImpl ?? fetch,
@@ -3358,12 +3368,9 @@ export class DomainExpertService {
       created_at: new Date().toISOString(),
     });
 
-    const ragIngest = params.ingest
-      ? await this.tryAnnasRagIngest(manifest, params, locator ?? digest, format, bytes, scale, finalPath.targetPath)
-      : { status: 'not_requested' };
-    const registry = params.ingest
-      ? await this.registerAnnasIngest(manifest, params, locator ?? digest, format, ragIngest)
-      : { status: 'skipped', reason: 'rag_ingest was not requested.' };
+    const { ragIngest, registry } = params.ingest
+      ? await this.annasIngestWithinResponseBudget(manifest, params, locator ?? digest, format, bytes, scale, finalPath.targetPath)
+      : { ragIngest: { status: 'not_requested' }, registry: { status: 'skipped', reason: 'rag_ingest was not requested.' } };
 
     return {
       kind: 'annas_archive_import_result',
@@ -3399,8 +3406,7 @@ export class DomainExpertService {
       format,
     };
     const scale = this.measureArtifactScale(format, bytes, params);
-    const ragIngest = await this.tryAnnasRagIngest(manifest, params, locator ?? digest, format, bytes, scale, duplicate.targetPath);
-    const registry = await this.registerAnnasIngest(manifest, params, locator ?? digest, format, ragIngest);
+    const { ragIngest, registry } = await this.annasIngestWithinResponseBudget(manifest, params, locator ?? digest, format, bytes, scale, duplicate.targetPath);
     await appendAnnasAudit(this.annasBooksRoot, {
       kind: 'annas_archive_acquisition_audit',
       action: 'ingested_existing',
@@ -4453,6 +4459,63 @@ export class DomainExpertService {
     return index;
   }
 
+  // On 2026-10-07 the plugin's 300 s request timeout cut off imports the
+  // worker was still finishing. The caller saw a timeout and no registry
+  // record, read the book as failed, and imported a second copy; the first
+  // landed anyway. Past the response budget the call now answers
+  // import_in_progress with the source registered as import_requested, and
+  // the import keeps running here and records its real outcome.
+  private async annasIngestWithinResponseBudget(
+    manifest: ReturnType<typeof domainManifest>,
+    params: AnnasArchiveImportParams,
+    locator: string,
+    format: string,
+    bytes: Uint8Array,
+    scale: AnnasArtifactScale,
+    sourcePath: string,
+  ): Promise<{ ragIngest: Record<string, unknown>; registry: Record<string, unknown> }> {
+    const work = this.tryAnnasRagIngest(manifest, params, locator, format, bytes, scale, sourcePath);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const pending = this.annasResponseBudgetMs > 0
+      ? new Promise<undefined>((resolveBudget) => { timer = setTimeout(() => resolveBudget(undefined), this.annasResponseBudgetMs); })
+      : undefined;
+    const settled = pending ? await Promise.race([work, pending]) : await work;
+    if (timer) clearTimeout(timer);
+    if (settled) {
+      return { ragIngest: settled, registry: await this.registerAnnasIngest(manifest, params, locator, format, settled) };
+    }
+    const ragIngest: Record<string, unknown> = {
+      status: 'import_in_progress',
+      ...(params.corpusId ? { target_corpus_id: params.corpusId } : {}),
+      response_budget_ms: this.annasResponseBudgetMs,
+      hint: 'The import is still running on the worker and records its outcome in the source registry when Vertex finishes. Check domain_source status for this source before acting; do not re-import it or substitute another copy.',
+    };
+    const registry = await this.registerAnnasIngest(manifest, params, locator, format, ragIngest, { inProgress: true });
+    void work
+      .then(async (outcome) => {
+        await this.registerAnnasIngest(manifest, params, locator, format, outcome, { recordOutcome: true });
+        await appendAnnasAudit(this.annasBooksRoot, {
+          kind: 'annas_archive_acquisition_audit',
+          action: 'ingest_completed',
+          domain_id: manifest.domain_id,
+          approval_id: params.approvalId,
+          selected: annasSelectionAudit(params),
+          target_path: sourcePath,
+          rag_ingest_status: outcome.status,
+          ...(typeof outcome.gcs_uri === 'string' ? { gcs_uri: outcome.gcs_uri } : {}),
+          created_at: new Date().toISOString(),
+        });
+      })
+      .catch((error: unknown) => {
+        console.error(JSON.stringify({
+          kind: 'domain_expert_annas_background_ingest_error',
+          domain_id: manifest.domain_id,
+          code: error instanceof DomainExpertWorkerError ? error.code : 'error',
+        }));
+      });
+    return { ragIngest, registry };
+  }
+
   // Every source that reaches the corpus is tracked and titled (owner ruling
   // 2026-09-20): an acquisition that Vertex counted writes the same
   // source-registry record the skill's manual registration would, keyed by
@@ -4466,10 +4529,16 @@ export class DomainExpertService {
     locator: string,
     format: string,
     ragIngest: Record<string, unknown>,
+    mode: { inProgress?: boolean; recordOutcome?: boolean } = {},
   ): Promise<Record<string, unknown>> {
-    if (ragIngest.status !== 'imported') {
+    // An import still running is registered as import_requested; the
+    // background completion of that import records whatever it ended as, so
+    // the registry never keeps claiming an import is in flight.
+    if (ragIngest.status !== 'imported' && !mode.inProgress && !mode.recordOutcome) {
       return { status: 'skipped', reason: `rag_ingest.status is ${String(ragIngest.status)}; only an imported source is registered.` };
     }
+    const ingestStatus = mode.inProgress ? 'import_requested' : String(ragIngest.status);
+    const ingestError = asOptionalRecord(ragIngest.error);
     const root = this.roots.get(manifest.workspace_root_id);
     if (!root) {
       return { status: 'unavailable', reason: 'No domain workspace root is configured, so the source registry cannot be written. Register the source manually with domain_source add.' };
@@ -4502,7 +4571,8 @@ export class DomainExpertService {
         ...(typeof ragIngest.target_corpus_id === 'string' ? { target_corpus_id: ragIngest.target_corpus_id } : {}),
         trust_posture: manifest.trust_posture,
         copyright_posture: params.copyrightPosture,
-        ingest_status: 'imported',
+        ingest_status: ingestStatus,
+        ...(typeof ingestError?.code === 'string' ? { ingest_reason: ingestError.code } : {}),
         ...(typeof ragIngest.gcs_uri === 'string' ? { gcs_uri: ragIngest.gcs_uri } : {}),
         ...(typeof importOutcome?.operation_name === 'string' ? { rag_operation_name: importOutcome.operation_name } : {}),
         registered_at: registeredAt,
@@ -5934,6 +6004,7 @@ export function domainExpertAnnasConfigFromEnv(env: Record<string, string | unde
     ...(env.EXPERT_AGENTS_DOMAIN_EXPERT_ANNAS_IMPORT_POLL_INTERVAL_MS
       ? { importPollIntervalMs: normalizePositiveInteger(env.EXPERT_AGENTS_DOMAIN_EXPERT_ANNAS_IMPORT_POLL_INTERVAL_MS, DEFAULT_ANNAS_IMPORT_POLL_INTERVAL_MS) }
       : {}),
+    responseBudgetMs: normalizeNonNegativeInteger(env.EXPERT_AGENTS_DOMAIN_EXPERT_ANNAS_RESPONSE_BUDGET_MS, DEFAULT_ANNAS_RESPONSE_BUDGET_MS),
     ...(env.EXPERT_AGENTS_DOMAIN_EXPERT_ANNAS_IMPORT_POLL_TIMEOUT_MS
       ? { importPollTimeoutMs: normalizeNonNegativeInteger(env.EXPERT_AGENTS_DOMAIN_EXPERT_ANNAS_IMPORT_POLL_TIMEOUT_MS, DEFAULT_ANNAS_IMPORT_POLL_TIMEOUT_MS) }
       : {}),
@@ -7909,6 +7980,7 @@ function annasAcquisitionStatus(base: 'downloaded' | 'ingested_existing', ingest
   if (ingestStatus === 'blocked' || ingestStatus === 'needs_corpus_decision') return `${prefix}_ingest_blocked`;
   if (ingestStatus === 'import_failed' || ingestStatus === 'import_empty') return `${prefix}_ingest_failed`;
   if (base === 'ingested_existing' && ingestStatus === 'import_requested') return 'skipped_duplicate_ingest_requested';
+  if (ingestStatus === 'import_in_progress') return `${prefix}_ingest_in_progress`;
   return base;
 }
 

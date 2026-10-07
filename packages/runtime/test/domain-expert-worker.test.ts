@@ -5094,7 +5094,7 @@ describe('acquisition ingest registers the imported source', () => {
     corpus_id: CORPUS_RESOURCE,
   };
 
-  function registryFixture(options: { roots: boolean }) {
+  function registryFixture(options: { roots: boolean; responseBudgetMs?: number; importOperation?: (name: string) => Record<string, unknown> }) {
     const fixture = workspaceFixture();
     const booksRoot = join(fixture.base, 'books');
     mkdirSync(booksRoot);
@@ -5109,10 +5109,14 @@ describe('acquisition ingest registers the imported source', () => {
         importGcsPrefix: 'gs://fixture-shared-library/v1/book-imports/',
         importPollIntervalMs: 1,
         importPollTimeoutMs: 2_000,
+        ...(options.responseBudgetMs !== undefined ? { responseBudgetMs: options.responseBudgetMs } : {}),
       },
       google: {
         accessToken: 'fixture-google-token',
-        fetchImpl: fakeGoogleFetch(googleCalls, { ragCorpora: [{ name: CORPUS_RESOURCE, displayName: 'research-library' }] }),
+        fetchImpl: fakeGoogleFetch(googleCalls, {
+          ragCorpora: [{ name: CORPUS_RESOURCE, displayName: 'research-library' }],
+          ...(options.importOperation ? { importOperation: options.importOperation } : {}),
+        }),
       },
       fetchImpl: fakeAnnasArtifactFetch([], syntheticPdfBytes(64), 'application/pdf'),
     });
@@ -5120,6 +5124,50 @@ describe('acquisition ingest registers the imported source', () => {
     const readRegistry = () => readFileSync(registryPath, 'utf8').split('\n').filter(Boolean).map((line) => JSON.parse(line) as Record<string, unknown>);
     return { worker, registryPath, readRegistry, cleanup: fixture.cleanup };
   }
+
+  // 2026-10-07: imports outlasting the plugin's 300 s timeout looked failed
+  // (timeout, no registry record), so the caller imported a second copy.
+  test('an import outlasting the response budget answers in progress, registers it, and records the outcome later', async () => {
+    let finishAt = Number.POSITIVE_INFINITY;
+    const gate = registryFixture({
+      roots: true,
+      responseBudgetMs: 50,
+      importOperation: (name) => (Date.now() >= finishAt
+        ? { name, done: true, response: { importedRagFilesCount: '1' } }
+        : { name, done: false }),
+    });
+    try {
+      const response = await postDomain(gate.worker, 'annas_archive_import', PARAMS);
+      expect(response.status).toBe('downloaded_ingest_in_progress');
+      expect(response.rag_ingest).toMatchObject({ status: 'import_in_progress', target_corpus_id: CORPUS_RESOURCE });
+      expect(response.rag_ingest.hint).toContain('do not re-import');
+      expect(response.registry).toMatchObject({ status: 'registered', locator: `annas:${MD5}` });
+      expect(gate.readRegistry().map((record) => record.ingest_status)).toEqual(['import_requested']);
+
+      finishAt = Date.now();
+      const deadline = Date.now() + 3_000;
+      while (gate.readRegistry().length < 2 && Date.now() < deadline) await new Promise((resolveWait) => setTimeout(resolveWait, 10));
+      const records = gate.readRegistry();
+      expect(records.map((record) => record.ingest_status)).toEqual(['import_requested', 'imported']);
+      expect(records[1]).toMatchObject({
+        source_id: response.registry.source_id,
+        gcs_uri: 'gs://fixture-shared-library/v1/book-imports/research/author---the-fixture-book-2005.pdf',
+      });
+    } finally {
+      gate.cleanup();
+    }
+  });
+
+  test('an import that settles within the response budget answers as before', async () => {
+    const gate = registryFixture({ roots: true, responseBudgetMs: 5_000 });
+    try {
+      const response = await postDomain(gate.worker, 'annas_archive_import', PARAMS);
+      expect(response.rag_ingest.status).toBe('imported');
+      expect(gate.readRegistry().map((record) => record.ingest_status)).toEqual(['imported']);
+    } finally {
+      gate.cleanup();
+    }
+  });
 
   test('an imported ingest writes one titled registry record keyed by the md5 locator', async () => {
     const gate = registryFixture({ roots: true });
