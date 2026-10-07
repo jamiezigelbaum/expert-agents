@@ -169,8 +169,10 @@ credential environment filter remains in force.
 
 `annas_archive_import` with `ingest: true` uploads only what Vertex RAG can
 parse (PDF, text, Markdown, HTML). An EPUB is converted to Markdown in-process
-(no dependency) and uploaded as `book-imports/<domain>/<author - title
-(year)>.md`; a DJVU is converted through `djvutxt` when
+(no dependency) and uploaded as `book-imports/<domain>/<surname - main title
+(year)>.md` (first author's surname, title without subtitle or edition notes;
+a different file already at that name gets a `--<content hash>` suffix, never
+an overwrite); a DJVU is converted through `djvutxt` when
 `EXPERT_AGENTS_DOMAIN_EXPERT_ANNAS_DJVUTXT_BIN` (default `djvutxt`, from
 djvulibre) resolves on PATH; MOBI/AZW3 are refused with
 `unsupported_ingest_format` and the download stays on disk. After submission

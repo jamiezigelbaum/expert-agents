@@ -3516,8 +3516,12 @@ export class DomainExpertService {
       // The GCS object path becomes the file's identity inside the RAG
       // corpus, so it carries the book's own details — author, title, year —
       // never an acquisition-source locator. Owner ruling 2026-07-29.
-      const stem = bookObjectStem(params.title?.trim(), params.author?.trim(), params.year?.trim(), locator);
-      const gcsUri = await this.uploadApprovedImportToGcs(manifest, stem, artifact.format, artifact.bytes);
+      const title = params.title?.trim();
+      const author = params.author?.trim();
+      const year = params.year?.trim();
+      const stem = title ? bookObjectStem(title, author, year) : safeObjectName(locator);
+      const legacyStem = title ? legacyBookObjectStem(title, author, year) : undefined;
+      const gcsUri = await this.uploadApprovedImportToGcs(manifest, stem, artifact.format, artifact.bytes, legacyStem);
       // One budget for the whole ingest: waiting out a busy corpus and waiting
       // for the operation both draw from it, so a tool call has one bound.
       const deadline = Date.now() + this.annasImportPollTimeoutMs;
@@ -3775,10 +3779,21 @@ export class DomainExpertService {
   // skipped the re-import of a URI it already held, and the corpus kept the
   // old book's chunks over the new book's bytes. A different file under the
   // same name goes to the name plus a content hash instead.
-  private async uploadApprovedImportToGcs(manifest: ReturnType<typeof domainManifest>, stem: string, format: string, bytes: Uint8Array): Promise<string> {
+  //
+  // Books imported before 2026-10-07 carry the raw-metadata name. The same
+  // bytes found there are reused, so re-acquiring one does not import it twice;
+  // nothing new is ever written under that name.
+  private async uploadApprovedImportToGcs(manifest: ReturnType<typeof domainManifest>, stem: string, format: string, bytes: Uint8Array, legacyStem?: string): Promise<string> {
     const prefix = this.annasImportGcsPrefix(manifest);
     const parsed = parseGcsPrefix(prefix);
     const base = `${parsed.prefix}${manifest.domain_id}/${stem}`;
+    if (legacyStem && legacyStem !== stem) {
+      const legacyName = `${parsed.prefix}${manifest.domain_id}/${legacyStem}.${format}`;
+      const legacyUri = `gs://${parsed.bucket}/${legacyName}`;
+      assertAllowedGcsDestination(legacyUri, manifest.allowed_gcs_prefixes);
+      const legacy = await this.google.getGcsObjectMetadata(parsed.bucket, legacyName);
+      if (legacy && gcsObjectHoldsBytes(legacy, bytes)) return legacyUri;
+    }
     const contentHash = createHash('sha256').update(bytes).digest('hex').slice(0, 12);
     for (const objectName of [`${base}.${format}`, `${base}--${contentHash}.${format}`]) {
       const gcsUri = `gs://${parsed.bucket}/${objectName}`;
@@ -8462,17 +8477,68 @@ function crc32cBase64(bytes: Uint8Array): string {
   return out.toString('base64');
 }
 
-// `<author> - <title> (<year>)` slugged, as parseObjectNameUri reads it back.
-// A long author and title are truncated before the year, never the year
-// itself: editions of one book differ by year, and a name cut short of it
-// made two of them one object.
-function bookObjectStem(title: string | undefined, author: string | undefined, year: string | undefined, locator: string): string {
-  if (!title) return safeObjectName(locator);
-  const yearSlug = year ? sanitizeObjectName(year) : '';
+// The standard book object name (owner ruling 2026-10-07):
+// `<first author's surname> - <main title> (<year>)`, slugged as
+// parseObjectNameUri reads it back. Acquisition metadata carries translators,
+// editors, subtitles and edition notes; none of it names the book, and it
+// pushed the year past the length limit. When the name is still long the title
+// is shortened, never the year: editions of one book differ by year, and a
+// name cut short of it made two of them one object.
+export function bookObjectStem(title: string, author: string | undefined, year: string | undefined): string {
+  const surname = author ? authorSurname(author) : '';
+  return yearPreservingStem(`${surname ? `${surname} - ` : ''}${mainTitle(title)}`, bookYear(year));
+}
+
+// The name imports used before 2026-10-07: raw metadata, year preserved.
+function legacyBookObjectStem(title: string, author: string | undefined, year: string | undefined): string {
+  return yearPreservingStem(`${author ? `${author} - ` : ''}${title}`, year ? sanitizeObjectName(year) : '');
+}
+
+function yearPreservingStem(body: string, yearSlug: string): string {
   const tail = yearSlug ? `-${yearSlug}` : '';
-  const body = sanitizeObjectName(`${author ? `${author} - ` : ''}${title}`);
-  const kept = body.slice(0, Math.max(SAFE_OBJECT_NAME_MAX_LENGTH - tail.length, 0)).replace(/-+$/, '');
+  const kept = sanitizeObjectName(body).slice(0, Math.max(SAFE_OBJECT_NAME_MAX_LENGTH - tail.length, 0)).replace(/-+$/, '');
   return `${kept}${tail}`.replace(/^-+/, '').slice(0, SAFE_OBJECT_NAME_MAX_LENGTH) || randomUUID();
+}
+
+const AUTHOR_SUFFIXES = new Set(['jr', 'sr', 'ii', 'iii', 'iv', 'phd']);
+
+// "Mogens Herman Hansen (tr. J.A. Crook)" → "Hansen"; "Hansen, Mogens Herman;
+// Crook, J.A." → "Hansen". The first author only, without roles, brackets or
+// generational suffixes. A comma after a single word is "Surname, Given";
+// otherwise it separates authors.
+function authorSurname(author: string): string {
+  const first = stripBracketed(author)
+    .split(/;|&|\band\b|\bwith\b|\bet al\.?|\b(?:tr|trans|ed|eds)\.(?=\s|$)|\b(?:translated|edited) by\b/i)[0]!
+    .trim();
+  const comma = first.indexOf(',');
+  if (comma !== -1) {
+    const before = first.slice(0, comma).trim();
+    if (before && !/\s/.test(before)) return before;
+  }
+  const words = (comma === -1 ? first : first.slice(0, comma)).split(/\s+/).filter(Boolean);
+  while (words.length > 1 && AUTHOR_SUFFIXES.has(words.at(-1)!.toLowerCase().replace(/\./g, ''))) words.pop();
+  return words.at(-1) ?? '';
+}
+
+// The main title: no subtitle (after a colon), bracketed notes or edition
+// statements. Falls back to the whole title if stripping leaves nothing.
+function mainTitle(title: string): string {
+  const main = stripBracketed(title)
+    .split(/\s*[:]\s+|\s+[—–]\s+/)[0]!
+    .replace(/[,;.]?\s*\b(?:\d+(?:st|nd|rd|th)|first|second|third|revised|new|expanded|updated)\s+(?:ed\.?|edition)\b.*$/i, '')
+    .trim();
+  return main || title;
+}
+
+function stripBracketed(value: string): string {
+  return value.replace(/\([^)]*\)|\[[^\]]*\]/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
+// The edition's year as four digits when the metadata has one ("c. 1991",
+// "1991-01-01"), else the metadata slugged.
+function bookYear(year: string | undefined): string {
+  if (!year) return '';
+  return year.match(/\b(1[0-9]|20)\d{2}\b/)?.[0] ?? sanitizeObjectName(year);
 }
 
 function safeObjectName(value: string): string {

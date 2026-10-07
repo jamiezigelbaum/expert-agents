@@ -31,6 +31,7 @@ import {
   withWorkerBearerAuth,
 } from '../src/workers/http.ts';
 import {
+  bookObjectStem,
   createDomainExpertWorker as createRawDomainExpertWorker,
   reciprocalRankFuse,
   type DomainExpertWorkerOptions,
@@ -1474,7 +1475,7 @@ describe('ported acquisition regressions', () => {
       expect(upload).toBeDefined();
       const objectPath = decodeURIComponent(upload!.url);
       // The EPUB is uploaded as its Markdown conversion, under the same metadata-derived name.
-      expect(objectPath).toContain('book-imports/research/example-author---the-fixture-book-2005.md');
+      expect(objectPath).toContain('book-imports/research/author---the-fixture-book-2005.md');
       expect(objectPath).not.toContain('.epub');
       expect(objectPath).not.toContain('book-one');
       expect(objectPath).not.toMatch(/\d{13}/);
@@ -1568,7 +1569,7 @@ describe('ported acquisition regressions', () => {
       });
       expect(annasCalls.filter((call) => call.url.startsWith('https://annas.example/download/book-one'))).toHaveLength(1);
       expect(uploadedObjectNames(googleCalls)).toEqual([
-        'v1/book-imports/research/example-author---the-fixture-book-2005.md',
+        'v1/book-imports/research/author---the-fixture-book-2005.md',
       ]);
       expect(googleCalls.some((call) => call.url.includes('ragFiles:import'))).toBe(true);
 
@@ -1720,7 +1721,7 @@ describe('book-scale sanity gate on acquisition ingest', () => {
         rag_ingest: { status: 'imported', target_corpus_id: FIXTURE_CORPUS },
       });
       expect(uploadedObjectNames(gate.googleCalls)).toEqual([
-        'v1/book-imports/research/example-author---the-fixture-monograph-1989.pdf',
+        'v1/book-imports/research/author---the-fixture-monograph-1989.pdf',
       ]);
       expect(gate.googleCalls.some((call) => call.url.includes('ragFiles:import'))).toBe(true);
 
@@ -2055,7 +2056,7 @@ describe('acquisition ingest defaults to the domain routing corpus', () => {
         },
       });
       expect(uploadedObjectNames(gate.googleCalls)).toEqual([
-        'v1/book-imports/research/example-author---the-fixture-monograph-1989.pdf',
+        'v1/book-imports/research/author---the-fixture-monograph-1989.pdf',
       ]);
       expect(gate.googleCalls.some((call) => call.url.endsWith('/ragFiles:import'))).toBe(true);
       expect(annasAuditRecords(gate.booksRoot).map((record) => record.action)).toEqual(['downloaded']);
@@ -2179,7 +2180,7 @@ describe('acquisition ingest converts ebooks and verifies the import outcome', (
         download: { format: 'epub' },
         rag_ingest: {
           status: 'imported',
-          gcs_uri: 'gs://fixture-shared-library/v1/book-imports/research/example-author---the-fixture-book-2005.md',
+          gcs_uri: 'gs://fixture-shared-library/v1/book-imports/research/author---the-fixture-book-2005.md',
           conversion: { from: 'epub', to: 'md', sections: 2, skipped_sections: 0 },
           import_outcome: { imported_rag_files_count: 1, failed_rag_files_count: 0, skipped_rag_files_count: 0 },
         },
@@ -2263,7 +2264,7 @@ describe('acquisition ingest converts ebooks and verifies the import outcome', (
         status: 'downloaded',
         rag_ingest: {
           status: 'imported',
-          gcs_uri: 'gs://fixture-shared-library/v1/book-imports/research/example-author---the-fixture-book-2005.md',
+          gcs_uri: 'gs://fixture-shared-library/v1/book-imports/research/author---the-fixture-book-2005.md',
           conversion: { from: 'djvu', to: 'md', converter: 'djvutxt' },
         },
       });
@@ -2296,7 +2297,7 @@ describe('acquisition ingest converts ebooks and verifies the import outcome', (
   });
 
   test('a retried import Vertex skips as already present is reported imported when its ragFile is ACTIVE', async () => {
-    const gcsUri = 'gs://fixture-shared-library/v1/book-imports/research/example-author---the-fixture-book-2005.pdf';
+    const gcsUri = 'gs://fixture-shared-library/v1/book-imports/research/author---the-fixture-book-2005.pdf';
     const ragFileName = `${ROUTED_CORPUS_RESOURCE}/ragFiles/already-present`;
     const gate = outcomeFixture(PDF, {
       importOperation: (name) => ({ name, done: true, response: { skippedRagFilesCount: '1' } }),
@@ -2461,7 +2462,7 @@ describe('acquisition ingest never overwrites a different book at the same objec
   const LONG_PARAMS = {
     domain_id: 'research',
     annas_archive_id: 'edition-fixture',
-    title: 'The Fixture Assembly in the Age of an Exceptionally Long Subtitle',
+    title: 'The Fixture Assembly in the Age of an Exceptionally Long and Discursive Main Title That Runs On',
     author: 'Example Author (tr. Second Example Translator)',
     year: '1987',
     topic: 'Research',
@@ -2498,7 +2499,18 @@ describe('acquisition ingest never overwrites a different book at the same objec
       .flatMap((call) => JSON.parse(call.body).importRagFilesConfig.gcsSource.uris as string[]);
   }
 
-  test('a long name is truncated before the year, so editions stay distinct', async () => {
+  test('the standard name is surname, main title and year, from noisy acquisition metadata', () => {
+    expect(bookObjectStem('The Fixture Democracy in the Age of an Orator', 'First Example Author (tr. Second Translator)', '1991'))
+      .toBe('author---the-fixture-democracy-in-the-age-of-an-orator-1991');
+    expect(bookObjectStem('Fixture Knowledge: Innovation and Learning in a Fixture City', 'Author, First; Translator, Second', '2008'))
+      .toBe('author---fixture-knowledge-2008');
+    expect(bookObjectStem('The Fixture Republic, 2nd edition [Series Name]', 'First Middle Author Jr.', 'c. 1999'))
+      .toBe('author---the-fixture-republic-1999');
+    expect(bookObjectStem('Fixture Essays', 'First Author, Second Author', '1975-01-01')).toBe('author---fixture-essays-1975');
+    expect(bookObjectStem('Fixture Fragments', undefined, undefined)).toBe('fixture-fragments');
+  });
+
+  test('a long name is shortened before the year, so editions stay distinct', async () => {
     const objects: FakeGcsObjects = new Map();
     const first = editionFixture(syntheticPdfBytes(64), objects);
     const second = editionFixture(syntheticPdfBytes(66), objects);
@@ -2510,7 +2522,8 @@ describe('acquisition ingest never overwrites a different book at the same objec
       expect(b.rag_ingest.status).toBe('imported');
       const [nameA] = uploadedObjectNames(first.googleCalls);
       const [nameB] = uploadedObjectNames(second.googleCalls);
-      expect(nameA).toMatch(/^v1\/book-imports\/research\/example-author-tr\.-second-example-translator---the-fixture-assembly.*-1987\.pdf$/);
+      expect(nameA).toMatch(/^v1\/book-imports\/research\/author---the-fixture-assembly-in-the-age-.*-1987\.pdf$/);
+      expect(nameA).not.toContain('translator');
       expect(nameB).toMatch(/-1991\.pdf$/);
       expect(nameA!.slice(PREFIX.length, -'.pdf'.length).length).toBeLessThanOrEqual(80);
       expect(nameA).not.toContain('edition-fixture');
@@ -2537,7 +2550,7 @@ describe('acquisition ingest never overwrites a different book at the same objec
   test('different bytes at the metadata name go to a content-hash name; the occupant is untouched', async () => {
     const occupant = syntheticPdfBytes(70);
     const bytes = syntheticPdfBytes(64);
-    const base = `${PREFIX}example-author---the-fixture-monograph-1989`;
+    const base = `${PREFIX}author---the-fixture-monograph-1989`;
     const objects: FakeGcsObjects = new Map([[`${base}.pdf`, occupant]]);
     const gate = editionFixture(bytes, objects);
     try {
@@ -2559,7 +2572,7 @@ describe('acquisition ingest never overwrites a different book at the same objec
 
   test('the same bytes already at the name are reused without a second upload', async () => {
     const bytes = syntheticPdfBytes(64);
-    const name = `${PREFIX}example-author---the-fixture-monograph-1989.pdf`;
+    const name = `${PREFIX}author---the-fixture-monograph-1989.pdf`;
     const gate = editionFixture(bytes, new Map([[name, bytes]]));
     try {
       const response = await postDomain(gate.worker, 'annas_archive_import', {
@@ -2574,9 +2587,27 @@ describe('acquisition ingest never overwrites a different book at the same objec
     }
   });
 
+  test('the same bytes under the pre-2026-10-07 raw-metadata name are reused, not imported twice', async () => {
+    const bytes = syntheticPdfBytes(64);
+    const legacy = `${PREFIX}example-author-tr.-second-translator---the-fixture-monograph-1989.pdf`;
+    const objects: FakeGcsObjects = new Map([[legacy, bytes]]);
+    const gate = editionFixture(bytes, objects);
+    try {
+      const response = await postDomain(gate.worker, 'annas_archive_import', {
+        ...LONG_PARAMS, title: 'The Fixture Monograph', author: 'Example Author (tr. Second Translator)', year: '1989',
+      });
+
+      expect(response.rag_ingest).toMatchObject({ status: 'imported', gcs_uri: `gs://fixture-shared-library/${legacy}` });
+      expect(uploadedObjectNames(gate.googleCalls)).toEqual([]);
+      expect(objects.size).toBe(1);
+    } finally {
+      gate.cleanup();
+    }
+  });
+
   test('when both names hold different files the ingest is refused with a typed code', async () => {
     const bytes = syntheticPdfBytes(64);
-    const base = `${PREFIX}example-author---the-fixture-monograph-1989`;
+    const base = `${PREFIX}author---the-fixture-monograph-1989`;
     const hash = createHash('sha256').update(bytes).digest('hex').slice(0, 12);
     const objects: FakeGcsObjects = new Map([
       [`${base}.pdf`, syntheticPdfBytes(70)],
@@ -5074,7 +5105,7 @@ describe('acquisition ingest registers the imported source', () => {
         target_corpus_id: CORPUS_RESOURCE,
         copyright_posture: 'approved_fixture_use',
         ingest_status: 'imported',
-        gcs_uri: 'gs://fixture-shared-library/v1/book-imports/research/example-author---the-fixture-book-2005.pdf',
+        gcs_uri: 'gs://fixture-shared-library/v1/book-imports/research/author---the-fixture-book-2005.pdf',
         rag_operation_name: `${CORPUS_RESOURCE}/operations/import-1`,
       });
       expect(typeof records[0]!.registered_at).toBe('string');
