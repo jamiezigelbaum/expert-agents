@@ -3519,10 +3519,9 @@ export class DomainExpertService {
       const title = params.title?.trim();
       const author = params.author?.trim();
       const year = params.year?.trim();
-      const descriptor = title
-        ? `${author ? `${author} - ` : ''}${title}${year ? ` (${year})` : ''}`
-        : locator;
-      const gcsUri = await this.uploadApprovedImportToGcs(manifest, descriptor, artifact.format, artifact.bytes);
+      const stem = title ? bookObjectStem(title, author, year) : safeObjectName(locator);
+      const legacyStem = title ? legacyBookObjectStem(title, author, year) : undefined;
+      const gcsUri = await this.uploadApprovedImportToGcs(manifest, stem, artifact.format, artifact.bytes, legacyStem);
       // One budget for the whole ingest: waiting out a busy corpus and waiting
       // for the operation both draw from it, so a tool call has one bound.
       const deadline = Date.now() + this.annasImportPollTimeoutMs;
@@ -3773,16 +3772,54 @@ export class DomainExpertService {
     return prefix;
   }
 
-  private async uploadApprovedImportToGcs(manifest: ReturnType<typeof domainManifest>, descriptor: string, format: string, bytes: Uint8Array): Promise<string> {
+  // Stable, metadata-derived name: re-ingesting the same bytes reuses the
+  // same object instead of accumulating timestamped duplicates. An object is
+  // never overwritten with different bytes. On 2026-10-07 two Hansen books
+  // truncated to one name; the second upload replaced the first, Vertex
+  // skipped the re-import of a URI it already held, and the corpus kept the
+  // old book's chunks over the new book's bytes. A different file under the
+  // same name goes to the name plus a content hash instead.
+  //
+  // Books imported before 2026-10-07 carry the raw-metadata name. The same
+  // bytes found there are reused, so re-acquiring one does not import it twice;
+  // nothing new is ever written under that name.
+  private async uploadApprovedImportToGcs(manifest: ReturnType<typeof domainManifest>, stem: string, format: string, bytes: Uint8Array, legacyStem?: string): Promise<string> {
     const prefix = this.annasImportGcsPrefix(manifest);
     const parsed = parseGcsPrefix(prefix);
-    // Stable, metadata-derived name: re-ingesting the same book overwrites
-    // the same object instead of accumulating timestamped duplicates.
-    const objectName = `${parsed.prefix}${manifest.domain_id}/${safeObjectName(descriptor)}.${format}`;
-    const gcsUri = `gs://${parsed.bucket}/${objectName}`;
-    assertAllowedGcsDestination(gcsUri, manifest.allowed_gcs_prefixes);
-    await this.google.uploadGcsObject(parsed.bucket, objectName, bytes);
-    return gcsUri;
+    const base = `${parsed.prefix}${manifest.domain_id}/${stem}`;
+    if (legacyStem && legacyStem !== stem) {
+      const legacyName = `${parsed.prefix}${manifest.domain_id}/${legacyStem}.${format}`;
+      const legacyUri = `gs://${parsed.bucket}/${legacyName}`;
+      assertAllowedGcsDestination(legacyUri, manifest.allowed_gcs_prefixes);
+      const legacy = await this.google.getGcsObjectMetadata(parsed.bucket, legacyName);
+      if (legacy && gcsObjectHoldsBytes(legacy, bytes)) return legacyUri;
+    }
+    const contentHash = createHash('sha256').update(bytes).digest('hex').slice(0, 12);
+    for (const objectName of [`${base}.${format}`, `${base}--${contentHash}.${format}`]) {
+      const gcsUri = `gs://${parsed.bucket}/${objectName}`;
+      assertAllowedGcsDestination(gcsUri, manifest.allowed_gcs_prefixes);
+      const existing = await this.google.getGcsObjectMetadata(parsed.bucket, objectName);
+      if (existing) {
+        if (gcsObjectHoldsBytes(existing, bytes)) return gcsUri;
+        continue;
+      }
+      try {
+        // Generation 0: create only. A concurrent writer that got there first
+        // fails this upload instead of being overwritten.
+        await this.google.uploadGcsObject(parsed.bucket, objectName, bytes, { ifGenerationMatch: '0' });
+        return gcsUri;
+      } catch (error) {
+        if (!(error instanceof DomainExpertWorkerError && error.status === 412)) throw error;
+        const raced = await this.google.getGcsObjectMetadata(parsed.bucket, objectName);
+        if (raced && gcsObjectHoldsBytes(raced, bytes)) return gcsUri;
+      }
+    }
+    throw new DomainExpertWorkerError(
+      409,
+      'gcs_object_name_conflict',
+      `Different files already occupy gs://${parsed.bucket}/${base}.${format} and its content-hash variant. Nothing was uploaded or imported.`,
+      'Check the edition metadata (author, title, year) and re-run with the details that distinguish this file.',
+    );
   }
 
   private async withRagCorpusRetry<T>(
@@ -5261,12 +5298,25 @@ class GoogleRuntimeClient {
     });
   }
 
-  async uploadGcsObject(bucket: string, objectName: string, bytes: Uint8Array): Promise<unknown> {
-    return this.googleBytes(`https://storage.googleapis.com/upload/storage/v1/b/${encodeURIComponent(bucket)}/o?uploadType=media&name=${encodeURIComponent(objectName)}`, {
+  async uploadGcsObject(bucket: string, objectName: string, bytes: Uint8Array, options: { ifGenerationMatch?: string } = {}): Promise<unknown> {
+    const precondition = options.ifGenerationMatch === undefined ? '' : `&ifGenerationMatch=${encodeURIComponent(options.ifGenerationMatch)}`;
+    return this.googleBytes(`https://storage.googleapis.com/upload/storage/v1/b/${encodeURIComponent(bucket)}/o?uploadType=media&name=${encodeURIComponent(objectName)}${precondition}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/octet-stream' },
       body: new Blob([copyToArrayBuffer(bytes)], { type: 'application/octet-stream' }),
     });
+  }
+
+  async getGcsObjectMetadata(bucket: string, objectName: string): Promise<GcsObjectMetadata | null> {
+    const response = await this.authedFetch(
+      `https://storage.googleapis.com/storage/v1/b/${encodeURIComponent(bucket)}/o/${encodeURIComponent(objectName)}?fields=generation,size,md5Hash,crc32c`,
+    );
+    const body = await responseTextOrJson(response);
+    if (response.status === 404) return null;
+    if (!response.ok) throw googleError(response, body);
+    const record = asOptionalRecord(body) ?? {};
+    const field = (key: string) => (typeof record[key] === 'string' ? { [key]: record[key] as string } : {});
+    return { ...field('generation'), ...field('size'), ...field('md5Hash'), ...field('crc32c') };
   }
 
   async downloadGcsObject(bucket: string, objectName: string): Promise<Uint8Array | null> {
@@ -8392,6 +8442,104 @@ function annasSourceKind(format: string): 'pdf' | 'epub' | 'book' {
 }
 
 const SAFE_OBJECT_NAME_MAX_LENGTH = 80;
+
+interface GcsObjectMetadata {
+  generation?: string;
+  size?: string;
+  md5Hash?: string;
+  crc32c?: string;
+}
+
+// GCS reports md5Hash (absent on composite objects) and crc32c, both base64.
+// An object with neither cannot be shown to hold these bytes, so it does not.
+function gcsObjectHoldsBytes(metadata: GcsObjectMetadata, bytes: Uint8Array): boolean {
+  if (metadata.size !== undefined && Number(metadata.size) !== bytes.byteLength) return false;
+  if (metadata.md5Hash) return metadata.md5Hash === createHash('md5').update(bytes).digest('base64');
+  if (metadata.crc32c) return metadata.crc32c === crc32cBase64(bytes);
+  return false;
+}
+
+const CRC32C_TABLE = (() => {
+  const table = new Uint32Array(256);
+  for (let n = 0; n < 256; n += 1) {
+    let c = n;
+    for (let k = 0; k < 8; k += 1) c = c & 1 ? 0x82f63b78 ^ (c >>> 1) : c >>> 1;
+    table[n] = c >>> 0;
+  }
+  return table;
+})();
+
+function crc32cBase64(bytes: Uint8Array): string {
+  let crc = 0xffffffff;
+  for (const byte of bytes) crc = CRC32C_TABLE[(crc ^ byte) & 0xff]! ^ (crc >>> 8);
+  const out = Buffer.alloc(4);
+  out.writeUInt32BE((crc ^ 0xffffffff) >>> 0);
+  return out.toString('base64');
+}
+
+// The standard book object name (owner ruling 2026-10-07):
+// `<first author's surname> - <main title> (<year>)`, slugged as
+// parseObjectNameUri reads it back. Acquisition metadata carries translators,
+// editors, subtitles and edition notes; none of it names the book, and it
+// pushed the year past the length limit. When the name is still long the title
+// is shortened, never the year: editions of one book differ by year, and a
+// name cut short of it made two of them one object.
+export function bookObjectStem(title: string, author: string | undefined, year: string | undefined): string {
+  const surname = author ? authorSurname(author) : '';
+  return yearPreservingStem(`${surname ? `${surname} - ` : ''}${mainTitle(title)}`, bookYear(year));
+}
+
+// The name imports used before 2026-10-07: raw metadata, year preserved.
+function legacyBookObjectStem(title: string, author: string | undefined, year: string | undefined): string {
+  return yearPreservingStem(`${author ? `${author} - ` : ''}${title}`, year ? sanitizeObjectName(year) : '');
+}
+
+function yearPreservingStem(body: string, yearSlug: string): string {
+  const tail = yearSlug ? `-${yearSlug}` : '';
+  const kept = sanitizeObjectName(body).slice(0, Math.max(SAFE_OBJECT_NAME_MAX_LENGTH - tail.length, 0)).replace(/-+$/, '');
+  return `${kept}${tail}`.replace(/^-+/, '').slice(0, SAFE_OBJECT_NAME_MAX_LENGTH) || randomUUID();
+}
+
+const AUTHOR_SUFFIXES = new Set(['jr', 'sr', 'ii', 'iii', 'iv', 'phd']);
+
+// "Mogens Herman Hansen (tr. J.A. Crook)" → "Hansen"; "Hansen, Mogens Herman;
+// Crook, J.A." → "Hansen". The first author only, without roles, brackets or
+// generational suffixes. A comma after a single word is "Surname, Given";
+// otherwise it separates authors.
+function authorSurname(author: string): string {
+  const first = stripBracketed(author)
+    .split(/;|&|\band\b|\bwith\b|\bet al\.?|\b(?:tr|trans|ed|eds)\.(?=\s|$)|\b(?:translated|edited) by\b/i)[0]!
+    .trim();
+  const comma = first.indexOf(',');
+  if (comma !== -1) {
+    const before = first.slice(0, comma).trim();
+    if (before && !/\s/.test(before)) return before;
+  }
+  const words = (comma === -1 ? first : first.slice(0, comma)).split(/\s+/).filter(Boolean);
+  while (words.length > 1 && AUTHOR_SUFFIXES.has(words.at(-1)!.toLowerCase().replace(/\./g, ''))) words.pop();
+  return words.at(-1) ?? '';
+}
+
+// The main title: no subtitle (after a colon), bracketed notes or edition
+// statements. Falls back to the whole title if stripping leaves nothing.
+function mainTitle(title: string): string {
+  const main = stripBracketed(title)
+    .split(/\s*[:]\s+|\s+[—–]\s+/)[0]!
+    .replace(/[,;.]?\s*\b(?:\d+(?:st|nd|rd|th)|first|second|third|revised|new|expanded|updated)\s+(?:ed\.?|edition)\b.*$/i, '')
+    .trim();
+  return main || title;
+}
+
+function stripBracketed(value: string): string {
+  return value.replace(/\([^)]*\)|\[[^\]]*\]/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
+// The edition's year as four digits when the metadata has one ("c. 1991",
+// "1991-01-01"), else the metadata slugged.
+function bookYear(year: string | undefined): string {
+  if (!year) return '';
+  return year.match(/\b(1[0-9]|20)\d{2}\b/)?.[0] ?? sanitizeObjectName(year);
+}
 
 function safeObjectName(value: string): string {
   return sanitizeObjectName(value).slice(0, SAFE_OBJECT_NAME_MAX_LENGTH) || randomUUID();
