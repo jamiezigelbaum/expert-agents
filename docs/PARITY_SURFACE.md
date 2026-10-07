@@ -109,7 +109,7 @@ handling process.
 ## Plugin ownership fingerprint
 
 The parity battery compares runtimes. It cannot say which plugin answered a
-gateway tool call. Two plugins may declare the same seven tool names in one
+gateway tool call. Two plugins may declare the same tool names in one
 gateway boot, and the host resolves that collision last-writer-wins without a
 warning, so a healthy-looking cutover can be a fork answering every call.
 
@@ -121,9 +121,9 @@ only those two booleans and classifies each tool name as `expert-agents`,
 policy object), or `missing` (no captured response at all).
 
 The check does not contact the gateway. The operator running the ceremony calls
-each of the seven tools and captures the response bodies into one JSON file,
+each of the registered research tools and captures the response bodies into one JSON file,
 either as an object mapping tool name to response body or as an array of
-`{ tool, response }` entries. Any name outside the seven is rejected.
+`{ tool, response }` entries. Any name outside that set is rejected.
 
 ```sh
 bun run plugin:ownership -- <captured-responses-json-path>
@@ -131,7 +131,7 @@ bun run plugin:ownership -- <captured-responses-json-path> --json
 ```
 
 With no path, captured responses are read from stdin. The exit code is 0 only
-when all seven names are present and every one fingerprints to `expert-agents`;
+when all registered names are present and every one fingerprints to `expert-agents`;
 a missing name is a failure with its own message, because silence must never
 read as ownership. `--json` writes a receipt with schema version 1, the per-tool
 rows, verdict counts, and a SHA-256 over the normalized tool/verdict pairs for
@@ -143,5 +143,5 @@ carry retrieved corpus content and, for the acquisition tools, source URLs, and
 are runtime artifacts under the same handling rules as battery receipts.
 
 Run this before declaring a plugin cutover complete, and again after any gateway
-restart that could reorder plugin registration. Every one of the seven names must
+restart that could reorder plugin registration. Every research tool name must
 fingerprint to `expert-agents`; anything else means the cutover is not done.

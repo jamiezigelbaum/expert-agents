@@ -1,5 +1,12 @@
 # Plan
 
+Delivered in source: [direct library reading](docs/direct-library-reading.md)
+through `domain_read`, with scoped canonical-source access, revision-pinned
+sequential reads, and extraction coverage. Live activation requires the worker
+and host plugin update under their deployment owner's procedure.
+Legacy staged/acquired holdings are also readable by their current authorized
+RAG file identity, without copying source objects or creating new embeddings.
+
 Open engineering work.
 
 1. **Large-document ingestion.** The delivered per-PDF ceiling is 100,000,000

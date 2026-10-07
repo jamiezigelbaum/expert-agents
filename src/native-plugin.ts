@@ -37,6 +37,7 @@ interface NativeToolResult {
 const definitions: Array<{ name: DomainExpertTool; description: string }> = [
   { name: 'domain_agent', description: 'Plan or inspect an independently managed domain expert.' },
   { name: 'domain_ask', description: 'Answer a question from an approved expert corpus with citations and explicit gaps.' },
+  { name: 'domain_read', description: 'Open, search within, and sequentially read a selected library source, chapter, or complete bibliography.' },
   { name: 'domain_source', description: 'Plan or perform bounded source-registry lifecycle work for an expert.' },
   { name: 'rag_corpus', description: 'Plan or perform bounded managed-RAG corpus operations.' },
   { name: 'domain_doc', description: 'Read, comment on, or apply an approved visible edit to a configured document.' },

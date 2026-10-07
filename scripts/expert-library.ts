@@ -49,6 +49,8 @@ Worker lane (POST <worker>/v1/domain; --worker <url> or ${WORKER_URL_ENV};
 bearer token from ${WORKER_TOKEN_ENV} or --token-file <path>, never an argument value):
   health
   ask      --domain <id> "<question>" [--passages] [--corpus <id>]
+  read     --domain <id> --action <catalog|open|find|read> [--object <sha256:id> | --rag-file <resource>]
+           [--revision <text-hash>] [--query <text>] [--offset <n>] [--end <n>] [--section <n>] [--limit <n>]
   search   --domain <id> --query "<q>" [--author <a>] [--title <t>] [--language <l>] [--top <n>] [--ingest-intent]
   acquire  --domain <id> --md5 <md5> --format <pdf|epub|mobi|azw3|djvu> --title <t> --author <a> [--year <y>]
            --corpus <id> --copyright-posture <p> --approval-id <id> [--no-ingest] [--dry-run] [--no-wait]
@@ -97,6 +99,7 @@ export interface WorkerCommandOptions {
 
 export type ExpertLibraryCommand =
   | ({ command: "health" } & WorkerCommandOptions)
+  | ({ command: "read"; domainId: string; params: Record<string, unknown> } & WorkerCommandOptions)
   | ({
     command: "ask";
     domainId: string;
@@ -295,6 +298,24 @@ export function parseExpertLibraryArguments(argv: string[]): ExpertLibraryComman
         ...workerOptions(flags),
       };
     }
+    case "read": {
+      const flags = parseFlags(rest, { named: [...WORKER_FLAGS, "--domain", "--action", "--object", "--rag-file", "--revision", "--query", "--offset", "--end", "--section", "--limit"] });
+      const action = requireFlag(flags, "--action");
+      if (!["catalog", "open", "find", "read"].includes(action)) throw usage("Invalid read action.");
+      const params: Record<string, unknown> = { action };
+      for (const [flag, key] of [["--object", "object_id"], ["--rag-file", "rag_file_name"], ["--revision", "text_revision"], ["--query", "query"]]) {
+        const value = flags.values.get(flag!);
+        if (value !== undefined) params[key!] = value;
+      }
+      for (const key of ["offset", "end", "section", "limit"]) {
+        const value = flags.values.get(`--${key}`);
+        if (value === undefined) continue;
+        if (!/^\d+$/.test(value) || !Number.isSafeInteger(Number(value))) throw usage(`--${key} must be a non-negative integer.`);
+        params[key] = Number(value);
+      }
+      if (action !== "catalog" && Boolean(params.object_id) === Boolean(params.rag_file_name)) throw usage("Exactly one of --object or --rag-file is required for this read action.");
+      return { command: "read", domainId: requireFlag(flags, "--domain"), params, ...workerOptions(flags) };
+    }
     case "search": {
       const flags = parseFlags(rest, {
         named: [...WORKER_FLAGS, "--domain", "--query", "--author", "--title", "--language", "--top"],
@@ -492,6 +513,12 @@ async function runWorkerCommand(
   const fetchImpl = dependencies.fetchImpl ?? fetch;
 
   switch (parsed.command) {
+    case "read": {
+      const outcome = await workerPost(target, "domain_read", { domain_id: parsed.domainId, ...parsed.params }, fetchImpl);
+      if (!outcome.ok) return failWorker(outcome, emitter);
+      emitter.out(prettyJson(outcome.body));
+      return 0;
+    }
     case "health": {
       const outcome = await workerGet(target, "/v1/health", fetchImpl);
       emitter.out(prettyJson(outcome.body));

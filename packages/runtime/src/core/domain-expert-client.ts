@@ -6,6 +6,7 @@ import { withWorkerAuthHeader, workerAuthTokenFromConfig } from './worker-auth.t
 export type DomainExpertTool =
   | 'domain_agent'
   | 'domain_ask'
+  | 'domain_read'
   | 'domain_source'
   | 'rag_corpus'
   | 'domain_doc'
@@ -19,6 +20,21 @@ export interface DomainExpertTransport {
 }
 
 const WORKER_ERROR_MESSAGES: Readonly<Record<string, string>> = Object.freeze({
+  library_read_disclosure_restricted: 'Direct reading is unavailable on a disclosure-bounded deployment. Use domain_ask.',
+  library_read_not_configured: 'Direct reading requires an operator-configured library scope manifest.',
+  library_read_scope_mismatch: 'The library scope does not match the configured corpus.',
+  library_read_busy: 'Direct reading is busy. Retry shortly.',
+  library_read_unavailable: 'The source or library state could not be read or validated.',
+  library_source_not_available: 'The source is not available in this library scope.',
+  library_source_too_large: 'The source exceeds the direct-reading size limit.',
+  library_source_format_unsupported: 'The source needs a text, Markdown, HTML, or PDF representation before direct reading.',
+  library_source_integrity_failed: 'The stored source does not match its library identity.',
+  library_source_text_unavailable: 'The source has no readable text. Scanned PDFs require a separately prepared OCR text representation.',
+  library_text_too_large: 'The text exceeds the direct-reading size limit.',
+  library_text_revision_required: 'Use the text_revision from open when selecting or continuing a text range.',
+  library_text_revision_changed: 'The text representation changed. Open the source again before continuing.',
+  library_pdf_reader_unavailable: 'PDF reading requires Poppler pdftotext on the worker host.',
+  library_pdf_extraction_failed: 'PDF text extraction failed or exceeded its size or time limit.',
   invalid_params: 'The domain expert request parameters are invalid.',
   domain_expert_not_configured: 'The domain expert worker is not configured.',
   annas_archive_not_configured: 'The library acquisition provider is not configured.',

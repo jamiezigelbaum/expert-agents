@@ -107,6 +107,7 @@ import {
   type DisclosureSummary,
 } from '../../core/disclosure.ts';
 import { completePassageSentences, completionSourceObject, SourceTextCache } from './passage-completion.ts';
+import { LibraryReader, LibraryReadError, parseLibraryReadParams } from './library-reader.ts';
 
 export const DOMAIN_EXPERT_NOTION_CREDENTIAL_GUIDANCE = `notion_import requires EXPERT_AGENTS_DOMAIN_EXPERT_NOTION_TOKEN. Configure it as documented in ${DOMAIN_EXPERT_ENV_EXAMPLE}.`;
 
@@ -222,6 +223,7 @@ type WebImportFetchImpl = (url: URL, options: {
 type DomainExpertTool =
   | 'domain_agent'
   | 'domain_ask'
+  | 'domain_read'
   | 'domain_source'
   | 'rag_corpus'
   | 'domain_doc'
@@ -689,6 +691,7 @@ export class DomainExpertService {
   private corpusEnsureQueue: Promise<unknown> = Promise.resolve();
   private gcpProject: string;
   private google: GoogleRuntimeClient;
+  private libraryReader: LibraryReader;
   private annas: DomainExpertAnnasConfig;
   private annasBooksRoot: string;
   private annasMaxDownloadBytes: number;
@@ -736,6 +739,9 @@ export class DomainExpertService {
     this.google = new GoogleRuntimeClient({
       ...(options.google ?? {}),
       fetchImpl: options.google?.fetchImpl ?? options.fetchImpl ?? fetch,
+    });
+    this.libraryReader = new LibraryReader({
+      download: (bucket, name, maxBytes, timeoutMs) => this.google.downloadLibraryObject(bucket, name, maxBytes, timeoutMs),
     });
     this.annas = options.annas ?? {};
     this.annasBooksRoot = options.annas?.booksRoot ?? DEFAULT_ANNAS_BOOKS_ROOT;
@@ -867,6 +873,8 @@ export class DomainExpertService {
         return this.domainAgent(parseDomainAgentParams(request.params));
       case 'domain_ask':
         return this.domainAsk(parseDomainAskParams(request.params));
+      case 'domain_read':
+        return this.domainRead(request.params);
       case 'domain_source':
         return this.domainSource(parseDomainSourceParams(request.params));
       case 'rag_corpus':
@@ -879,6 +887,44 @@ export class DomainExpertService {
         return this.annasImport(parseAnnasArchiveImportParams(request.params));
       default:
         throw new DomainExpertWorkerError(400, 'invalid_tool', 'Unsupported domain expert tool.');
+    }
+  }
+
+  private async domainRead(params: Record<string, unknown>): Promise<unknown> {
+    try {
+      const parsed = parseLibraryReadParams(params);
+      const manifest = this.manifest(optionalStringField(params.domain_id, 'domainId').domainId);
+      requireConfiguredAgent(manifest, 'domain_read');
+      const route = this.agentRouting[manifest.domain_id]!;
+      const result = await this.libraryReader.run(route, parsed, async (name) => {
+        const requested = parseRagFileResourceName(name)!;
+        if (requested.location !== manifest.rag_location
+          || (requested.project !== manifest.gcp_project && !/^[1-9][0-9]*$/.test(requested.project))) {
+          throw new LibraryReadError('library_source_not_available', 'The source is not available in this library scope.', 404);
+        }
+        const resolved = await this.resolveRagCorpus(manifest,
+          corpusResourceNameFromParts(manifest.gcp_project, manifest.rag_location, requested.corpusId));
+        // Always address the configured project. Its authenticated GetRagFile
+        // response proves Google's numeric spelling without a warm list cache.
+        const canonicalName = `${resolved.resourceName}/ragFiles/${requested.fileId}`;
+        const file = await this.google.getRagFile(canonicalName);
+        const returned = typeof file.name === 'string' ? parseRagFileResourceName(file.name) : undefined;
+        if (!returned || returned.location !== requested.location || returned.corpusId !== requested.corpusId
+          || returned.fileId !== requested.fileId
+          || (returned.project !== manifest.gcp_project && !/^[1-9][0-9]*$/.test(returned.project))
+          || (requested.project !== manifest.gcp_project && requested.project !== returned.project)) {
+          throw new LibraryReadError('library_source_not_available', 'The source is not available in this library scope.', 404);
+        }
+        const uris = file.gcsSource?.uris ?? file.ragFileSource?.gcsSource?.uris ?? (file.sourceUri ? [file.sourceUri] : []);
+        if (!Array.isArray(uris) || uris.length !== 1 || typeof uris[0] !== 'string') {
+          throw new LibraryReadError('library_source_not_available', 'The source is not available in this library scope.', 404);
+        }
+        return { uri: uris[0], ...(typeof file.displayName === 'string' ? { title: file.displayName } : {}) };
+      });
+      return { kind: 'domain_read_result', domain_id: manifest.domain_id, ...result, policy: domainPolicy() };
+    } catch (error) {
+      if (error instanceof LibraryReadError) throw new DomainExpertWorkerError(error.status, error.code, error.message);
+      throw error;
     }
   }
 
@@ -4640,6 +4686,15 @@ class GoogleRuntimeClient {
     };
   }
 
+  async getRagFile(name: string): Promise<Record<string, any>> {
+    try {
+      return await this.googleJson(`${vertexBase(name.split('/')[3]!)}/v1/${name}`) as Record<string, any>;
+    } catch (error) {
+      if (isGoogleNotFoundError(error)) throw new LibraryReadError('library_source_not_available', 'The source is not available in this library scope.', 404);
+      throw error;
+    }
+  }
+
   async deleteRagFile(options: {
     project: string;
     location: string;
@@ -4960,6 +5015,40 @@ class GoogleRuntimeClient {
       throw googleError(response, body);
     }
     return new Uint8Array(await response.arrayBuffer());
+  }
+
+  async downloadLibraryObject(bucket: string, objectName: string, maxBytes: number, timeoutMs: number): Promise<Uint8Array | null> {
+    const response = await this.authedFetch(
+      `https://storage.googleapis.com/storage/v1/b/${encodeURIComponent(bucket)}/o/${encodeURIComponent(objectName)}?alt=media`,
+      {}, timeoutMs,
+    );
+    if (response.status === 404) { await response.body?.cancel(); return null; }
+    if (!response.ok) {
+      await response.body?.cancel();
+      throw new LibraryReadError('library_read_unavailable', 'The source or library state could not be read or validated.', 502);
+    }
+    if (Number(response.headers.get('content-length')) > maxBytes) {
+      await response.body?.cancel();
+      throw new LibraryReadError('library_source_too_large', 'The source exceeds the direct-reading size limit.', 413);
+    }
+    if (!response.body) return new Uint8Array();
+    const reader = response.body.getReader();
+    const signal = upstreamResponseContexts.get(response)!.signal;
+    const chunks: Uint8Array[] = [];
+    let size = 0;
+    try {
+      while (true) {
+        const { done, value } = await readWebImportChunk(reader, signal);
+        if (done) break;
+        size += value.byteLength;
+        if (size > maxBytes) throw new LibraryReadError('library_source_too_large', 'The source exceeds the direct-reading size limit.', 413);
+        chunks.push(value);
+      }
+      return new Uint8Array(Buffer.concat(chunks, size));
+    } finally {
+      void reader.cancel().catch(() => {});
+      reader.releaseLock();
+    }
   }
 
   // A bounded read for passage completion: a short timeout and a size cap, so
@@ -9729,6 +9818,7 @@ function asDomainExpertTool(value: unknown): DomainExpertTool {
   if (
     value === 'domain_agent'
     || value === 'domain_ask'
+    || value === 'domain_read'
     || value === 'domain_source'
     || value === 'rag_corpus'
     || value === 'domain_doc'
