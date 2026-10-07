@@ -2605,6 +2605,43 @@ describe('acquisition ingest never overwrites a different book at the same objec
     }
   });
 
+  test('a re-acquisition with different details reuses the earlier import of the same record', async () => {
+    const fixture = workspaceFixture();
+    const booksRoot = join(fixture.base, 'books');
+    mkdirSync(booksRoot);
+    const googleCalls: CapturedCall[] = [];
+    const bytes = syntheticPdfBytes(64);
+    const objects: FakeGcsObjects = new Map();
+    const worker = createDomainExpertWorker({
+      gcpProject: 'fixture-project',
+      annas: {
+        apiKey: 'fixture-acquisition-token',
+        baseUrl: 'https://annas.example',
+        booksRoot,
+        importGcsPrefix: 'gs://fixture-shared-library/v1/book-imports/',
+      },
+      google: { accessToken: 'fixture-google-token', fetchImpl: fakeIngestGoogleFetch(googleCalls, objects) },
+      fetchImpl: fakeAnnasArtifactFetch([], bytes, 'application/pdf'),
+    });
+    const params = {
+      ...LONG_PARAMS, annas_archive_id: 'feedfacefeedfacefeedfacefeedface', md5: 'feedfacefeedfacefeedfacefeedface',
+      title: 'The Fixture Monograph', author: 'Example Author', year: '1962',
+    };
+    try {
+      const first = await postDomain(worker, 'annas_archive_import', params);
+      const firstName = `${PREFIX}author---the-fixture-monograph-1962.pdf`;
+      expect(first.rag_ingest).toMatchObject({ status: 'imported', gcs_uri: `gs://fixture-shared-library/${firstName}` });
+
+      // The same record, re-acquired with a different year: the bytes are already imported.
+      const second = await postDomain(worker, 'annas_archive_import', { ...params, year: '1939' });
+      expect(second.rag_ingest).toMatchObject({ gcs_uri: `gs://fixture-shared-library/${firstName}` });
+      expect(uploadedObjectNames(googleCalls)).toEqual([firstName]);
+      expect([...objects.keys()]).toEqual([firstName]);
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
   test('when both names hold different files the ingest is refused with a typed code', async () => {
     const bytes = syntheticPdfBytes(64);
     const base = `${PREFIX}author---the-fixture-monograph-1989`;

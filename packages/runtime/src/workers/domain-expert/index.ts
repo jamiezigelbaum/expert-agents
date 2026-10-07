@@ -3520,8 +3520,11 @@ export class DomainExpertService {
       const author = params.author?.trim();
       const year = params.year?.trim();
       const stem = title ? bookObjectStem(title, author, year) : safeObjectName(locator);
-      const legacyStem = title ? legacyBookObjectStem(title, author, year) : undefined;
-      const gcsUri = await this.uploadApprovedImportToGcs(manifest, stem, artifact.format, artifact.bytes, legacyStem);
+      const priorStems = [
+        ...(title ? [legacyBookObjectStem(title, author, year)] : []),
+        ...await this.priorAnnasObjectStems(manifest, params, artifact.format),
+      ];
+      const gcsUri = await this.uploadApprovedImportToGcs(manifest, stem, artifact.format, artifact.bytes, priorStems);
       // One budget for the whole ingest: waiting out a busy corpus and waiting
       // for the operation both draw from it, so a tool call has one bound.
       const deadline = Date.now() + this.annasImportPollTimeoutMs;
@@ -3772,6 +3775,51 @@ export class DomainExpertService {
     return prefix;
   }
 
+  // Object names an earlier import of this Anna record may have used: the
+  // gcs_uri of any registry record for its locator, and the names built from
+  // the details each audited acquisition of it supplied. Only names in this
+  // domain's import directory with this format are returned; a missing or
+  // unreadable registry or audit adds nothing.
+  private async priorAnnasObjectStems(manifest: ReturnType<typeof domainManifest>, params: AnnasArchiveImportParams, format: string): Promise<string[]> {
+    const md5 = annasFastDownloadMd5(params);
+    if (!md5) return [];
+    const parsed = parseGcsPrefix(this.annasImportGcsPrefix(manifest));
+    const directoryUri = `gs://${parsed.bucket}/${parsed.prefix}${manifest.domain_id}/`;
+    const suffix = `.${format}`;
+    const stems: string[] = [];
+    const root = this.roots.get(manifest.workspace_root_id);
+    if (root) {
+      try {
+        const registryPath = resolveInside(await checkedRootPath(root), `${manifest.workspace_relative_path}/references/source-registry.jsonl`);
+        for (const { record } of (await readDomainSourceRegistry(registryPath)).records) {
+          const gcsUri = stringRecordField(record, 'gcs_uri');
+          if (stringRecordField(record, 'locator') !== `annas:${md5}` || !gcsUri?.startsWith(directoryUri) || !gcsUri.endsWith(suffix)) continue;
+          const name = gcsUri.slice(directoryUri.length, -suffix.length);
+          if (name && !name.includes('/')) stems.push(name);
+        }
+      } catch {
+        // The registry is advisory here; the upload's own checks still hold.
+      }
+    }
+    const raw = await readFile(join(resolve(this.annasBooksRoot), ANNAS_AUDIT_FILE), 'utf8').catch(() => '');
+    for (const line of raw.split('\n')) {
+      if (!line.includes(md5)) continue;
+      let selected: Record<string, unknown>;
+      try {
+        selected = asOptionalRecord((JSON.parse(line) as Record<string, unknown>).selected) ?? {};
+      } catch {
+        continue;
+      }
+      if (selected.md5 !== md5 && selected.annas_archive_id !== md5) continue;
+      const title = typeof selected.title === 'string' ? selected.title.trim() : '';
+      if (!title) continue;
+      const author = typeof selected.author === 'string' ? selected.author.trim() : undefined;
+      const year = typeof selected.year === 'string' ? selected.year.trim() : undefined;
+      stems.push(bookObjectStem(title, author, year), legacyBookObjectStem(title, author, year));
+    }
+    return stems;
+  }
+
   // Stable, metadata-derived name: re-ingesting the same bytes reuses the
   // same object instead of accumulating timestamped duplicates. An object is
   // never overwritten with different bytes. On 2026-10-07 two Hansen books
@@ -3780,19 +3828,23 @@ export class DomainExpertService {
   // old book's chunks over the new book's bytes. A different file under the
   // same name goes to the name plus a content hash instead.
   //
-  // Books imported before 2026-10-07 carry the raw-metadata name. The same
-  // bytes found there are reused, so re-acquiring one does not import it twice;
-  // nothing new is ever written under that name.
-  private async uploadApprovedImportToGcs(manifest: ReturnType<typeof domainManifest>, stem: string, format: string, bytes: Uint8Array, legacyStem?: string): Promise<string> {
+  // An earlier import of the same file may sit under another name: the
+  // raw-metadata name used before 2026-10-07, or a name built from the details
+  // a previous acquisition of the same record supplied. The same bytes found
+  // under any of them are reused, so a re-acquisition never imports a book
+  // twice (2026-10-07: a retry with a different year duplicated Syme). Nothing
+  // new is ever written under a prior name.
+  private async uploadApprovedImportToGcs(manifest: ReturnType<typeof domainManifest>, stem: string, format: string, bytes: Uint8Array, priorStems: string[] = []): Promise<string> {
     const prefix = this.annasImportGcsPrefix(manifest);
     const parsed = parseGcsPrefix(prefix);
-    const base = `${parsed.prefix}${manifest.domain_id}/${stem}`;
-    if (legacyStem && legacyStem !== stem) {
-      const legacyName = `${parsed.prefix}${manifest.domain_id}/${legacyStem}.${format}`;
-      const legacyUri = `gs://${parsed.bucket}/${legacyName}`;
-      assertAllowedGcsDestination(legacyUri, manifest.allowed_gcs_prefixes);
-      const legacy = await this.google.getGcsObjectMetadata(parsed.bucket, legacyName);
-      if (legacy && gcsObjectHoldsBytes(legacy, bytes)) return legacyUri;
+    const directory = `${parsed.prefix}${manifest.domain_id}/`;
+    const base = `${directory}${stem}`;
+    for (const prior of new Set(priorStems.filter((candidate) => candidate && candidate !== stem))) {
+      const priorName = `${directory}${prior}.${format}`;
+      const priorUri = `gs://${parsed.bucket}/${priorName}`;
+      assertAllowedGcsDestination(priorUri, manifest.allowed_gcs_prefixes);
+      const existing = await this.google.getGcsObjectMetadata(parsed.bucket, priorName);
+      if (existing && gcsObjectHoldsBytes(existing, bytes)) return priorUri;
     }
     const contentHash = createHash('sha256').update(bytes).digest('hex').slice(0, 12);
     for (const objectName of [`${base}.${format}`, `${base}--${contentHash}.${format}`]) {

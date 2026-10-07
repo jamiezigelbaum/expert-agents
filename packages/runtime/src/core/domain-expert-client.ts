@@ -48,6 +48,18 @@ const WORKER_ERROR_MESSAGES: Readonly<Record<string, string>> = Object.freeze({
   rag_corpus_ambiguous: 'Multiple corpora have the configured display name.',
   google_generation_empty: 'Google returned no usable text generation.',
   google_generation_incomplete: 'Google did not return a complete text generation.',
+  // Worker refusals an agent can act on. Without these a 403 surfaced as a
+  // generic policy violation: on 2026-10-07 an import missing approval_id read
+  // as a blocked lane and halted a whole intake batch.
+  approval_required: 'This action requires approval_id. Pass the approval reference for the owner request.',
+  gcs_destination_not_allowed: 'The storage destination is outside the domain allowlisted prefixes.',
+  gcs_object_name_conflict: 'Different files already occupy this book name and its content-hash variant. Nothing was uploaded; check the edition metadata.',
+  rag_corpus_not_configured_for_domain: 'The requested corpus is not configured for this domain.',
+  rag_corpus_foreign_project: 'The requested corpus belongs to a project not configured for this domain.',
+  rag_corpus_foreign_location: 'The requested corpus is in a location not configured for this domain.',
+  rag_file_foreign_corpus: 'The rag file does not belong to the resolved corpus.',
+  annas_archive_url_not_allowed: 'The acquisition URL is not an allowed library endpoint.',
+  drive_import_review_required: 'Drive imports require owner review before ingestion.',
 });
 
 export class DomainExpertClient {

@@ -18,6 +18,21 @@ describe('worker client error boundary', () => {
     }
   });
 
+  test('a worker 403 the agent can act on keeps its code instead of reading as a policy violation', async () => {
+    const transport = new DirectHttpDomainExpertTransport(async () => Response.json({
+      error: { code: 'approval_required', message: privateText },
+    }, { status: 403 }));
+    const error = await transport.requestJson('http://worker.test/v1/domain', {}).catch((caught: unknown) => caught);
+    expect(error).toMatchObject({ code: 'approval_required' });
+    expect(String((error as Error).message)).toContain('approval_id');
+    expect(JSON.stringify(error)).not.toContain(privateText);
+  });
+
+  test('an unrecognized worker 403 still reads as a policy violation', async () => {
+    const transport = new DirectHttpDomainExpertTransport(async () => Response.json({ error: { code: 'unknown_code' } }, { status: 403 }));
+    await expect(transport.requestJson('http://worker.test/v1/domain', {})).rejects.toMatchObject({ code: 'domain_expert_policy_violation' });
+  });
+
   test('oversized streamed failures are cancelled without retaining raw response content', async () => {
     let cancelled = false;
     const transport = new DirectHttpDomainExpertTransport(async () => new Response(new ReadableStream({
