@@ -352,3 +352,67 @@ describe('RAG delete not-found classification', () => {
     expect(calls.some((call) => call.method === 'GET' && call.url.endsWith(`/ragCorpora/${corpusResource.split('/').at(-1)}`))).toBe(true);
   });
 });
+
+// 2026-10-08: after a worker restart, deleting a rag file named with the
+// project number (as Vertex lists it) was refused as foreign until something
+// listed the corpus first, because number aliases lived only in memory.
+describe('RAG delete accepts the project-number spelling Resource Manager confirms', () => {
+  const corpusResource = 'projects/fixture-project/locations/us-central1/ragCorpora/1234567890123456789';
+  const numberedFile = (projectNumber: string) => `projects/${projectNumber}/locations/us-central1/ragCorpora/1234567890123456789/ragFiles/fixture-file`;
+
+  function numberWorker(calls: CapturedCall[]) {
+    return createDomainExpertWorker({
+      gcpProject: 'fixture-project',
+      google: {
+        accessToken: 'fixture-google-token',
+        fetchImpl: (async (input: string | URL | Request, init?: RequestInit) => {
+          const url = input instanceof Request ? input.url : String(input);
+          const method = init?.method ?? (input instanceof Request ? input.method : 'GET');
+          const path = new URL(url).pathname;
+          calls.push({ url, method });
+          if (url === 'https://cloudresourcemanager.googleapis.com/v1/projects/fixture-project') {
+            return jsonResponse({ projectId: 'fixture-project', projectNumber: '111111111111' });
+          }
+          if (method === 'GET' && path.endsWith('/ragCorpora')) {
+            return jsonResponse({ ragCorpora: [{ name: corpusResource, displayName: 'research-library' }] });
+          }
+          if (method === 'DELETE' && path.includes('/ragFiles/')) {
+            return jsonResponse({ name: `${corpusResource}/operations/delete-1` });
+          }
+          return jsonResponse({ error: `unexpected Google fixture URL: ${url}` }, 500);
+        }) as typeof fetch,
+      },
+    });
+  }
+
+  test('a fresh worker deletes a file named with the confirmed project number, with no listing first', async () => {
+    const calls: CapturedCall[] = [];
+    const response = await postDomainResponse(numberWorker(calls), 'rag_corpus', {
+      action: 'delete_file',
+      domain_id: 'research',
+      corpus_id: 'research-library',
+      rag_file_name: numberedFile('111111111111'),
+      dry_run: false,
+    });
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ status: 'delete_file_requested' });
+    expect(calls.filter((call) => call.method === 'DELETE')).toHaveLength(1);
+    expect(calls.some((call) => call.url.endsWith('/ragCorpora/1234567890123456789/ragFiles') && call.method === 'GET')).toBe(false);
+  });
+
+  test('a project number Resource Manager does not confirm is still refused', async () => {
+    const calls: CapturedCall[] = [];
+    const response = await postDomainResponse(numberWorker(calls), 'rag_corpus', {
+      action: 'delete_file',
+      domain_id: 'research',
+      corpus_id: 'research-library',
+      rag_file_name: numberedFile('999999999999'),
+      dry_run: false,
+    });
+
+    expect(response.status).toBe(403);
+    expect(await response.json()).toMatchObject({ error: { code: 'rag_file_foreign_corpus' } });
+    expect(calls.filter((call) => call.method === 'DELETE')).toHaveLength(0);
+  });
+});
