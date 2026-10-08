@@ -1870,6 +1870,7 @@ export class DomainExpertService {
     }
     if (params.action === 'delete_file') {
       const ragFileName = requireString(params.ragFileName, 'rag_file_name');
+      await this.learnRagFileProjectNumber(manifest, ragFileName, resolved);
       this.assertRagFileBelongsToResolvedCorpus(manifest, ragFileName, resolved);
       const base = {
         action: 'delete_file',
@@ -4234,6 +4235,33 @@ export class DomainExpertService {
     this.rememberRagCorpusProjectAlias(manifest.gcp_project, parsed.location, parsed.corpusId, parsed.project);
   }
 
+  // A rag file named with the project number (as Vertex lists them) is only
+  // accepted once that number is known to be the configured project's. The
+  // aliases learned from listings live in memory, so after a restart a delete
+  // sent before any listing was refused as foreign (2026-10-08). Resource
+  // Manager settles it; a number it does not confirm stays refused.
+  private async learnRagFileProjectNumber(
+    manifest: ReturnType<typeof domainManifest>,
+    ragFileName: string,
+    resolved: ResolvedRagCorpus,
+  ): Promise<void> {
+    const parsedFile = parseRagFileResourceName(ragFileName);
+    const parsedCorpus = parseRagCorpusResourceName(resolved.resourceName);
+    if (!parsedFile || !parsedCorpus || !/^[1-9][0-9]*$/.test(parsedFile.project)) return;
+    if (parsedFile.location !== parsedCorpus.location || parsedFile.corpusId !== parsedCorpus.corpusId) return;
+    const key = ragCorpusProjectAliasKey(manifest.gcp_project, parsedCorpus.location, parsedCorpus.corpusId);
+    if (parsedFile.project === parsedCorpus.project || this.ragCorpusProjectAliases.get(key)?.has(parsedFile.project)) return;
+    let number: string;
+    try {
+      number = await this.google.projectNumber(manifest.gcp_project);
+    } catch {
+      return;
+    }
+    if (number === parsedFile.project) {
+      this.rememberRagCorpusProjectAlias(manifest.gcp_project, parsedCorpus.location, parsedCorpus.corpusId, number);
+    }
+  }
+
   private rememberListedRagFileProjects(
     manifest: ReturnType<typeof domainManifest>,
     resolved: ResolvedRagCorpus,
@@ -4951,6 +4979,19 @@ class GoogleRuntimeClient {
     }
   }
 
+  // The project number Resource Manager reports for a configured project id.
+  // Vertex spells resources either way; only this lookup links the two.
+  async projectNumber(project: string): Promise<string> {
+    const cached = this.projectNumbers.get(project);
+    if (cached) return cached;
+    const resource = asOptionalRecord(await this.googleJson(`https://cloudresourcemanager.googleapis.com/v1/projects/${project}`));
+    if (resource?.projectId !== project || typeof resource.projectNumber !== 'string' || !/^[1-9][0-9]*$/.test(resource.projectNumber)) {
+      throw new DomainExpertWorkerError(502, 'google_project_identity_invalid', 'The configured project identity could not be verified.');
+    }
+    this.projectNumbers.set(project, resource.projectNumber);
+    return resource.projectNumber;
+  }
+
   async validateCreationOperationName(project: string, location: string, value: unknown, response?: unknown): Promise<{ name: string; parents: string[] }> {
     requireGoogleProject(project);
     // A numeric candidate still must match the configured location before any
@@ -4965,20 +5006,15 @@ class GoogleRuntimeClient {
       // Vertex can use the project number where configuration names the id.
       // Only Resource Manager establishes that alias; an operation's own
       // spelling can never confer authority to poll a different project.
-      let number = this.projectNumbers.get(project);
-      if (!number) {
-        let resource;
-        try {
-          resource = asOptionalRecord(await this.googleJson(`https://cloudresourcemanager.googleapis.com/v1/projects/${project}`));
-        } catch (error) {
-          if (!(error instanceof DomainExpertWorkerError) || error.code !== 'google_api_error') throw error;
+      let number: string;
+      try {
+        number = await this.projectNumber(project);
+      } catch (error) {
+        if (!(error instanceof DomainExpertWorkerError)) throw error;
+        if (error.code === 'google_api_error') {
           throw new DomainExpertWorkerError(error.status, 'rag_corpus_creation_project_identity_unavailable', 'The submitted corpus operation is retained, but its project alias cannot currently be verified. Restore Resource Manager project lookup access and resume.');
         }
-        if (resource?.projectId !== project || typeof resource.projectNumber !== 'string' || !/^[1-9][0-9]*$/.test(resource.projectNumber)) {
-          throw new DomainExpertWorkerError(502, 'rag_corpus_creation_operation_scope_invalid', 'The corpus creation project identity could not be verified.');
-        }
-        number = resource.projectNumber;
-        this.projectNumbers.set(project, number);
+        throw new DomainExpertWorkerError(502, 'rag_corpus_creation_operation_scope_invalid', 'The corpus creation project identity could not be verified.');
       }
       parents.push(`projects/${number}/locations/${location}`);
       name = validatedVertexOperationName(value, parents);
