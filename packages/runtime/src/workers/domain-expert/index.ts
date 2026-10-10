@@ -91,6 +91,7 @@ import {
 import {
   agentRoutingConfigFromEnv,
   type AgentRoutingConfig,
+  type ExplicitCorpusOperation,
 } from '../../core/agent-routing.ts';
 import {
   DISCLOSURE_REFUSAL_CODES,
@@ -2094,6 +2095,7 @@ export class DomainExpertService {
 
   private async webRagImport(params: RagCorpusParams, dryRun: boolean): Promise<unknown> {
     const manifest = this.manifest(params.domainId);
+    this.requireExplicitCorpus(manifest, 'web_import', params.corpusId);
     const corpusId = params.corpusId ?? defaultCorpusId(manifest);
     const urls = params.urls ?? [];
     if (urls.length === 0 || urls.length > 200) {
@@ -3296,6 +3298,8 @@ export class DomainExpertService {
   private async annasImport(params: AnnasArchiveImportParams): Promise<unknown> {
     const dryRun = params.dryRun ?? true;
     const manifest = this.manifest(params.domainId);
+    // Only an ingest chooses a corpus; a download-only acquisition is unaffected.
+    if (params.ingest) this.requireExplicitCorpus(manifest, 'annas_archive_import', params.corpusId);
     const plan = planAnnasArchiveImport({ ...params, dryRun: true }, manifest);
     if (dryRun) return plan;
     requireApprovalId(params.approvalId, 'annas_archive_import');
@@ -3945,6 +3949,29 @@ export class DomainExpertService {
   /** The corpora agent routing configures this domain to reach, by display name. */
   private configuredCorpusIds(manifest: ReturnType<typeof domainManifest>): string[] {
     return manifest.corpora.map((corpus) => corpus.id);
+  }
+
+  /**
+   * A deployment can list acquisition operations that must name their corpus.
+   * Defaulting to the first configured corpus is right for a single-library
+   * domain and wrong for one whose first corpus is private while acquisitions
+   * belong on a public shelf. Called before any fetch, download, or staging,
+   * and before the dry-run plan, so a planning caller learns the rule first.
+   */
+  private requireExplicitCorpus(
+    manifest: ReturnType<typeof domainManifest>,
+    operation: ExplicitCorpusOperation,
+    requestedCorpusId: string | undefined,
+  ): void {
+    if (requestedCorpusId?.trim()) return;
+    const required = this.agentRouting[manifest.domain_id]?.ingestion?.explicitCorpusRequiredFor;
+    if (!required?.includes(operation)) return;
+    throw new DomainExpertWorkerError(
+      400,
+      'corpus_id_required',
+      `${operation} for domain "${manifest.domain_id}" requires an explicit corpus_id; this deployment does not default it. Configured corpora: ${this.configuredCorpusIds(manifest).join(', ')}.`,
+      'Re-run with corpus_id naming the corpus this source belongs in.',
+    );
   }
 
   /**

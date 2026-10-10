@@ -33,6 +33,7 @@ const count = (description: string, minimum: number, maximum?: number): Record<s
 
 const domainId = text('Registered domain ID. Supply it unless the deployment or current agent binding provides a default.');
 const corpusId = text('Corpus display name, numeric ID, or full Vertex resource name. Must resolve to this domain\'s authorized corpus; omit to use its configured target.');
+const ingestCorpusId = text('Corpus display name, numeric ID, or full Vertex resource name. Must resolve to this domain\'s authorized corpus. Omit to use its configured target, except where the deployment requires an explicit corpus for this operation (refused with corpus_id_required).');
 const dryRun = flag('Defaults to true: return a plan without performing the mutation. Set false only for an authorized operation. Some status/catalog actions always inspect current state.');
 const approvalId = text('Approval reference for the authorized mutation where required. Do not invent approval or supply a credential here.');
 
@@ -103,7 +104,7 @@ export const researchToolSchemas: Record<DomainExpertTool, ToolParameterSchema> 
   rag_corpus: schema('Operate on a registered domain\'s Vertex corpus. ensure reuses an existing corpus or creates it. import needs gcs_uri or drive_file_id; stage_import needs workspace_relative_path; web_import needs urls; notion_import needs urls, page_ids, or database_ids; delete_file needs rag_file_name. Execution is subject to worker approval and destination checks.', {
     action: choice(RAG_CORPUS_ACTIONS, 'Choose the corpus lifecycle or ingestion operation.'),
     domain_id: domainId,
-    corpus_id: corpusId,
+    corpus_id: ingestCorpusId,
     rag_file_name: text('Full Vertex ragFiles resource name; required for delete_file.'),
     page_token: text('Opaque continuation token returned by list_files.'),
     source_id: text('Optional source-registry identifier associated with the import.'),
@@ -151,7 +152,7 @@ export const researchToolSchemas: Record<DomainExpertTool, ToolParameterSchema> 
     annas_archive_id: text('Archive item identifier; required unless url is supplied.'),
     url: text('Archive item URL; required unless annas_archive_id is supplied.'),
     format: choice(ANNAS_ARCHIVE_FORMATS, 'Requested artifact format.'),
-    corpus_id: corpusId,
+    corpus_id: ingestCorpusId,
     title: text('Source title.'),
     author: text('Source author.'),
     year: text('Publication year as text.'),

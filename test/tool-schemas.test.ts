@@ -49,6 +49,8 @@ describe('research tool schema guidance', () => {
     expect(researchToolSchemas.domain_doc.description).toContain('range_start and range_end');
     expect(researchToolSchemas.domain_ask.properties.domain_id!.description).toContain('provides a default');
     expect(researchToolSchemas.annas_archive_import.required).toContain('copyright_posture');
+    expect(researchToolSchemas.annas_archive_import.properties.corpus_id!.description).toContain('corpus_id_required');
+    expect(researchToolSchemas.rag_corpus.properties.corpus_id!.description).toContain('requires an explicit corpus');
   });
 
   test('advertised registration, corpus, registry, document, and acquisition plans reach the worker', async () => {
