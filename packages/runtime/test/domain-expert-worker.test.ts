@@ -5,6 +5,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   rmSync,
   writeFileSync,
 } from 'node:fs';
@@ -1396,6 +1397,137 @@ describe('web_import extraction through summarize', () => {
       expect(body).not.toContain('neutral-user');
     } finally {
       fixture.cleanup();
+    }
+  });
+});
+
+describe('explicit corpus requirement for acquisitions', () => {
+  const SHELVED_ROUTING = {
+    library: { bucket: 'fixture-shared-library', prefix: 'v1' },
+    targetCorpusDisplayName: 'research-library',
+    servingCorpusDisplayNames: ['research-library', 'history-library'],
+  };
+
+  function explicitCorpusFixture(ingestion?: Record<string, unknown>) {
+    const fixture = workspaceFixture();
+    const booksRoot = join(fixture.base, 'books');
+    mkdirSync(booksRoot);
+    const upstream: string[] = [];
+    const worker = createDomainExpertWorker({
+      roots: [rootPolicy(fixture.workspaceRoot)],
+      dataDir: join(fixture.base, 'data'),
+      agentRouting: validateAgentRoutingConfig({
+        research: { ...SHELVED_ROUTING, ...(ingestion ? { ingestion } : {}) },
+      }),
+      annas: { apiKey: 'fixture-acquisition-token', baseUrl: 'https://annas.example', booksRoot },
+      fetchImpl: (async (input: string | URL | Request) => {
+        upstream.push(input instanceof Request ? input.url : String(input));
+        throw new Error('the refusal must precede any acquisition fetch');
+      }) as unknown as typeof fetch,
+      google: { accessToken: 'fixture-google-token', fetchImpl: fakeGoogleFetch([]) },
+      resolveHostImpl: async (host: string) => {
+        upstream.push(`resolve:${host}`);
+        return ['93.184.216.34'];
+      },
+      webImportFetchImpl: async (url) => {
+        upstream.push(String(url));
+        return new Response(new Uint8Array([137, 80, 78, 71]), { status: 200, headers: { 'content-type': 'image/png' } });
+      },
+    });
+    return { worker, upstream, fixture, booksRoot };
+  }
+
+  const WEB_IMPORT = {
+    action: 'web_import',
+    domain_id: 'research',
+    urls: ['https://files.example/image.png'],
+    include_media: true,
+    batch_id: 'explicit-corpus',
+  };
+  const ANNAS_INGEST = {
+    domain_id: 'research',
+    annas_archive_id: 'book-one',
+    title: 'The Fixture Book',
+    format: 'epub',
+    copyright_posture: 'approved_fixture_use',
+    approval_id: 'approval-fixture',
+    ingest: true,
+  };
+
+  async function expectCorpusRequired(response: Response, operation: string): Promise<void> {
+    expect(response.status).toBe(400);
+    const body = await response.json() as Record<string, any>;
+    expect(body.error.code).toBe('corpus_id_required');
+    expect(body.error.message).toContain(operation);
+    expect(body.error.message).toContain('research-library, history-library');
+  }
+
+  test('refuses web_import without corpus_id in dry run and live, before any fetch or write', async () => {
+    const gate = explicitCorpusFixture({ explicitCorpusRequiredFor: ['web_import'] });
+    try {
+      await expectCorpusRequired(await postDomainResponse(gate.worker, 'rag_corpus', { ...WEB_IMPORT, dry_run: true }), 'web_import');
+      await expectCorpusRequired(await postDomainResponse(gate.worker, 'rag_corpus', {
+        ...WEB_IMPORT, approval_id: 'approval-fixture', dry_run: false,
+      }), 'web_import');
+      expect(gate.upstream).toEqual([]);
+      expect(existsSync(join(gate.fixture.workspaceRoot, 'experts', 'research', 'sources', 'web-imports'))).toBe(false);
+    } finally {
+      gate.fixture.cleanup();
+    }
+  });
+
+  test('refuses an annas_archive_import ingest without corpus_id in dry run and live, before any download', async () => {
+    const gate = explicitCorpusFixture({ explicitCorpusRequiredFor: ['annas_archive_import'] });
+    try {
+      await expectCorpusRequired(await postDomainResponse(gate.worker, 'annas_archive_import', { ...ANNAS_INGEST, dry_run: true }), 'annas_archive_import');
+      await expectCorpusRequired(await postDomainResponse(gate.worker, 'annas_archive_import', { ...ANNAS_INGEST, dry_run: false }), 'annas_archive_import');
+      expect(gate.upstream).toEqual([]);
+      expect(readdirSync(gate.booksRoot)).toEqual([]);
+      // A download-only acquisition chooses no corpus, so it is not gated.
+      const downloadPlan = await postDomain(gate.worker, 'annas_archive_import', { ...ANNAS_INGEST, ingest: false, dry_run: true });
+      expect(downloadPlan.rag_ingest).toEqual({ status: 'not_requested' });
+    } finally {
+      gate.fixture.cleanup();
+    }
+  });
+
+  test('an operation not listed keeps defaulting to the first configured corpus', async () => {
+    const gate = explicitCorpusFixture({ explicitCorpusRequiredFor: ['annas_archive_import'] });
+    try {
+      const web = await postDomain(gate.worker, 'rag_corpus', { ...WEB_IMPORT, dry_run: true });
+      expect(web.status).toBe('dry_run_web_import_ready');
+      expect(web.resolved_corpus.display_name).toBe('research-library');
+    } finally {
+      gate.fixture.cleanup();
+    }
+  });
+
+  test('without the setting, both operations default exactly as before', async () => {
+    const gate = explicitCorpusFixture();
+    try {
+      const plan = await postDomain(gate.worker, 'annas_archive_import', { ...ANNAS_INGEST, dry_run: true });
+      expect(plan.rag_ingest).toMatchObject({ status: 'planned', target_corpus_id: 'research-library', target_corpus_source: 'domain_default' });
+      const web = await postDomain(gate.worker, 'rag_corpus', { ...WEB_IMPORT, dry_run: true });
+      expect(web.status).toBe('dry_run_web_import_ready');
+      expect(web.resolved_corpus.display_name).toBe('research-library');
+    } finally {
+      gate.fixture.cleanup();
+    }
+  });
+
+  test('with corpus_id named, both operations proceed against that allowlisted corpus', async () => {
+    const gate = explicitCorpusFixture({ explicitCorpusRequiredFor: ['annas_archive_import', 'web_import'] });
+    try {
+      const plan = await postDomain(gate.worker, 'annas_archive_import', { ...ANNAS_INGEST, corpus_id: 'history-library', dry_run: true });
+      expect(plan.rag_ingest).toMatchObject({ status: 'planned', target_corpus_id: 'history-library', target_corpus_source: 'request' });
+      const web = await postDomain(gate.worker, 'rag_corpus', { ...WEB_IMPORT, corpus_id: 'history-library', dry_run: true });
+      expect(web.status).toBe('dry_run_web_import_ready');
+      expect(web.resolved_corpus.display_name).toBe('history-library');
+      // The allowlist still applies to a named corpus.
+      const outside = await postDomainResponse(gate.worker, 'rag_corpus', { ...WEB_IMPORT, corpus_id: 'unrouted-library', dry_run: true });
+      expect(outside.status).not.toBe(200);
+    } finally {
+      gate.fixture.cleanup();
     }
   });
 });

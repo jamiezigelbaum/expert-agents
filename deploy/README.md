@@ -129,6 +129,22 @@ by the agent repository and is never copied or mutated by this deployment.
 
 Optional `retrieval.preferenceProfilePath` and `ingestion.importResultSink`
 settings are described in [retrieval preferences](../docs/retrieval-preferences.md).
+
+Optional `ingestion.explicitCorpusRequiredFor` lists acquisition operations
+(`annas_archive_import`, `web_import`) that must name `corpus_id`. Without it,
+an import defaults to the first configured corpus (the first
+`servingCorpusDisplayNames` entry, else `targetCorpusDisplayName`). A domain
+whose first corpus is private and whose public acquisitions belong on separate
+shelves sets it so those imports cannot land in the private corpus by default:
+
+```json
+"ingestion": { "explicitCorpusRequiredFor": ["annas_archive_import", "web_import"] }
+```
+
+A listed operation without `corpus_id` is refused with `corpus_id_required`
+before any fetch, download or staging, including in dry runs. An
+`annas_archive_import` without `ingest: true` chooses no corpus and is not
+affected. A named `corpus_id` is still checked against the domain's corpora.
 Provision profiles as private operator files with `root:expert-agents 0640`
 permissions and atomically replace them when reviewed file IDs change.
 

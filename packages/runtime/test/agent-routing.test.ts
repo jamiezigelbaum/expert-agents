@@ -31,6 +31,20 @@ describe('agent routing config', () => {
     )).toEqual({ history: { domainId: 'history', ...value.history } });
   });
 
+  test('accepts an explicit-corpus requirement alongside the import result sink', () => {
+    const route = {
+      library: { bucket: 'fixture-bucket', prefix: 'v1' },
+      targetCorpusDisplayName: 'private-library',
+      servingCorpusDisplayNames: ['private-library', 'public-shelf'],
+    };
+    expect(validateAgentRoutingConfig({ history: { ...route, ingestion: { explicitCorpusRequiredFor: ['annas_archive_import', 'web_import'] } } }).history!.ingestion)
+      .toEqual({ explicitCorpusRequiredFor: ['annas_archive_import', 'web_import'] });
+    expect(validateAgentRoutingConfig({ history: { ...route, ingestion: { importResultSink: 'client', explicitCorpusRequiredFor: ['web_import'] } } }).history!.ingestion)
+      .toEqual({ importResultSink: 'client', explicitCorpusRequiredFor: ['web_import'] });
+    expect(validateAgentRoutingConfig({ history: { ...route, ingestion: { importResultSink: 'gcs' } } }).history!.ingestion)
+      .toEqual({ importResultSink: 'gcs' });
+  });
+
   test('rejects malformed, unknown, and invalid routing fields without echoing values', () => {
     const sensitiveValue = 'private-fixture-value';
     const invalidCases: unknown[] = [
@@ -45,6 +59,12 @@ describe('agent routing config', () => {
       { history: { library: { bucket: 'fixture-bucket', prefix: 'v1' }, targetCorpusDisplayName: 'primary', servingCorpusDisplayNames: [] } },
       { history: { library: { bucket: 'fixture-bucket', prefix: 'v1' }, targetCorpusDisplayName: 'primary', servingCorpusDisplayNames: ['a', 'a'] } },
       { history: { library: { bucket: 'fixture-bucket', prefix: 'v1' }, targetCorpusDisplayName: 'primary', servingCorpusDisplayNames: [sensitiveValue, ''] } },
+      { history: { library: { bucket: 'fixture-bucket', prefix: 'v1' }, targetCorpusDisplayName: 'primary', ingestion: { explicitCorpusRequiredFor: [] } } },
+      { history: { library: { bucket: 'fixture-bucket', prefix: 'v1' }, targetCorpusDisplayName: 'primary', ingestion: { explicitCorpusRequiredFor: 'web_import' } } },
+      { history: { library: { bucket: 'fixture-bucket', prefix: 'v1' }, targetCorpusDisplayName: 'primary', ingestion: { explicitCorpusRequiredFor: ['web_import', 'web_import'] } } },
+      { history: { library: { bucket: 'fixture-bucket', prefix: 'v1' }, targetCorpusDisplayName: 'primary', ingestion: { explicitCorpusRequiredFor: [sensitiveValue] } } },
+      { history: { library: { bucket: 'fixture-bucket', prefix: 'v1' }, targetCorpusDisplayName: 'primary', ingestion: { explicitCorpusRequiredFor: ['stage_import'] } } },
+      { history: { library: { bucket: 'fixture-bucket', prefix: 'v1' }, targetCorpusDisplayName: 'primary', ingestion: { explicitCorpusRequiredFor: [1] } } },
     ];
 
     for (const invalid of invalidCases) {

@@ -22,9 +22,19 @@ export interface AgentRoutingRetrievalConfig {
   preferenceProfilePath?: string;
 }
 
+/** Acquisition operations a deployment can require to name their corpus explicitly. */
+export const EXPLICIT_CORPUS_OPERATIONS = ['annas_archive_import', 'web_import'] as const;
+export type ExplicitCorpusOperation = typeof EXPLICIT_CORPUS_OPERATIONS[number];
+
 export interface AgentRoutingIngestionConfig {
   /** Optional provider-written result receipts. Client submission receipts are always retained. */
   importResultSink?: 'client' | 'gcs';
+  /**
+   * Optional. Operations listed here are refused without an explicit corpus_id
+   * instead of defaulting to the domain's first configured corpus. Absent, every
+   * operation keeps defaulting as before.
+   */
+  explicitCorpusRequiredFor?: ExplicitCorpusOperation[];
 }
 
 export interface AgentRoutingEntry {
@@ -212,11 +222,31 @@ function validateRetrieval(value: unknown): AgentRoutingRetrievalConfig {
 
 function validateIngestion(value: unknown): AgentRoutingIngestionConfig {
   const ingestion = requireRecord(value, 'an entry ingestion must be an object');
-  requireExactKeys(ingestion, ['importResultSink'], 'an entry ingestion');
+  requireExactKeys(ingestion, ['importResultSink', 'explicitCorpusRequiredFor'], 'an entry ingestion');
   if (ingestion.importResultSink !== undefined && ingestion.importResultSink !== 'client' && ingestion.importResultSink !== 'gcs') {
     throw new AgentRoutingConfigError('an entry ingestion importResultSink must be client or gcs');
   }
-  return Object.freeze(ingestion.importResultSink === undefined ? {} : { importResultSink: ingestion.importResultSink });
+  const explicitCorpusRequiredFor = ingestion.explicitCorpusRequiredFor === undefined
+    ? undefined
+    : validateExplicitCorpusOperations(ingestion.explicitCorpusRequiredFor);
+  return Object.freeze({
+    ...(ingestion.importResultSink === undefined ? {} : { importResultSink: ingestion.importResultSink }),
+    ...(explicitCorpusRequiredFor ? { explicitCorpusRequiredFor } : {}),
+  }) as AgentRoutingIngestionConfig;
+}
+
+function validateExplicitCorpusOperations(value: unknown): ExplicitCorpusOperation[] {
+  const allowed: readonly string[] = EXPLICIT_CORPUS_OPERATIONS;
+  if (!Array.isArray(value) || value.length === 0
+    || value.some((operation) => typeof operation !== 'string' || !allowed.includes(operation))) {
+    throw new AgentRoutingConfigError(
+      `an entry ingestion explicitCorpusRequiredFor must list one or more of: ${EXPLICIT_CORPUS_OPERATIONS.join(', ')}`,
+    );
+  }
+  if (new Set(value).size !== value.length) {
+    throw new AgentRoutingConfigError('an entry ingestion explicitCorpusRequiredFor has duplicates');
+  }
+  return Object.freeze([...value]) as ExplicitCorpusOperation[];
 }
 
 function requireRecord(value: unknown, message: string): Record<string, unknown> {
