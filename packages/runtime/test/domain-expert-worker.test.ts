@@ -4994,7 +4994,7 @@ describe('configured retrieval preference integration', () => {
     const unrelated = await run([0.8, 0.85], 2);
     expect(unrelated.texts).toEqual(['shelf 0', 'shelf 1', 'shelf 2', 'shelf 3']);
     expect(unrelated.preferences.profile_corpus_floor).toEqual({ min_contexts: 2, added: 0 });
-    expect(() => validateAgentRoutingConfig({ research: { ...TEST_AGENT_ROUTING.research!, retrieval: { profileCorpusMinContexts: 2 } } }))
+    expect(() => validateAgentRoutingConfig({ research: { library: TEST_AGENT_ROUTING.research!.library, targetCorpusDisplayName: 'research-library', retrieval: { profileCorpusMinContexts: 2 } } }))
       .toThrow(/requires preferenceProfilePath/);
   });
 
