@@ -42,6 +42,34 @@ function fixture(text = '# Sample Book\nBody\n\n# References\n' + 'Example Autho
 }
 
 describe('direct library reading', () => {
+  test('serving shelves are catalogued and readable from their ledgers, not the scope alone', async () => {
+    const f = fixture();
+    f.updateScope([]);
+    const ledger = (shelf: string, objectId: string) => Buffer.from(JSON.stringify({ schemaVersion: 1, revision: 1, entries: [
+      { objectId, ragFileId: 'projects/1/locations/us-central1/ragCorpora/9/ragFiles/1', corpusResourceName: 'projects/1/locations/us-central1/ragCorpora/9', importedAtRevision: 1, targetCorpusDisplayName: shelf },
+    ] }));
+    f.stored.set('library/ledgers/shelf.json', ledger('research-shelf', f.id));
+    f.stored.set('library/ledgers/other.json', ledger('someone-elses-shelf', `sha256:${'0'.repeat(64)}`));
+    const listed: string[] = [];
+    const reader = new LibraryReader({
+      download: async (_bucket, name) => f.stored.get(name) ?? null,
+      list: async (_bucket, prefix) => { listed.push(prefix); return [...f.stored.keys()].filter(name => name.startsWith(prefix)); },
+    });
+    const route = { ...f.route, servingCorpusDisplayNames: ['research-library', 'research-shelf'] };
+    // The scope alone selects nothing, exactly as a private-only target corpus does.
+    expect(await reader.run(f.route, { action: 'catalog' })).toMatchObject({ total_objects: 0, catalog_scope: 'canonical_scope' });
+    expect(listed).toEqual([]);
+    const catalog = await reader.run(route, { action: 'catalog', query: 'sample' }) as any;
+    expect(catalog).toMatchObject({ catalog_scope: 'canonical_scope_and_serving_shelves', total_objects: 1 });
+    expect(catalog.objects).toEqual([expect.objectContaining({ object_id: f.id, title: 'Sample Book', shelves: ['research-shelf'] })]);
+    expect(listed).toEqual(['library/ledgers/']);
+    expect(await reader.run(route, { action: 'open', object_id: f.id })).toMatchObject({ object_id: f.id, title: 'Sample Book' });
+    // A shelf the deployment does not serve grants nothing.
+    await expect(reader.run({ ...route, servingCorpusDisplayNames: ['research-library', 'someone-elses-shelf'] }, { action: 'open', object_id: f.id }))
+      .rejects.toMatchObject({ code: 'library_source_not_available' });
+    // Without a lister the reader keeps its scope-only behavior.
+    await expect(f.reader.run(route, { action: 'open', object_id: f.id })).rejects.toMatchObject({ code: 'library_source_not_available' });
+  });
   test('explicit prior source roots remain read-only and domain-specific', async () => {
     const f = fixture();
     const routes = validateAgentRoutingConfig({ research: { ...f.route, readOnlySourceRoots: [{ bucket: 'prior-library', prefix: 'staged/research' }] } });
