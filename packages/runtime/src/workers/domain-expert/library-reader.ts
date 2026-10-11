@@ -23,11 +23,15 @@ export interface LibraryReadRoute {
   readOnlySourceRoots?: LibraryLocationConfig[];
   scopeManifestPath?: string;
   targetCorpusDisplayName: string;
+  /** Shelves this deployment answers from; their ledgered holdings are readable too. */
+  servingCorpusDisplayNames?: readonly string[];
   disclosure?: unknown;
 }
 
 export interface LibraryReadDependencies {
   download(bucket: string, name: string, maxBytes: number, timeoutMs: number): Promise<Uint8Array | null>;
+  /** Object names under a prefix. Without it, only the scope's own selection is readable. */
+  list?: (bucket: string, prefix: string, timeoutMs: number) => Promise<string[]>;
   extractPdf?: (bytes: Uint8Array) => Promise<string>;
 }
 
@@ -108,6 +112,12 @@ export class LibraryReader {
     const master = parseMasterManifest(decode(manifestBytes));
     const plan = planReconciliation(master, scope, { schemaVersion: 1, entries: [] });
     const selected = new Set(plan.imports.map(entry => entry.objectId));
+    // A serving shelf's books are already answerable through domain_ask, so
+    // they are readable and findable by title too. Its ledger, not a copy of
+    // its scope, says what it holds; tombstoned objects stay unreadable.
+    const tombstoned = new Set(master.tombstones.map(entry => entry.objectId));
+    const shelves = await this.servingHoldings(route);
+    for (const id of shelves.keys()) if (!tombstoned.has(id)) selected.add(id);
     const objects = master.objects.filter(object => selected.has(object.id));
     if (params.action === 'catalog') {
       if (params.object_id !== undefined || params.section !== undefined || params.end !== undefined || params.text_revision !== undefined) invalid();
@@ -118,11 +128,12 @@ export class LibraryReader {
       const limit = params.limit ?? 100;
       if (offset > matches.length || limit < 1 || limit > 200) invalid();
       const end = Math.min(matches.length, offset + limit);
-      return { action: 'catalog', catalog_scope: 'canonical_scope',
-        other_holdings: 'Older imports may only appear in rag_corpus list_files. Enumerate all configured shelves before concluding a title is missing; use their name as rag_file_name to read them.',
+      return { action: 'catalog', catalog_scope: shelves.size ? 'canonical_scope_and_serving_shelves' : 'canonical_scope',
+        other_holdings: 'Older imports and private documents outside the canonical library may only appear in rag_corpus list_files; use their name as rag_file_name to read them.',
         library_revision: master.revision, total_objects: matches.length,
         objects: matches.slice(offset, end).map(object => ({ object_id: object.id, title: boundedMetadata(object.title),
-          creator: boundedMetadata(object.creator), media_type: object.mediaType, byte_size: object.byteSize, derivative_kind: object.derivativeKind })),
+          creator: boundedMetadata(object.creator), media_type: object.mediaType, byte_size: object.byteSize, derivative_kind: object.derivativeKind,
+          ...(shelves.has(object.id) ? { shelves: shelves.get(object.id) } : {}) })),
         complete: end === matches.length, next_offset: end === matches.length ? null : end };
     }
     let object: (Pick<LibraryObject, 'title' | 'creator' | 'mediaType' | 'byteSize' | 'relativePath' | 'derivativeKind'> & { id?: Sha256Id }) | undefined = objects.find(object => object.id === params.object_id);
@@ -191,6 +202,32 @@ export class LibraryReader {
       citation: { ...identity, text_revision: revision, offset_unit: 'utf16' },
       extraction: { method, original_completeness: 'unverified',
         coverage_basis: 'stored_representation', ...(method === 'pdf_text_layer' ? pdfCoverage(text, navigation) : {}) } };
+  }
+
+  /** objectId -> serving shelves whose ledger records it, excluding the scope's own corpus. */
+  private async servingHoldings(route: LibraryReadRoute): Promise<Map<Sha256Id, string[]>> {
+    const shelves = new Set((route.servingCorpusDisplayNames ?? []).filter(name => name !== route.targetCorpusDisplayName));
+    const holdings = new Map<Sha256Id, string[]>();
+    if (!shelves.size || !this.dependencies.list) return holdings;
+    const { bucket, prefix } = route.library;
+    const names = (await this.dependencies.list(bucket, `${prefix}/ledgers/`, READ_TIMEOUT_MS))
+      .filter(name => /^[^/]+\.json$/.test(name.slice(prefix.length + '/ledgers/'.length)));
+    for (const name of names.sort()) {
+      const bytes = await this.dependencies.download(bucket, name, MANIFEST_MAX_BYTES, READ_TIMEOUT_MS);
+      if (!bytes) continue;
+      const ledger = JSON.parse(decode(bytes)) as { entries?: unknown };
+      if (!Array.isArray(ledger.entries)) throw new Error('invalid ledger');
+      for (const entry of ledger.entries as Array<Record<string, unknown>>) {
+        const shelf = entry?.targetCorpusDisplayName;
+        if (typeof shelf !== 'string' || !shelves.has(shelf)) continue;
+        if (typeof entry.objectId !== 'string' || !/^sha256:[a-f0-9]{64}$/.test(entry.objectId)) throw new Error('invalid ledger');
+        const id = entry.objectId as Sha256Id;
+        const list = holdings.get(id) ?? [];
+        if (!list.includes(shelf)) list.push(shelf);
+        holdings.set(id, list);
+      }
+    }
+    return holdings;
   }
 }
 

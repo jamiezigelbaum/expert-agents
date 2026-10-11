@@ -20,6 +20,13 @@ export interface AgentRoutingRetrievalConfig {
   multiQuery?: boolean;
   /** An operator-owned, atomically replaced profile. Not a model-supplied path. */
   preferenceProfilePath?: string;
+  /**
+   * With a preference profile and several corpora: the fewest answer contexts
+   * the profile's corpus keeps when it holds passages at least as close as
+   * those already chosen. Pooled ranking otherwise lets a large shelf crowd an
+   * owner's own documents out before the profile ever sees them.
+   */
+  profileCorpusMinContexts?: number;
 }
 
 /** Acquisition operations a deployment can require to name their corpus explicitly. */
@@ -190,7 +197,7 @@ function validateServingCorpora(value: unknown): string[] {
 
 function validateRetrieval(value: unknown): AgentRoutingRetrievalConfig {
   const retrieval = requireRecord(value, 'an entry retrieval must be an object');
-  requireExactKeys(retrieval, ['topK', 'contextLimit', 'reranker', 'multiQuery', 'preferenceProfilePath'], 'an entry retrieval');
+  requireExactKeys(retrieval, ['topK', 'contextLimit', 'reranker', 'multiQuery', 'preferenceProfilePath', 'profileCorpusMinContexts'], 'an entry retrieval');
   const result: AgentRoutingRetrievalConfig = {};
   if (retrieval.topK !== undefined) {
     result.topK = requirePositiveInteger(retrieval.topK, 'an entry retrieval topK', 100);
@@ -216,6 +223,12 @@ function validateRetrieval(value: unknown): AgentRoutingRetrievalConfig {
       throw new AgentRoutingConfigError('an entry retrieval preferenceProfilePath must be an absolute file path');
     }
     result.preferenceProfilePath = path;
+  }
+  if (retrieval.profileCorpusMinContexts !== undefined) {
+    if (result.preferenceProfilePath === undefined) {
+      throw new AgentRoutingConfigError('an entry retrieval profileCorpusMinContexts requires preferenceProfilePath');
+    }
+    result.profileCorpusMinContexts = requirePositiveInteger(retrieval.profileCorpusMinContexts, 'an entry retrieval profileCorpusMinContexts', 100);
   }
   return Object.freeze(result);
 }

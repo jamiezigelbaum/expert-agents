@@ -50,6 +50,16 @@ qualifying clauses. Unknown files retain ordinary weight. A preference is
 neither an access grant nor evidence of the owner's current belief; disclosure
 bounds still apply after selection.
 
+When a domain serves several corpora, they are first ranked as one pool and the
+profile then reorders that pool. A large shelf can fill the pool before the
+profile corpus's boosted files are seen. `retrieval.profileCorpusMinContexts`
+(requires `preferenceProfilePath`) keeps at least that many answer contexts from
+the profile corpus, taken in the profile's order from that corpus's own results,
+replacing the lowest-ranked other passages. Only passages at least as close to
+the question as the farthest one already chosen qualify, so an unrelated
+question is not padded. Results report `profile_corpus_floor` with the count
+added. History mode skips it.
+
 Profiles map Vertex file identities. Reimporting a file with a new ID requires
 an explicit profile update. Keep the original-to-prepared-unit manifest and
 verified import receipt alongside the private profile, with independent backup.

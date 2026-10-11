@@ -763,6 +763,7 @@ export class DomainExpertService {
     });
     this.libraryReader = new LibraryReader({
       download: (bucket, name, maxBytes, timeoutMs) => this.google.downloadLibraryObject(bucket, name, maxBytes, timeoutMs),
+      list: (bucket, prefix, timeoutMs) => this.google.listLibraryObjectNames(bucket, prefix, timeoutMs),
     });
     this.annas = options.annas ?? {};
     this.annasBooksRoot = options.annas?.booksRoot ?? DEFAULT_ANNAS_BOOKS_ROOT;
@@ -1320,6 +1321,8 @@ export class DomainExpertService {
     }
     let rankedLists: Array<Array<Record<string, unknown> & { corpus_id: string }>> = [];
     const queryLists: Array<Array<Record<string, unknown> & { corpus_id: string }>> = queries.map(() => []);
+    // The profile corpus's own per-query lists, before pooling with other shelves.
+    const profileCorpusLists: Array<Array<Record<string, unknown> & { corpus_id: string }>> = [];
     const usedCorpora = new Map<string, ResolvedRagCorpus>();
     // Every corpus x query retrieval runs at once; results are consumed in
     // corpus then query order so fusion stays deterministic.
@@ -1358,6 +1361,7 @@ export class DomainExpertService {
         }));
         rankedLists.push(tagged);
         queryLists[queryIndex]!.push(...tagged);
+        if (preference && resolved.resourceName === preference.profile.corpus) profileCorpusLists.push(tagged);
       }
     }
     if (firstFatal !== undefined && (resolvedCorpora.length === 1 || rankedLists.length === 0)) throw firstFatal;
@@ -1390,7 +1394,7 @@ export class DomainExpertService {
       preference && preferenceMode === 'preferred' ? topK : synthesisContextLimit);
     // Scope bare Vertex file IDs before ranking: identical IDs in another corpus
     // must never inherit this profile's editorial weight.
-    const preferred = preference ? applyRetrievalPreferences(candidates.map((context) => {
+    const preferenceInput = (context: Record<string, unknown> & { corpus_id: string }) => {
       const fileId = (context.chunk as { fileId?: unknown } | undefined)?.fileId;
       const resource = usedCorpora.get(context.corpus_id)?.resourceName;
       return {
@@ -1399,8 +1403,41 @@ export class DomainExpertService {
         ...(typeof context.sourceUri === 'string' ? { sourceUri: context.sourceUri } : {}),
         ...(typeof fileId === 'string' ? { chunk: { fileId: fileId.includes('/') ? fileId : `${resource}/ragFiles/${fileId}` } } : {}),
       };
-    }), preference.profile, { corpus: preference.profile.corpus, mode: preferenceMode, limit: synthesisContextLimit }) : undefined;
-    const fusedContexts = preferred ? preferred.contexts.map((context) => context.original) : candidates;
+    };
+    const preferred = preference ? applyRetrievalPreferences(candidates.map(preferenceInput), preference.profile,
+      { corpus: preference.profile.corpus, mode: preferenceMode, limit: synthesisContextLimit }) : undefined;
+    let fusedContexts = preferred ? preferred.contexts.map((context) => context.original) : candidates;
+    // The pooled cut above ranks every shelf together, so a large public shelf
+    // can push the profile corpus out before its editorial weights apply. Keep
+    // a floor of its own preference-ranked passages, admitting only those at
+    // least as close to the question as the farthest passage already chosen,
+    // so an unrelated question is not padded with them.
+    const profileFloor = Math.min(retrievalOverrides?.profileCorpusMinContexts ?? 0, synthesisContextLimit);
+    let profileFloorAdded = 0;
+    if (preference && preferenceMode === 'preferred' && profileFloor > 0 && resolvedCorpora.length > 1 && profileCorpusLists.length) {
+      const inProfileCorpus = (context: { corpus_id: string }) =>
+        usedCorpora.get(context.corpus_id)?.resourceName === preference.profile.corpus;
+      const present = fusedContexts.filter(inProfileCorpus).length;
+      if (present < profileFloor) {
+        const own = applyRetrievalPreferences(reciprocalRankFuse(profileCorpusLists, topK).map(preferenceInput), preference.profile,
+          { corpus: preference.profile.corpus, mode: preferenceMode, limit: synthesisContextLimit }).contexts.map((context) => context.original);
+        const chosen = new Set(fusedContexts.map(retrievedContextDedupeKey));
+        const distances = fusedContexts.map((context) => context.score).filter((score): score is number => typeof score === 'number');
+        const farthest = distances.length ? Math.max(...distances) : Number.NEGATIVE_INFINITY;
+        const additions = own.filter((context) => !chosen.has(retrievedContextDedupeKey(context))
+          && typeof context.score === 'number' && context.score <= farthest).slice(0, profileFloor - present);
+        let excess = fusedContexts.length + additions.length - synthesisContextLimit;
+        const kept = [...fusedContexts];
+        for (let index = kept.length - 1; index >= 0 && excess > 0; index -= 1) {
+          if (!inProfileCorpus(kept[index]!)) {
+            kept.splice(index, 1);
+            excess -= 1;
+          }
+        }
+        fusedContexts = [...kept, ...additions];
+        profileFloorAdded = additions.length;
+      }
+    }
     // Sentence completion runs before the disclosure bound, so a declared
     // posture measures, and may still trim, the completed text.
     const completedContexts = await this.completePassageSentences(fusedContexts);
@@ -1441,6 +1478,7 @@ export class DomainExpertService {
         status: preference ? 'applied' : preferencePath ? 'bypassed' : 'unconfigured',
         ...(preference ? { profile_sha256: preference.sha256, unit_count: preference.profile.units.length,
           diagnostics: preferred?.diagnostics } : {}),
+        ...(profileFloor > 0 && preference ? { profile_corpus_floor: { min_contexts: profileFloor, added: profileFloorAdded } } : {}),
       } } : {}),
       domain_id: manifest.domain_id,
       question,
@@ -5530,6 +5568,25 @@ class GoogleRuntimeClient {
       throw googleError(response, body);
     }
     return new Uint8Array(await response.arrayBuffer());
+  }
+
+  async listLibraryObjectNames(bucket: string, prefix: string, timeoutMs: number): Promise<string[]> {
+    const names: string[] = [];
+    let pageToken: string | undefined;
+    do {
+      const response = await this.authedFetch(
+        `https://storage.googleapis.com/storage/v1/b/${encodeURIComponent(bucket)}/o?prefix=${encodeURIComponent(prefix)}&fields=items(name),nextPageToken${pageToken ? `&pageToken=${encodeURIComponent(pageToken)}` : ''}`,
+        {}, timeoutMs,
+      );
+      const body = asOptionalRecord(await responseTextOrJson(response)) ?? {};
+      if (!response.ok) throw new LibraryReadError('library_read_unavailable', 'The source or library state could not be read or validated.', 502);
+      for (const item of Array.isArray(body.items) ? body.items : []) {
+        const name = asOptionalRecord(item)?.name;
+        if (typeof name === 'string') names.push(name);
+      }
+      pageToken = typeof body.nextPageToken === 'string' ? body.nextPageToken : undefined;
+    } while (pageToken && names.length < 10_000);
+    return names;
   }
 
   async downloadLibraryObject(bucket: string, objectName: string, maxBytes: number, timeoutMs: number): Promise<Uint8Array | null> {

@@ -11,7 +11,12 @@ such as reading a complete bibliography and checking its entries against holding
    titles, creators, media types, sizes, and derivative kinds. Paginate until
    `complete: true` when checking all holdings. Title search is case-insensitive;
    edition selection remains explicit, and objects without title metadata will
-   only appear in the unfiltered catalog.
+   only appear in the unfiltered catalog. When the domain serves shelves
+   (`servingCorpusDisplayNames`), the catalog also lists every object a serving
+   shelf's ledger (`<prefix>/ledgers/*.json`) records for that shelf, tagged
+   with `shelves`; those objects are readable by object ID like scoped ones.
+   A private target corpus outside the shared library contributes nothing here;
+   its files stay reachable through `rag_corpus list_files` and `rag_file_name`.
 2. `open` with an object ID returns text length, `text_revision`, and a paginated
    outline. Headings have an index and exclusive start/end offsets. Duplicate
    headings remain separate; check the text to distinguish a contents entry from

@@ -4931,6 +4931,73 @@ describe('configured retrieval preference integration', () => {
     });
   });
 
+  // 2026-10-11: pooled shelves crowded the owner's own documents out of an
+  // answer about the owner's writing before the profile could weigh them.
+  test('keeps a floor of profile-corpus passages that a pooled shelf would crowd out', async () => {
+    const shelf = 'projects/fixture-project/locations/us-central1/ragCorpora/4001';
+    const run = async (ownScores: number[], floor?: number) => {
+      const root = mkdtempSync(join(tmpdir(), 'profile-floor-'));
+      const path = join(root, 'profile.json');
+      writeFileSync(path, JSON.stringify(profile()));
+      const calls: CapturedCall[] = [];
+      const own = [
+        { id: 'own-plain', text: 'own plain', sourceUri: 'gs://fixture/own-plain.md', score: ownScores[0], chunk: { fileId: 'own-plain-file' } },
+        { id: 'own-anchor', text: 'own anchor', sourceUri: 'gs://fixture/own-anchor.md', score: ownScores[1], chunk: { fileId: 'reviewed-file' } },
+        { id: 'own-far', text: 'own far', sourceUri: 'gs://fixture/own-far.md', score: 0.9, chunk: { fileId: 'own-far-file' } },
+      ];
+      const shelved = Array.from({ length: 6 }, (_, index) => ({
+        id: `shelf-${index}`, text: `shelf ${index}`, sourceUri: `gs://fixture/shelf-${index}.md`, score: 0.4 + index / 100,
+        chunk: { fileId: `shelf-file-${index}` },
+      }));
+      const inner = fakeGoogleFetch(calls, {
+        ragCorpora: [{ name: corpus, displayName: 'research-library' }, { name: shelf, displayName: 'research-shelf' }],
+      });
+      const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
+        const url = String(input instanceof Request ? input.url : input);
+        if (url.endsWith(':retrieveContexts')) {
+          return jsonResponse({ contexts: { contexts: String(init?.body).includes(shelf) ? shelved : own } });
+        }
+        if (url.endsWith(':rank')) {
+          // The pooled ranker prefers every shelf passage to the owner's.
+          const records = JSON.parse(String(init?.body)).records as Array<{ id: string; content: string }>;
+          const order = [...records].sort((left, right) => Number(right.content.startsWith('shelf')) - Number(left.content.startsWith('shelf'))
+            || left.content.localeCompare(right.content));
+          return jsonResponse({ records: order.slice(0, JSON.parse(String(init?.body)).topN).map((record) => ({ id: record.id })) });
+        }
+        return inner(input, init);
+      }) as typeof fetch;
+      const worker = createDomainExpertWorker({
+        gcpProject: 'fixture-project', dataDir: join(root, 'data'),
+        agentRouting: validateAgentRoutingConfig({ research: {
+          library: TEST_AGENT_ROUTING.research!.library,
+          targetCorpusDisplayName: 'research-library',
+          servingCorpusDisplayNames: ['research-library', 'research-shelf'],
+          retrieval: { topK: 6, contextLimit: 4, reranker: 'rank-service', multiQuery: false, preferenceProfilePath: path,
+            ...(floor ? { profileCorpusMinContexts: floor } : {}) },
+        } }),
+        google: { accessToken: 'fixture-google-token', fetchImpl },
+      });
+      try {
+        const result = await postDomain(worker, 'domain_ask', { ...request, output: 'passages' });
+        return { texts: result.passages.map((passage: { text: string }) => passage.text), preferences: result.retrieval_preferences };
+      } finally { rmSync(root, { recursive: true, force: true }); }
+    };
+
+    // Without a floor the pooled cut leaves only shelf passages.
+    expect((await run([0.35, 0.3])).texts).toEqual(['shelf 0', 'shelf 1', 'shelf 2', 'shelf 3']);
+    // With one, the closest owner passages replace the lowest shelf passages,
+    // in the profile's order (the selected unit first); the far one stays out.
+    const kept = await run([0.35, 0.3], 2);
+    expect(kept.texts).toEqual(['shelf 0', 'shelf 1', 'own anchor', 'own plain']);
+    expect(kept.preferences.profile_corpus_floor).toEqual({ min_contexts: 2, added: 2 });
+    // An unrelated question: owner passages farther than every chosen one are not padded in.
+    const unrelated = await run([0.8, 0.85], 2);
+    expect(unrelated.texts).toEqual(['shelf 0', 'shelf 1', 'shelf 2', 'shelf 3']);
+    expect(unrelated.preferences.profile_corpus_floor).toEqual({ min_contexts: 2, added: 0 });
+    expect(() => validateAgentRoutingConfig({ research: { ...TEST_AGENT_ROUTING.research!, retrieval: { profileCorpusMinContexts: 2 } } }))
+      .toThrow(/requires preferenceProfilePath/);
+  });
+
   test('rejects unknown retrieval mode before loading preferences or calling providers', async () => {
     await fixture(async ({ worker, calls }) => {
       const response = await postDomainResponse(worker, 'domain_ask', { ...request, retrieval_mode: 'source-text-instruction' });
