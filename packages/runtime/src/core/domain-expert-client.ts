@@ -20,6 +20,8 @@ export interface DomainExpertTransport {
 }
 
 const WORKER_ERROR_MESSAGES: Readonly<Record<string, string>> = Object.freeze({
+  retrieval_preferences_corpus_mismatch: 'The retrieval preference profile does not match the resolved corpus. Retry with retrieval_mode history and report the profile binding.',
+  retrieval_preferences_unavailable: 'The retrieval preference profile could not be validated. Retry with retrieval_mode history and report the profile.',
   library_read_disclosure_restricted: 'Direct reading is unavailable on a disclosure-bounded deployment. Use domain_ask.',
   library_read_not_configured: 'Direct reading requires an operator-configured library scope manifest.',
   library_read_scope_mismatch: 'The library scope does not match the configured corpus.',

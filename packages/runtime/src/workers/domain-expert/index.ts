@@ -1254,13 +1254,14 @@ export class DomainExpertService {
     const retrievalOverrides = this.agentRouting[manifest.domain_id]?.retrieval;
     const preferencePath = retrievalOverrides?.preferenceProfilePath;
     // History is an explicit recovery path even when an operator profile is unavailable.
-    const preference = preferencePath && params.retrievalMode !== 'history'
+    let preference = preferencePath && params.retrievalMode !== 'history'
       ? await loadRetrievalPreferenceFile(preferencePath).catch(() => {
         throw new DomainExpertWorkerError(503, 'retrieval_preferences_unavailable',
           'Configured retrieval preferences could not be validated.',
           'Repair the operator profile or explicitly request retrieval_mode history.');
       }) : undefined;
-    const preferenceMode = params.retrievalMode ?? preference?.profile.query_layer.default_mode ?? 'history';
+    let preferenceMode = params.retrievalMode ?? preference?.profile.query_layer.default_mode ?? 'history';
+    let preferenceOutOfScope = false;
     const topK = Math.min(params.maxResults ?? retrievalOverrides?.topK ?? this.google.retrievalTopK(),
       preference?.profile.query_layer.candidate_top_k ?? Number.POSITIVE_INFINITY);
     const answerContextLimit = Math.min(
@@ -1290,7 +1291,17 @@ export class DomainExpertService {
         'Run rag_corpus create for at least one requested corpus before asking.',
       );
     }
-    if (preference && !resolvedCorpora.some((corpus) => corpus.resourceName === preference.profile.corpus)) {
+    // 2026-10-14 (Olympus#383): a caller that scopes an ask to shelves other
+    // than the profile's corpus gets plain semantic ranking. The mismatch
+    // guard still catches a profile bound to the wrong resource: same corpus
+    // number in another project, or an unscoped ask that misses it.
+    if (preference && (params.corpusId || params.corpora?.length)
+      && !resolvedCorpora.some((corpus) => ragCorpusNumber(corpus.resourceName) === ragCorpusNumber(preference!.profile.corpus))) {
+      preference = undefined;
+      preferenceMode = 'history';
+      preferenceOutOfScope = true;
+    }
+    if (preference && !resolvedCorpora.some((corpus) => corpus.resourceName === preference!.profile.corpus)) {
       throw new DomainExpertWorkerError(409, 'retrieval_preferences_corpus_mismatch',
         'Configured retrieval preferences do not match the resolved corpus.',
         'Repair the operator profile or explicitly request retrieval_mode history.');
@@ -1475,7 +1486,7 @@ export class DomainExpertService {
       ...(preferencePath || params.retrievalMode ? { retrieval_preferences: {
         configured: Boolean(preferencePath),
         mode: preferenceMode,
-        status: preference ? 'applied' : preferencePath ? 'bypassed' : 'unconfigured',
+        status: preference ? 'applied' : preferenceOutOfScope ? 'out_of_scope' : preferencePath ? 'bypassed' : 'unconfigured',
         ...(preference ? { profile_sha256: preference.sha256, unit_count: preference.profile.units.length,
           diagnostics: preferred?.diagnostics } : {}),
         ...(profileFloor > 0 && preference ? { profile_corpus_floor: { min_contexts: profileFloor, added: profileFloorAdded } } : {}),
@@ -6726,6 +6737,10 @@ async function inspectConfiguredScopeManifest(
       parseable: false,
     };
   }
+}
+
+function ragCorpusNumber(resourceName: string): string | undefined {
+  return /\/ragCorpora\/([^/]+)$/.exec(resourceName)?.[1];
 }
 
 function ragCorpusWarning(corpusId: string, error: DomainExpertWorkerError): RagCorpusNotFoundWarning {
