@@ -32,7 +32,9 @@ The profile caps that count; it does not expand an explicit `max_results`.
 `contextLimit` still bounds synthesis. The profile corpus must exactly match a
 resolved, authorized Vertex resource, including its project identifier. Use
 the resource returned by Vertex rather than guessing a project ID/number alias.
-Invalid or mismatched configured profiles fail explicitly.
+Invalid or mismatched configured profiles fail explicitly. An ask scoped with
+`corpus_id` or `corpora` to shelves that exclude the profile's corpus is not a
+mismatch: it ranks like history and reports status `out_of_scope`.
 
 `domain_ask` accepts `retrieval_mode: "preferred" | "history"`. The default is
 the profile's mode. History preserves normal retrieval order and bypasses file
