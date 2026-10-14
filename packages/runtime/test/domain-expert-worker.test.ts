@@ -4998,9 +4998,9 @@ describe('configured retrieval preference integration', () => {
       .toThrow(/requires preferenceProfilePath/);
   });
 
-  // 2026-10-14 (Olympus#383): Solon's probe of a public shelf it had just
-  // imported into failed with a bare 409 because the profile names the
-  // owner's private corpus, which a shelf-scoped ask never resolves.
+  // 2026-10-14: an agent's probe of a public shelf it had just imported into
+  // failed with a bare 409 because the profile names the owner's private
+  // corpus, which a shelf-scoped ask never resolves.
   test('an ask scoped to another shelf ranks without the profile instead of failing', async () => {
     const shelf = 'projects/fixture-project/locations/us-central1/ragCorpora/4001';
     const root = mkdtempSync(join(tmpdir(), 'profile-scope-'));

@@ -1291,7 +1291,7 @@ export class DomainExpertService {
         'Run rag_corpus create for at least one requested corpus before asking.',
       );
     }
-    // 2026-10-14 (Olympus#383): a caller that scopes an ask to shelves other
+    // 2026-10-14: a caller that scopes an ask to shelves other
     // than the profile's corpus gets plain semantic ranking. The mismatch
     // guard still catches a profile bound to the wrong resource: same corpus
     // number in another project, or an unscoped ask that misses it.
