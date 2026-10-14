@@ -4998,6 +4998,36 @@ describe('configured retrieval preference integration', () => {
       .toThrow(/requires preferenceProfilePath/);
   });
 
+  // 2026-10-14: an agent's probe of a public shelf it had just imported into
+  // failed with a bare 409 because the profile names the owner's private
+  // corpus, which a shelf-scoped ask never resolves.
+  test('an ask scoped to another shelf ranks without the profile instead of failing', async () => {
+    const shelf = 'projects/fixture-project/locations/us-central1/ragCorpora/4001';
+    const root = mkdtempSync(join(tmpdir(), 'profile-scope-'));
+    const path = join(root, 'profile.json');
+    writeFileSync(path, JSON.stringify(profile()));
+    const calls: CapturedCall[] = [];
+    const worker = createDomainExpertWorker({
+      gcpProject: 'fixture-project', dataDir: join(root, 'data'),
+      agentRouting: validateAgentRoutingConfig({ research: {
+        library: TEST_AGENT_ROUTING.research!.library,
+        targetCorpusDisplayName: 'research-library',
+        servingCorpusDisplayNames: ['research-library', 'research-shelf'],
+        retrieval: { topK: 6, contextLimit: 4, reranker: 'off', multiQuery: false, preferenceProfilePath: path },
+      } }),
+      google: { accessToken: 'fixture-google-token', fetchImpl: fakeGoogleFetch(calls, {
+        ragCorpora: [{ name: corpus, displayName: 'research-library' }, { name: shelf, displayName: 'research-shelf' }],
+      }) },
+    });
+    try {
+      const scoped = await postDomain(worker, 'domain_ask', { ...request, corpus_id: 'research-shelf', output: 'passages' });
+      expect(scoped.retrieval_preferences).toEqual({ configured: true, mode: 'history', status: 'out_of_scope' });
+      expect(scoped.passages.length).toBeGreaterThan(0);
+      const own = await postDomain(worker, 'domain_ask', { ...request, corpus_id: 'research-library', output: 'passages' });
+      expect(own.retrieval_preferences).toMatchObject({ mode: 'preferred', status: 'applied' });
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
   test('rejects unknown retrieval mode before loading preferences or calling providers', async () => {
     await fixture(async ({ worker, calls }) => {
       const response = await postDomainResponse(worker, 'domain_ask', { ...request, retrieval_mode: 'source-text-instruction' });
