@@ -77,6 +77,25 @@ Install the unit from the active release:
 sudo install -m 0644 -o root -g root /opt/expert-agents/current/deploy/systemd/expert-agents-domain-expert.service /etc/systemd/system/expert-agents-domain-expert.service
 ```
 
+### Packaging an artifact from a commit on the deploy host
+
+When no published release covers the commit you need, build the artifact in a
+scratch directory (never under `/opt`) as the deploying operator, then install
+it exactly like a packaged release. The host needs a git clone over https
+(the `expert-agents` service account has no GitHub credentials and is not
+used) and Bun `1.3.14`:
+
+```sh
+git clone https://github.com/jamiezigelbaum/Expert-Agents.git "$HOME/.rb-tmp/deploy-<sha>"
+cd "$HOME/.rb-tmp/deploy-<sha>" && git checkout <sha>
+bun install --frozen-lockfile && bun run build && bun run package:deploy
+```
+
+Use `dist/deploy-package/.` as `<artifact-dir>` and the full commit sha as the
+version (`/opt/expert-agents/releases/git-<full-sha>`), repoint `current`, then
+restart the unit and require both readiness proofs below. Rollback is the
+procedure in "Roll back to a previous version".
+
 ## Provision configuration and credentials
 
 Use `deploy/systemd/domain-expert.env.example` as the field list, but have the
