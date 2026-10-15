@@ -19,7 +19,8 @@ logs, generated web output, caches, or learning episodes. Secret values are
 injected through a task-scoped credential adapter and must not appear in
 errors or receipts.
 
-Run `bun run verify` before claiming completion. It executes all Bun tests,
-TypeScript checks, builds, boundary scans, and plugin packaging without
-skip-on-missing behavior. Preserve unrelated work and stage files
-intentionally. Never push red; `main` requires a pull request and a green check.
+`bun run verify` is the full gate: all Bun tests, TypeScript checks, builds,
+boundary scans, and plugin packaging without skip-on-missing behavior. Run
+focused checks locally; the full verify and required CI must be green before
+merge, and `main` requires a pull request and a green check. Preserve
+unrelated work and stage files intentionally.
