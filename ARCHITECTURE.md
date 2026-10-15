@@ -18,6 +18,10 @@ manifest, built plugin entry, package metadata, and active skills.
 - No package imports another project's private modules.
 - External knowledge platforms are ordinary public-interface dependencies,
   never privileged runtime dependencies.
+- An owner's personal data (financial, health, credentials, anything Olympus
+  classifies Private or Secret) is not ingested into a cloud corpus; it stays in
+  the owner's local Olympus pipeline. The owner's own documents are classified
+  per document before they are considered for a cloud corpus.
 - Credentials enter only through a task-scoped adapter and are never included
   in tool output, logs, receipts, or Git.
 - Source holdings, workspaces, generated corpora, databases, and logs remain
