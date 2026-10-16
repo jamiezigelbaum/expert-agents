@@ -55,11 +55,11 @@ download stays on disk and the refusal names the path.
 
 **Always acquire the EPUB; take a PDF only when no EPUB of the work is
 offered** (owner ruling). PDF imports with the LLM parser have failed above
-about 500 pages, so the runtime refuses a PDF whose page tree counts more than
-its configured ceiling (default 500) before upload, with
-`annas_pdf_exceeds_parser_page_limit`; the file stays on disk. A long PDF it
-cannot count may still fail its import (`import_failed`, a Vertex internal
-error). For a book that long, look harder for an EPUB, a text edition or a
+about 500 pages, so while imports use that parser (the default) the runtime
+refuses a PDF measured above its configured ceiling (default 500) before
+upload, with `annas_pdf_exceeds_parser_page_limit`; the file stays on disk. A
+long PDF it cannot measure reliably may still fail its import (`import_failed`,
+a Vertex internal error). For a book that long, look harder for an EPUB, a text edition or a
 volume split, and tell the owner a long PDF may not ingest before choosing it.
 Report a refusal or failure with the measured page count (`scale.pages`); do
 not retry the same file. When the owner intends to ingest, search with
