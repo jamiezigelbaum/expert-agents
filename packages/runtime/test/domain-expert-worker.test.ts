@@ -5923,6 +5923,8 @@ describe('acquisition imports for a registered domain', () => {
       expect(imports[0]!.body).toContain(`${IMPORT_PREFIX}research/author---the-fixture-monograph-1989.pdf`);
       // The same bytes again reuse the stored object: nothing new is uploaded.
       const again = await postDomain(f.worker, 'annas_archive_import', { ...PARAMS, ingest: true, corpus_id: CORPUS });
+      expect(again.status).toBe('ingested_existing');
+      expect(again.scale).toMatchObject({ measured: true, pages: 64 });
       expect(again.rag_ingest.gcs_uri).toBe(response.rag_ingest.gcs_uri);
       expect(uploadedObjectNames(f.googleCalls)).toHaveLength(1);
     } finally { f.cleanup(); }
@@ -6060,8 +6062,7 @@ describe('acquisition imports for a registered domain', () => {
       expect(readRegistry().map((record) => record.ingest_status)).toEqual(['import_requested', 'imported']);
       expect(readRegistry()[1]!.gcs_uri).toBe(uri);
       // A later acquisition of the same record with a different year reuses the stored object.
-      const again = await postDomain(worker, 'annas_archive_import', { ...params, year: '1990' });
-      expect(again.rag_ingest.gcs_uri ?? readRegistry().at(-1)!.gcs_uri).toBe(uri);
+      await postDomain(worker, 'annas_archive_import', { ...params, year: '1990' });
       expect(uploadedObjectNames(googleCalls)).toEqual(['v1/book-imports/example/author---the-fixture-monograph-1989.pdf']);
     } finally { fixture.cleanup(); }
   });
