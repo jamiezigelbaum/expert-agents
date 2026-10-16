@@ -141,15 +141,21 @@ itself, so the factory applies it to its own push:
   an owner-only directory, not a symbolic link, whose owner-only `hosts.yml`
   holds a `github.com` token (and whose optional `config.yml` is owner-only).
 - The push runs with the stock `gh auth git-credential` as the only credential
-  helper and `GH_CONFIG_DIR` pointing at the profile. `gh` must be on the
-  Gateway's `PATH`. The token reaches Git only through that helper; it never
-  appears in arguments, environment, state or results.
+  helper and `GH_CONFIG_DIR` pointing at the profile. The token reaches Git
+  only through that helper; it never appears in arguments, environment, state
+  or results.
 - Nothing else on the host can authenticate, redirect or observe that push.
   Inherited credential helpers, askpass programs and hooks are cleared, and
   inherited `GIT_*`, `GH_*` and `GITHUB_*` variables (including ambient tokens)
   are removed. Git reads no global or system configuration, and `HOME` is an
   empty private directory, so host `.netrc` entries, extra headers and URL
-  rewrites do not apply.
+  rewrites do not apply. The repository is created without a Git template, and
+  the push is refused with `factory_repository_git_config` while the
+  repository's own config has URL rewrite, HTTP, include or push-URL settings,
+  for example on an `origin` an operator added by hand.
+- Because of that isolation, `gh` must be a real executable on the Gateway's
+  `PATH` (not a shell shim that depends on `HOME`), and Git proxy or CA
+  settings from global or system config do not apply to this push.
 - No other command receives the identity, and host Git configuration is not
   changed. `remoteCreateCommand` runs with the factory's ordinary environment;
   a command that creates GitHub repositories resolves its own credentials and
