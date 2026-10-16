@@ -59,7 +59,7 @@ export function factoryCommand(github?: FactoryGitHubSelection): FactoryCommand 
       // repository's config, its worktree config and anything they include.
       const settings = await runFactoryCommand(['git', 'config', '--list', '--name-only', '--includes', '-z'], cwd, env);
       if (settings.split('\0').some((name) => REDIRECTING_REPOSITORY_SETTINGS.test(name.trim()))) {
-        throw new FactoryError('factory_repository_git_config', 'The agent repository has its own Git URL rewrite, HTTP, include or push-URL setting that could redirect or authenticate the GitHub push. Remove it, then resume.');
+        throw new FactoryError('factory_repository_git_config', 'The agent repository has its own Git URL rewrite, HTTP, include, push-URL or remote-helper setting that could redirect or authenticate the GitHub push. Remove it, then resume.');
       }
       return await runFactoryCommand(['git', ...GITHUB_GIT_CONFIG, ...argv.slice(1)], cwd, env);
     } catch (error) {

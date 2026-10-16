@@ -151,8 +151,9 @@ itself, so the factory applies it to its own push:
   empty private directory, so host `.netrc` entries, extra headers and URL
   rewrites do not apply. The repository is created without a Git template, and
   the push is refused with `factory_repository_git_config` while the
-  repository's own config has URL rewrite, HTTP, include or push-URL settings,
-  for example on an `origin` an operator added by hand.
+  repository's own config (including worktree config and includes) has URL
+  rewrite, HTTP, include, push-URL or remote-helper settings, for example on an
+  `origin` an operator added by hand.
 - Because of that isolation, `gh` must be a real executable on the Gateway's
   `PATH` (not a shell shim that depends on `HOME`), and Git proxy or CA
   settings from global or system config do not apply to this push.
