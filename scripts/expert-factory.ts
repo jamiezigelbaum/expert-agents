@@ -36,8 +36,8 @@ const GITHUB_GIT_CONFIG = ['-c', 'credential.helper=', '-c', 'credential.helper=
 // reach the push: they could supply another credential, reroute the remote or trace headers.
 const INHERITED_GIT_SETTINGS = /^(GIT_|GH_|GITHUB_|SSH_ASKPASS$|NETRC$|XDG_CONFIG_HOME$)/i;
 // Repository settings that could still redirect, proxy or authenticate the push: URL rewrites,
-// HTTP settings, includes and per-remote push URLs or proxies.
-const REDIRECTING_REPOSITORY_SETTINGS = /^(url\.|http\.|include\.|includeif\.|remote\..+\.(pushurl|proxy|proxyauthmethod)$)/i;
+// HTTP settings, includes, and per-remote push URLs, proxies or remote helpers.
+const REDIRECTING_REPOSITORY_SETTINGS = /^(url\.|http\.|include\.|includeif\.|remote\..+\.(pushurl|proxy|proxyauthmethod|vcs)$)/i;
 
 /** Runs factory commands. Only commands the factory marks as GitHub operations receive the System identity. */
 export function factoryCommand(github?: FactoryGitHubSelection): FactoryCommand {
@@ -55,8 +55,10 @@ export function factoryCommand(github?: FactoryGitHubSelection): FactoryCommand 
       const env: Record<string, string> = {};
       for (const [name, value] of Object.entries(process.env)) if (value !== undefined && !INHERITED_GIT_SETTINGS.test(name)) env[name] = value;
       Object.assign(env, { HOME: home, GH_CONFIG_DIR: profileDir, GIT_CONFIG_GLOBAL: devNull, GIT_CONFIG_NOSYSTEM: '1', GIT_TERMINAL_PROMPT: '0' });
-      const settings = await runFactoryCommand(['git', 'config', '--local', '--name-only', '--list'], cwd, env);
-      if (settings.split('\n').some((name) => REDIRECTING_REPOSITORY_SETTINGS.test(name.trim()))) {
+      // Every setting the push itself reads: with global and system config off, that is the
+      // repository's config, its worktree config and anything they include.
+      const settings = await runFactoryCommand(['git', 'config', '--list', '--name-only', '--includes', '-z'], cwd, env);
+      if (settings.split('\0').some((name) => REDIRECTING_REPOSITORY_SETTINGS.test(name.trim()))) {
         throw new FactoryError('factory_repository_git_config', 'The agent repository has its own Git URL rewrite, HTTP, include or push-URL setting that could redirect or authenticate the GitHub push. Remove it, then resume.');
       }
       return await runFactoryCommand(['git', ...GITHUB_GIT_CONFIG, ...argv.slice(1)], cwd, env);

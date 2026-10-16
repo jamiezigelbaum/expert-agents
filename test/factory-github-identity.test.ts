@@ -166,7 +166,7 @@ describe('factory pushes as the System GitHub identity', () => {
     expect(f.server.seen).not.toContain('host');
     // A repository-settings check, then the push with the stock helper only; both isolated alike.
     expect(result.spawned.map((spawn) => spawn.argv)).toEqual([
-      ['git', 'config', '--local', '--name-only', '--list'],
+      ['git', 'config', '--list', '--name-only', '--includes', '-z'],
       ['git', ...IDENTITY_ARGS, 'push', '--set-upstream', 'origin', 'HEAD'],
     ]);
     expect(result.spawned[0]!.env).toEqual(result.spawned[1]!.env);
@@ -236,16 +236,17 @@ describe('factory pushes as the System GitHub identity', () => {
   }, 30_000);
 
   test.each([
-    ['a push URL', (f: Fixture) => ['remote.origin.pushurl', `file://${f.decoy}`]],
-    ['a URL rewrite', (f: Fixture) => [`url.file://${f.decoy}.insteadOf`, f.remote]],
-    ['an extra HTTP header', () => ['http.extraHeader', `Authorization: Basic ${Buffer.from(`host-user:${HOST}`).toString('base64')}`]],
-    ['an HTTP proxy', () => ['http.proxy', 'http://127.0.0.1:9']],
-    ['an include', (f: Fixture) => ['include.path', join(f.base, 'included.gitconfig')]],
-  ])('refuses a repository whose own settings could redirect or authenticate the push: %s', async (_name, setting) => {
+    ['a push URL', (f: Fixture) => [['remote.origin.pushurl', `file://${f.decoy}`]]],
+    ['a URL rewrite', (f: Fixture) => [[`url.file://${f.decoy}.insteadOf`, f.remote]]],
+    ['a worktree-config URL rewrite', (f: Fixture) => [['extensions.worktreeConfig', 'true'], ['--worktree', `url.file://${f.decoy}.insteadOf`, f.remote]]],
+    ['a remote helper', () => [['remote.origin.vcs', 'example']]],
+    ['an extra HTTP header', () => [['http.extraHeader', `Authorization: Basic ${Buffer.from(`host-user:${HOST}`).toString('base64')}`]]],
+    ['an HTTP proxy', () => [['http.proxy', 'http://127.0.0.1:9']]],
+    ['an include', (f: Fixture) => [['include.path', join(f.base, 'included.gitconfig')]]],
+  ])('refuses a repository whose own settings could redirect or authenticate the push: %s', async (_name, settings) => {
     const f = await fixture();
     await git(f.base, ['init', '--quiet', '--bare', f.decoy]);
-    const [key, value] = setting(f);
-    await git(f.workspace, ['config', key!, value!]);
+    for (const setting of settings(f)) expect((await git(f.workspace, ['config', ...setting])).code).toBe(0);
     const result = await f.run({ identity: true });
     expect(result).toMatchObject({ ok: false, code: 'factory_repository_git_config' });
     expect(result.spawned).toHaveLength(1);
