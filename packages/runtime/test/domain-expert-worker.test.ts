@@ -5926,6 +5926,14 @@ describe('acquisition imports for a registered domain', () => {
     } finally { f.cleanup(); }
   });
 
+  test('a domain with no routing gains no acquisition directory', async () => {
+    const f = registeredFixture();
+    try {
+      const plan = await postDomain(f.worker, 'rag_corpus', { domain_id: 'unrouted-example', action: 'import', dry_run: true });
+      expect(plan.allowed_gcs_prefixes).toEqual([]);
+    } finally { f.cleanup(); }
+  });
+
   test('without a configured import prefix the allowlist is the library alone and acquisitions stay unconfigured', async () => {
     const f = registeredFixture({ importGcsPrefix: undefined });
     try {
