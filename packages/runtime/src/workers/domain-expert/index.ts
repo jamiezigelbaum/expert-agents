@@ -3843,8 +3843,9 @@ export class DomainExpertService {
       try {
         const existing = await this.google.getGcsObjectMetadata(bucket, objectName);
         if (existing && gcsObjectHoldsBytes(existing, bytes)) found.push(`gs://${bucket}/${objectName}`);
-      } catch {
-        // An unreadable name is not a whole copy we know of; the upload's own checks still hold.
+      } catch (error) {
+        // An unreadable name could hold the whole copy; unknown, like a failed listing.
+        return { unknown: annasIngestErrorRecord(error).code };
       }
     }
     if (!found.length) return 'absent';
