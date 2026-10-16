@@ -128,6 +128,8 @@ export async function runFactory(config: FactoryConfig, request: FactoryRequest,
     }
     if (config.remoteUrlTemplate && !state.remotePushed) {
       // Every step here is idempotent, so a crash after the remote exists but before the proof is recorded resumes cleanly.
+      // A resume first records corpus re-checking; a failure here must still report this step.
+      if (state.phase !== 'wiring_remote') await save('wiring_remote');
       const remoteUrl = config.remoteUrlTemplate.replaceAll('{agentId}', spec.agentId);
       if (config.remoteCreateCommand) await io.command([config.remoteCreateCommand, spec.agentId, remoteUrl]);
       const remotes = (await io.command(['git', 'remote'], workspace)).split('\n').map((name) => name.trim()).filter(Boolean);

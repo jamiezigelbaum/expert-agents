@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from 'bun:test';
 import { randomBytes, randomUUID } from 'node:crypto';
-import { chmod, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
+import { chmod, lstat, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { factoryCommand } from '../scripts/expert-factory.ts';
@@ -14,7 +14,7 @@ const MANAGED = `synthetic-managed-credential-${randomUUID()}`;
 const ROTATED = `synthetic-rotated-credential-${randomUUID()}`;
 const HOST = `synthetic-host-credential-${randomUUID()}`;
 const PUSH = ['git', 'push', '--set-upstream', 'origin', 'HEAD'];
-const IDENTITY_ARGS = ['-c', 'credential.helper=', '-c', 'credential.helper=!gh auth git-credential', '-c', 'core.askPass='];
+const IDENTITY_ARGS = ['-c', 'credential.helper=', '-c', 'credential.helper=!gh auth git-credential', '-c', 'core.askPass=', '-c', 'core.hooksPath=/dev/null'];
 const GIT_ISOLATED = { GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' };
 
 const roots: string[] = [];
@@ -25,6 +25,7 @@ afterEach(async () => {
 });
 
 const profileId = () => `ghp_${randomBytes(16).toString('hex')}`;
+const exists = (path: string) => lstat(path).then(() => true, () => false);
 const hostsYaml = (token: string) => `github.com:\n    user: example-user\n    oauth_token: ${token}\n    git_protocol: https\n    users:\n        example-user:\n            oauth_token: ${token}\n`;
 
 async function git(cwd: string, args: string[], env: Record<string, string> = {}): Promise<{ code: number; stdout: string }> {
@@ -122,8 +123,11 @@ catch (error) { console.log(JSON.stringify({ ok: false, code: error.code, messag
   const hostCalls = async () => (await readFile(hostLog, 'utf8').catch(() => '')).split('\n').filter(Boolean);
   const pushed = async () => (await git(bare, ['rev-parse', '--verify', '--quiet', 'refs/heads/main'])).stdout;
   const head = async () => (await git(workspace, ['rev-parse', 'HEAD'])).stdout;
-  return { base, stateDir, id, profileDir, home, bin, bare, remote, workspace, server, gatewayEnv, selection, run, ghCalls, hostCalls, pushed, head };
+  const decoy = join(base, 'decoy.git');
+  const hookLog = join(base, 'hook.log');
+  return { base, stateDir, id, profileDir, home, bin, bare, decoy, hookLog, remote, workspace, server, gatewayEnv, selection, run, ghCalls, hostCalls, pushed, head };
 }
+type Fixture = Awaited<ReturnType<typeof fixture>>;
 
 // CGI bridge to `git http-backend`: a real smart-HTTP Git remote, behind the fixture's authentication.
 async function gitHttpBackend(request: Request, root: string, home: string): Promise<Response> {
@@ -160,8 +164,12 @@ describe('factory pushes as the System GitHub identity', () => {
     // One Git process: the stock helper only, inherited helpers and askpass cleared, nothing else widened.
     expect(result.spawned).toHaveLength(1);
     expect(result.spawned[0]!.argv).toEqual(['git', ...IDENTITY_ARGS, 'push', '--set-upstream', 'origin', 'HEAD']);
-    expect(Object.keys(result.spawned[0]!.env!).sort()).toEqual(['GH_CONFIG_DIR', 'GIT_TERMINAL_PROMPT', 'HOME', 'PATH', 'TMPDIR', 'USER']);
-    expect(result.spawned[0]!.env!.GH_CONFIG_DIR).toBe(f.profileDir);
+    const env = result.spawned[0]!.env!;
+    expect(Object.keys(env).sort()).toEqual(['GH_CONFIG_DIR', 'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_NOSYSTEM', 'GIT_TERMINAL_PROMPT', 'HOME', 'PATH', 'TMPDIR', 'USER']);
+    expect(env).toMatchObject({ GH_CONFIG_DIR: f.profileDir, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1', GIT_TERMINAL_PROMPT: '0' });
+    // The push ran with an empty private HOME that is removed afterwards.
+    expect(env.HOME).not.toBe(f.home);
+    expect(await exists(env.HOME!)).toBe(false);
     const lookups = (await f.ghCalls()).filter((call) => call.args.join(' ') === 'auth git-credential get');
     expect(lookups.length).toBeGreaterThan(0);
     expect(lookups.every((call) => call.configDir === f.profileDir && !call.ghToken && !call.githubToken)).toBe(true);
@@ -170,17 +178,64 @@ describe('factory pushes as the System GitHub identity', () => {
     expect(result.transcript).not.toContain(MANAGED);
   }, 30_000);
 
-  test('ignores ambient tokens, inherited and URL-scoped credential helpers and askpass', async () => {
+  test('ignores ambient tokens, inherited and URL-scoped credential helpers, injected Git config and askpass', async () => {
     const f = await fixture();
-    await writeFile(join(f.home, '.gitconfig'), `[credential]\n\thelper = !${join(f.bin, 'host-helper')}\n[credential "${f.remote}"]\n\thelper = !${join(f.bin, 'host-helper')}\n[core]\n\taskPass = ${join(f.bin, 'host-askpass')}\n`);
-    const result = await f.run({ identity: true, env: { ...f.gatewayEnv, GH_TOKEN: HOST, GITHUB_TOKEN: HOST, GIT_ASKPASS: join(f.bin, 'host-askpass') } });
+    const helper = `!${join(f.bin, 'host-helper')}`;
+    await writeFile(join(f.home, '.gitconfig'), `[credential]\n\thelper = ${helper}\n[credential "${f.remote}"]\n\thelper = ${helper}\n[core]\n\taskPass = ${join(f.bin, 'host-askpass')}\n`);
+    const result = await f.run({ identity: true, env: { ...f.gatewayEnv, GH_TOKEN: HOST, GITHUB_TOKEN: HOST,
+      GIT_ASKPASS: join(f.bin, 'host-askpass'), SSH_ASKPASS: join(f.bin, 'host-askpass'),
+      GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'credential.helper', GIT_CONFIG_VALUE_0: helper,
+      GIT_CONFIG_PARAMETERS: `'credential.helper'='${helper}'`, GIT_TRACE_CURL: join(f.base, 'curl-trace') } });
     expect(result).toMatchObject({ ok: true });
     expect(await f.pushed()).toBe(await f.head());
     expect(f.server.seen).not.toContain('host');
     expect(await f.hostCalls()).toEqual([]);
     expect((await f.ghCalls()).every((call) => !call.ghToken && !call.githubToken)).toBe(true);
-    expect(Object.keys(result.spawned[0]!.env!)).not.toContain('GH_TOKEN');
-    expect(Object.keys(result.spawned[0]!.env!)).not.toContain('GITHUB_TOKEN');
+    expect(Object.keys(result.spawned[0]!.env!).filter((name) => /^(GH_TOKEN|GITHUB_|GIT_ASKPASS|SSH_ASKPASS|GIT_CONFIG_(COUNT|KEY|VALUE|PARAMETERS)|GIT_TRACE)/.test(name))).toEqual([]);
+    expect(await exists(join(f.base, 'curl-trace'))).toBe(false);
+  }, 30_000);
+
+  test.each([
+    ['a netrc entry', async (f: Fixture) => {
+      await writeFile(join(f.home, '.netrc'), `machine 127.0.0.1 login host-user password ${HOST}\n`, { mode: 0o600 });
+    }],
+    ['a global extra Authorization header', async (f: Fixture) => {
+      await writeFile(join(f.home, '.gitconfig'), `[http]\n\textraHeader = Authorization: Basic ${Buffer.from(`host-user:${HOST}`).toString('base64')}\n`);
+    }],
+    ['a global URL rewrite', async (f: Fixture) => {
+      await git(f.base, ['init', '--quiet', '--bare', f.decoy]);
+      await writeFile(join(f.home, '.gitconfig'), `[url "file://${f.decoy}"]\n\tinsteadOf = ${f.remote}\n`);
+    }],
+    ['a global hooks path', async (f: Fixture) => {
+      await mkdir(join(f.base, 'global-hooks'));
+      await writeFile(join(f.base, 'global-hooks', 'pre-push'), `#!/bin/sh\necho "$GH_CONFIG_DIR" >> ${JSON.stringify(f.hookLog)}\n`, { mode: 0o755 });
+      await writeFile(join(f.home, '.gitconfig'), `[core]\n\thooksPath = ${join(f.base, 'global-hooks')}\n`);
+    }],
+    ['a repository pre-push hook', async (f: Fixture) => {
+      await writeFile(join(f.workspace, '.git', 'hooks', 'pre-push'), `#!/bin/sh\necho "$GH_CONFIG_DIR" >> ${JSON.stringify(f.hookLog)}\n`, { mode: 0o755 });
+    }],
+  ])('host Git configuration cannot authenticate, redirect or observe the push: %s', async (_name, configure) => {
+    const f = await fixture();
+    await configure(f);
+    expect(await f.run({ identity: true })).toMatchObject({ ok: true });
+    expect(await f.pushed()).toBe(await f.head());
+    expect(f.server.seen).toContain('managed');
+    expect(f.server.seen).not.toContain('host');
+    expect(await exists(f.hookLog)).toBe(false);
+    expect((await git(f.base, ['--git-dir', f.decoy, 'for-each-ref'])).stdout).toBe('');
+  }, 30_000);
+
+  test('fails closed without asking a host askpass when gh cannot answer', async () => {
+    const f = await fixture();
+    await writeFile(join(f.bin, 'gh'), '#!/bin/sh\ncat >/dev/null\nexit 1\n', { mode: 0o700 });
+    await writeFile(join(f.home, '.gitconfig'), `[core]\n\taskPass = ${join(f.bin, 'host-askpass')}\n`);
+    const askpass = join(f.bin, 'host-askpass');
+    const result = await f.run({ identity: true, env: { ...f.gatewayEnv, GIT_ASKPASS: askpass, SSH_ASKPASS: askpass } });
+    expect(result).toMatchObject({ ok: false, code: 'factory_command_failed' });
+    expect(await f.hostCalls()).toEqual([]);
+    expect(f.server.seen).not.toContain('host');
+    expect(f.server.seen).not.toContain('managed');
+    expect(await f.pushed()).toBe('');
   }, 30_000);
 
   test('negative control: without the identity the same push falls through to the host login and fails', async () => {
@@ -234,7 +289,12 @@ describe('factory pushes as the System GitHub identity', () => {
 });
 
 describe('the System GitHub identity fails closed', () => {
-  const cases: [string, (f: Awaited<ReturnType<typeof fixture>>) => Promise<FactoryGitHubSelection | undefined>, string][] = [
+  const withProfile = async (f: Fixture, change: (dir: string) => Promise<unknown>) => {
+    const id = profileId();
+    await change(await writeProfile(f.stateDir, id, hostsYaml(MANAGED)));
+    return { profileId: id, stateDir: f.stateDir };
+  };
+  const cases: [string, (f: Fixture) => Promise<FactoryGitHubSelection | undefined>, string][] = [
     ['no selection', async () => undefined, 'factory_github_identity_missing'],
     ['tools.github unset', async (f) => ({ stateDir: f.stateDir }), 'factory_github_identity_missing'],
     ['empty profile id', async (f) => ({ profileId: '', stateDir: f.stateDir }), 'factory_github_identity_missing'],
@@ -278,6 +338,16 @@ describe('the System GitHub identity fails closed', () => {
     }, 'factory_github_identity_unavailable'],
     ['group-readable profile directory', async (f) => { await chmod(f.profileDir, 0o750); return f.selection; }, 'factory_github_identity_unavailable'],
     ['world-readable hosts.yml', async (f) => { await chmod(join(f.profileDir, 'hosts.yml'), 0o644); return f.selection; }, 'factory_github_identity_unavailable'],
+    ['hosts.yml that is a FIFO', (f) => withProfile(f, async (dir) => {
+      await rm(join(dir, 'hosts.yml'));
+      expect(Bun.spawnSync(['mkfifo', '-m', '600', join(dir, 'hosts.yml')]).exitCode).toBe(0);
+    }), 'factory_github_identity_unavailable'],
+    ['world-readable config.yml', (f) => withProfile(f, (dir) => writeFile(join(dir, 'config.yml'), 'git_protocol: https\n', { mode: 0o644 })), 'factory_github_identity_unavailable'],
+    ['symlinked config.yml', (f) => withProfile(f, async (dir) => {
+      await writeFile(join(f.base, 'config.yml'), 'git_protocol: https\n', { mode: 0o600 });
+      await symlink(join(f.base, 'config.yml'), join(dir, 'config.yml'));
+    }), 'factory_github_identity_unavailable'],
+    ['unparseable config.yml', (f) => withProfile(f, (dir) => writeFile(join(dir, 'config.yml'), 'aliases:\n  co: [\n', { mode: 0o600 })), 'factory_github_identity_unavailable'],
   ];
 
   test.each(cases)('%s refuses before Git starts and never uses the host login', async (_name, select, code) => {

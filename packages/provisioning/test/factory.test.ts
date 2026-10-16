@@ -717,6 +717,9 @@ describe('conversational expert factory', () => {
       };
       await expect(f.run()).rejects.toMatchObject({ code: 'factory_github_identity_unavailable' });
       expect((await f.run({ action: 'status', agent_id: 'example' })).status).toBe('wiring_remote');
+      // A resume before reconnecting fails the same way and still reports the step it stopped at.
+      await expect(f.resume()).rejects.toMatchObject({ code: 'factory_github_identity_unavailable' });
+      expect((await f.run({ action: 'status', agent_id: 'example' })).status).toBe('wiring_remote');
       expect(f.workers.filter((call) => call.params.dry_run === false)).toHaveLength(0);
       connected = true;
       const result = await f.resume();

@@ -1,5 +1,6 @@
 import { constants } from 'node:fs';
-import { lstat, open } from 'node:fs/promises';
+import { lstat, mkdtemp, open, rm } from 'node:fs/promises';
+import { devNull, tmpdir } from 'node:os';
 import { isAbsolute, join } from 'node:path';
 import { runFactory, FactoryError, type FactoryCommand } from '../packages/provisioning/src/factory.ts';
 import type { FactoryConfig, FactoryGitHubSelection, FactoryRequest } from '../packages/provisioning/src/factory-types.ts';
@@ -27,32 +28,42 @@ export async function executeFactoryEnvelope(value: unknown): Promise<unknown> {
 
 // OpenClaw's managed profile id shape (tools.github.profileId).
 const MANAGED_PROFILE_ID = /^ghp_[a-f0-9]{32}$/;
-// OpenClaw's own worker checkout pattern: inherited credential helpers cleared, the stock gh helper
-// as the only one, and no askpass program, so a missing credential fails instead of prompting.
-const GITHUB_GIT_CONFIG = ['-c', 'credential.helper=', '-c', 'credential.helper=!gh auth git-credential', '-c', 'core.askPass='];
-const AMBIENT_GITHUB_TOKENS = new Set(['GH_TOKEN', 'GITHUB_TOKEN', 'GH_ENTERPRISE_TOKEN', 'GITHUB_ENTERPRISE_TOKEN']);
+// OpenClaw's own worker checkout pattern: inherited credential helpers cleared and the stock gh
+// helper as the only one. No askpass program or hook runs, so a missing credential fails instead
+// of prompting and nothing else sees the profile.
+const GITHUB_GIT_CONFIG = ['-c', 'credential.helper=', '-c', 'credential.helper=!gh auth git-credential', '-c', 'core.askPass=', '-c', `core.hooksPath=${devNull}`];
+// Like OpenClaw's authenticated worker Git, inherited Git, GitHub CLI and askpass settings never
+// reach the push: they could supply another credential, reroute the remote or trace headers.
+const INHERITED_GIT_SETTINGS = /^(GIT_|GH_|GITHUB_|SSH_ASKPASS$|NETRC$|XDG_CONFIG_HOME$)/i;
 
 /** Runs factory commands. Only commands the factory marks as GitHub operations receive the System identity. */
 export function factoryCommand(github?: FactoryGitHubSelection): FactoryCommand {
   return async (argv, cwd, options) => {
     if (!options?.githubIdentity) return runFactoryCommand(argv, cwd);
     if (argv[0] !== 'git') throw new FactoryError('factory_invalid_command', 'Only Git commands can use the System GitHub identity.');
-    const env = await systemGitHubEnvironment(github);
-    try { return await runFactoryCommand(['git', ...GITHUB_GIT_CONFIG, ...argv.slice(1)], cwd, env); }
-    catch (error) {
+    const profileDir = await systemGitHubProfile(github);
+    // An empty private HOME with no global or system Git config: host netrc entries, extra
+    // headers, URL rewrites and hooks cannot authenticate or redirect this push.
+    const home = await mkdtemp(join(tmpdir(), 'expert-factory-github-'));
+    try {
+      const env: Record<string, string> = {};
+      for (const [name, value] of Object.entries(process.env)) if (value !== undefined && !INHERITED_GIT_SETTINGS.test(name)) env[name] = value;
+      Object.assign(env, { HOME: home, GH_CONFIG_DIR: profileDir, GIT_CONFIG_GLOBAL: devNull, GIT_CONFIG_NOSYSTEM: '1', GIT_TERMINAL_PROMPT: '0' });
+      return await runFactoryCommand(['git', ...GITHUB_GIT_CONFIG, ...argv.slice(1)], cwd, env);
+    } catch (error) {
       if (!(error instanceof FactoryError) || error.code !== 'factory_command_failed') throw error;
-      throw new FactoryError('factory_command_failed', 'A required Git command failed as the System GitHub identity. Its private output was withheld; check that identity can write the remote, then resume.');
-    }
+      throw new FactoryError('factory_command_failed', 'A required Git command failed as the System GitHub identity. Its private output was withheld; check that System GitHub is connected and can write the remote, then resume.');
+    } finally { await rm(home, { recursive: true, force: true }); }
   };
 }
 
 /**
- * The child environment for one GitHub Git command: the factory's own environment with ambient
- * tokens removed and `GH_CONFIG_DIR` pointing at the System profile, so the stock helper reads the
- * Gateway-refreshed credential at use time. The profile is validated on every call; a missing,
- * insecure or tokenless profile refuses before Git starts and never reaches host gh logins.
+ * Resolves the System profile for one GitHub Git command. `GH_CONFIG_DIR` then points the stock
+ * helper at it, so gh reads the Gateway-refreshed credential at use time. A missing, insecure or
+ * tokenless profile refuses before Git starts; gh consults the OS keyring only for a profile
+ * without a token, which this check excludes immediately before use.
  */
-export async function systemGitHubEnvironment(github: FactoryGitHubSelection | undefined): Promise<Record<string, string>> {
+async function systemGitHubProfile(github: FactoryGitHubSelection | undefined): Promise<string> {
   const profileId = github?.profileId;
   const stateDir = github?.stateDir;
   if (typeof profileId !== 'string' || !MANAGED_PROFILE_ID.test(profileId) || typeof stateDir !== 'string' || stateDir.length > 4096 || !isAbsolute(stateDir) || /[\x00-\x1F\x7F]/.test(stateDir)) {
@@ -62,27 +73,35 @@ export async function systemGitHubEnvironment(github: FactoryGitHubSelection | u
   if (!await managedProfileHoldsToken(profileDir)) {
     throw new FactoryError('factory_github_identity_unavailable', 'The System GitHub profile is missing, not private or holds no token. Reconnect System GitHub in OpenClaw, then resume; host GitHub logins are never used.');
   }
-  const env: Record<string, string> = {};
-  for (const [name, value] of Object.entries(process.env)) if (value !== undefined && !AMBIENT_GITHUB_TOKENS.has(name)) env[name] = value;
-  return { ...env, GH_CONFIG_DIR: profileDir, GIT_TERMINAL_PROMPT: '0' };
+  return profileDir;
 }
 
-// Mirrors OpenClaw's own profile check: an owner-only real directory whose owner-only hosts.yml,
-// opened without following links, holds a github.com token. The token is never kept or returned.
+// Mirrors OpenClaw's own profile check: an owner-only real directory whose owner-only hosts.yml
+// and optional config.yml parse, and whose hosts.yml holds a github.com token. The token is never
+// kept or returned.
 async function managedProfileHoldsToken(profileDir: string): Promise<boolean> {
   const uid = process.getuid?.();
   try {
     const profile = await lstat(profileDir);
     if (!profile.isDirectory() || (profile.mode & 0o077) !== 0 || (uid !== undefined && profile.uid !== uid)) return false;
-    const hosts = await open(join(profileDir, 'hosts.yml'), constants.O_RDONLY | constants.O_NOFOLLOW);
-    try {
-      const metadata = await hosts.stat();
-      if (!metadata.isFile() || (metadata.mode & 0o077) !== 0 || (uid !== undefined && metadata.uid !== uid) || metadata.size > 64 * 1024) return false;
-      const parsed = Bun.YAML.parse(await hosts.readFile('utf8')) as Record<string, Record<string, unknown> | undefined> | null;
-      const token = parsed?.['github.com']?.oauth_token;
-      return typeof token === 'string' && token.trim() !== '';
-    } finally { await hosts.close(); }
+    await privateYaml(join(profileDir, 'config.yml'), uid).catch((error: unknown) => {
+      if ((error as { code?: string }).code !== 'ENOENT') throw error;
+    });
+    const hosts = await privateYaml(join(profileDir, 'hosts.yml'), uid) as Record<string, Record<string, unknown> | undefined> | null;
+    const token = hosts?.['github.com']?.oauth_token;
+    return typeof token === 'string' && token.trim() !== '';
   } catch { return false; }
+}
+
+// Opened without following links or blocking on a FIFO; anything but a small owner-only regular
+// file that parses as YAML is refused.
+async function privateYaml(path: string, uid: number | undefined): Promise<unknown> {
+  const file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+  try {
+    const metadata = await file.stat();
+    if (!metadata.isFile() || (metadata.mode & 0o077) !== 0 || (uid !== undefined && metadata.uid !== uid) || metadata.size > 64 * 1024) throw new Error('not a private profile file');
+    return Bun.YAML.parse(await file.readFile('utf8'));
+  } finally { await file.close(); }
 }
 
 export async function runFactoryCommand(argv: string[], cwd?: string, env?: Record<string, string>): Promise<string> {
