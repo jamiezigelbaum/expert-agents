@@ -217,7 +217,13 @@ the LLM parser, a PDF longer than
 coverage-checked (ACTIVE ragFile; text layer read with `pdftotext`); the host
 needs `qpdf` and `pdftotext` (poppler-utils) on PATH, and without `qpdf` such a
 PDF above `EXPERT_AGENTS_DOMAIN_EXPERT_ANNAS_MAX_PDF_PAGES` (default 500) is
-refused instead. After submission
+refused instead. Only this acquisition path splits: a long PDF reaching the
+corpus through `stage_import`, `rag_corpus import` of a GCS object or the
+library materializer is still imported whole. A re-run reuses parts only when
+the split reproduces the same bytes (`qpdf --deterministic-id`): changing the
+split size or the installed qpdf version makes new parts, which import beside
+the earlier ones, so remove the earlier parts first. A book already imported
+whole is left whole. After submission
 the worker polls the Vertex operation, starting at
 `EXPERT_AGENTS_DOMAIN_EXPERT_ANNAS_IMPORT_POLL_INTERVAL_MS` (default 5000) and
 growing ×1.5 per read up to 30 s while the import runs (each read counts

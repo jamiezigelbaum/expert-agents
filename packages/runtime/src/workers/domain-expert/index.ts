@@ -3682,7 +3682,7 @@ export class DomainExpertService {
     }
     const conversion = artifact.conversion ? { conversion: artifact.conversion } : {};
     if (artifact.format === 'pdf') {
-      const split = await this.splitLongAnnasPdf(artifact.bytes, sourcePath);
+      const split = await this.splitLongAnnasPdf(artifact.bytes, sourcePath, scale, () => this.wholeAnnasPdfInCorpus(manifest, params, locator, corpusId, artifact.bytes));
       if ('refusal' in split) return { status: 'blocked', ...corpusTarget, error: split.refusal, source_path: sourcePath, ...(split.split ? { split: split.split } : {}) };
       if (split.parts) return this.ingestSplitAnnasPdf(manifest, params, locator, corpusId, corpusTarget, split.pages, split.parts);
     }
@@ -3759,6 +3759,8 @@ export class DomainExpertService {
   private async splitLongAnnasPdf(
     bytes: Uint8Array,
     sourcePath: string,
+    scale: AnnasArtifactScale,
+    wholeAlreadyInCorpus: () => Promise<boolean>,
   ): Promise<
     | { parts?: undefined }
     | { pages: number; parts: PdfPart[] }
@@ -3770,9 +3772,22 @@ export class DomainExpertService {
     try {
       pages = await qpdfPageCount(qpdf, bytes);
     } catch {
+      // Unsplittable, so the #36 ceiling applies on the byte-scan measurement it always used.
+      if (this.annasMaxPdfPages > 0 && scale.corroborated_pages !== undefined && scale.corroborated_pages > this.annasMaxPdfPages) {
+        return {
+          refusal: {
+            code: 'annas_pdf_exceeds_parser_page_limit',
+            message: `Measured ${scale.pages} pages in the downloaded PDF, above this deployment's ${this.annasMaxPdfPages}-page ceiling for PDF imports with the LLM parser, and qpdf could not read it to split it. Nothing was uploaded or imported; the download is still on disk at ${sourcePath}.`,
+            suggestion: 'Acquire an EPUB edition of the same work, or a PDF split into volumes; annas_archive_search with ingest_intent: true ranks EPUB first. The file may be encrypted or damaged.',
+          },
+        };
+      }
       return {};
     }
     if (pages <= this.annasPdfSplitPages) return {};
+    // A book imported whole before splitting existed stays whole: the parts
+    // would put it in the corpus a second time.
+    if (await wholeAlreadyInCorpus()) return {};
     const plan = planPdfParts(pages, this.annasPdfSplitPages);
     try {
       return { pages, parts: await splitPdf(qpdf, bytes, plan) };
@@ -3786,6 +3801,34 @@ export class DomainExpertService {
         split: { pages, max_part_pages: this.annasPdfSplitPages, parts: plan.length },
       };
     }
+  }
+
+  // Whether these exact bytes already sit under the book's whole-file name
+  // (or a prior name) with an ACTIVE ragFile. Only a found object costs a
+  // corpus listing; any failure answers no, and the book is split.
+  private async wholeAnnasPdfInCorpus(
+    manifest: ReturnType<typeof domainManifest>,
+    params: AnnasArchiveImportParams,
+    locator: string,
+    corpusId: string,
+    bytes: Uint8Array,
+  ): Promise<boolean> {
+    try {
+      const { stem, priorStems } = await this.annasObjectStems(manifest, params, locator, 'pdf');
+      const { bucket, directory } = this.annasImportDirectory(manifest);
+      const contentHash = createHash('sha256').update(bytes).digest('hex').slice(0, 12);
+      for (const candidate of new Set([stem, `${stem}--${contentHash}`, ...priorStems.filter((prior) => prior && !/--part\d+of\d+$/.test(prior))])) {
+        const objectName = `${directory}${candidate}.pdf`;
+        const existing = await this.google.getGcsObjectMetadata(bucket, objectName);
+        if (!existing || !gcsObjectHoldsBytes(existing, bytes)) continue;
+        const resolved = await this.resolveRagCorpus(manifest, corpusId);
+        const [file] = await this.ragFilesForImportedUris(manifest, resolved, [`gs://${bucket}/${objectName}`]);
+        return file?.state === 'ACTIVE';
+      }
+    } catch {
+      // Unknown means split; a split of a book not in the corpus is the safe direction.
+    }
+    return false;
   }
 
   // Each part is uploaded as `<stem>--partNofM.pdf` and imported on its own,
@@ -3810,23 +3853,39 @@ export class DomainExpertService {
     } catch (error) {
       return { status: 'blocked', ...corpusTarget, error: annasIngestErrorRecord(error) };
     }
+    // Every part is uploaded before the first import, as the manual workaround
+    // did, so each part has its object and name even when a later import stops.
+    const uploads: string[] = [];
+    try {
+      for (const part of parts) {
+        const priorStems = stems.priorStems.map((prior) => pdfPartStem(stripPdfPartSuffix(prior), part));
+        uploads.push(await this.uploadApprovedImportToGcs(manifest, pdfPartStem(stems.stem, part), 'pdf', part.bytes, priorStems));
+      }
+    } catch (error) {
+      return {
+        status: 'blocked',
+        ...corpusTarget,
+        ...(uploads.length ? { gcs_uris: uploads } : {}),
+        split: { pages, max_part_pages: this.annasPdfSplitPages, parts: parts.length, imported_parts: 0 },
+        error: { ...annasIngestErrorRecord(error), message: `Uploading part ${uploads.length + 1} of ${parts.length} failed: ${annasIngestErrorRecord(error).message} Nothing was imported.` },
+      };
+    }
     let resourceName: string | undefined;
     let stopped: string | undefined;
-    for (const part of parts) {
-      const base = annasSplitPartBase(part);
+    for (const [position, part] of parts.entries()) {
+      const gcsUri = uploads[position]!;
+      const base = { ...annasSplitPartBase(part), gcs_uri: gcsUri };
       if (stopped) {
         results.push({ ...base, status: 'not_attempted', reason: stopped });
         continue;
       }
-      let gcsUri: string | undefined;
       try {
-        const partStem = pdfPartStem(stems.stem, part);
-        const priorStems = stems.priorStems.map((prior) => pdfPartStem(stripPdfPartSuffix(prior), part));
-        gcsUri = await this.uploadApprovedImportToGcs(manifest, partStem, 'pdf', part.bytes, priorStems);
+        // Each part has the whole ingest budget; the response budget, not this,
+        // bounds how long the tool call waits (annasIngestWithinResponseBudget).
         const deadline = Date.now() + this.annasImportPollTimeoutMs;
         const submission = await this.submitAnnasImportWithBackoff(manifest, corpusId, gcsUri, deadline);
         if ('blocked' in submission) {
-          results.push({ ...base, gcs_uri: gcsUri, status: 'blocked', error: submission.blocked });
+          results.push({ ...base, status: 'blocked', error: submission.blocked });
           stopped = `Part ${part.index} of ${part.of} was blocked (${submission.blocked.code}), so later parts were not submitted.`;
           continue;
         }
@@ -3841,13 +3900,12 @@ export class DomainExpertService {
         );
         results.push({
           ...base,
-          gcs_uri: gcsUri,
           status: outcome.status,
           import_outcome: outcome.detail,
           ...(submission.retries ? { submission_retries: submission.retries } : {}),
         });
       } catch (error) {
-        results.push({ ...base, ...(gcsUri ? { gcs_uri: gcsUri } : {}), status: 'blocked', error: annasIngestErrorRecord(error) });
+        results.push({ ...base, status: 'blocked', error: annasIngestErrorRecord(error) });
         stopped = `Part ${part.index} of ${part.of} was blocked, so later parts were not submitted.`;
       }
     }
@@ -3855,7 +3913,7 @@ export class DomainExpertService {
     const status = annasSplitStatus(results);
     const imported = results.filter((result) => result.status === 'imported').length;
     const incomplete = results.filter((result) => result.status !== 'imported');
-    const gcsUris = results.flatMap((result) => result.gcs_uri ? [result.gcs_uri] : []);
+    const gcsUris = uploads;
     return {
       status,
       ...corpusTarget,
@@ -4988,12 +5046,7 @@ export class DomainExpertService {
         ...(typeof importOutcome?.operation_name === 'string' ? { rag_operation_name: importOutcome.operation_name } : {}),
         // One record for the book; its parts are the rag_files list a batch import also writes.
         ...(splitParts.length
-          ? {
-              split_parts: splitParts.length,
-              rag_files: splitParts.flatMap((part) => part.gcs_uri
-                ? [{ gcs_uri: part.gcs_uri, part: part.name, status: part.status, ...(typeof part.coverage?.rag_file_name === 'string' ? { rag_file_name: part.coverage.rag_file_name } : {}) }]
-                : []),
-            }
+          ? { split_parts: splitParts.length, rag_files: annasSplitRegistryFiles(splitParts, previous?.record) }
           : {}),
         registered_at: registeredAt,
       };
@@ -8442,6 +8495,32 @@ function annasSplitPartRecords(ragIngest: Record<string, unknown>): AnnasSplitPa
   return Array.isArray(ragIngest.parts) ? ragIngest.parts as AnnasSplitPartResult[] : [];
 }
 
+// A split book's parts for its registry record. A part this run did not
+// import keeps what the previous record knew about the same object, so a
+// re-run stopped early never forgets a part already in the corpus.
+function annasSplitRegistryFiles(parts: AnnasSplitPartResult[], previous: Record<string, unknown> | undefined): Array<Record<string, unknown>> {
+  const earlier = new Map<string, Record<string, unknown>>();
+  if (Array.isArray(previous?.rag_files)) {
+    for (const file of previous.rag_files) {
+      const record = asOptionalRecord(file);
+      if (typeof record?.gcs_uri === 'string') earlier.set(record.gcs_uri, record);
+    }
+  }
+  return parts.flatMap((part) => {
+    if (!part.gcs_uri) return [];
+    const prior = earlier.get(part.gcs_uri);
+    if (part.status !== 'imported' && prior?.status === 'imported') return [{ ...prior, part: part.name }];
+    const present = asOptionalRecord(Array.isArray(part.import_outcome?.rag_files) ? part.import_outcome.rag_files[0] : undefined);
+    const ragFileName = part.coverage?.rag_file_name ?? present?.rag_file_name;
+    return [{
+      gcs_uri: part.gcs_uri,
+      part: part.name,
+      status: part.status,
+      ...(typeof ragFileName === 'string' ? { rag_file_name: ragFileName } : {}),
+    }];
+  });
+}
+
 // The objects a registry record holds: its gcs_uri, or each entry of its rag_files list.
 function registryRecordGcsUris(record: Record<string, unknown>): string[] {
   const uris: string[] = [];
@@ -8627,7 +8706,7 @@ function classifyRagImportOperation(
 // into a new import drops them, so a re-import never inherits the last one's
 // ragFile or verification.
 const RAG_IMPORT_OUTCOME_FIELDS = new Set([
-  'ingest_status', 'rag_operation_name', 'rag_file_name', 'rag_files', 'gcs_uri',
+  'ingest_status', 'rag_operation_name', 'rag_file_name', 'rag_files', 'gcs_uri', 'split_parts',
   'verification', 'ingest_reason', 'import_batch_source_id', 'registered_at',
 ]);
 

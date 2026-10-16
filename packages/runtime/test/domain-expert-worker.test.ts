@@ -6265,6 +6265,18 @@ describe('PDF part planning', () => {
   });
 });
 
+test('qpdf finishing with warnings (exit 3) still yields the parts', async () => {
+  const qpdf = Bun.which('qpdf');
+  expect(qpdf, 'qpdf must be installed for the PDF split tests').toBeTruthy();
+  const directory = mkdtempSync(join(tmpdir(), 'expert-qpdf-warn-'));
+  try {
+    const shim = join(directory, 'qpdf-warns');
+    writeFileSync(shim, `#!/bin/sh\n"${qpdf}" "$@"\nstatus=$?\n[ $status -eq 0 ] && { echo "WARNING: fixture warning" >&2; exit 3; }\nexit $status\n`, { mode: 0o755 });
+    const parts = await splitPdf(shim, textPdfBytes(6), planPdfParts(6, 4));
+    expect(parts.map((part) => part.pages)).toEqual([3, 3]);
+  } finally { rmSync(directory, { recursive: true, force: true }); }
+});
+
 function sha256Hex(bytes: Uint8Array): string {
   return createHash('sha256').update(bytes).digest('hex');
 }
@@ -6285,9 +6297,9 @@ describe('splitting long PDFs for LLM-parser imports', () => {
 
   // Vertex as the parts see it: each import names one object, its outcome is chosen per part
   // name, and the ragFile listing shows every object imported so far as ACTIVE.
-  function splitGoogleFetch(calls: CapturedCall[], behaviour: ImportBehaviour, listing: { state?: string } = {}): typeof fetch {
-    const objects: FakeGcsObjects = new Map();
-    const imported = new Map<string, string>();
+  function splitGoogleFetch(calls: CapturedCall[], behaviour: ImportBehaviour, listing: { state?: string } = {}, seed: { objects?: Array<[string, Uint8Array]>; imported?: string[] } = {}): typeof fetch {
+    const objects: FakeGcsObjects = new Map(seed.objects ?? []);
+    const imported = new Map<string, string>((seed.imported ?? []).map((uri, index) => [uri, `${CORPUS}/ragFiles/8000${index}`]));
     const attempts = new Map<string, number>();
     let operations = 0;
     return (async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
@@ -6301,8 +6313,10 @@ describe('splitting long PDFs for LLM-parser imports', () => {
         const part = /--(part\d+of\d+)\.pdf$/.exec(uri)?.[1] ?? 'whole';
         const attempt = (attempts.get(part) ?? 0) + 1;
         attempts.set(part, attempt);
-        const outcome = imported.has(uri) ? { skippedRagFilesCount: '1' } : behaviour(part, attempt);
-        if (outcome instanceof Response) return outcome;
+        // A refusal (quota, busy corpus) comes before Vertex looks at the file; a present file is skipped.
+        const chosen = behaviour(part, attempt);
+        if (chosen instanceof Response) return chosen;
+        const outcome = imported.has(uri) ? { skippedRagFilesCount: '1' } : chosen;
         if ('importedRagFilesCount' in outcome) imported.set(uri, `${CORPUS}/ragFiles/${9000 + imported.size}`);
         operations += 1;
         return jsonResponse({ name: `${CORPUS}/operations/split-${operations}`, done: true, ...(('error' in outcome) ? { error: outcome.error } : { response: outcome }) });
@@ -6316,6 +6330,7 @@ describe('splitting long PDFs for LLM-parser imports', () => {
 
   function splitFixture(bytes: Uint8Array, behaviour: ImportBehaviour, options: {
     ragParserModel?: string; pdfSplitPages?: number; qpdfBin?: string; listingState?: string; importPollTimeoutMs?: number;
+    seed?: { objects?: Array<[string, Uint8Array]>; imported?: string[] };
   } = {}) {
     const fixture = workspaceFixture();
     const booksRoot = join(fixture.base, 'books');
@@ -6336,7 +6351,7 @@ describe('splitting long PDFs for LLM-parser imports', () => {
       },
       google: {
         accessToken: 'fixture-google-token',
-        fetchImpl: splitGoogleFetch(googleCalls, behaviour, { ...(options.listingState ? { state: options.listingState } : {}) }),
+        fetchImpl: splitGoogleFetch(googleCalls, behaviour, { ...(options.listingState ? { state: options.listingState } : {}) }, options.seed),
         ...(options.ragParserModel ? { ragParserModel: options.ragParserModel } : {}),
       },
       fetchImpl: fakeAnnasArtifactFetch([], bytes, 'application/pdf'),
@@ -6504,6 +6519,61 @@ describe('splitting long PDFs for LLM-parser imports', () => {
       expect(response.rag_ingest.status).toBe('imported');
       expect(response.rag_ingest.split).toBeUndefined();
       expect(f.importedUris()).toHaveLength(1);
+    } finally { f.cleanup(); fixture.cleanup(); }
+  });
+
+  const WHOLE_NAME = 'v1/book-imports/research/author---the-fixture-compendium-1989.pdf';
+
+  // Review finding: a book imported whole before splitting existed would otherwise be imported
+  // a second time as parts on any re-run.
+  test('a book already in the corpus whole is not split again', async () => {
+    const bytes = textPdfBytes(260);
+    const f = splitFixture(bytes, importsAll, { seed: { objects: [[WHOLE_NAME, bytes]], imported: [`gs://fixture-shared-library/${WHOLE_NAME}`] } });
+    try {
+      const response = await postDomain(f.worker, 'annas_archive_import', PARAMS);
+      expect(response.rag_ingest).toMatchObject({ status: 'imported', gcs_uri: `gs://fixture-shared-library/${WHOLE_NAME}`, import_outcome: { already_present: true } });
+      expect(response.rag_ingest.split).toBeUndefined();
+      expect(uploadedObjectNames(f.googleCalls)).toEqual([]);
+    } finally { f.cleanup(); }
+    // The same object uploaded but never imported is split as usual.
+    const g = splitFixture(bytes, importsAll, { seed: { objects: [[WHOLE_NAME, bytes]] } });
+    try {
+      const response = await postDomain(g.worker, 'annas_archive_import', PARAMS);
+      expect(response.rag_ingest).toMatchObject({ status: 'imported', split: { parts: 2 } });
+    } finally { g.cleanup(); }
+  });
+
+  // Review finding: a re-run stopped early must not drop a part the previous run imported.
+  test('a re-run stopped by quota keeps the earlier parts in the registry', async () => {
+    let quota = false;
+    const f = splitFixture(textPdfBytes(450), (part) => (quota && part === 'part2of3'
+      ? jsonResponse({ error: { code: 429, status: 'RESOURCE_EXHAUSTED', message: 'Quota exceeded.' } }, 429)
+      : { importedRagFilesCount: '1' }), { importPollTimeoutMs: 30 });
+    try {
+      expect((await postDomain(f.worker, 'annas_archive_import', PARAMS)).rag_ingest.status).toBe('imported');
+      const first = f.readRegistry().at(-1)!;
+      quota = true;
+      const again = await postDomain(f.worker, 'annas_archive_import', PARAMS);
+      expect(again.rag_ingest.parts.map((part: Record<string, any>) => part.status)).toEqual(['imported', 'blocked', 'not_attempted']);
+      const latest = f.readRegistry().at(-1)!;
+      expect(latest.rag_files.map((file: Record<string, any>) => [file.part, file.status])).toEqual([
+        ['part1of3', 'imported'], ['part2of3', 'imported'], ['part3of3', 'imported'],
+      ]);
+      expect(latest.rag_files[2].rag_file_name).toBe(first.rag_files[2].rag_file_name);
+    } finally { f.cleanup(); }
+  });
+
+  // Review finding: when qpdf cannot read a long PDF, the #36 ceiling still refuses it.
+  test('a long PDF qpdf cannot read is refused at the ceiling instead of imported whole', async () => {
+    const fixture = workspaceFixture();
+    const qpdf = join(fixture.base, 'qpdf-fixture');
+    writeFileSync(qpdf, '#!/bin/sh\necho "qpdf: not a PDF" >&2\nexit 2\n', { mode: 0o755 });
+    const f = splitFixture(textPdfBytes(582), importsAll, { qpdfBin: qpdf });
+    try {
+      const response = await postDomain(f.worker, 'annas_archive_import', PARAMS);
+      expect(response).toMatchObject({ status: 'downloaded_ingest_blocked', rag_ingest: { error: { code: 'annas_pdf_exceeds_parser_page_limit' } } });
+      expect(response.rag_ingest.error.message).toContain('qpdf could not read it');
+      expect(uploadedObjectNames(f.googleCalls)).toEqual([]);
     } finally { f.cleanup(); fixture.cleanup(); }
   });
 

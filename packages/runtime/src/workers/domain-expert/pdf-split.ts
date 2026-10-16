@@ -81,6 +81,8 @@ export async function qpdfPageCount(qpdf: string, bytes: Uint8Array): Promise<nu
  * before anything is uploaded. The same qpdf version splits the same bytes
  * identically.
  */
+// Every part is returned in memory, so an ingest holds about twice the
+// download (bounded by the worker's download cap) until its parts are uploaded.
 export async function splitPdf(qpdf: string, bytes: Uint8Array, plan: PdfPartPlan[]): Promise<PdfPart[]> {
   return withScratch(async (directory) => {
     const source = join(directory, 'source.pdf');
