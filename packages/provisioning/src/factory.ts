@@ -118,7 +118,8 @@ export async function runFactory(config: FactoryConfig, request: FactoryRequest,
       await save('committing_repository');
     }
     if (!state.commit) {
-      await io.command(['git', 'init'], workspace);
+      // No host template: it could seed hooks or URL, HTTP or credential settings into the repository.
+      await io.command(['git', 'init', '--template='], workspace);
       await io.command(['git', 'add', '--', '.gitignore', 'agent.json', 'binding.json', 'AGENTS.md', 'HEARTBEAT.md', 'IDENTITY.md', 'SOUL.md', 'TOOLS.md', 'USER.md', 'library/scope-manifest.json', 'library/eval-questions.json', 'references/.gitkeep'], workspace);
       await io.command(['git', '-c', 'user.name=Expert Agent Factory', '-c', 'user.email=factory@expert-agent.invalid', 'commit', '--allow-empty', '-m', 'Initialize independent expert agent'], workspace);
       const commit = (await io.command(['git', 'rev-parse', 'HEAD'], workspace)).trim();

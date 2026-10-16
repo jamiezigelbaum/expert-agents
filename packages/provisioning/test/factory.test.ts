@@ -703,6 +703,17 @@ describe('conversational expert factory', () => {
       expect(f.calls.filter((call) => call.options && !call.options.githubIdentity)).toEqual([]);
     }, 60_000);
 
+    test('the repository is created without a host Git template that could seed its settings', async () => {
+      const f = await fixture();
+      const template = join(f.base, 'template');
+      await mkdir(join(template, 'hooks'), { recursive: true });
+      await writeFile(join(template, 'config'), '[url "file:///decoy/"]\n\tinsteadOf = https://github.com/\n');
+      const previous = process.env.GIT_TEMPLATE_DIR;
+      process.env.GIT_TEMPLATE_DIR = template;
+      try { await f.run(); } finally { if (previous === undefined) delete process.env.GIT_TEMPLATE_DIR; else process.env.GIT_TEMPLATE_DIR = previous; }
+      expect(await readFile(join(f.workspace, '.git', 'config'), 'utf8')).not.toContain('insteadOf');
+    }, 60_000);
+
     test('an unavailable System GitHub identity stops at wiring_remote and resumes once reconnected', async () => {
       const f = await fixture();
       f.config.remoteUrlTemplate = 'https://github.com/example-owner/{agentId}.git';

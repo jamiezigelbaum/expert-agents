@@ -1,4 +1,4 @@
-import { constants } from 'node:fs';
+import { constants, rmSync } from 'node:fs';
 import { lstat, mkdtemp, open, rm } from 'node:fs/promises';
 import { devNull, tmpdir } from 'node:os';
 import { isAbsolute, join } from 'node:path';
@@ -35,6 +35,9 @@ const GITHUB_GIT_CONFIG = ['-c', 'credential.helper=', '-c', 'credential.helper=
 // Like OpenClaw's authenticated worker Git, inherited Git, GitHub CLI and askpass settings never
 // reach the push: they could supply another credential, reroute the remote or trace headers.
 const INHERITED_GIT_SETTINGS = /^(GIT_|GH_|GITHUB_|SSH_ASKPASS$|NETRC$|XDG_CONFIG_HOME$)/i;
+// Repository settings that could still redirect, proxy or authenticate the push: URL rewrites,
+// HTTP settings, includes and per-remote push URLs or proxies.
+const REDIRECTING_REPOSITORY_SETTINGS = /^(url\.|http\.|include\.|includeif\.|remote\..+\.(pushurl|proxy|proxyauthmethod)$)/i;
 
 /** Runs factory commands. Only commands the factory marks as GitHub operations receive the System identity. */
 export function factoryCommand(github?: FactoryGitHubSelection): FactoryCommand {
@@ -45,15 +48,25 @@ export function factoryCommand(github?: FactoryGitHubSelection): FactoryCommand 
     // An empty private HOME with no global or system Git config: host netrc entries, extra
     // headers, URL rewrites and hooks cannot authenticate or redirect this push.
     const home = await mkdtemp(join(tmpdir(), 'expert-factory-github-'));
+    // The plugin ends a timed-out or interrupted factory with SIGTERM; remove the HOME first.
+    const terminate = () => { rmSync(home, { recursive: true, force: true }); process.exit(143); };
+    process.once('SIGTERM', terminate);
     try {
       const env: Record<string, string> = {};
       for (const [name, value] of Object.entries(process.env)) if (value !== undefined && !INHERITED_GIT_SETTINGS.test(name)) env[name] = value;
       Object.assign(env, { HOME: home, GH_CONFIG_DIR: profileDir, GIT_CONFIG_GLOBAL: devNull, GIT_CONFIG_NOSYSTEM: '1', GIT_TERMINAL_PROMPT: '0' });
+      const settings = await runFactoryCommand(['git', 'config', '--local', '--name-only', '--list'], cwd, env);
+      if (settings.split('\n').some((name) => REDIRECTING_REPOSITORY_SETTINGS.test(name.trim()))) {
+        throw new FactoryError('factory_repository_git_config', 'The agent repository has its own Git URL rewrite, HTTP, include or push-URL setting that could redirect or authenticate the GitHub push. Remove it, then resume.');
+      }
       return await runFactoryCommand(['git', ...GITHUB_GIT_CONFIG, ...argv.slice(1)], cwd, env);
     } catch (error) {
       if (!(error instanceof FactoryError) || error.code !== 'factory_command_failed') throw error;
       throw new FactoryError('factory_command_failed', 'A required Git command failed as the System GitHub identity. Its private output was withheld; check that System GitHub is connected and can write the remote, then resume.');
-    } finally { await rm(home, { recursive: true, force: true }); }
+    } finally {
+      process.off('SIGTERM', terminate);
+      await rm(home, { recursive: true, force: true });
+    }
   };
 }
 

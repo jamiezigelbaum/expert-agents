@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from 'bun:test';
 import { randomBytes, randomUUID } from 'node:crypto';
-import { chmod, lstat, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
+import { chmod, lstat, mkdir, mkdtemp, readdir, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { factoryCommand } from '../scripts/expert-factory.ts';
@@ -74,12 +74,14 @@ process.stdout.write('username=x-access-token\\npassword=' + token + '\\n');
     await writeFile(join(bin, name), `#!/bin/sh\necho "${name} $*" >> ${JSON.stringify(hostLog)}\ncat >/dev/null 2>&1 || true\nprintf 'username=host-user\\npassword=%s\\n' ${JSON.stringify(HOST)}\n`, { mode: 0o700 });
   }
 
-  const server = { accepted: MANAGED, seen: [] as string[] };
+  const server = { accepted: MANAGED, seen: [] as string[], hold: undefined as Promise<void> | undefined, arrived: () => {} };
   const repositories = join(base, 'server');
   await mkdir(repositories);
   const bare = join(repositories, 'example.git');
   await git(base, ['init', '--quiet', '--bare', bare]);
   const listener = Bun.serve({ port: 0, hostname: '127.0.0.1', async fetch(request) {
+    server.arrived();
+    if (server.hold) await server.hold;
     const header = request.headers.get('authorization');
     const presented = header?.startsWith('Basic ') ? Buffer.from(header.slice(6), 'base64').toString('utf8') : undefined;
     server.seen.push(presented === undefined ? 'none' : presented === `x-access-token:${server.accepted}` ? 'managed'
@@ -109,11 +111,12 @@ catch (error) { console.log(JSON.stringify({ ok: false, code: error.code, messag
   const gatewayEnv = { PATH: `${bin}:${process.env.PATH}`, HOME: home, USER: 'example', TMPDIR: tmpdir() };
   const selection: FactoryGitHubSelection = { profileId: id, stateDir };
 
-  const run = async (options: { identity: boolean; env?: Record<string, string>; selection?: FactoryGitHubSelection }) => {
-    const child = Bun.spawn([process.execPath, harness], {
-      cwd: workspace, env: options.env ?? gatewayEnv, stdout: 'pipe', stderr: 'pipe',
-      stdin: new Blob([JSON.stringify({ selection: options.selection ?? selection, argv: PUSH, cwd: workspace, identity: options.identity })]),
-    });
+  const start = (options: { identity: boolean; env?: Record<string, string>; selection?: FactoryGitHubSelection }) => Bun.spawn([process.execPath, harness], {
+    cwd: workspace, env: options.env ?? gatewayEnv, stdout: 'pipe', stderr: 'pipe',
+    stdin: new Blob([JSON.stringify({ selection: options.selection ?? selection, argv: PUSH, cwd: workspace, identity: options.identity })]),
+  });
+  const run = async (options: Parameters<typeof start>[0]) => {
+    const child = start(options);
     const [stdout, stderr] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
     const result = JSON.parse(stdout) as { ok: boolean; code?: string; message?: string; spawned: { argv: string[]; env: Record<string, string> | null }[] };
     return { ...result, transcript: stdout + stderr };
@@ -125,7 +128,7 @@ catch (error) { console.log(JSON.stringify({ ok: false, code: error.code, messag
   const head = async () => (await git(workspace, ['rev-parse', 'HEAD'])).stdout;
   const decoy = join(base, 'decoy.git');
   const hookLog = join(base, 'hook.log');
-  return { base, stateDir, id, profileDir, home, bin, bare, decoy, hookLog, remote, workspace, server, gatewayEnv, selection, run, ghCalls, hostCalls, pushed, head };
+  return { base, stateDir, id, profileDir, home, bin, bare, decoy, hookLog, remote, workspace, server, gatewayEnv, selection, start, run, ghCalls, hostCalls, pushed, head };
 }
 type Fixture = Awaited<ReturnType<typeof fixture>>;
 
@@ -161,10 +164,13 @@ describe('factory pushes as the System GitHub identity', () => {
     expect(await f.pushed()).toBe(await f.head());
     expect(f.server.seen).toContain('managed');
     expect(f.server.seen).not.toContain('host');
-    // One Git process: the stock helper only, inherited helpers and askpass cleared, nothing else widened.
-    expect(result.spawned).toHaveLength(1);
-    expect(result.spawned[0]!.argv).toEqual(['git', ...IDENTITY_ARGS, 'push', '--set-upstream', 'origin', 'HEAD']);
-    const env = result.spawned[0]!.env!;
+    // A repository-settings check, then the push with the stock helper only; both isolated alike.
+    expect(result.spawned.map((spawn) => spawn.argv)).toEqual([
+      ['git', 'config', '--local', '--name-only', '--list'],
+      ['git', ...IDENTITY_ARGS, 'push', '--set-upstream', 'origin', 'HEAD'],
+    ]);
+    expect(result.spawned[0]!.env).toEqual(result.spawned[1]!.env);
+    const env = result.spawned[1]!.env!;
     expect(Object.keys(env).sort()).toEqual(['GH_CONFIG_DIR', 'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_NOSYSTEM', 'GIT_TERMINAL_PROMPT', 'HOME', 'PATH', 'TMPDIR', 'USER']);
     expect(env).toMatchObject({ GH_CONFIG_DIR: f.profileDir, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1', GIT_TERMINAL_PROMPT: '0' });
     // The push ran with an empty private HOME that is removed afterwards.
@@ -227,6 +233,45 @@ describe('factory pushes as the System GitHub identity', () => {
     expect(await f.hostCalls()).toEqual([]);
     expect(await exists(f.hookLog)).toBe(false);
     expect((await git(f.base, ['--git-dir', f.decoy, 'for-each-ref'])).stdout).toBe('');
+  }, 30_000);
+
+  test.each([
+    ['a push URL', (f: Fixture) => ['remote.origin.pushurl', `file://${f.decoy}`]],
+    ['a URL rewrite', (f: Fixture) => [`url.file://${f.decoy}.insteadOf`, f.remote]],
+    ['an extra HTTP header', () => ['http.extraHeader', `Authorization: Basic ${Buffer.from(`host-user:${HOST}`).toString('base64')}`]],
+    ['an HTTP proxy', () => ['http.proxy', 'http://127.0.0.1:9']],
+    ['an include', (f: Fixture) => ['include.path', join(f.base, 'included.gitconfig')]],
+  ])('refuses a repository whose own settings could redirect or authenticate the push: %s', async (_name, setting) => {
+    const f = await fixture();
+    await git(f.base, ['init', '--quiet', '--bare', f.decoy]);
+    const [key, value] = setting(f);
+    await git(f.workspace, ['config', key!, value!]);
+    const result = await f.run({ identity: true });
+    expect(result).toMatchObject({ ok: false, code: 'factory_repository_git_config' });
+    expect(result.spawned).toHaveLength(1);
+    expect(f.server.seen).toEqual([]);
+    expect(await f.pushed()).toBe('');
+    expect((await git(f.base, ['--git-dir', f.decoy, 'for-each-ref'])).stdout).toBe('');
+    expect(result.transcript).not.toContain(HOST);
+  }, 30_000);
+
+  test('an interrupted push removes its private HOME', async () => {
+    const f = await fixture();
+    const tmp = join(f.base, 'tmp');
+    await mkdir(tmp);
+    let release = () => {};
+    f.server.hold = new Promise((resolve) => { release = resolve; });
+    const arrived = new Promise<void>((resolve) => { f.server.arrived = resolve; });
+    const child = f.start({ identity: true, env: { ...f.gatewayEnv, TMPDIR: tmp } });
+    const homes = async () => (await readdir(tmp)).filter((name) => name.startsWith('expert-factory-github-'));
+    try {
+      await arrived;
+      expect(await homes()).toHaveLength(1);
+      // How the plugin ends a timed-out or interrupted factory.
+      child.kill('SIGTERM');
+      expect(await child.exited).toBe(143);
+      expect(await homes()).toEqual([]);
+    } finally { release(); }
   }, 30_000);
 
   test('fails closed without asking a host askpass when gh cannot answer', async () => {
