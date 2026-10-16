@@ -210,7 +210,14 @@ a different file already at that name gets a `--<content hash>` suffix, never
 an overwrite); a DJVU is converted through `djvutxt` when
 `EXPERT_AGENTS_DOMAIN_EXPERT_ANNAS_DJVUTXT_BIN` (default `djvutxt`, from
 djvulibre) resolves on PATH; MOBI/AZW3 are refused with
-`unsupported_ingest_format` and the download stays on disk. After submission
+`unsupported_ingest_format` and the download stays on disk. While imports use
+the LLM parser, a PDF longer than
+`EXPERT_AGENTS_DOMAIN_EXPERT_ANNAS_PDF_SPLIT_PAGES` (default 200) is split with
+`qpdf` into `<name>--partNofM.pdf` parts that are imported one at a time and
+coverage-checked (ACTIVE ragFile; text layer read with `pdftotext`); the host
+needs `qpdf` and `pdftotext` (poppler-utils) on PATH, and without `qpdf` such a
+PDF above `EXPERT_AGENTS_DOMAIN_EXPERT_ANNAS_MAX_PDF_PAGES` (default 500) is
+refused instead. After submission
 the worker polls the Vertex operation, starting at
 `EXPERT_AGENTS_DOMAIN_EXPERT_ANNAS_IMPORT_POLL_INTERVAL_MS` (default 5000) and
 growing ×1.5 per read up to 30 s while the import runs (each read counts

@@ -88,6 +88,7 @@ import {
   type Sha256Id,
   type LibraryLocationConfig,
 } from '@expert-agents/library';
+import { pdfPartStem, pdfTextLayer, planPdfParts, qpdfPageCount, splitPdf, stripPdfPartSuffix, type PdfPart, type PdfPartPlan, type PdfTextLayer } from './pdf-split.ts';
 import {
   agentRoutingConfigFromEnv,
   type AgentRoutingConfig,
@@ -177,8 +178,17 @@ export interface DomainExpertAnnasConfig {
   // Page floor a measured PDF has to clear before it may be ingested. 0 disables
   // the gate; artifacts whose scale cannot be measured are never blocked by it.
   minPdfPages?: number;
-  // Page ceiling for a measured PDF while imports use the LLM parser. 0 disables it.
+  // Page ceiling for a measured PDF while imports use the LLM parser and no split is
+  // available. 0 disables it.
   maxPdfPages?: number;
+  // While imports use the LLM parser, a PDF longer than this many pages is split with
+  // qpdf into parts of at most this many pages, each imported on its own. 0 disables
+  // splitting, which leaves maxPdfPages refusing long PDFs instead.
+  pdfSplitPages?: number;
+  // qpdf, looked up on PATH; without it long PDFs fall back to the maxPdfPages refusal.
+  qpdfBin?: string;
+  // Poppler's pdftotext, looked up on PATH, reads each part's text layer for the coverage check.
+  pdftotextBin?: string;
   // Opt-in: resolve downloads through the member fast-download API on baseUrl instead of
   // the download URL template. Only correct when baseUrl is a real Anna Archive origin.
   fastDownload?: boolean;
@@ -538,6 +548,12 @@ const DEFAULT_ANNAS_MIN_PDF_PAGES = 60;
 // PDFs of roughly 500-600 pages while smaller ones imported. Google documents
 // 500 pages per PDF for its layout parser. A configured 0 disables the ceiling.
 const DEFAULT_ANNAS_MAX_PDF_PAGES = 500;
+// Split size for LLM-parser PDF imports. On 2026-10-08 the parser failed PDFs of
+// about 330 pages and more while 254 imported, and parts of at most 200 pages
+// imported 9 of 9 (4 books, one a 508-page OCR scan). See pdf-split.ts.
+const DEFAULT_ANNAS_PDF_SPLIT_PAGES = 200;
+const DEFAULT_ANNAS_QPDF_BIN = 'qpdf';
+const DEFAULT_ANNAS_PDFTOTEXT_BIN = 'pdftotext';
 const DEFAULT_ANNAS_DJVUTXT_BIN = 'djvutxt';
 const ANNAS_DJVUTXT_TIMEOUT_MS = 120_000;
 const ANNAS_DJVUTXT_MAX_OUTPUT_BYTES = 64 * 1024 * 1024;
@@ -727,6 +743,9 @@ export class DomainExpertService {
   private annasMaxDownloadBytes: number;
   private annasMinPdfPages: number;
   private annasMaxPdfPages: number;
+  private annasPdfSplitPages: number;
+  private annasQpdfBin: string;
+  private annasPdftotextBin: string;
   private annasDjvutxtBin: string;
   private annasImportPollIntervalMs: number;
   private annasImportPollTimeoutMs: number;
@@ -786,6 +805,9 @@ export class DomainExpertService {
       throw new DomainExpertWorkerError(400, 'invalid_config', 'The PDF page floor must not exceed the PDF page ceiling.');
     }
     this.annasDjvutxtBin = options.annas?.djvutxtBin?.trim() || DEFAULT_ANNAS_DJVUTXT_BIN;
+    this.annasPdfSplitPages = normalizeNonNegativeInteger(options.annas?.pdfSplitPages, DEFAULT_ANNAS_PDF_SPLIT_PAGES);
+    this.annasQpdfBin = options.annas?.qpdfBin?.trim() || DEFAULT_ANNAS_QPDF_BIN;
+    this.annasPdftotextBin = options.annas?.pdftotextBin?.trim() || DEFAULT_ANNAS_PDFTOTEXT_BIN;
     this.annasImportPollIntervalMs = normalizePositiveInteger(options.annas?.importPollIntervalMs, DEFAULT_ANNAS_IMPORT_POLL_INTERVAL_MS);
     this.annasImportPollTimeoutMs = normalizeNonNegativeInteger(options.annas?.importPollTimeoutMs, DEFAULT_ANNAS_IMPORT_POLL_TIMEOUT_MS);
     this.annasResponseBudgetMs = normalizeNonNegativeInteger(options.annas?.responseBudgetMs, 0);
@@ -3595,7 +3617,8 @@ export class DomainExpertService {
     return annasArtifactScale(format, bytes, {
       minPdfPages: this.annasMinPdfPages,
       // The ceiling belongs to the LLM parser; Google's default parser takes PDFs up to 50 MB.
-      maxPdfPages: this.google.ragParserModel() === undefined ? 0 : this.annasMaxPdfPages,
+      // Where the worker can split a long PDF instead, the ceiling does not refuse it.
+      maxPdfPages: this.google.ragParserModel() === undefined || this.annasPdfSplitter() ? 0 : this.annasMaxPdfPages,
       allowShortArtifact: params.allowShortArtifact === true,
     });
   }
@@ -3643,7 +3666,7 @@ export class DomainExpertService {
         error: {
           code: 'annas_pdf_exceeds_parser_page_limit',
           message: `Measured ${scale.pages} pages in the downloaded PDF, above this deployment's ${scale.max_pdf_pages}-page ceiling for PDF imports with the LLM parser, which have failed above about 500 pages with a Vertex internal error. Nothing was uploaded or imported; the file is still on disk.`,
-          suggestion: 'Acquire an EPUB edition of the same work, or a PDF split into volumes; annas_archive_search with ingest_intent: true ranks EPUB first.',
+          suggestion: `Acquire an EPUB edition of the same work, or a PDF split into volumes; annas_archive_search with ingest_intent: true ranks EPUB first. With ${this.annasQpdfBin} (qpdf) on the worker host and PDF splitting enabled, the worker splits long PDFs into parts instead.`,
         },
         scale,
       };
@@ -3658,18 +3681,13 @@ export class DomainExpertService {
       return { status: 'blocked', ...corpusTarget, error: artifact.refusal, source_path: sourcePath };
     }
     const conversion = artifact.conversion ? { conversion: artifact.conversion } : {};
+    if (artifact.format === 'pdf') {
+      const split = await this.splitLongAnnasPdf(artifact.bytes, sourcePath);
+      if ('refusal' in split) return { status: 'blocked', ...corpusTarget, error: split.refusal, source_path: sourcePath, ...(split.split ? { split: split.split } : {}) };
+      if (split.parts) return this.ingestSplitAnnasPdf(manifest, params, locator, corpusId, corpusTarget, split.pages, split.parts);
+    }
     try {
-      // The GCS object path becomes the file's identity inside the RAG
-      // corpus, so it carries the book's own details — author, title, year —
-      // never an acquisition-source locator. Owner ruling 2026-07-29.
-      const title = params.title?.trim();
-      const author = params.author?.trim();
-      const year = params.year?.trim();
-      const stem = title ? bookObjectStem(title, author, year) : safeObjectName(locator);
-      const priorStems = [
-        ...(title ? [legacyBookObjectStem(title, author, year)] : []),
-        ...await this.priorAnnasObjectStems(manifest, params, artifact.format),
-      ];
+      const { stem, priorStems } = await this.annasObjectStems(manifest, params, locator, artifact.format);
       const gcsUri = await this.uploadApprovedImportToGcs(manifest, stem, artifact.format, artifact.bytes, priorStems);
       // One budget for the whole ingest: waiting out a busy corpus and waiting
       // for the operation both draw from it, so a tool call has one bound.
@@ -3703,6 +3721,207 @@ export class DomainExpertService {
           ? { code: error.code, message: error.message, ...(error.suggestion ? { suggestion: error.suggestion } : {}) }
           : { code: 'rag_ingest_error', message: error instanceof Error ? error.message : String(error) },
       };
+    }
+  }
+
+  // The GCS object path becomes the file's identity inside the RAG corpus, so
+  // it carries the book's own details — author, title, year — never an
+  // acquisition-source locator. Owner ruling 2026-07-29.
+  private async annasObjectStems(
+    manifest: ReturnType<typeof domainManifest>,
+    params: AnnasArchiveImportParams,
+    locator: string,
+    format: string,
+  ): Promise<{ stem: string; priorStems: string[] }> {
+    const title = params.title?.trim();
+    const author = params.author?.trim();
+    const year = params.year?.trim();
+    return {
+      stem: title ? bookObjectStem(title, author, year) : safeObjectName(locator),
+      priorStems: [
+        ...(title ? [legacyBookObjectStem(title, author, year)] : []),
+        ...await this.priorAnnasObjectStems(manifest, params, format),
+      ],
+    };
+  }
+
+  // qpdf, when this deployment splits long PDFs: imports use the LLM parser,
+  // splitting is enabled and the binary resolves on PATH.
+  private annasPdfSplitter(): string | undefined {
+    if (this.google.ragParserModel() === undefined || this.annasPdfSplitPages === 0) return undefined;
+    return Bun.which(this.annasQpdfBin) ?? undefined;
+  }
+
+  // A PDF longer than the split size is cut into page-range parts before
+  // upload (#33). qpdf's page count decides, not the byte-scan measurement,
+  // which can over- or under-count. A PDF qpdf cannot count is imported whole
+  // as before; one it counts but cannot split is refused with the file on disk.
+  private async splitLongAnnasPdf(
+    bytes: Uint8Array,
+    sourcePath: string,
+  ): Promise<
+    | { parts?: undefined }
+    | { pages: number; parts: PdfPart[] }
+    | { refusal: { code: string; message: string; suggestion: string }; split?: Record<string, unknown> }
+  > {
+    const qpdf = this.annasPdfSplitter();
+    if (!qpdf) return {};
+    let pages: number;
+    try {
+      pages = await qpdfPageCount(qpdf, bytes);
+    } catch {
+      return {};
+    }
+    if (pages <= this.annasPdfSplitPages) return {};
+    const plan = planPdfParts(pages, this.annasPdfSplitPages);
+    try {
+      return { pages, parts: await splitPdf(qpdf, bytes, plan) };
+    } catch (error) {
+      return {
+        refusal: {
+          code: 'annas_pdf_split_failed',
+          message: `The ${pages}-page PDF is above the ${this.annasPdfSplitPages}-page split size for LLM-parser imports, and splitting it failed: ${error instanceof Error ? error.message : String(error)} Nothing was uploaded or imported; the download is still on disk at ${sourcePath}.`,
+          suggestion: 'Acquire an EPUB edition of the same work, or a PDF split into volumes; annas_archive_search with ingest_intent: true ranks EPUB first.',
+        },
+        split: { pages, max_part_pages: this.annasPdfSplitPages, parts: plan.length },
+      };
+    }
+  }
+
+  // Each part is uploaded as `<stem>--partNofM.pdf` and imported on its own,
+  // one at a time (a corpus takes one import at a time), each with the full
+  // ingest budget. A part that fails does not stop the others; a part blocked
+  // by a busy corpus or exhausted quota does, since the next would be too.
+  // Imported parts then get a coverage check. A re-run skips parts Vertex
+  // already holds, so only the missing parts are imported again.
+  private async ingestSplitAnnasPdf(
+    manifest: ReturnType<typeof domainManifest>,
+    params: AnnasArchiveImportParams,
+    locator: string,
+    corpusId: string,
+    corpusTarget: Record<string, unknown>,
+    pages: number,
+    parts: PdfPart[],
+  ): Promise<Record<string, unknown>> {
+    const results: AnnasSplitPartResult[] = [];
+    let stems: { stem: string; priorStems: string[] };
+    try {
+      stems = await this.annasObjectStems(manifest, params, locator, 'pdf');
+    } catch (error) {
+      return { status: 'blocked', ...corpusTarget, error: annasIngestErrorRecord(error) };
+    }
+    let resourceName: string | undefined;
+    let stopped: string | undefined;
+    for (const part of parts) {
+      const base = annasSplitPartBase(part);
+      if (stopped) {
+        results.push({ ...base, status: 'not_attempted', reason: stopped });
+        continue;
+      }
+      let gcsUri: string | undefined;
+      try {
+        const partStem = pdfPartStem(stems.stem, part);
+        const priorStems = stems.priorStems.map((prior) => pdfPartStem(stripPdfPartSuffix(prior), part));
+        gcsUri = await this.uploadApprovedImportToGcs(manifest, partStem, 'pdf', part.bytes, priorStems);
+        const deadline = Date.now() + this.annasImportPollTimeoutMs;
+        const submission = await this.submitAnnasImportWithBackoff(manifest, corpusId, gcsUri, deadline);
+        if ('blocked' in submission) {
+          results.push({ ...base, gcs_uri: gcsUri, status: 'blocked', error: submission.blocked });
+          stopped = `Part ${part.index} of ${part.of} was blocked (${submission.blocked.code}), so later parts were not submitted.`;
+          continue;
+        }
+        const name = asOptionalRecord(submission.result.resolved_corpus)?.resource_name;
+        if (typeof name === 'string') resourceName = name;
+        const outcome = await this.annasSkippedImportAsPresent(
+          manifest,
+          corpusId,
+          submission.result,
+          gcsUri,
+          await this.awaitRagImportOutcome(manifest, submission.result, 'pdf', deadline),
+        );
+        results.push({
+          ...base,
+          gcs_uri: gcsUri,
+          status: outcome.status,
+          import_outcome: outcome.detail,
+          ...(submission.retries ? { submission_retries: submission.retries } : {}),
+        });
+      } catch (error) {
+        results.push({ ...base, ...(gcsUri ? { gcs_uri: gcsUri } : {}), status: 'blocked', error: annasIngestErrorRecord(error) });
+        stopped = `Part ${part.index} of ${part.of} was blocked, so later parts were not submitted.`;
+      }
+    }
+    await this.checkSplitPartCoverage(manifest, corpusId, resourceName, parts, results);
+    const status = annasSplitStatus(results);
+    const imported = results.filter((result) => result.status === 'imported').length;
+    const incomplete = results.filter((result) => result.status !== 'imported');
+    const gcsUris = results.flatMap((result) => result.gcs_uri ? [result.gcs_uri] : []);
+    return {
+      status,
+      ...corpusTarget,
+      gcs_uris: gcsUris,
+      split: {
+        pages,
+        max_part_pages: this.annasPdfSplitPages,
+        parts: parts.length,
+        imported_parts: imported,
+        coverage: annasSplitCoverageSummary(results),
+      },
+      parts: results,
+      ...(incomplete.length
+        ? {
+            error: {
+              code: 'annas_pdf_split_import_incomplete',
+              message: `${imported} of ${parts.length} parts of the ${pages}-page PDF imported. ${incomplete.map(describeAnnasSplitPart).join(' ')}`,
+              suggestion: 'Re-run annas_archive_import with ingest: true for the same record once the cause is cleared; parts Vertex already holds are skipped as present and only the missing parts are imported again. Report the failing parts with their page ranges; do not substitute another copy without telling the owner.',
+            },
+          }
+        : {}),
+    };
+  }
+
+  // Coverage per imported part, the check the manual workaround ran by hand:
+  // Vertex lists an ACTIVE ragFile for the part's object, and the part's text
+  // layer spans the part's pages with text. A part whose pages carry no text
+  // is a scan the parser OCRs; it is reported as text_layer_absent, since the
+  // worker cannot read what Vertex extracted from it.
+  private async checkSplitPartCoverage(
+    manifest: ReturnType<typeof domainManifest>,
+    corpusId: string,
+    resourceName: string | undefined,
+    parts: PdfPart[],
+    results: AnnasSplitPartResult[],
+  ): Promise<void> {
+    const imported = results.filter((result) => result.status === 'imported' && result.gcs_uri);
+    if (!imported.length) return;
+    let files: Array<Record<string, unknown>> | undefined;
+    let listingError: string | undefined;
+    if (resourceName) {
+      try {
+        // One listing for every part, settled briefly for a lagging listing.
+        const deadline = Date.now() + this.annasImportPollIntervalMs * (RAG_FILE_LISTING_RETRIES + 1);
+        ({ files } = await this.ragFilesForImportedUrisSettled(manifest, { requested: corpusId, corpusId, resourceName }, imported.map((result) => result.gcs_uri!), deadline));
+      } catch (error) {
+        listingError = error instanceof DomainExpertWorkerError ? error.code : 'rag_file_listing_failed';
+      }
+    } else {
+      listingError = 'corpus_resource_unknown';
+    }
+    const pdftotext = Bun.which(this.annasPdftotextBin) ?? undefined;
+    for (const result of imported) {
+      const part = parts.find((candidate) => candidate.index === result.part)!;
+      const file = files?.find((candidate) => candidate.gcs_uri === result.gcs_uri);
+      let text: PdfTextLayer | undefined;
+      let textError: string | undefined;
+      if (!pdftotext) textError = 'pdftotext_unavailable';
+      else {
+        try {
+          text = await pdfTextLayer(pdftotext, part.bytes);
+        } catch {
+          textError = 'pdf_text_extraction_failed';
+        }
+      }
+      result.coverage = annasSplitPartCoverage(part, file, listingError, text, textError);
     }
   }
 
@@ -3949,10 +4168,13 @@ export class DomainExpertService {
       try {
         const registryPath = resolveInside(await checkedRootPath(root), `${manifest.workspace_relative_path}/references/source-registry.jsonl`);
         for (const { record } of (await readDomainSourceRegistry(registryPath)).records) {
-          const gcsUri = stringRecordField(record, 'gcs_uri');
-          if (stringRecordField(record, 'locator') !== `annas:${md5}` || !gcsUri?.startsWith(directoryUri) || !gcsUri.endsWith(suffix)) continue;
-          const name = gcsUri.slice(directoryUri.length, -suffix.length);
-          if (name && !name.includes('/')) stems.push(name);
+          if (stringRecordField(record, 'locator') !== `annas:${md5}`) continue;
+          for (const gcsUri of registryRecordGcsUris(record)) {
+            if (!gcsUri.startsWith(directoryUri) || !gcsUri.endsWith(suffix)) continue;
+            // A split part's name stands for the whole book's stem; parts re-derive their suffix.
+            const name = stripPdfPartSuffix(gcsUri.slice(directoryUri.length, -suffix.length));
+            if (name && !name.includes('/')) stems.push(name);
+          }
         }
       } catch {
         // The registry is advisory here; the upload's own checks still hold.
@@ -4584,11 +4806,11 @@ export class DomainExpertService {
       for (const history of groupDomainSourceRecords(registry.records).values()) {
         const latest = latestDomainSourceRecord(history);
         if (latest.removed) continue;
-        const uri = stringRecordField(latest.record, 'gcs_uri', 'gcsUri');
         const title = stringRecordField(latest.record, 'title');
-        if (!uri || !title) continue;
+        if (!title) continue;
         const creator = stringRecordField(latest.record, 'author', 'creator');
-        titles.set(uri, { title, ...(creator ? { creator } : {}) });
+        // A split book records its parts as rag_files; each part cites as the book.
+        for (const uri of registryRecordGcsUris(latest.record)) titles.set(uri, { title, ...(creator ? { creator } : {}) });
       }
     } catch {
       // Display only: the object name still titles the citation.
@@ -4688,6 +4910,7 @@ export class DomainExpertService {
           target_path: sourcePath,
           rag_ingest_status: outcome.status,
           ...(typeof outcome.gcs_uri === 'string' ? { gcs_uri: outcome.gcs_uri } : {}),
+          ...(Array.isArray(outcome.gcs_uris) ? { gcs_uris: outcome.gcs_uris } : {}),
           created_at: new Date().toISOString(),
         });
       })
@@ -4719,7 +4942,10 @@ export class DomainExpertService {
     // An import still running is registered as import_requested; the
     // background completion of that import records whatever it ended as, so
     // the registry never keeps claiming an import is in flight.
-    if (ragIngest.status !== 'imported' && !mode.inProgress && !mode.recordOutcome) {
+    // A split PDF with some parts imported has those parts in the corpus, so it
+    // is registered with its real status and the parts it holds.
+    const splitParts = annasSplitPartRecords(ragIngest);
+    if (ragIngest.status !== 'imported' && !mode.inProgress && !mode.recordOutcome && !splitParts.some((part) => part.status === 'imported')) {
       return { status: 'skipped', reason: `rag_ingest.status is ${String(ragIngest.status)}; only an imported source is registered.` };
     }
     const ingestStatus = mode.inProgress ? 'import_requested' : String(ragIngest.status);
@@ -4760,6 +4986,15 @@ export class DomainExpertService {
         ...(typeof ingestError?.code === 'string' ? { ingest_reason: ingestError.code } : {}),
         ...(typeof ragIngest.gcs_uri === 'string' ? { gcs_uri: ragIngest.gcs_uri } : {}),
         ...(typeof importOutcome?.operation_name === 'string' ? { rag_operation_name: importOutcome.operation_name } : {}),
+        // One record for the book; its parts are the rag_files list a batch import also writes.
+        ...(splitParts.length
+          ? {
+              split_parts: splitParts.length,
+              rag_files: splitParts.flatMap((part) => part.gcs_uri
+                ? [{ gcs_uri: part.gcs_uri, part: part.name, status: part.status, ...(typeof part.coverage?.rag_file_name === 'string' ? { rag_file_name: part.coverage.rag_file_name } : {}) }]
+                : []),
+            }
+          : {}),
         registered_at: registeredAt,
       };
       await mkdir(dirname(registryPath), { recursive: true });
@@ -6216,6 +6451,11 @@ export function domainExpertAnnasConfigFromEnv(env: Record<string, string | unde
       ? { minPdfPages: normalizeNonNegativeInteger(env.EXPERT_AGENTS_DOMAIN_EXPERT_ANNAS_MIN_PDF_PAGES, DEFAULT_ANNAS_MIN_PDF_PAGES) }
       : {}),
     ...(env.EXPERT_AGENTS_DOMAIN_EXPERT_ANNAS_DJVUTXT_BIN ? { djvutxtBin: env.EXPERT_AGENTS_DOMAIN_EXPERT_ANNAS_DJVUTXT_BIN } : {}),
+    ...(env.EXPERT_AGENTS_DOMAIN_EXPERT_ANNAS_PDF_SPLIT_PAGES
+      ? { pdfSplitPages: normalizeNonNegativeInteger(env.EXPERT_AGENTS_DOMAIN_EXPERT_ANNAS_PDF_SPLIT_PAGES, DEFAULT_ANNAS_PDF_SPLIT_PAGES) }
+      : {}),
+    ...(env.EXPERT_AGENTS_DOMAIN_EXPERT_ANNAS_QPDF_BIN ? { qpdfBin: env.EXPERT_AGENTS_DOMAIN_EXPERT_ANNAS_QPDF_BIN } : {}),
+    ...(env.EXPERT_AGENTS_DOMAIN_EXPERT_ANNAS_PDFTOTEXT_BIN ? { pdftotextBin: env.EXPERT_AGENTS_DOMAIN_EXPERT_ANNAS_PDFTOTEXT_BIN } : {}),
     ...(env.EXPERT_AGENTS_DOMAIN_EXPERT_ANNAS_IMPORT_POLL_INTERVAL_MS
       ? { importPollIntervalMs: normalizePositiveInteger(env.EXPERT_AGENTS_DOMAIN_EXPERT_ANNAS_IMPORT_POLL_INTERVAL_MS, DEFAULT_ANNAS_IMPORT_POLL_INTERVAL_MS) }
       : {}),
@@ -8198,6 +8438,109 @@ type AnnasImportOutcomeStatus = 'imported' | 'import_failed' | 'import_empty' | 
 // The acquisition's top-level status must not read as success when the
 // ingest did not verify: a caller that only looks at the outer status saw
 // 'downloaded' on 2026-09-20 for sixteen books that never entered the corpus.
+function annasSplitPartRecords(ragIngest: Record<string, unknown>): AnnasSplitPartResult[] {
+  return Array.isArray(ragIngest.parts) ? ragIngest.parts as AnnasSplitPartResult[] : [];
+}
+
+// The objects a registry record holds: its gcs_uri, or each entry of its rag_files list.
+function registryRecordGcsUris(record: Record<string, unknown>): string[] {
+  const uris: string[] = [];
+  const single = stringRecordField(record, 'gcs_uri', 'gcsUri');
+  if (single) uris.push(single);
+  if (Array.isArray(record.rag_files)) {
+    for (const file of record.rag_files) {
+      const uri = asOptionalRecord(file)?.gcs_uri;
+      if (typeof uri === 'string' && uri) uris.push(uri);
+    }
+  }
+  return uris;
+}
+
+interface AnnasSplitPartResult {
+  part: number;
+  of: number;
+  name: string;
+  first_page: number;
+  last_page: number;
+  pages: number;
+  gcs_uri?: string;
+  status: AnnasImportOutcomeStatus | 'blocked' | 'not_attempted';
+  import_outcome?: Record<string, unknown>;
+  submission_retries?: number;
+  error?: { code: string; message: string; suggestion?: string };
+  reason?: string;
+  coverage?: Record<string, unknown>;
+}
+
+function annasSplitPartBase(part: PdfPartPlan): Pick<AnnasSplitPartResult, 'part' | 'of' | 'name' | 'first_page' | 'last_page' | 'pages'> {
+  return { part: part.index, of: part.of, name: `part${part.index}of${part.of}`, first_page: part.firstPage, last_page: part.lastPage, pages: part.pages };
+}
+
+function annasIngestErrorRecord(error: unknown): { code: string; message: string; suggestion?: string } {
+  return error instanceof DomainExpertWorkerError
+    ? { code: error.code, message: error.message, ...(error.suggestion ? { suggestion: error.suggestion } : {}) }
+    : { code: 'rag_ingest_error', message: error instanceof Error ? error.message : String(error) };
+}
+
+// The book is imported only when every part is. Otherwise the status is the
+// most actionable part outcome: something blocked, then a failure, then an
+// import still running.
+function annasSplitStatus(results: AnnasSplitPartResult[]): string {
+  if (results.every((result) => result.status === 'imported')) return 'imported';
+  for (const status of ['blocked', 'import_failed', 'import_empty', 'import_requested'] as const) {
+    if (results.some((result) => result.status === status)) return status;
+  }
+  return 'blocked';
+}
+
+function describeAnnasSplitPart(result: AnnasSplitPartResult): string {
+  const range = `Part ${result.part} of ${result.of} (pages ${result.first_page}-${result.last_page})`;
+  if (result.status === 'not_attempted') return `${range} was not attempted.`;
+  if (result.error) return `${range} was blocked: ${result.error.code}: ${result.error.message}`;
+  const detail = result.import_outcome ? ragImportReason(result.import_outcome) : 'No reason reported.';
+  return `${range} ended ${result.status}: ${detail}`;
+}
+
+function annasSplitPartCoverage(
+  part: PdfPartPlan,
+  file: Record<string, unknown> | undefined,
+  listingError: string | undefined,
+  text: PdfTextLayer | undefined,
+  textError: string | undefined,
+): Record<string, unknown> {
+  const ragFile = file?.rag_file_name
+    ? { rag_file_name: file.rag_file_name, rag_file_state: file.state ?? 'unknown' }
+    : {};
+  const textFacts = text
+    ? { text_pages: text.pages, text_characters: text.characters, pages_without_text: text.pagesWithoutText }
+    : {};
+  const facts = { ...ragFile, ...textFacts };
+  if (!listingError && file?.state !== 'ACTIVE') {
+    return { status: 'not_covered', ...facts, reason: file?.rag_file_name ? `The part's ragFile is ${String(file.state ?? 'in an unknown state')}, not ACTIVE.` : 'Vertex lists no ragFile for the part.' };
+  }
+  if (listingError) return { status: 'unverified', ...facts, reason: `The corpus file listing was unavailable (${listingError}).` };
+  if (!text) return { status: 'unverified', ...facts, reason: `The part's text layer could not be read (${textError}).` };
+  if (text.pages !== part.pages) {
+    return { status: 'unverified', ...facts, reason: `The text layer reads ${text.pages} pages for a ${part.pages}-page part.` };
+  }
+  if (text.characters === 0) {
+    return { status: 'text_layer_absent', ...facts, reason: 'The part has no text layer; Vertex parsed it from page images, which the worker cannot verify. Probe it with domain_ask before relying on it.' };
+  }
+  return { status: 'covered', ...facts };
+}
+
+// covered only when every imported part is covered; otherwise the parts to look at.
+function annasSplitCoverageSummary(results: AnnasSplitPartResult[]): Record<string, unknown> {
+  const checked = results.filter((result) => result.coverage);
+  const attention = checked.filter((result) => result.coverage!.status !== 'covered').map((result) => ({ part: result.name, status: result.coverage!.status }));
+  return {
+    checked_parts: checked.length,
+    covered_parts: checked.length - attention.length,
+    status: !checked.length ? 'not_checked' : attention.length ? 'needs_attention' : 'covered',
+    ...(attention.length ? { needs_attention: attention } : {}),
+  };
+}
+
 function annasAcquisitionStatus(base: 'downloaded' | 'ingested_existing', ingestStatus: string): string {
   const prefix = base === 'downloaded' ? 'downloaded' : 'skipped_duplicate';
   if (ingestStatus === 'blocked' || ingestStatus === 'needs_corpus_decision') return `${prefix}_ingest_blocked`;

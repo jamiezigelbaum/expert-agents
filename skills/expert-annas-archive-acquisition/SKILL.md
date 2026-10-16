@@ -1,6 +1,6 @@
 ---
 name: expert-annas-archive-acquisition
-version: 0.4.2
+version: 0.5.0
 description: Search for candidate books, download owner-named titles immediately, present candidates for selection questions, save approved files through the configured sink, and route them to the domain's target corpus.
 tools:
   - annas_archive_search
@@ -54,16 +54,24 @@ DJVU on a host without `djvutxt`) with `unsupported_ingest_format` — the
 download stays on disk and the refusal names the path.
 
 **Always acquire the EPUB; take a PDF only when no EPUB of the work is
-offered** (owner ruling). PDF imports with the LLM parser have failed above
-about 500 pages, so while this deployment imports with the LLM parser (its
-usual setting) the runtime refuses a PDF measured above its configured ceiling
-(default 500) before upload, with `annas_pdf_exceeds_parser_page_limit`; the
-file stays on disk. A long PDF it cannot measure reliably may still fail its
-import (`import_failed`, a Vertex internal error). For a book that long, look
-harder for an EPUB or a volume split, and tell the owner a long PDF may not
-ingest before choosing it.
-Report a refusal or failure with the measured page count (`scale.pages`); do
-not retry the same file. When the owner intends to ingest, search with
+offered** (owner ruling). PDF imports with the LLM parser fail at about 300
+pages, so while this deployment imports with the LLM parser (its usual
+setting) the runtime splits a longer PDF into parts of at most 200 pages,
+uploads them as `<name>--partNofM.pdf` and imports them one at a time.
+`rag_ingest.split` gives the page count and how many parts imported;
+`rag_ingest.parts` lists each part's page range, status and coverage
+(`covered`, `text_layer_absent` for a scan the parser read from images —
+probe it with `domain_ask` — `not_covered` or `unverified`). When a part fails
+or is blocked the error is `annas_pdf_split_import_incomplete`, naming each
+part and its pages; re-run the same import once the cause is cleared and only
+the missing parts are imported again. If splitting fails the code is
+`annas_pdf_split_failed` and the file stays on disk. On a host that cannot
+split (no qpdf, or splitting disabled) the runtime instead refuses a PDF
+measured above its configured ceiling (default 500) before upload, with
+`annas_pdf_exceeds_parser_page_limit`; the file stays on disk.
+Report a refusal or failure with the measured page count (`scale.pages`) and,
+for a split, the failing parts; do not substitute another copy without telling
+the owner. When the owner intends to ingest, search with
 `ingest_intent: true`: EPUB ranks first, PDF next, DJVU below them, MOBI/AZW3
 last with the rationale "not ingestible". Without the flag the reading
 preference alone decides.

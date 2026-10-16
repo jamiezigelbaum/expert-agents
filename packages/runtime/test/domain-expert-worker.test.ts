@@ -40,6 +40,7 @@ import {
   reciprocalRankFuse,
   type DomainExpertWorkerOptions,
   type DomainExpertReranker, parseLibgenSearchHtml } from '../src/workers/domain-expert/index.ts';
+import { pdfPartStem, planPdfParts, qpdfPageCount, splitPdf, stripPdfPartSuffix } from '../src/workers/domain-expert/pdf-split.ts';
 import { TEST_AGENT_ROUTING } from './routing-fixture.ts';
 import { buildEpub } from '../../library/test/epub-fixture.ts';
 
@@ -6077,16 +6078,17 @@ function withPdfObject(pdf: Uint8Array, dictionary: string): Uint8Array {
 }
 
 // LLM-parser imports of PDFs above about 500 pages fail inside Vertex with an internal error
-// (2026-10-16: a 582-page text PDF, every time). A measured PDF above the ceiling is refused
-// before upload with a specific code; the file stays on disk.
-describe('PDF page ceiling for LLM-parser imports', () => {
+// (2026-10-16: a 582-page text PDF, every time). Where the worker cannot split a long PDF
+// (splitting disabled, or no qpdf), a measured PDF above the ceiling is refused before upload
+// with a specific code; the file stays on disk. Splitting is covered further down.
+describe('PDF page ceiling for LLM-parser imports when splitting is unavailable', () => {
   const CORPUS = 'projects/fixture-project/locations/us-central1/ragCorpora/1001';
   const PARAMS = {
     domain_id: 'research', annas_archive_id: 'long-fixture', title: 'The Fixture Compendium', author: 'Example Author',
     year: '1989', topic: 'Research', format: 'pdf', copyright_posture: 'approved_fixture_use', approval_id: 'approval-fixture', dry_run: false,
   };
 
-  function ceilingFixture(bytes: Uint8Array, options: { maxPdfPages?: number; ragParserModel?: string } = {}) {
+  function ceilingFixture(bytes: Uint8Array, options: { maxPdfPages?: number; ragParserModel?: string; pdfSplitPages?: number; qpdfBin?: string } = {}) {
     const fixture = workspaceFixture();
     const booksRoot = join(fixture.base, 'books');
     mkdirSync(booksRoot);
@@ -6097,6 +6099,8 @@ describe('PDF page ceiling for LLM-parser imports', () => {
         apiKey: 'fixture-acquisition-token', baseUrl: 'https://annas.example', booksRoot,
         importGcsPrefix: 'gs://fixture-shared-library/v1/book-imports/',
         ...(options.maxPdfPages !== undefined ? { maxPdfPages: options.maxPdfPages } : {}),
+        pdfSplitPages: options.pdfSplitPages ?? 0,
+        ...(options.qpdfBin ? { qpdfBin: options.qpdfBin } : {}),
       },
       google: { accessToken: 'fixture-google-token', fetchImpl: fakeIngestGoogleFetch(googleCalls), ...(options.ragParserModel ? { ragParserModel: options.ragParserModel } : {}) },
       fetchImpl: fakeAnnasArtifactFetch([], bytes, 'application/pdf'),
@@ -6177,9 +6181,11 @@ describe('PDF page ceiling for LLM-parser imports', () => {
   });
 
   test.each([
-    ['a PDF one page over the ceiling', syntheticPdfBytes(501)],
-  ] as const)('refuses %s', async (_name, bytes) => {
-    const f = ceilingFixture(bytes);
+    ['a PDF one page over the ceiling', syntheticPdfBytes(501), {}],
+    // Splitting is enabled but qpdf does not resolve, so the ceiling still refuses.
+    ['a long PDF on a host without qpdf', syntheticPdfBytes(582), { pdfSplitPages: 200, qpdfBin: 'qpdf-missing-fixture' }],
+  ] as const)('refuses %s', async (_name, bytes, options) => {
+    const f = ceilingFixture(bytes, options);
     try {
       const response = await postDomain(f.worker, 'annas_archive_import', { ...PARAMS, ingest: true, corpus_id: CORPUS });
       expect(response.rag_ingest.error.code).toBe('annas_pdf_exceeds_parser_page_limit');
@@ -6203,5 +6209,310 @@ describe('PDF page ceiling for LLM-parser imports', () => {
       // The ceiling in effect is recorded only while it applies.
       expect(response.scale.max_pdf_pages).toBe('maxPdfPages' in options || 'ragParserModel' in options ? undefined : 500);
     } finally { f.cleanup(); }
+  });
+});
+
+// A PDF whose pages carry a text layer pdftotext can read; blank pages carry none.
+function textPdfBytes(pages: number, blankPages: ReadonlySet<number> = new Set()): Uint8Array {
+  const kids = Array.from({ length: pages }, (_, index) => `${4 + 2 * index} 0 R`).join(' ');
+  const body = Array.from({ length: pages }, (_, index) => {
+    const stream = blankPages.has(index + 1) ? '' : `BT /F1 12 Tf 72 720 Td (Fixture page ${index + 1}) Tj ET`;
+    return `${4 + 2 * index} 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R >> >> /Contents ${5 + 2 * index} 0 R >>\nendobj\n`
+      + `${5 + 2 * index} 0 obj\n<< /Length ${stream.length} >>\nstream\n${stream}\nendstream\nendobj\n`;
+  }).join('');
+  return new TextEncoder().encode([
+    '%PDF-1.7\n',
+    '1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n',
+    `2 0 obj\n<< /Type /Pages /Count ${pages} /Kids [${kids}] >>\nendobj\n`,
+    '3 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n',
+    body,
+    'trailer\n<< /Root 1 0 R >>\n%%EOF\n',
+  ].join(''));
+}
+
+describe('PDF part planning', () => {
+  test('parts are balanced, contiguous, at most the split size, and cover every page once', () => {
+    expect(planPdfParts(508, 200).map((part) => [part.firstPage, part.lastPage])).toEqual([[1, 170], [171, 339], [340, 508]]);
+    expect(planPdfParts(334, 200).map((part) => part.pages)).toEqual([167, 167]);
+    expect(planPdfParts(201, 200).map((part) => part.pages)).toEqual([101, 100]);
+    expect(planPdfParts(200, 200)).toEqual([{ index: 1, of: 1, firstPage: 1, lastPage: 200, pages: 200 }]);
+    for (const pages of [201, 399, 400, 401, 1234]) {
+      const plan = planPdfParts(pages, 200);
+      expect(plan.every((part) => part.pages <= 200 && part.of === plan.length)).toBe(true);
+      expect(plan.reduce((total, part) => total + part.pages, 0)).toBe(pages);
+      plan.forEach((part, index) => expect(part.firstPage).toBe(index === 0 ? 1 : plan[index - 1]!.lastPage + 1));
+    }
+    expect(() => planPdfParts(0, 200)).toThrow();
+    expect(() => planPdfParts(10, 0)).toThrow();
+  });
+
+  test('part names follow <stem>--partNofM and strip back to the book stem', () => {
+    expect(pdfPartStem('riker - liberalism (1982)', { index: 2, of: 3 })).toBe('riker - liberalism (1982)--part2of3');
+    expect(stripPdfPartSuffix('riker - liberalism (1982)--part2of3')).toBe('riker - liberalism (1982)');
+    expect(stripPdfPartSuffix('riker - liberalism (1982)')).toBe('riker - liberalism (1982)');
+  });
+
+  test('qpdf splits a PDF into parts holding exactly the planned pages, identically on every run', async () => {
+    const qpdf = Bun.which('qpdf');
+    expect(qpdf, 'qpdf must be installed for the PDF split tests').toBeTruthy();
+    const bytes = textPdfBytes(9);
+    expect(await qpdfPageCount(qpdf!, bytes)).toBe(9);
+    const plan = planPdfParts(9, 4);
+    const parts = await splitPdf(qpdf!, bytes, plan);
+    expect(await Promise.all(parts.map((part) => qpdfPageCount(qpdf!, part.bytes)))).toEqual([3, 3, 3]);
+    const again = await splitPdf(qpdf!, bytes, plan);
+    expect(again.map((part) => sha256Hex(part.bytes))).toEqual(parts.map((part) => sha256Hex(part.bytes)));
+  });
+});
+
+function sha256Hex(bytes: Uint8Array): string {
+  return createHash('sha256').update(bytes).digest('hex');
+}
+
+// #33: the LLM parser fails PDFs of about 300 pages and more (2026-10-08: 254 passed; about
+// 330, 350, 400 and 500 failed). A longer PDF is split with qpdf into parts of at most 200
+// pages, each imported and coverage-checked on its own, the workaround that imported 9 of 9
+// parts by hand.
+describe('splitting long PDFs for LLM-parser imports', () => {
+  const CORPUS = INGEST_CORPUS_RESOURCE;
+  const PARAMS = {
+    domain_id: 'research', annas_archive_id: 'split-fixture', title: 'The Fixture Compendium', author: 'Example Author',
+    year: '1989', topic: 'Research', format: 'pdf', copyright_posture: 'approved_fixture_use', approval_id: 'approval-fixture',
+    dry_run: false, ingest: true, corpus_id: CORPUS,
+  };
+
+  type ImportBehaviour = (part: string, attempt: number) => Record<string, unknown> | Response;
+
+  // Vertex as the parts see it: each import names one object, its outcome is chosen per part
+  // name, and the ragFile listing shows every object imported so far as ACTIVE.
+  function splitGoogleFetch(calls: CapturedCall[], behaviour: ImportBehaviour, listing: { state?: string } = {}): typeof fetch {
+    const objects: FakeGcsObjects = new Map();
+    const imported = new Map<string, string>();
+    const attempts = new Map<string, number>();
+    let operations = 0;
+    return (async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+      const url = input instanceof Request ? input.url : String(input);
+      const method = init?.method ?? 'GET';
+      calls.push({ url, method, body: init?.body instanceof Blob || init?.body instanceof Uint8Array ? '' : init?.body ? String(init.body) : '', headers: {} });
+      const gcs = fakeGcsObjectResponse(url, method, init, objects);
+      if (gcs) return gcs;
+      if (url.endsWith('/ragFiles:import')) {
+        const uri = JSON.parse(String(init?.body)).importRagFilesConfig.gcsSource.uris[0] as string;
+        const part = /--(part\d+of\d+)\.pdf$/.exec(uri)?.[1] ?? 'whole';
+        const attempt = (attempts.get(part) ?? 0) + 1;
+        attempts.set(part, attempt);
+        const outcome = imported.has(uri) ? { skippedRagFilesCount: '1' } : behaviour(part, attempt);
+        if (outcome instanceof Response) return outcome;
+        if ('importedRagFilesCount' in outcome) imported.set(uri, `${CORPUS}/ragFiles/${9000 + imported.size}`);
+        operations += 1;
+        return jsonResponse({ name: `${CORPUS}/operations/split-${operations}`, done: true, ...(('error' in outcome) ? { error: outcome.error } : { response: outcome }) });
+      }
+      if (method === 'GET' && new URL(url).pathname.endsWith('/ragFiles')) {
+        return jsonResponse({ ragFiles: [...imported].map(([uri, name]) => ({ name, gcsSource: { uris: [uri] }, fileStatus: { state: listing.state ?? 'ACTIVE' } })) });
+      }
+      return jsonResponse({ name: CORPUS, displayName: 'research-library', ragCorpora: [{ name: CORPUS, displayName: 'research-library' }] });
+    }) as typeof fetch;
+  }
+
+  function splitFixture(bytes: Uint8Array, behaviour: ImportBehaviour, options: {
+    ragParserModel?: string; pdfSplitPages?: number; qpdfBin?: string; listingState?: string; importPollTimeoutMs?: number;
+  } = {}) {
+    const fixture = workspaceFixture();
+    const booksRoot = join(fixture.base, 'books');
+    mkdirSync(booksRoot);
+    const googleCalls: CapturedCall[] = [];
+    const worker = createDomainExpertWorker({
+      gcpProject: 'fixture-project',
+      dataDir: join(fixture.base, 'data'),
+      roots: [rootPolicy(fixture.workspaceRoot)],
+      annas: {
+        apiKey: 'fixture-acquisition-token', baseUrl: 'https://annas.example', booksRoot,
+        importGcsPrefix: 'gs://fixture-shared-library/v1/book-imports/',
+        importPollIntervalMs: 1,
+        importPollTimeoutMs: options.importPollTimeoutMs ?? 2_000,
+        responseBudgetMs: 0,
+        ...(options.pdfSplitPages !== undefined ? { pdfSplitPages: options.pdfSplitPages } : {}),
+        ...(options.qpdfBin ? { qpdfBin: options.qpdfBin } : {}),
+      },
+      google: {
+        accessToken: 'fixture-google-token',
+        fetchImpl: splitGoogleFetch(googleCalls, behaviour, { ...(options.listingState ? { state: options.listingState } : {}) }),
+        ...(options.ragParserModel ? { ragParserModel: options.ragParserModel } : {}),
+      },
+      fetchImpl: fakeAnnasArtifactFetch([], bytes, 'application/pdf'),
+    });
+    const registryPath = join(fixture.workspaceRoot, domainManifest('research').workspace_relative_path, 'references/source-registry.jsonl');
+    const readRegistry = () => readFileSync(registryPath, 'utf8').split('\n').filter(Boolean).map((line) => JSON.parse(line) as Record<string, any>);
+    const importedUris = () => googleCalls.filter((call) => call.url.endsWith('/ragFiles:import'))
+      .map((call) => JSON.parse(call.body).importRagFilesConfig.gcsSource.uris[0] as string);
+    return { worker, googleCalls, booksRoot, readRegistry, importedUris, cleanup: fixture.cleanup };
+  }
+
+  const importsAll: ImportBehaviour = () => ({ importedRagFilesCount: '1' });
+
+  test('a 450-page PDF is uploaded and imported as three 150-page parts, each coverage-checked', async () => {
+    const f = splitFixture(textPdfBytes(450), importsAll);
+    try {
+      const response = await postDomain(f.worker, 'annas_archive_import', PARAMS);
+      expect(response).toMatchObject({
+        status: 'downloaded',
+        rag_ingest: {
+          status: 'imported',
+          split: { pages: 450, max_part_pages: 200, parts: 3, imported_parts: 3, coverage: { status: 'covered', checked_parts: 3, covered_parts: 3 } },
+        },
+      });
+      expect(response.rag_ingest.error).toBeUndefined();
+      expect(response.rag_ingest.gcs_uri).toBeUndefined();
+      const uploaded = uploadedObjectNames(f.googleCalls);
+      expect(uploaded).toEqual([1, 2, 3].map((index) => `v1/book-imports/research/author---the-fixture-compendium-1989--part${index}of3.pdf`));
+      // One import per part, in order, each naming its own object.
+      expect(f.importedUris()).toEqual(uploaded.map((name) => `gs://fixture-shared-library/${name}`));
+      expect(response.rag_ingest.gcs_uris).toEqual(f.importedUris());
+      expect(response.rag_ingest.parts.map((part: Record<string, any>) => [part.name, part.first_page, part.last_page, part.status])).toEqual([
+        ['part1of3', 1, 150, 'imported'], ['part2of3', 151, 300, 'imported'], ['part3of3', 301, 450, 'imported'],
+      ]);
+      expect(response.rag_ingest.parts[1].coverage).toMatchObject({
+        status: 'covered', rag_file_state: 'ACTIVE', text_pages: 150, pages_without_text: 0,
+      });
+      expect(response.rag_ingest.parts[1].coverage.rag_file_name).toMatch(/ragFiles\/900\d$/);
+      expect(response.rag_ingest.parts[1].coverage.text_characters).toBeGreaterThan(150 * 10);
+      // Registered once for the book, with its parts.
+      const [record] = f.readRegistry();
+      expect(record).toMatchObject({ ingest_status: 'imported', split_parts: 3, title: 'The Fixture Compendium' });
+      expect(record!.gcs_uri).toBeUndefined();
+      expect(record!.rag_files.map((file: Record<string, any>) => [file.gcs_uri, file.part, file.status])).toEqual(
+        f.importedUris().map((uri, index) => [uri, `part${index + 1}of3`, 'imported']));
+      expect(record!.rag_files.every((file: Record<string, any>) => /ragFiles\/900\d$/.test(file.rag_file_name))).toBe(true);
+    } finally { f.cleanup(); }
+  });
+
+  // Replaces the #36 refusal: the 582-page PDF from the incident splits instead of being refused.
+  test('a PDF above the parser page ceiling is split, not refused', async () => {
+    const f = splitFixture(textPdfBytes(582), importsAll);
+    try {
+      const response = await postDomain(f.worker, 'annas_archive_import', PARAMS);
+      expect(response).toMatchObject({ status: 'downloaded', rag_ingest: { status: 'imported', split: { pages: 582, parts: 3, imported_parts: 3 } } });
+      expect(response.rag_ingest.parts.map((part: Record<string, any>) => part.pages)).toEqual([194, 194, 194]);
+      expect(response.scale.above_max_pdf_pages).toBeUndefined();
+      expect(response.scale.max_pdf_pages).toBeUndefined();
+    } finally { f.cleanup(); }
+  });
+
+  test('a failing part is reported with its page range, the other parts still import, and a re-run imports only the missing part', async () => {
+    const f = splitFixture(textPdfBytes(450), (part, attempt) => (part === 'part2of3' && attempt === 1
+      ? { error: { code: 13, message: 'An internal error occurred processing the file.' } }
+      : { importedRagFilesCount: '1' }));
+    try {
+      const response = await postDomain(f.worker, 'annas_archive_import', PARAMS);
+      expect(response).toMatchObject({
+        status: 'downloaded_ingest_failed',
+        rag_ingest: { status: 'import_failed', split: { parts: 3, imported_parts: 2 }, error: { code: 'annas_pdf_split_import_incomplete' } },
+      });
+      expect(response.rag_ingest.parts.map((part: Record<string, any>) => part.status)).toEqual(['imported', 'import_failed', 'imported']);
+      expect(response.rag_ingest.error.message).toContain('2 of 3 parts');
+      expect(response.rag_ingest.error.message).toContain('Part 2 of 3 (pages 151-300) ended import_failed: Vertex error: An internal error occurred');
+      expect(response.rag_ingest.error.suggestion).toContain('only the missing parts');
+      expect(response.rag_ingest.parts[1].coverage).toBeUndefined();
+      // The two imported parts are in the corpus, so the source is tracked with its real status.
+      expect(f.readRegistry().at(-1)).toMatchObject({ ingest_status: 'import_failed', ingest_reason: 'annas_pdf_split_import_incomplete', split_parts: 3 });
+
+      const uploadsBefore = uploadedObjectNames(f.googleCalls).length;
+      const again = await postDomain(f.worker, 'annas_archive_import', PARAMS);
+      expect(again).toMatchObject({ status: 'ingested_existing', rag_ingest: { status: 'imported', split: { imported_parts: 3, coverage: { status: 'covered' } } } });
+      // The same bytes split to the same parts: nothing is uploaded again, parts 1 and 3 are
+      // skipped by Vertex as present, and part 2 is imported.
+      expect(uploadedObjectNames(f.googleCalls).length).toBe(uploadsBefore);
+      expect(again.rag_ingest.parts.map((part: Record<string, any>) => part.import_outcome.already_present === true)).toEqual([true, false, true]);
+      expect(f.readRegistry().at(-1)).toMatchObject({ ingest_status: 'imported', split_parts: 3 });
+    } finally { f.cleanup(); }
+  });
+
+  test('a part blocked by quota stops the later parts, which are reported as not attempted', async () => {
+    const f = splitFixture(textPdfBytes(450), (part) => (part === 'part2of3'
+      ? jsonResponse({ error: { code: 429, status: 'RESOURCE_EXHAUSTED', message: 'Quota exceeded.' } }, 429)
+      : { importedRagFilesCount: '1' }), { importPollTimeoutMs: 30 });
+    try {
+      const response = await postDomain(f.worker, 'annas_archive_import', PARAMS);
+      expect(response.rag_ingest).toMatchObject({ status: 'blocked', split: { imported_parts: 1 }, error: { code: 'annas_pdf_split_import_incomplete' } });
+      expect(response.rag_ingest.parts.map((part: Record<string, any>) => part.status)).toEqual(['imported', 'blocked', 'not_attempted']);
+      expect(response.rag_ingest.parts[1].error.code).toBe('rag_import_quota_exhausted');
+      expect(response.rag_ingest.parts[2].reason).toContain('Part 2 of 3 was blocked');
+      expect(f.importedUris().some((uri) => uri.includes('part3of3'))).toBe(false);
+      expect(response.rag_ingest.error.message).toContain('Part 3 of 3 (pages 301-450) was not attempted.');
+    } finally { f.cleanup(); }
+  });
+
+  test('coverage flags a part whose ragFile is not ACTIVE, and a part with no text layer', async () => {
+    const blank = new Set(Array.from({ length: 125 }, (_, index) => 126 + index));
+    const f = splitFixture(textPdfBytes(250, blank), importsAll, { listingState: 'ERROR' });
+    try {
+      const response = await postDomain(f.worker, 'annas_archive_import', PARAMS);
+      expect(response.rag_ingest.status).toBe('imported');
+      expect(response.rag_ingest.parts.map((part: Record<string, any>) => part.coverage.status)).toEqual(['not_covered', 'not_covered']);
+      expect(response.rag_ingest.parts[0].coverage.reason).toContain('ERROR, not ACTIVE');
+      expect(response.rag_ingest.split.coverage).toMatchObject({ status: 'needs_attention', covered_parts: 0 });
+    } finally { f.cleanup(); }
+    const g = splitFixture(textPdfBytes(250, blank), importsAll);
+    try {
+      const response = await postDomain(g.worker, 'annas_archive_import', PARAMS);
+      expect(response.rag_ingest.parts.map((part: Record<string, any>) => part.coverage.status)).toEqual(['covered', 'text_layer_absent']);
+      expect(response.rag_ingest.parts[1].coverage).toMatchObject({ text_characters: 0, pages_without_text: 125 });
+      expect(response.rag_ingest.split.coverage).toMatchObject({ status: 'needs_attention', needs_attention: [{ part: 'part2of2', status: 'text_layer_absent' }] });
+    } finally { g.cleanup(); }
+  });
+
+  test.each([
+    ['a PDF at the split size', textPdfBytes(200), {}],
+    ['a deployment that disables splitting', textPdfBytes(450), { pdfSplitPages: 0 }],
+    ["a deployment using Google's default parser", textPdfBytes(450), { ragParserModel: 'default' }],
+  ] as const)('imports %s whole', async (_name, bytes, options) => {
+    const f = splitFixture(bytes, importsAll, options);
+    try {
+      const response = await postDomain(f.worker, 'annas_archive_import', PARAMS);
+      expect(response).toMatchObject({ status: 'downloaded', rag_ingest: { status: 'imported' } });
+      expect(response.rag_ingest.split).toBeUndefined();
+      expect(f.importedUris()).toEqual(['gs://fixture-shared-library/v1/book-imports/research/author---the-fixture-compendium-1989.pdf']);
+    } finally { f.cleanup(); }
+  });
+
+  test('a long PDF qpdf counts but cannot split is refused with the file on disk', async () => {
+    const fixture = workspaceFixture();
+    const qpdf = join(fixture.base, 'qpdf-fixture');
+    // Counts 450 pages, then fails every write.
+    writeFileSync(qpdf, '#!/bin/sh\nif [ "$1" = "--show-npages" ]; then echo 450; exit 0; fi\necho "qpdf: fixture write failure" >&2\nexit 2\n', { mode: 0o755 });
+    const f = splitFixture(textPdfBytes(450), importsAll, { qpdfBin: qpdf });
+    try {
+      const response = await postDomain(f.worker, 'annas_archive_import', PARAMS);
+      expect(response).toMatchObject({
+        status: 'downloaded_ingest_blocked',
+        rag_ingest: { status: 'blocked', error: { code: 'annas_pdf_split_failed' }, split: { pages: 450, parts: 3 } },
+      });
+      expect(response.rag_ingest.error.message).toContain('fixture write failure');
+      expect(response.rag_ingest.error.message).toContain('still on disk');
+      expect(uploadedObjectNames(f.googleCalls)).toEqual([]);
+      expect(existsSync(response.download.path)).toBe(true);
+    } finally { f.cleanup(); fixture.cleanup(); }
+  });
+
+  test('a PDF qpdf cannot read is imported whole, as before splitting existed', async () => {
+    const fixture = workspaceFixture();
+    const qpdf = join(fixture.base, 'qpdf-fixture');
+    writeFileSync(qpdf, '#!/bin/sh\necho "qpdf: not a PDF" >&2\nexit 2\n', { mode: 0o755 });
+    const f = splitFixture(textPdfBytes(450), importsAll, { qpdfBin: qpdf });
+    try {
+      const response = await postDomain(f.worker, 'annas_archive_import', PARAMS);
+      expect(response.rag_ingest.status).toBe('imported');
+      expect(response.rag_ingest.split).toBeUndefined();
+      expect(f.importedUris()).toHaveLength(1);
+    } finally { f.cleanup(); fixture.cleanup(); }
+  });
+
+  test('splitting is configured from the environment', () => {
+    expect(domainExpertAnnasConfigFromEnv({ EXPERT_AGENTS_DOMAIN_EXPERT_ANNAS_PDF_SPLIT_PAGES: '0' }).pdfSplitPages).toBe(0);
+    expect(domainExpertAnnasConfigFromEnv({ EXPERT_AGENTS_DOMAIN_EXPERT_ANNAS_PDF_SPLIT_PAGES: '150' }).pdfSplitPages).toBe(150);
+    expect(domainExpertAnnasConfigFromEnv({}).pdfSplitPages).toBeUndefined();
+    expect(() => domainExpertAnnasConfigFromEnv({ EXPERT_AGENTS_DOMAIN_EXPERT_ANNAS_PDF_SPLIT_PAGES: 'some' })).toThrow();
+    expect(domainExpertAnnasConfigFromEnv({ EXPERT_AGENTS_DOMAIN_EXPERT_ANNAS_QPDF_BIN: '/opt/qpdf/bin/qpdf' }).qpdfBin).toBe('/opt/qpdf/bin/qpdf');
+    expect(domainExpertAnnasConfigFromEnv({ EXPERT_AGENTS_DOMAIN_EXPERT_ANNAS_PDFTOTEXT_BIN: '/opt/poppler/pdftotext' }).pdftotextBin).toBe('/opt/poppler/pdftotext');
   });
 });

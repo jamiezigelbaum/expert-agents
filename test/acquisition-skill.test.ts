@@ -18,4 +18,12 @@ describe("acquisition skill", () => {
     expect(ceiling).toBeDefined();
     expect(skill).toContain(`configured ceiling (default ${ceiling})`);
   });
+
+  test("the split size it describes is the worker's default", async () => {
+    const skill = (await readFile("skills/expert-annas-archive-acquisition/SKILL.md", "utf8")).replace(/\s+/g, " ");
+    const worker = await readFile("packages/runtime/src/workers/domain-expert/index.ts", "utf8");
+    const size = /const DEFAULT_ANNAS_PDF_SPLIT_PAGES = (\d+);/.exec(worker)?.[1];
+    expect(size).toBeDefined();
+    expect(skill).toContain(`parts of at most ${size} pages`);
+  });
 });
