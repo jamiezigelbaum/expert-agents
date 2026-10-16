@@ -196,6 +196,39 @@ external services. Creation validates existing identities, authorizes the
 worker route, writes and commits the agent repository, ensures the corpus,
 then returns Telegram's confirmation link. Share that link immediately.
 
+Every applied create and resume first runs a preflight. It checks only what
+the remaining steps need, and it refuses before the Telegram link, the local
+repository or the GitHub repository exists:
+
+- `factory_gateway_reload_off`: the running Gateway's `gateway.reload.mode` is
+  `off`, so it would never load the new agent or its Telegram account. The
+  plugin reads the mode from its live runtime config; without one, the factory
+  reads the configured value, and an unset value means the default (`hybrid`).
+  Skipped once the Gateway configuration step has completed.
+- The `remoteCreateCommand` and `activationCommand` programs, when configured
+  and still needed, must be executable files (`missing_command`).
+- For an `https://github.com/` remote that is not yet pushed:
+  `gh auth status --hostname github.com` and `git ls-remote` run with exactly
+  the push's System GitHub identity, helper and isolated environment. A refused
+  credential fails with category `auth`. An absent remote is accepted when
+  `remoteCreateCommand` will create it, and refused with
+  `factory_remote_missing` otherwise.
+
+The expert factory acts only in a turn the owner sent directly. A subagent
+completion, another session or a scheduled turn is refused with
+`factory_owner_required`; continue in the owner's next message.
+
+Failures are located without revealing private output. Every factory error
+from an applied invocation names its `phase` (`preflight`, or the recorded step
+below). A failed command also names a fixed `step` label (for example
+`git push` or `agents.update`) and a `category`: `auth`, `not_found`,
+`rejected`, `unavailable`, `invalid`, `timeout`, `missing_command` or `failed`.
+The category is derived privately from the exit status and output; the output
+itself is withheld. The message has the same form, for example
+`configuring_gateway: agents.update failed (not_found)`. Other unexpected
+failures become `factory_step_failed` with their phase. The recorded phase is
+always the step in progress, so `status` and the error agree.
+
 After the owner confirms, call:
 
 ```json
@@ -205,14 +238,22 @@ After the owner confirms, call:
 | State | Meaning and next step |
 | --- | --- |
 | `planned` | No resources created. Repeat with authorized `apply: true`. |
+| `creating_repository` | The Telegram link exists; the local agent repository is being written. |
+| `committing_repository` | The repository exists; its first commit is being made. |
 | `wiring_remote` | The initial commit exists but the configured remote has not proven the pushed head. Fix the remote or its credentials, then resume; the commit is never repeated. |
-| `waiting_for_corpus` | A Vertex create operation has been submitted. Resume checks its result without replaying an uncertain submission. |
+| `registering_library` | The worker is registering the domain. |
+| `creating_corpus` | The Vertex corpus is being requested. |
+| `waiting_for_corpus` | A Vertex create operation has been submitted, or a resume is re-checking corpus readiness. Resume checks its result without replaying an uncertain submission. |
 | `waiting_for_telegram` | Use `confirmation_url` with the configured owner account; keep the suggested username or pick another if Telegram reports it taken. Then resume. |
-| `waiting_for_activation` | Config is validated; live polling and bot identity are not yet proven. Complete approved activation, then resume. |
-| `ready_empty_library` | Repository commit, corpus readiness, account configuration and matching Telegram polling are established. Import sources and prove an agent answer. |
+| `installing_telegram_token` | The confirmed bot's token is being installed. |
+| `configuring_gateway` | The agent, its route and its Telegram account are being configured and validated. |
+| `waiting_for_activation` | Config is validated; live polling and bot identity are not yet proven, and the bot is silent. With hybrid reload the Gateway starts the account after in-flight runs finish, which can take several minutes; then resume. With reload off, complete approved activation first. |
+| `ready_empty_library` | Repository commit, corpus readiness, account configuration and matching Telegram polling are established. The owner messaging the bot is the real test. Import sources and prove an agent answer. |
 
 `status` reads stored progress only; it is not a live health check. `resume`
-performs a fresh readiness check. Spec changes for an existing id are refused.
+performs a fresh readiness check. A resume first records the first unfinished
+step, which also downgrades an earlier readiness receipt, and re-proves corpus
+readiness. Spec changes for an existing id are refused.
 Never delete and recreate an operation to work around a provider failure.
 
 The route to the new agent is installed before its Telegram account is enabled,

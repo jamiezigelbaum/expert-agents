@@ -1,7 +1,7 @@
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import type { ExpertAgentsConfig } from '../packages/runtime/src/core/config.ts';
-import type { FactoryConfig, FactoryGitHubSelection, FactoryRequest } from '../packages/provisioning/src/factory-types.ts';
+import type { FactoryConfig, FactoryGatewaySelection, FactoryGitHubSelection, FactoryRequest } from '../packages/provisioning/src/factory-types.ts';
 
 export interface FactoryPluginConfig extends FactoryConfig { bunBin: string }
 export interface FactoryToolContext {
@@ -29,10 +29,13 @@ export const factoryParameters = {
 /** One child per invocation: no human wait, no shell, no token-bearing arguments. */
 export async function invokeFactory(
   factory: Partial<FactoryPluginConfig>, worker: ExpertAgentsConfig, request: unknown,
-  context: FactoryToolContext, signal?: AbortSignal, github: FactoryGitHubSelection = {},
+  context: FactoryToolContext, signal?: AbortSignal, github: FactoryGitHubSelection = {}, gateway?: FactoryGatewaySelection,
 ): Promise<{ result?: unknown; error?: { code: string; message: string } }> {
-  if (context.senderIsOwner !== true || context.sandboxed === true || context.fsPolicy?.workspaceOnly === true) {
-    return failure('factory_owner_required', 'Agent creation requires a trusted owner session with host filesystem authority.');
+  if (context.senderIsOwner !== true) {
+    return failure('factory_owner_required', 'The expert factory runs only in a turn the owner sent directly. A subagent completion, another session or a scheduled turn cannot advance it; ask the owner to continue in their own message.');
+  }
+  if (context.sandboxed === true || context.fsPolicy?.workspaceOnly === true) {
+    return failure('factory_owner_required', 'Agent creation requires host filesystem authority; this session is sandboxed or limited to its workspace.');
   }
   if (factory.enabled !== true) return failure('factory_disabled', 'The deployment owner must configure and enable the expert factory first.');
   if (!worker.domainExpert.enabled) return failure('factory_worker_disabled', 'Enable and configure the Expert Agents worker before creating an agent.');
@@ -79,7 +82,7 @@ export async function invokeFactory(
         else finish(failure('factory_invalid_response', 'The packaged factory returned an invalid response.'));
       } catch { finish(failure('factory_invalid_response', 'The packaged factory returned no valid response.')); }
     });
-    child.stdin.end(JSON.stringify({ factory, worker, request: request as FactoryRequest, github }));
+    child.stdin.end(JSON.stringify({ factory, worker, request: request as FactoryRequest, github, ...(gateway ? { gateway } : {}) }));
   });
 }
 

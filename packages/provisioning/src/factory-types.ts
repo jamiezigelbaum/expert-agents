@@ -27,6 +27,11 @@ export interface FactoryGitHubSelection {
   stateDir?: unknown;
 }
 
+/** The running Gateway's `gateway.reload.mode`, read by the plugin from its live runtime config. */
+export interface FactoryGatewaySelection {
+  reloadMode?: unknown;
+}
+
 export interface FactoryRequest {
   action: 'create' | 'resume' | 'status';
   agent_id: string;

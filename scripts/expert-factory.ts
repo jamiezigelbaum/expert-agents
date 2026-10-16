@@ -1,29 +1,46 @@
 import { constants, rmSync } from 'node:fs';
 import { lstat, mkdtemp, open, rm } from 'node:fs/promises';
 import { devNull, tmpdir } from 'node:os';
-import { isAbsolute, join } from 'node:path';
-import { runFactory, FactoryError, type FactoryCommand } from '../packages/provisioning/src/factory.ts';
-import type { FactoryConfig, FactoryGitHubSelection, FactoryRequest } from '../packages/provisioning/src/factory-types.ts';
+import { dirname, isAbsolute, join } from 'node:path';
+import { runFactory, FactoryError, type FactoryCommand, type FactoryFailureCategory } from '../packages/provisioning/src/factory.ts';
+import type { FactoryConfig, FactoryGatewaySelection, FactoryGitHubSelection, FactoryRequest } from '../packages/provisioning/src/factory-types.ts';
 import { DomainExpertClient } from '../packages/runtime/src/core/domain-expert-client.ts';
 import type { ExpertAgentsConfig } from '../packages/runtime/src/core/config.ts';
 import { OperationError } from '../packages/runtime/src/core/operation-error.ts';
 
 /** Packaged Bun adapter. Credentials arrive through private stdin, never argv or a receipt. */
 export async function executeFactoryEnvelope(value: unknown): Promise<unknown> {
-  const envelope = value as { factory: FactoryConfig; worker: ExpertAgentsConfig; request: FactoryRequest; github?: FactoryGitHubSelection };
+  const envelope = value as { factory: FactoryConfig; worker: ExpertAgentsConfig; request: FactoryRequest; github?: FactoryGitHubSelection; gateway?: FactoryGatewaySelection };
   if (!envelope || typeof envelope !== 'object' || !envelope.factory || !envelope.worker || !envelope.request) {
     return { error: { code: 'factory_invalid_envelope', message: 'Invalid factory invocation.' } };
   }
   try {
     const client = new DomainExpertClient(envelope.worker);
-    return { result: await runFactory(envelope.factory, envelope.request, { command: factoryCommand(envelope.github), worker: (tool, params) => client.run(tool, params) }) };
+    const command = factoryCommand(envelope.github);
+    return { result: await runFactory(envelope.factory, envelope.request, {
+      command, worker: (tool, params) => client.run(tool, params),
+      gatewayReloadMode: () => gatewayReloadMode(envelope.gateway, envelope.factory.openclawBin),
+    }) };
   } catch (error) {
     // Child command stderr, provider response bodies and paths may include secrets or personal
-    // content. Only our fixed factory errors are suitable for the model-facing protocol.
-    return { error: error instanceof FactoryError || error instanceof OperationError
-      ? { code: error.code, message: error.message }
-      : { code: 'factory_step_failed', message: 'A factory dependency failed. Progress was retained; inspect the deployment privately before resuming.' } };
+    // content. Only our fixed factory errors, and their fixed phase, step and category, are
+    // suitable for the model-facing protocol.
+    return { error: error instanceof FactoryError
+      ? { code: error.code, message: error.message, ...error.details }
+      : error instanceof OperationError
+        ? { code: error.code, message: error.message }
+        : { code: 'factory_step_failed', message: 'A factory dependency failed. Progress was retained; inspect the deployment privately before resuming.' } };
   }
+}
+
+// The plugin passes the live runtime value. Without it (another host or a direct invocation), the
+// factory reads the configured value; an unset path means OpenClaw's default.
+export async function gatewayReloadMode(gateway: FactoryGatewaySelection | undefined, openclawBin: string): Promise<unknown> {
+  if (gateway && typeof gateway === 'object') return gateway.reloadMode;
+  const output = (await runFactoryCommand([openclawBin, 'config', 'get', 'gateway.reload.mode', '--json'])).trim();
+  if (output === '') return undefined;
+  try { return JSON.parse(output); }
+  catch { throw new FactoryError('factory_command_failed', 'The configured Gateway reload mode could not be read.', { category: 'invalid' }); }
 }
 
 // OpenClaw's managed profile id shape (tools.github.profileId).
@@ -43,7 +60,9 @@ const REDIRECTING_REPOSITORY_SETTINGS = /^(url\.|http\.|include\.|includeif\.|re
 export function factoryCommand(github?: FactoryGitHubSelection): FactoryCommand {
   return async (argv, cwd, options) => {
     if (!options?.githubIdentity) return runFactoryCommand(argv, cwd);
-    if (argv[0] !== 'git') throw new FactoryError('factory_invalid_command', 'Only Git commands can use the System GitHub identity.');
+    // Git, and GitHub CLI's own credential check, are the only programs that receive the identity.
+    const probe = argv.join(' ') === 'gh auth status --hostname github.com';
+    if (argv[0] !== 'git' && !probe) throw new FactoryError('factory_invalid_command', 'Only Git commands and the GitHub CLI credential check can use the System GitHub identity.');
     const profileDir = await systemGitHubProfile(github);
     // An empty private HOME with no global or system Git config: host netrc entries, extra
     // headers, URL rewrites and hooks cannot authenticate or redirect this push.
@@ -55,16 +74,20 @@ export function factoryCommand(github?: FactoryGitHubSelection): FactoryCommand 
       const env: Record<string, string> = {};
       for (const [name, value] of Object.entries(process.env)) if (value !== undefined && !INHERITED_GIT_SETTINGS.test(name)) env[name] = value;
       Object.assign(env, { HOME: home, GH_CONFIG_DIR: profileDir, GIT_CONFIG_GLOBAL: devNull, GIT_CONFIG_NOSYSTEM: '1', GIT_TERMINAL_PROMPT: '0' });
+      if (probe) return await runFactoryCommand(argv, home, env);
+      // A check against a remote before the repository exists runs outside any repository.
+      const workdir = cwd ?? home;
+      if (cwd === undefined) env.GIT_CEILING_DIRECTORIES = dirname(home);
       // Every setting the push itself reads: with global and system config off, that is the
       // repository's config, its worktree config and anything they include.
-      const settings = await runFactoryCommand(['git', 'config', '--list', '--name-only', '--includes', '-z'], cwd, env);
+      const settings = await runFactoryCommand(['git', 'config', '--list', '--name-only', '--includes', '-z'], workdir, env);
       if (settings.split('\0').some((name) => REDIRECTING_REPOSITORY_SETTINGS.test(name.trim()))) {
         throw new FactoryError('factory_repository_git_config', 'The agent repository has its own Git URL rewrite, HTTP, include, push-URL or remote-helper setting that could redirect or authenticate the GitHub push. Remove it, then resume.');
       }
-      return await runFactoryCommand(['git', ...GITHUB_GIT_CONFIG, ...argv.slice(1)], cwd, env);
+      return await runFactoryCommand(['git', ...GITHUB_GIT_CONFIG, ...argv.slice(1)], workdir, env);
     } catch (error) {
       if (!(error instanceof FactoryError) || error.code !== 'factory_command_failed') throw error;
-      throw new FactoryError('factory_command_failed', 'A required Git command failed as the System GitHub identity. Its private output was withheld; check that System GitHub is connected and can write the remote, then resume.');
+      throw new FactoryError('factory_command_failed', 'A required command failed as the System GitHub identity. Its private output was withheld; check that System GitHub is connected and can write the remote, then resume.', error.details);
     } finally {
       process.off('SIGTERM', terminate);
       await rm(home, { recursive: true, force: true });
@@ -123,7 +146,13 @@ export async function runFactoryCommand(argv: string[], cwd?: string, env?: Reco
   // Read-only fleet lint can exceed 90 seconds on installations with many
   // plugins. Keep every check, bounded within the outer 300-second invocation.
   const healthCheck = argv[1] === 'doctor' && argv[2] === '--lint';
-  const child = Bun.spawn(argv, { cwd, ...(env ? { env } : {}), stdin: 'ignore', stdout: 'pipe', stderr: 'pipe', timeout: healthCheck ? 180_000 : 90_000 });
+  let child;
+  try { child = Bun.spawn(argv, { cwd, ...(env ? { env } : {}), stdin: 'ignore', stdout: 'pipe', stderr: 'pipe', timeout: healthCheck ? 180_000 : 90_000 }); }
+  catch (error) {
+    const code = (error as { code?: unknown }).code;
+    if (code !== 'ENOENT' && code !== 'EACCES') throw error;
+    throw new FactoryError('factory_command_failed', 'A required program could not start; it is missing or not executable.', { category: 'missing_command' });
+  }
   const readBounded = async (stream: ReadableStream<Uint8Array>): Promise<string> => {
     const reader = stream.getReader();
     const parts: Uint8Array[] = [];
@@ -140,16 +169,48 @@ export async function runFactoryCommand(argv: string[], cwd?: string, env?: Reco
     return Buffer.concat(parts).toString('utf8');
   };
   const [code, output, errorOutput] = await Promise.all([child.exited, readBounded(child.stdout), readBounded(child.stderr)]);
-  // A fresh OpenClaw installation may have no Telegram section. Recognize only the
-  // installed CLI's exact missing-path contract; authentication, parse and validation
-  // failures must not be converted into an empty configuration.
+  // A fresh OpenClaw installation may have no Telegram section or reload setting. Recognize only
+  // the CLI's exact unset-path contracts; authentication, parse and validation failures must not
+  // be converted into an empty or default configuration.
   const plainError = errorOutput.replace(/\x1b\[[0-9;]*m/g, '').trim();
-  if (code === 1 && argv.slice(1).join('\0') === ['config', 'get', 'channels.telegram', '--json'].join('\0')
-    && output.trim() === '' && plainError === 'Config path not found: channels.telegram. Run openclaw config validate to inspect config shape.') return '{}';
+  const unset = UNSET_CONFIG_DEFAULTS.get(argv[3] ?? '');
+  if (code === 1 && unset !== undefined && argv.length === 5 && argv[1] === 'config' && argv[2] === 'get' && argv[4] === '--json'
+    && isUnsetConfigPath(argv[3]!, output, plainError)) return unset;
   if (code !== 0) throw new FactoryError('factory_command_failed', healthCheck
     ? 'The OpenClaw health check failed or exceeded its 180-second budget. Its private output was withheld; inspect the operation before retrying.'
-    : `A required ${argv[0] === 'git' ? 'Git' : 'deployment'} command failed. Its private output was withheld; inspect the operation before retrying.`);
+    : `A required ${argv[0] === 'git' ? 'Git' : 'deployment'} command failed. Its private output was withheld; inspect the operation before retrying.`,
+  { category: classifyFailure(child.signalCode, `${plainError}\n${output}`) });
   return output;
+}
+
+// Unset paths the factory may read, with the value an unset path means.
+const UNSET_CONFIG_DEFAULTS = new Map([['channels.telegram', '{}'], ['gateway.reload.mode', '']]);
+
+function isUnsetConfigPath(path: string, output: string, plainError: string): boolean {
+  // OpenClaw up to 2026.9: a plain stderr message and no output.
+  if (output.trim() === '' && plainError === `Config path not found: ${path}. Run openclaw config validate to inspect config shape.`) return true;
+  // OpenClaw 2026.10: a JSON error on stdout and nothing on stderr.
+  if (plainError !== '') return false;
+  try {
+    const parsed = JSON.parse(output) as { ok?: unknown; error?: { type?: unknown; message?: unknown } };
+    return parsed.ok === false && parsed.error?.type === 'cli_error' && typeof parsed.error.message === 'string'
+      && parsed.error.message.startsWith(`Config path is valid but unset: ${path}. The runtime default applies until`);
+  } catch { return false; }
+}
+
+// A closed set of causes read privately from a failed command's output. Only the category leaves
+// this function; the output itself never does.
+const FAILURE_PATTERNS: [FactoryFailureCategory, RegExp][] = [
+  ['auth', /authentication failed|could not read (username|password)|terminal prompts disabled|invalid username or (password|token)|bad credentials|permission to .* denied|permission denied|requires authentication|not logged in|failed to log in|token .*(invalid|expired|revoked)|unauthori[sz]ed|forbidden|returned error: 40[13]|http 40[13]\b/i],
+  ['not_found', /repository not found|\bnot found\b|does not exist|does not appear to be a git repository|no such (remote|agent|file)|unknown agent|returned error: 404|http 404\b/i],
+  ['rejected', /\[(remote )?rejected\]|non-fast-forward|fetch first|hook declined|protected branch/i],
+  ['unavailable', /could not resolve host|connection (refused|reset|timed out)|failed to connect|couldn't connect|error connecting|dial tcp|i\/o timeout|network is unreachable|econnrefused|enotfound|etimedout|eai_again|rate limit|service unavailable|bad gateway|returned error: 5\d\d|http 5\d\d\b|gateway (is )?(not running|unreachable|closed)/i],
+  ['invalid', /\binvalid\b|validation failed|failed validation|schema/i],
+];
+
+export function classifyFailure(signal: string | null, output: string): FactoryFailureCategory {
+  if (signal !== null) return 'timeout';
+  return FAILURE_PATTERNS.find(([, pattern]) => pattern.test(output))?.[0] ?? 'failed';
 }
 
 // Bun's entrypoint test spelled without import.meta.main: OpenClaw's plugin source scan

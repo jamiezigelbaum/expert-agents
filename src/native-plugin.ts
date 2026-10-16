@@ -3,7 +3,7 @@ import type { ExpertAgentsConfig } from '../packages/runtime/src/core/config.ts'
 import { OperationError } from '../packages/runtime/src/core/operation-error.ts';
 import { readSecretInput } from '../packages/runtime/src/core/secret-input.ts';
 import { factoryParameters, invokeFactory, type FactoryPluginConfig, type FactoryToolContext } from './factory-tool.ts';
-import type { FactoryGitHubSelection } from '../packages/provisioning/src/factory-types.ts';
+import type { FactoryGatewaySelection, FactoryGitHubSelection } from '../packages/provisioning/src/factory-types.ts';
 import { researchToolSchemas } from './tool-schemas.ts';
 import { realpath } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
@@ -96,7 +96,7 @@ const plugin = {
           const current = currentPluginConfig(api, context);
           const config = configFromPluginConfig(current);
           const factory = asRecord(asRecord(current).factory) as unknown as Partial<FactoryPluginConfig>;
-          const response = await invokeFactory(factory, config, params, context, signal, systemGitHub(api, context));
+          const response = await invokeFactory(factory, config, params, context, signal, systemGitHub(api, context), gatewayReload(context));
           return response.error
             ? { content: [{ type: 'text', text: JSON.stringify(response) }], details: response, isError: true }
             : resultPayload(response.result);
@@ -132,6 +132,14 @@ function systemGitHub(api: OpenClawPluginApi, context: RuntimeToolContext): Fact
   let stateDir: unknown;
   try { stateDir = api.runtime?.state?.resolveStateDir?.(process.env); } catch { stateDir = undefined; }
   return { profileId, stateDir };
+}
+
+// The running Gateway's reload mode from the same live snapshot. With reload off, config the
+// factory writes is never loaded, so its preflight refuses before creating anything.
+function gatewayReload(context: RuntimeToolContext): FactoryGatewaySelection | undefined {
+  if (!context.getRuntimeConfig && context.runtimeConfig === undefined) return undefined;
+  const runtime = context.getRuntimeConfig ? context.getRuntimeConfig() : context.runtimeConfig;
+  return { reloadMode: asRecord(asRecord(asRecord(runtime).gateway).reload).mode };
 }
 
 async function factoryDomain(factory: Partial<FactoryPluginConfig>, context: FactoryToolContext): Promise<string | undefined> {

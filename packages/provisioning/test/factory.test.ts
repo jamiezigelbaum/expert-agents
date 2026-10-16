@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from 'bun:test';
 import { chmod, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { FactoryError, runFactory, type FactoryCommandOptions, type FactoryDependencies } from '../src/factory.ts';
+import { FACTORY_PHASES, FactoryError, runFactory, type FactoryCommandOptions, type FactoryDependencies } from '../src/factory.ts';
 import type { FactoryConfig, FactoryRequest } from '../src/factory-types.ts';
 import { probeManagedBotProvision } from '../../../scripts/expert-telegram-provision.ts';
 
@@ -26,6 +26,11 @@ async function fixture() {
   await mkdir(config.rootDir, { mode: 0o700 });
   await mkdir(config.tokenDirectory, { mode: 0o700 });
   await writeFile(config.managerTokenFile, TOKEN, { mode: 0o600 });
+  // Deployment-owned programs must exist and be executable before anything is created.
+  const bin = join(base, 'bin');
+  await mkdir(bin);
+  const programs = { activate: join(bin, 'activate'), createRemote: join(bin, 'create-remote') };
+  for (const program of Object.values(programs)) await writeFile(program, '#!/bin/sh\nexit 0\n', { mode: 0o700 });
   const calls: { argv: string[]; cwd?: string; options?: FactoryCommandOptions }[] = [];
   const workers: { tool: string; params: Record<string, unknown> }[] = [];
   const state = {
@@ -35,6 +40,7 @@ async function fixture() {
     beginCount: 0, provisionCount: 0, probeCount: 0, validationFails: false,
     channelError: false, registrationStatus: 'registered',
     remoteCreateCalls: [] as string[][], remoteCreateFails: false,
+    reloadMode: undefined as unknown, githubAuth: 'valid' as 'valid' | 'invalid',
     latestUpdateId: 0, confirmedUsername: 'ExampleFactoryTestBot',
     renamedCandidates: [] as { botId: number; username: string; updateId: number }[],
     probeInputs: [] as Record<string, unknown>[],
@@ -47,14 +53,20 @@ async function fixture() {
         const local = ['github.com', 'git.example.com'].flatMap((host) => ['-c', `url.file://${join(base, 'https', host)}/.insteadOf=https://${host}/`]);
         const child = Bun.spawn(['git', ...local, ...argv.slice(1)], { cwd, stdout: 'pipe', stderr: 'pipe', env: { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' } });
         const [stdout, stderr, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
-        if (code !== 0) throw new Error(`Fixture git failed: ${stderr}`);
+        // Categorized like the packaged adapter; a missing local remote stands in for GitHub's 404.
+        if (code !== 0) throw new FactoryError('factory_command_failed', `Fixture git failed: ${stderr}`, { category: /does not appear to be a git repository/.test(stderr) ? 'not_found' : 'failed' });
         return stdout;
+      }
+      if (argv.join(' ') === 'gh auth status --hostname github.com') {
+        if (state.githubAuth === 'invalid') throw new FactoryError('factory_command_failed', 'Fixture identity refused', { category: 'auth' });
+        return '';
       }
       if (argv[0] === config.activationCommand) return '';
       if (argv[0] === config.remoteCreateCommand) {
         state.remoteCreateCalls.push(argv.slice(1));
         if (state.remoteCreateFails) throw new Error('Fixture remote creation failed');
-        const bare = new URL(argv[2]!).pathname;
+        const url = new URL(argv[2]!);
+        const bare = url.protocol === 'file:' ? url.pathname : join(base, 'https', url.hostname, url.pathname);
         await mkdir(bare, { recursive: true });
         const child = Bun.spawn(['git', 'init', '--bare', '--quiet', bare], { stdout: 'pipe', stderr: 'pipe', env: { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' } });
         if (await child.exited !== 0) throw new Error('Fixture bare init failed');
@@ -100,6 +112,7 @@ async function fixture() {
       }
       throw new Error(`Unexpected fixture command: ${argv.join(' ')}`);
     },
+    gatewayReloadMode: async () => state.reloadMode,
     worker: async (tool, params) => {
       workers.push({ tool, params });
       return tool === 'domain_agent' ? { status: params.dry_run ? 'dry_run_registration_ready' : state.registrationStatus }
@@ -129,11 +142,11 @@ async function fixture() {
   };
   const wireRemote = () => {
     config.remoteUrlTemplate = `file://${join(base, 'remotes')}/{agentId}.git`;
-    config.remoteCreateCommand = '/fixture/create-remote';
+    config.remoteCreateCommand = programs.createRemote;
   };
   const run = (next: FactoryRequest = request) => runFactory(config, next, dependencies);
   const resume = () => run({ action: 'resume', agent_id: 'example', apply: true });
-  return { base, config, state, calls, workers, dependencies, run, resume, wireRemote, workspace: join(config.rootDir, 'agents', 'example') };
+  return { base, config, state, calls, workers, dependencies, programs, run, resume, wireRemote, workspace: join(config.rootDir, 'agents', 'example') };
 }
 
 describe('conversational expert factory', () => {
@@ -237,7 +250,7 @@ describe('conversational expert factory', () => {
       if (argv[1] === 'gateway' && argv[3] === method) throw new Error('Fixture Gateway unavailable');
       return command(argv, cwd);
     };
-    await expect(f.resume()).rejects.toThrow('Fixture Gateway unavailable');
+    await expect(f.resume()).rejects.toMatchObject({ code: 'factory_command_failed', details: { phase: 'configuring_gateway', step: method, category: 'failed' } });
     expect(f.state.agents).toHaveLength(method === 'agents.update' ? 1 : 0);
     expect(f.state.accounts).toEqual({});
     expect(f.state.bindings).toEqual([]);
@@ -260,7 +273,7 @@ describe('conversational expert factory', () => {
       }
       return command(argv, cwd);
     };
-    await expect(f.resume()).rejects.toThrow('Fixture account enable unavailable');
+    await expect(f.resume()).rejects.toMatchObject({ code: 'factory_command_failed', details: { phase: 'configuring_gateway', step: 'openclaw config set' } });
     expect(f.state.accounts).toEqual({});
     failEnable = false;
     expect((await f.resume()).status).toBe('ready_empty_library');
@@ -275,7 +288,7 @@ describe('conversational expert factory', () => {
       if (argv[1] === 'gateway' && argv[3] === 'agents.create') throw new Error('Fixture response lost after creation');
       return output;
     };
-    await expect(f.resume()).rejects.toThrow('Fixture response lost after creation');
+    await expect(f.resume()).rejects.toMatchObject({ code: 'factory_command_failed', details: { phase: 'configuring_gateway', step: 'agents.create' } });
     expect(f.state.agents).toHaveLength(1);
     expect(f.state.accounts).toEqual({});
     f.dependencies.command = command;
@@ -511,11 +524,11 @@ describe('conversational expert factory', () => {
 
   test('activation wrapper is attempted once, with no caller arguments', async () => {
     const f = await fixture(); f.state.running = false;
-    f.config.activationCommand = '/fixture/activate';
+    f.config.activationCommand = f.programs.activate;
     await f.run(); f.state.confirmed = true;
     expect((await f.resume()).status).toBe('waiting_for_activation');
     expect((await f.resume()).status).toBe('waiting_for_activation');
-    expect(f.calls.filter((call) => call.argv[0] === '/fixture/activate')).toEqual([{ argv: ['/fixture/activate'], cwd: undefined }]);
+    expect(f.calls.filter((call) => call.argv[0] === f.programs.activate)).toEqual([{ argv: [f.programs.activate], cwd: undefined }]);
   }, 60_000);
 
   test.each([
@@ -698,8 +711,10 @@ describe('conversational expert factory', () => {
       const result = await f.run();
       expect(result.repository_remote).toBe(remote);
       expect(await gitOutput(bare, ['rev-parse', 'HEAD'])).toBe(result.commit!);
-      expect(f.calls.filter((call) => call.options?.githubIdentity).map((call) => call.argv))
-        .toEqual(identity ? [['git', 'push', '--set-upstream', 'origin', 'HEAD']] : []);
+      // Preflight checks the identity and the remote the same way the push uses them.
+      expect(f.calls.filter((call) => call.options?.githubIdentity).map((call) => call.argv)).toEqual(identity
+        ? [['gh', 'auth', 'status', '--hostname', 'github.com'], ['git', 'ls-remote', remote], ['git', 'push', '--set-upstream', 'origin', 'HEAD']]
+        : []);
       expect(f.calls.filter((call) => call.options && !call.options.githubIdentity)).toEqual([]);
     }, 60_000);
 
@@ -721,18 +736,21 @@ describe('conversational expert factory', () => {
       await mkdir(bare, { recursive: true });
       await gitOutput(f.base, ['init', '--bare', '--quiet', bare]);
       const command = f.dependencies.command;
-      let connected = false;
+      // Available at preflight, then disconnected before the push.
+      let connected = true;
+      let reconnected = false;
       f.dependencies.command = async (argv, cwd, options) => {
+        if (options?.githubIdentity && argv[1] === 'push' && !reconnected) connected = false;
         if (options?.githubIdentity && !connected) throw new FactoryError('factory_github_identity_unavailable', 'Fixture identity unavailable');
         return command(argv, cwd, options);
       };
-      await expect(f.run()).rejects.toMatchObject({ code: 'factory_github_identity_unavailable' });
+      await expect(f.run()).rejects.toMatchObject({ code: 'factory_github_identity_unavailable', details: { phase: 'wiring_remote', step: 'git push' } });
       expect((await f.run({ action: 'status', agent_id: 'example' })).status).toBe('wiring_remote');
-      // A resume before reconnecting fails the same way and still reports the step it stopped at.
-      await expect(f.resume()).rejects.toMatchObject({ code: 'factory_github_identity_unavailable' });
+      // A resume before reconnecting stops at its preflight and still reports the recorded step.
+      await expect(f.resume()).rejects.toMatchObject({ code: 'factory_github_identity_unavailable', details: { phase: 'preflight', step: 'gh auth status' } });
       expect((await f.run({ action: 'status', agent_id: 'example' })).status).toBe('wiring_remote');
       expect(f.workers.filter((call) => call.params.dry_run === false)).toHaveLength(0);
-      connected = true;
+      connected = true; reconnected = true;
       const result = await f.resume();
       expect(result.repository_remote).toBe('https://github.com/example-owner/example.git');
       expect(await gitOutput(bare, ['rev-parse', 'HEAD'])).toBe(result.commit!);
@@ -741,7 +759,7 @@ describe('conversational expert factory', () => {
 
     test('a failed remote creation retains the commit and resumes without a second commit', async () => {
       const f = await fixture(); f.wireRemote(); f.state.remoteCreateFails = true;
-      await expect(f.run()).rejects.toMatchObject({ message: 'Fixture remote creation failed' });
+      await expect(f.run()).rejects.toMatchObject({ code: 'factory_command_failed', details: { phase: 'wiring_remote', step: 'remote creation command', category: 'failed' } });
       expect((await f.run({ action: 'status', agent_id: 'example' })).status).toBe('wiring_remote');
       expect(f.workers.filter((call) => call.params.dry_run === false)).toHaveLength(0);
       f.state.remoteCreateFails = false;
@@ -862,6 +880,178 @@ describe('conversational expert factory', () => {
       expect(result.status).toBe('ready_empty_library');
       expect(result.telegram_url).toBe('https://t.me/ExampleRenamed_tBot');
       expect(f.state.provisionCount).toBe(1);
+    }, 60_000);
+  });
+
+  describe('preflight', () => {
+    async function nothingCreated(f: Awaited<ReturnType<typeof fixture>>) {
+      expect(await Bun.file(join(f.config.rootDir, 'operations', 'example', 'state.json')).exists()).toBe(false);
+      expect(await Bun.file(join(f.workspace, 'agent.json')).exists()).toBe(false);
+      expect(f.state.beginCount).toBe(0);
+      expect(f.state.remoteCreateCalls).toEqual([]);
+      expect(f.workers.filter((call) => call.params.dry_run !== true)).toEqual([]);
+      expect(await Bun.file(join(f.config.rootDir, 'factory.lock')).exists()).toBe(false);
+    }
+    const githubRemote = (f: Awaited<ReturnType<typeof fixture>>, create = true) => {
+      f.config.remoteUrlTemplate = 'https://github.com/example-owner/{agentId}.git';
+      if (!create) delete f.config.remoteCreateCommand; else f.config.remoteCreateCommand = f.programs.createRemote;
+    };
+
+    test('refuses before anything is created when the running Gateway does not reload config', async () => {
+      const f = await fixture(); f.state.reloadMode = 'off';
+      const error = await f.run().catch((caught: unknown) => caught);
+      expect(error).toMatchObject({ code: 'factory_gateway_reload_off', details: { phase: 'preflight', step: 'gateway reload mode' } });
+      expect(String(error)).toContain('gateway.reload.mode');
+      await nothingCreated(f);
+      // Negative controls: the default and hybrid reload proceed.
+      for (const mode of [undefined, 'hybrid']) {
+        const g = await fixture(); g.state.reloadMode = mode;
+        expect((await g.run()).status).toBe('waiting_for_telegram');
+      }
+    }, 60_000);
+
+    test('a resume refuses with reload off until the Gateway is configured, then readiness still checks', async () => {
+      const f = await fixture(); await f.run(); f.state.confirmed = true; f.state.reloadMode = 'off';
+      await expect(f.resume()).rejects.toMatchObject({ code: 'factory_gateway_reload_off', details: { phase: 'preflight' } });
+      expect((await f.run({ action: 'status', agent_id: 'example' })).status).toBe('waiting_for_telegram');
+      expect(f.state.provisionCount).toBe(0);
+      f.state.reloadMode = undefined;
+      expect((await f.resume()).status).toBe('ready_empty_library');
+      // Once configured, reload no longer gates a readiness check.
+      f.state.reloadMode = 'off'; f.state.running = false;
+      expect((await f.resume()).status).toBe('waiting_for_activation');
+    }, 60_000);
+
+    test('refuses a refused System GitHub identity before the Telegram link or any repository', async () => {
+      const f = await fixture(); githubRemote(f); f.state.githubAuth = 'invalid';
+      const error = await f.run().catch((caught: unknown) => caught);
+      expect(error).toMatchObject({ code: 'factory_command_failed', details: { phase: 'preflight', step: 'gh auth status', category: 'auth' } });
+      expect(String(error)).toContain('System GitHub');
+      expect(String(error)).toContain('Nothing was changed');
+      await nothingCreated(f);
+      // Negative control: a valid identity and an absent remote that the factory will create.
+      f.state.githubAuth = 'valid';
+      const result = await f.run();
+      expect(result.repository_remote).toBe('https://github.com/example-owner/example.git');
+      expect(f.state.remoteCreateCalls).toHaveLength(1);
+    }, 60_000);
+
+    test('refuses an absent GitHub remote when nothing is configured to create it', async () => {
+      const f = await fixture(); githubRemote(f, false);
+      await expect(f.run()).rejects.toMatchObject({ code: 'factory_remote_missing', details: { phase: 'preflight', step: 'git ls-remote', category: 'not_found' } });
+      await nothingCreated(f);
+      // Negative control: an existing remote needs no creation command.
+      const bare = join(f.base, 'https', 'github.com', 'example-owner', 'example.git');
+      await mkdir(bare, { recursive: true });
+      expect(Bun.spawnSync(['git', 'init', '--bare', '--quiet', bare], { env: { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' } }).exitCode).toBe(0);
+      expect((await f.run()).repository_remote).toBe('https://github.com/example-owner/example.git');
+    }, 60_000);
+
+    test.each([
+      ['remote creation command', 'missing'], ['remote creation command', 'not executable'],
+      ['activation command', 'missing'], ['activation command', 'not executable'],
+    ])('refuses a %s that is %s before anything is created', async (step, problem) => {
+      const f = await fixture(); f.wireRemote();
+      const program = join(f.base, 'bin', 'deployment-program');
+      if (problem === 'not executable') await writeFile(program, '#!/bin/sh\nexit 0\n', { mode: 0o600 });
+      if (step === 'remote creation command') f.config.remoteCreateCommand = program; else f.config.activationCommand = program;
+      await expect(f.run()).rejects.toMatchObject({ code: 'factory_command_failed', details: { phase: 'preflight', step, category: 'missing_command' } });
+      await nothingCreated(f);
+      // Negative control: the same program once present and executable.
+      await writeFile(program, '#!/bin/sh\nexit 0\n');
+      await chmod(program, 0o700);
+      expect((await f.run()).status).toBe('waiting_for_telegram');
+    }, 60_000);
+  });
+
+  describe('diagnosable failures', () => {
+    const PRIVATE = `private-output ${TOKEN}`;
+    // One failing command per step, with the phase it must report.
+    const steps: [string, string, (argv: string[]) => boolean, string][] = [
+      ['committing_repository', 'git commit', (argv) => argv[0] === 'git' && argv.includes('commit'), 'create'],
+      ['wiring_remote', 'git push', (argv) => argv[0] === 'git' && argv[1] === 'push', 'create'],
+      ['configuring_gateway', 'agents.update', (argv) => argv[3] === 'agents.update', 'resume'],
+      ['configuring_gateway', 'openclaw agents bind', (argv) => argv[1] === 'agents' && argv[2] === 'bind', 'resume'],
+      ['configuring_gateway', 'openclaw doctor', (argv) => argv[1] === 'doctor', 'resume'],
+    ];
+    test.each(steps)('%s: %s names its phase, step and category, and status agrees', async (phase, step, matches, when) => {
+      const f = await fixture(); f.wireRemote();
+      if (when === 'resume') { await f.run(); f.state.confirmed = true; }
+      const command = f.dependencies.command;
+      f.dependencies.command = async (argv, cwd, options) => {
+        if (matches(argv)) throw new FactoryError('factory_command_failed', PRIVATE, { category: 'not_found' });
+        return command(argv, cwd, options);
+      };
+      const error = await (when === 'create' ? f.run() : f.resume()).catch((caught: unknown) => caught) as FactoryError;
+      expect(error).toMatchObject({ code: 'factory_command_failed', details: { phase, step, category: 'not_found' } });
+      expect(error.message.startsWith(`${phase}: ${step} failed (not_found).`)).toBe(true);
+      expect(error.message).toContain('resume this operation; never start another');
+      expect(JSON.stringify([error.message, error.details])).not.toContain('private-output');
+      expect(JSON.stringify([error.message, error.details])).not.toContain(TOKEN);
+      expect((await f.run({ action: 'status', agent_id: 'example' })).status).toBe(phase);
+    }, 60_000);
+
+    test('an agent the running Gateway cannot see points at config reload', async () => {
+      const f = await fixture(); await f.run(); f.state.confirmed = true;
+      const command = f.dependencies.command;
+      f.dependencies.command = async (argv, cwd, options) => {
+        if (argv[3] === 'agents.update') throw new FactoryError('factory_command_failed', 'agent not found', { category: 'not_found' });
+        return command(argv, cwd, options);
+      };
+      await expect(f.resume()).rejects.toThrow('Gateway config reload is off');
+      // Negative control: another category on the same step carries no reload hint.
+      f.dependencies.command = async (argv, cwd, options) => {
+        if (argv[3] === 'agents.update') throw new FactoryError('factory_command_failed', 'refused', { category: 'auth' });
+        return command(argv, cwd, options);
+      };
+      const error = await f.resume().catch((caught: unknown) => caught);
+      expect(error).toMatchObject({ details: { phase: 'configuring_gateway', step: 'agents.update', category: 'auth' } });
+      expect(String(error)).not.toContain('reload');
+    }, 60_000);
+
+    test('an unexpected failure is replaced with its phase and no private detail', async () => {
+      const f = await fixture(); await f.run(); f.state.confirmed = true;
+      f.dependencies.provisionTelegram = async () => { throw new Error(PRIVATE); };
+      const error = await f.resume().catch((caught: unknown) => caught);
+      expect(error).toMatchObject({ code: 'factory_step_failed', details: { phase: 'installing_telegram_token' } });
+      expect(String(error)).not.toContain('private-output');
+      expect((await f.run({ action: 'status', agent_id: 'example' })).status).toBe('installing_telegram_token');
+      // Coded worker errors keep their own code and message.
+      const g = await fixture();
+      g.dependencies.worker = async () => { throw Object.assign(new Error('Worker refused the plan.'), { code: 'domain_expert_policy_violation' }); };
+      await expect(g.run()).rejects.toMatchObject({ code: 'domain_expert_policy_violation', message: 'Worker refused the plan.' });
+    }, 60_000);
+
+    test('a resume records the step it is in, so a corpus re-check failure is not reported as another step', async () => {
+      const f = await fixture(); await f.run(); f.state.confirmed = true;
+      expect((await f.resume()).status).toBe('ready_empty_library');
+      const worker = f.dependencies.worker;
+      f.dependencies.worker = async (tool, params) => {
+        if (tool === 'rag_corpus') throw Object.assign(new Error('Corpus check unavailable.'), { code: 'rag_corpus_unavailable' });
+        return worker(tool, params);
+      };
+      await expect(f.resume()).rejects.toMatchObject({ code: 'rag_corpus_unavailable' });
+      expect((await f.run({ action: 'status', agent_id: 'example' })).status).toBe('waiting_for_corpus');
+      f.dependencies.worker = worker;
+      expect((await f.resume()).status).toBe('ready_empty_library');
+    }, 60_000);
+
+    test('every phase an operation records is a declared phase', async () => {
+      const f = await fixture(); f.wireRemote(); f.state.running = false;
+      const seen = new Set<string>();
+      const statePath = join(f.config.rootDir, 'operations', 'example', 'state.json');
+      const command = f.dependencies.command;
+      f.dependencies.command = async (argv, cwd, options) => {
+        const saved = await readFile(statePath, 'utf8').then((text) => JSON.parse(text).phase as string, () => undefined);
+        if (saved) seen.add(saved);
+        return command(argv, cwd, options);
+      };
+      for (const status of [(await f.run()).status, ...await (async () => { f.state.confirmed = true; return [(await f.resume()).status]; })()]) seen.add(status);
+      f.state.running = true;
+      seen.add((await f.resume()).status);
+      expect([...seen].filter((phase) => !(FACTORY_PHASES as readonly string[]).includes(phase))).toEqual([]);
+      expect(seen.has('ready_empty_library')).toBe(true);
+      expect(seen.has('configuring_gateway')).toBe(true);
     }, 60_000);
   });
 });

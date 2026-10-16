@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from 'bun:test';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { chmod, lstat, mkdir, mkdtemp, readdir, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { factoryCommand } from '../scripts/expert-factory.ts';
 import type { FactoryGitHubSelection } from '../packages/provisioning/src/factory-types.ts';
 
@@ -60,8 +60,16 @@ async function fixture() {
 const args = process.argv.slice(2);
 await Bun.stdin.text();
 appendFileSync(${JSON.stringify(ghLog)}, JSON.stringify({ args, configDir: process.env.GH_CONFIG_DIR ?? null, ghToken: process.env.GH_TOKEN !== undefined, githubToken: process.env.GITHUB_TOKEN !== undefined }) + '\\n');
-if (args.join(' ') !== 'auth git-credential get') process.exit(0);
 let token = process.env.GH_TOKEN || process.env.GITHUB_TOKEN;
+if (args.join(' ') === 'auth status --hostname github.com') {
+  // Like gh: validate the profile's credential against the service, here the fixture's accepted one.
+  let stored;
+  try { stored = Bun.YAML.parse(readFileSync(process.env.GH_CONFIG_DIR + '/hosts.yml', 'utf8'))?.['github.com']?.oauth_token; } catch {}
+  if (!token && stored === readFileSync(${JSON.stringify(join(base, 'accepted-token'))}, 'utf8')) process.exit(0);
+  process.stderr.write('X Failed to log in to github.com account example-user\\n  - The token in ' + process.env.GH_CONFIG_DIR + ' is invalid.\\n');
+  process.exit(1);
+}
+if (args.join(' ') !== 'auth git-credential get') process.exit(0);
 if (!token) {
   try { token = Bun.YAML.parse(readFileSync((process.env.GH_CONFIG_DIR || process.env.HOME + '/.config/gh') + '/hosts.yml', 'utf8'))?.['github.com']?.oauth_token; } catch {}
 }
@@ -74,6 +82,7 @@ process.stdout.write('username=x-access-token\\npassword=' + token + '\\n');
     await writeFile(join(bin, name), `#!/bin/sh\necho "${name} $*" >> ${JSON.stringify(hostLog)}\ncat >/dev/null 2>&1 || true\nprintf 'username=host-user\\npassword=%s\\n' ${JSON.stringify(HOST)}\n`, { mode: 0o700 });
   }
 
+  await writeFile(join(base, 'accepted-token'), MANAGED);
   const server = { accepted: MANAGED, seen: [] as string[], hold: undefined as Promise<void> | undefined, arrived: () => {} };
   const repositories = join(base, 'server');
   await mkdir(repositories);
@@ -105,20 +114,20 @@ const spawned = [];
 const spawn = Bun.spawn;
 Bun.spawn = (command, options) => { spawned.push({ argv: [...command], env: options?.env ?? null }); return spawn(command, options); };
 try { await factoryCommand(selection)(argv, cwd, identity ? { githubIdentity: true } : undefined); console.log(JSON.stringify({ ok: true, spawned })); }
-catch (error) { console.log(JSON.stringify({ ok: false, code: error.code, message: String(error), spawned })); }
+catch (error) { console.log(JSON.stringify({ ok: false, code: error.code, message: String(error), details: error.details, spawned })); }
 `);
   // Exactly what the plugin's allowlist gives the factory process; no GitHub identity of any kind.
   const gatewayEnv = { PATH: `${bin}:${process.env.PATH}`, HOME: home, USER: 'example', TMPDIR: tmpdir() };
   const selection: FactoryGitHubSelection = { profileId: id, stateDir };
 
-  const start = (options: { identity: boolean; env?: Record<string, string>; selection?: FactoryGitHubSelection }) => Bun.spawn([process.execPath, harness], {
+  const start = (options: { identity: boolean; env?: Record<string, string>; selection?: FactoryGitHubSelection; argv?: string[]; outsideRepository?: boolean }) => Bun.spawn([process.execPath, harness], {
     cwd: workspace, env: options.env ?? gatewayEnv, stdout: 'pipe', stderr: 'pipe',
-    stdin: new Blob([JSON.stringify({ selection: options.selection ?? selection, argv: PUSH, cwd: workspace, identity: options.identity })]),
+    stdin: new Blob([JSON.stringify({ selection: options.selection ?? selection, argv: options.argv ?? PUSH, cwd: options.outsideRepository ? undefined : workspace, identity: options.identity })]),
   });
   const run = async (options: Parameters<typeof start>[0]) => {
     const child = start(options);
     const [stdout, stderr] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
-    const result = JSON.parse(stdout) as { ok: boolean; code?: string; message?: string; spawned: { argv: string[]; env: Record<string, string> | null }[] };
+    const result = JSON.parse(stdout) as { ok: boolean; code?: string; message?: string; details?: Record<string, unknown>; spawned: { argv: string[]; env: Record<string, string> | null }[] };
     return { ...result, transcript: stdout + stderr };
   };
   const ghCalls = async () => (await readFile(ghLog, 'utf8').catch(() => '')).split('\n').filter(Boolean)
@@ -335,6 +344,61 @@ describe('factory pushes as the System GitHub identity', () => {
     expect(result.message).toContain('System GitHub identity');
     expect(await Bun.file(marker).exists()).toBe(true);
     expect(result.transcript).not.toContain(MANAGED);
+  }, 30_000);
+});
+
+describe('preflight probes use the push identity and environment', () => {
+  test('git ls-remote outside any repository: an existing remote, an absent one, and a refused credential', async () => {
+    const f = await fixture();
+    const existing = await f.run({ identity: true, argv: ['git', 'ls-remote', f.remote], outsideRepository: true });
+    expect(existing).toMatchObject({ ok: true });
+    // The same isolation as the push, plus a ceiling so no enclosing repository is discovered.
+    expect(existing.spawned.map((spawn) => spawn.argv)).toEqual([
+      ['git', 'config', '--list', '--name-only', '--includes', '-z'],
+      ['git', ...IDENTITY_ARGS, 'ls-remote', f.remote],
+    ]);
+    const env = existing.spawned[1]!.env!;
+    expect(env).toMatchObject({ GH_CONFIG_DIR: f.profileDir, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1', GIT_TERMINAL_PROMPT: '0' });
+    expect(env.GIT_CEILING_DIRECTORIES).toBe(dirname(env.HOME!));
+    expect(f.server.seen).toContain('managed');
+    const absent = await f.run({ identity: true, argv: ['git', 'ls-remote', f.remote.replace('example.git', 'absent.git')], outsideRepository: true });
+    expect(absent).toMatchObject({ ok: false, code: 'factory_command_failed', details: { category: 'not_found' } });
+    f.server.accepted = ROTATED;
+    const refused = await f.run({ identity: true, argv: ['git', 'ls-remote', f.remote], outsideRepository: true });
+    expect(refused).toMatchObject({ ok: false, code: 'factory_command_failed', details: { category: 'auth' } });
+    for (const result of [existing, absent, refused]) {
+      expect(result.transcript).not.toContain(MANAGED);
+      expect(JSON.stringify(result.spawned)).not.toContain(MANAGED);
+    }
+  }, 30_000);
+
+  test('gh auth status checks only the System profile credential, with no token in its environment', async () => {
+    const f = await fixture();
+    const probe = ['gh', 'auth', 'status', '--hostname', 'github.com'];
+    const valid = await f.run({ identity: true, argv: probe, env: { ...f.gatewayEnv, GH_TOKEN: HOST, GITHUB_TOKEN: HOST } });
+    expect(valid).toMatchObject({ ok: true });
+    expect(valid.spawned.map((spawn) => spawn.argv)).toEqual([probe]);
+    expect(Object.keys(valid.spawned[0]!.env!).filter((name) => /^(GH_TOKEN|GITHUB_TOKEN)$/.test(name))).toEqual([]);
+    const calls = (await f.ghCalls()).filter((call) => call.args[1] === 'status');
+    expect(calls).toEqual([{ args: ['auth', 'status', '--hostname', 'github.com'], configDir: f.profileDir, ghToken: false, githubToken: false }]);
+    // A credential the service no longer accepts.
+    await writeFile(join(f.base, 'accepted-token'), ROTATED);
+    const refused = await f.run({ identity: true, argv: probe });
+    expect(refused).toMatchObject({ ok: false, code: 'factory_command_failed', details: { category: 'auth' } });
+    expect(refused.message).toContain('System GitHub identity');
+    // gh's own diagnostic names the profile path; none of it leaves the factory.
+    expect(JSON.stringify([refused.message, refused.details])).not.toContain(f.id);
+    expect(refused.transcript).not.toContain(MANAGED);
+  }, 30_000);
+
+  test.each([
+    [['gh', 'api', 'user']], [['gh', 'auth', 'token']], [['gh', 'auth', 'status']], [['/bin/sh', '-c', 'true']],
+  ])('no other program receives the identity: %p', async (argv) => {
+    const f = await fixture();
+    const result = await f.run({ identity: true, argv });
+    expect(result).toMatchObject({ ok: false, code: 'factory_invalid_command' });
+    expect(result.spawned).toEqual([]);
+    expect(await f.ghCalls()).toEqual([]);
   }, 30_000);
 });
 
