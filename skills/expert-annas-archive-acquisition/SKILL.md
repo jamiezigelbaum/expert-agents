@@ -1,6 +1,6 @@
 ---
 name: expert-annas-archive-acquisition
-version: 0.4.1
+version: 0.4.2
 description: Search for candidate books, download owner-named titles immediately, present candidates for selection questions, save approved files through the configured sink, and route them to the domain's target corpus.
 tools:
   - annas_archive_search
@@ -54,13 +54,16 @@ DJVU on a host without `djvutxt`) with `unsupported_ingest_format` — the
 download stays on disk and the refusal names the path.
 
 **Always acquire the EPUB; take a PDF only when no EPUB of the work is
-offered** (owner ruling). PDF imports have failed above about 500 pages (observed
-with the parser this deployment uses): a longer PDF downloads but its import
-fails (`import_failed`, a Vertex internal error).
-For a book that long, look harder for an EPUB, a text edition or a volume
-split, and before choosing it tell the owner a long PDF may not ingest. After
-such a failure, report it with the measured page count (`scale.pages`); do not
-retry the same file. When the owner intends to ingest, search with
+offered** (owner ruling). PDF imports with the LLM parser have failed above
+about 500 pages, so while this deployment imports with the LLM parser (its
+usual setting) the runtime refuses a PDF measured above its configured ceiling
+(default 500) before upload, with `annas_pdf_exceeds_parser_page_limit`; the
+file stays on disk. A long PDF it cannot measure reliably may still fail its
+import (`import_failed`, a Vertex internal error). For a book that long, look
+harder for an EPUB or a volume split, and tell the owner a long PDF may not
+ingest before choosing it.
+Report a refusal or failure with the measured page count (`scale.pages`); do
+not retry the same file. When the owner intends to ingest, search with
 `ingest_intent: true`: EPUB ranks first, PDF next, DJVU below them, MOBI/AZW3
 last with the rationale "not ingestible". Without the flag the reading
 preference alone decides.

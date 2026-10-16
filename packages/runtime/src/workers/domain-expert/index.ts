@@ -177,6 +177,8 @@ export interface DomainExpertAnnasConfig {
   // Page floor a measured PDF has to clear before it may be ingested. 0 disables
   // the gate; artifacts whose scale cannot be measured are never blocked by it.
   minPdfPages?: number;
+  // Page ceiling for a measured PDF while imports use the LLM parser. 0 disables it.
+  maxPdfPages?: number;
   // Opt-in: resolve downloads through the member fast-download API on baseUrl instead of
   // the download URL template. Only correct when baseUrl is a real Anna Archive origin.
   fastDownload?: boolean;
@@ -530,6 +532,12 @@ const DEFAULT_ANNAS_BOOKS_ROOT = join(homedir(), 'ExpertAgents', 'Books');
 // 60 catches the pamphlet class with margin while clearing legitimately short
 // books. A configured 0 disables the gate.
 const DEFAULT_ANNAS_MIN_PDF_PAGES = 60;
+// Parser page ceiling. LLM-parser imports of longer PDFs fail inside Vertex with
+// an internal error (code 13) after about a minute: on 2026-10-16 a 582-page text
+// PDF failed every time, and the acquisition audit showed the same for other
+// PDFs of roughly 500-600 pages while smaller ones imported. Google documents
+// 500 pages per PDF for its layout parser. A configured 0 disables the ceiling.
+const DEFAULT_ANNAS_MAX_PDF_PAGES = 500;
 const DEFAULT_ANNAS_DJVUTXT_BIN = 'djvutxt';
 const ANNAS_DJVUTXT_TIMEOUT_MS = 120_000;
 const ANNAS_DJVUTXT_MAX_OUTPUT_BYTES = 64 * 1024 * 1024;
@@ -718,6 +726,7 @@ export class DomainExpertService {
   private annasBooksRoot: string;
   private annasMaxDownloadBytes: number;
   private annasMinPdfPages: number;
+  private annasMaxPdfPages: number;
   private annasDjvutxtBin: string;
   private annasImportPollIntervalMs: number;
   private annasImportPollTimeoutMs: number;
@@ -771,6 +780,11 @@ export class DomainExpertService {
     this.annasBooksRoot = options.annas?.booksRoot ?? DEFAULT_ANNAS_BOOKS_ROOT;
     this.annasMaxDownloadBytes = normalizePositiveInteger(options.annas?.maxDownloadBytes, DEFAULT_ANNAS_ARCHIVE_MAX_DOWNLOAD_BYTES);
     this.annasMinPdfPages = normalizeNonNegativeInteger(options.annas?.minPdfPages, DEFAULT_ANNAS_MIN_PDF_PAGES);
+    this.annasMaxPdfPages = normalizeNonNegativeInteger(options.annas?.maxPdfPages, DEFAULT_ANNAS_MAX_PDF_PAGES);
+    // Only while the ceiling applies, which is while imports use the LLM parser.
+    if (this.google.ragParserModel() !== undefined && this.annasMinPdfPages > 0 && this.annasMaxPdfPages > 0 && this.annasMinPdfPages > this.annasMaxPdfPages) {
+      throw new DomainExpertWorkerError(400, 'invalid_config', 'The PDF page floor must not exceed the PDF page ceiling.');
+    }
     this.annasDjvutxtBin = options.annas?.djvutxtBin?.trim() || DEFAULT_ANNAS_DJVUTXT_BIN;
     this.annasImportPollIntervalMs = normalizePositiveInteger(options.annas?.importPollIntervalMs, DEFAULT_ANNAS_IMPORT_POLL_INTERVAL_MS);
     this.annasImportPollTimeoutMs = normalizeNonNegativeInteger(options.annas?.importPollTimeoutMs, DEFAULT_ANNAS_IMPORT_POLL_TIMEOUT_MS);
@@ -3580,6 +3594,8 @@ export class DomainExpertService {
   private measureArtifactScale(format: string, bytes: Uint8Array, params: AnnasArchiveImportParams): AnnasArtifactScale {
     return annasArtifactScale(format, bytes, {
       minPdfPages: this.annasMinPdfPages,
+      // The ceiling belongs to the LLM parser; Google's default parser takes PDFs up to 50 MB.
+      maxPdfPages: this.google.ragParserModel() === undefined ? 0 : this.annasMaxPdfPages,
       allowShortArtifact: params.allowShortArtifact === true,
     });
   }
@@ -3615,6 +3631,19 @@ export class DomainExpertService {
           code: 'annas_artifact_scale_implausible',
           message: `Measured ${scale.pages} page(s) in the downloaded ${scale.format}, below the ${scale.min_pdf_pages}-page floor for a book-scale artifact. Nothing was uploaded or imported; the file is still on disk.`,
           suggestion: 'Confirm the file is the edition its metadata advertised — a source can advertise a monograph and deliver a pamphlet. To ingest it deliberately anyway, re-run annas_archive_import with allow_short_artifact: true.',
+        },
+        scale,
+      };
+    }
+    // A PDF too long for the LLM parser fails inside Vertex after the upload; refuse it first.
+    if (scale.above_max_pdf_pages) {
+      return {
+        status: 'blocked',
+        ...corpusTarget,
+        error: {
+          code: 'annas_pdf_exceeds_parser_page_limit',
+          message: `Measured ${scale.pages} pages in the downloaded PDF, above this deployment's ${scale.max_pdf_pages}-page ceiling for PDF imports with the LLM parser, which have failed above about 500 pages with a Vertex internal error. Nothing was uploaded or imported; the file is still on disk.`,
+          suggestion: 'Acquire an EPUB edition of the same work, or a PDF split into volumes; annas_archive_search with ingest_intent: true ranks EPUB first.',
         },
         scale,
       };
@@ -6180,6 +6209,9 @@ export function domainExpertAnnasConfigFromEnv(env: Record<string, string | unde
     ...(env.EXPERT_AGENTS_DOMAIN_EXPERT_ANNAS_MAX_DOWNLOAD_BYTES
       ? { maxDownloadBytes: normalizePositiveInteger(env.EXPERT_AGENTS_DOMAIN_EXPERT_ANNAS_MAX_DOWNLOAD_BYTES, DEFAULT_ANNAS_ARCHIVE_MAX_DOWNLOAD_BYTES) }
       : {}),
+    ...(env.EXPERT_AGENTS_DOMAIN_EXPERT_ANNAS_MAX_PDF_PAGES
+      ? { maxPdfPages: normalizeNonNegativeInteger(env.EXPERT_AGENTS_DOMAIN_EXPERT_ANNAS_MAX_PDF_PAGES, DEFAULT_ANNAS_MAX_PDF_PAGES) }
+      : {}),
     ...(env.EXPERT_AGENTS_DOMAIN_EXPERT_ANNAS_MIN_PDF_PAGES
       ? { minPdfPages: normalizeNonNegativeInteger(env.EXPERT_AGENTS_DOMAIN_EXPERT_ANNAS_MIN_PDF_PAGES, DEFAULT_ANNAS_MIN_PDF_PAGES) }
       : {}),
@@ -8146,6 +8178,8 @@ interface AnnasArtifactScale {
   bytes: number;
   pages?: number;
   page_signal?: 'page_tree_count' | 'page_objects';
+  // Pages both signals report; the ceiling refuses on this alone.
+  corroborated_pages?: number;
   // Byte-based proxy, deliberately not named for extracted text: no text
   // extractor runs here, so this is total artifact bytes divided by pages.
   content_bytes_per_page?: number;
@@ -8155,6 +8189,8 @@ interface AnnasArtifactScale {
   min_pdf_pages?: number;
   below_min_pdf_pages?: boolean;
   short_artifact_override?: boolean;
+  max_pdf_pages?: number;
+  above_max_pdf_pages?: boolean;
 }
 
 type AnnasImportOutcomeStatus = 'imported' | 'import_failed' | 'import_empty' | 'import_requested';
@@ -8312,7 +8348,7 @@ function runDjvuTextExtraction(binary: string, sourcePath: string): Promise<stri
   });
 }
 
-type AnnasArtifactMeasurement = Omit<AnnasArtifactScale, 'format' | 'bytes' | 'min_pdf_pages' | 'below_min_pdf_pages' | 'short_artifact_override'>;
+type AnnasArtifactMeasurement = Omit<AnnasArtifactScale, 'format' | 'bytes' | 'min_pdf_pages' | 'below_min_pdf_pages' | 'short_artifact_override' | 'max_pdf_pages' | 'above_max_pdf_pages'>;
 
 // Source metadata is advertising, not evidence. On 2026-07-29 an acquisition
 // arrived carrying a 512-page monograph's title, author, year and advertised
@@ -8323,7 +8359,7 @@ type AnnasArtifactMeasurement = Omit<AnnasArtifactScale, 'format' | 'bytes' | 'm
 function annasArtifactScale(
   format: string,
   bytes: Uint8Array,
-  policy: { minPdfPages: number; allowShortArtifact: boolean },
+  policy: { minPdfPages: number; maxPdfPages: number; allowShortArtifact: boolean },
 ): AnnasArtifactScale {
   const scale: AnnasArtifactScale = {
     ...measureAnnasArtifact(format, bytes),
@@ -8334,6 +8370,14 @@ function annasArtifactScale(
   if (format === 'pdf' && policy.minPdfPages > 0) {
     scale.min_pdf_pages = policy.minPdfPages;
     if (scale.pages !== undefined && scale.pages < policy.minPdfPages) scale.below_min_pdf_pages = true;
+  }
+  if (format === 'pdf' && policy.maxPdfPages > 0) {
+    scale.max_pdf_pages = policy.maxPdfPages;
+    // Each signal can over-count, which fails open for the floor but would refuse a book here:
+    // the page tree scan takes the largest nearby /Count (an outline's count qualifies), and
+    // loose page objects include superseded ones in an incrementally updated file. Only pages
+    // both report may refuse; anything uncorroborated is let through to Vertex.
+    if (scale.corroborated_pages !== undefined && scale.corroborated_pages > policy.maxPdfPages) scale.above_max_pdf_pages = true;
   }
   return scale;
 }
@@ -8372,6 +8416,8 @@ function measurePdfArtifactScale(bytes: Uint8Array): AnnasArtifactMeasurement {
     measured: true,
     pages,
     page_signal: pageTreeCount >= pageObjects ? 'page_tree_count' : 'page_objects',
+    // The smaller signal: both must agree before a ceiling refuses. See annasArtifactScale.
+    corroborated_pages: Math.min(pageTreeCount, pageObjects),
     content_bytes_per_page: Math.round(bytes.byteLength / pages),
   };
 }
