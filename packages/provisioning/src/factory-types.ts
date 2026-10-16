@@ -17,6 +17,16 @@ export interface FactoryConfig {
   remoteCreateCommand?: string;
 }
 
+/**
+ * The deployment's System GitHub identity as the plugin reads it from the live Gateway runtime on
+ * each invocation: the `tools.github.profileId` selection and the OpenClaw state directory. Both
+ * are non-secret; the packaged factory validates them immediately before each GitHub command.
+ */
+export interface FactoryGitHubSelection {
+  profileId?: unknown;
+  stateDir?: unknown;
+}
+
 export interface FactoryRequest {
   action: 'create' | 'resume' | 'status';
   agent_id: string;

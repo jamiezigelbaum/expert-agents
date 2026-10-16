@@ -1,7 +1,7 @@
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import type { ExpertAgentsConfig } from '../packages/runtime/src/core/config.ts';
-import type { FactoryConfig, FactoryRequest } from '../packages/provisioning/src/factory-types.ts';
+import type { FactoryConfig, FactoryGitHubSelection, FactoryRequest } from '../packages/provisioning/src/factory-types.ts';
 
 export interface FactoryPluginConfig extends FactoryConfig { bunBin: string }
 export interface FactoryToolContext {
@@ -29,7 +29,7 @@ export const factoryParameters = {
 /** One child per invocation: no human wait, no shell, no token-bearing arguments. */
 export async function invokeFactory(
   factory: Partial<FactoryPluginConfig>, worker: ExpertAgentsConfig, request: unknown,
-  context: FactoryToolContext, signal?: AbortSignal,
+  context: FactoryToolContext, signal?: AbortSignal, github: FactoryGitHubSelection = {},
 ): Promise<{ result?: unknown; error?: { code: string; message: string } }> {
   if (context.senderIsOwner !== true || context.sandboxed === true || context.fsPolicy?.workspaceOnly === true) {
     return failure('factory_owner_required', 'Agent creation requires a trusted owner session with host filesystem authority.');
@@ -39,6 +39,8 @@ export async function invokeFactory(
   if (!factory.bunBin?.startsWith('/')) return failure('factory_invalid_config', 'Configure an absolute Bun executable path for the packaged factory.');
   signal?.throwIfAborted();
   const entry = fileURLToPath(new URL('./factory.js', import.meta.url));
+  // No GitHub credential or GH_CONFIG_DIR here: the System GitHub selection travels on private
+  // stdin, and the factory applies it only to its own GitHub Git commands.
   const env: Record<string, string> = {};
   for (const name of ['PATH', 'HOME', 'USER', 'TMPDIR', 'XDG_CONFIG_HOME', 'XDG_STATE_HOME', 'OPENCLAW_CONFIG_PATH', 'OPENCLAW_STATE_DIR', 'OPENCLAW_PROFILE']) {
     if (process.env[name]) env[name] = process.env[name]!;
@@ -77,7 +79,7 @@ export async function invokeFactory(
         else finish(failure('factory_invalid_response', 'The packaged factory returned an invalid response.'));
       } catch { finish(failure('factory_invalid_response', 'The packaged factory returned no valid response.')); }
     });
-    child.stdin.end(JSON.stringify({ factory, worker, request: request as FactoryRequest }));
+    child.stdin.end(JSON.stringify({ factory, worker, request: request as FactoryRequest, github }));
   });
 }
 

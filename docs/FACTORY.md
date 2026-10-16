@@ -124,11 +124,40 @@ factory adds it as `origin` right after the initial commit, pushes with
 pushed head. An optional `remoteCreateCommand` names an absolute,
 deployment-owned executable that creates the remote idempotently; it receives
 the agent id and the resolved URL as its only arguments and must succeed when
-the repository already exists. Push authentication is the host's
-responsibility (a credential helper or deploy key reachable from the Gateway's
-environment). Both settings are excluded from the operation fingerprint, so an
+the repository already exists. Both settings are excluded from the operation fingerprint, so an
 operation recorded before wiring existed is adopted on its next resume: an
 `origin` an operator already added by hand is reused, never duplicated.
+
+An `https://github.com/` remote is pushed as the Gateway's System GitHub
+identity (`tools.github`; see OpenClaw's GitHub identity documentation). The
+Gateway gives that credential only to agent exec, not to processes it runs
+itself, so the factory applies it to its own push:
+
+- On every invocation the plugin reads `tools.github.profileId` from the live
+  runtime config and the state directory from OpenClaw, and passes both to the
+  factory on its private stdin. Reconnects, token refreshes and profile changes
+  apply without reconfiguring the factory.
+- Immediately before the push, the factory requires the selected profile to be
+  an owner-only directory, not a symbolic link, whose owner-only `hosts.yml`
+  holds a `github.com` token.
+- It runs that push with inherited credential helpers and askpass cleared, the
+  stock `gh auth git-credential` as the only helper, `GH_CONFIG_DIR` pointing at
+  the profile, and ambient `GH_TOKEN`/`GITHUB_TOKEN` removed. `gh` must be on
+  the Gateway's `PATH`. The token reaches Git only through that helper; it never
+  appears in arguments, environment, state or results.
+- No other command receives the identity, and host Git configuration is not
+  changed. `remoteCreateCommand` runs with the factory's ordinary environment;
+  a command that creates GitHub repositories resolves its own credentials and
+  must fail closed.
+- A missing, malformed, insecure or tokenless profile stops the operation at
+  `wiring_remote` with `factory_github_identity_missing` or
+  `factory_github_identity_unavailable`. Reconnect System GitHub, then resume.
+  The factory never falls back to the host's own `gh` login, keyring or
+  credential helpers.
+
+Other remotes (`ssh://`, `file:///` and HTTPS on other hosts) keep the host's
+own transport configuration, such as a deploy key reachable from the Gateway's
+environment.
 
 ## Conversation and states
 

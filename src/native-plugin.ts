@@ -3,6 +3,7 @@ import type { ExpertAgentsConfig } from '../packages/runtime/src/core/config.ts'
 import { OperationError } from '../packages/runtime/src/core/operation-error.ts';
 import { readSecretInput } from '../packages/runtime/src/core/secret-input.ts';
 import { factoryParameters, invokeFactory, type FactoryPluginConfig, type FactoryToolContext } from './factory-tool.ts';
+import type { FactoryGitHubSelection } from '../packages/provisioning/src/factory-types.ts';
 import { researchToolSchemas } from './tool-schemas.ts';
 import { realpath } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
@@ -17,6 +18,7 @@ interface RuntimeToolContext extends FactoryToolContext {
 
 interface OpenClawPluginApi {
   pluginConfig?: unknown;
+  runtime?: { state?: { resolveStateDir?: (env: NodeJS.ProcessEnv) => string } };
   registerTool(tool: NativeTool | ((context: RuntimeToolContext) => NativeTool), options?: { name: string }): void;
 }
 
@@ -94,7 +96,7 @@ const plugin = {
           const current = currentPluginConfig(api, context);
           const config = configFromPluginConfig(current);
           const factory = asRecord(asRecord(current).factory) as unknown as Partial<FactoryPluginConfig>;
-          const response = await invokeFactory(factory, config, params, context, signal);
+          const response = await invokeFactory(factory, config, params, context, signal, systemGitHub(api, context));
           return response.error
             ? { content: [{ type: 'text', text: JSON.stringify(response) }], details: response, isError: true }
             : resultPayload(response.result);
@@ -118,6 +120,18 @@ function currentPluginConfig(api: OpenClawPluginApi, context: RuntimeToolContext
     return asRecord(entry).config;
   }
   return api.pluginConfig;
+}
+
+// The factory pushes as the Gateway's System GitHub identity (tools.github), the profile the
+// Gateway keeps refreshed. Read the selection from the live runtime snapshot on every invocation so
+// reconnects and profile changes apply; the factory validates the profile itself before each use
+// and refuses rather than falling back when either value is absent.
+function systemGitHub(api: OpenClawPluginApi, context: RuntimeToolContext): FactoryGitHubSelection {
+  const runtime = context.getRuntimeConfig ? context.getRuntimeConfig() : context.runtimeConfig;
+  const profileId = asRecord(asRecord(asRecord(runtime).tools).github).profileId;
+  let stateDir: unknown;
+  try { stateDir = api.runtime?.state?.resolveStateDir?.(process.env); } catch { stateDir = undefined; }
+  return { profileId, stateDir };
 }
 
 async function factoryDomain(factory: Partial<FactoryPluginConfig>, context: FactoryToolContext): Promise<string | undefined> {

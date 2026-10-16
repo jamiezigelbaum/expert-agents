@@ -36,6 +36,47 @@ describe('packaged expert factory', () => {
     expect(output.content[0]!.text).toContain('factory_owner_required');
   });
 
+  test('passes the live System GitHub selection on private stdin and no GitHub credential in the environment', async () => {
+    const root = await realpath(await mkdtemp(join(tmpdir(), 'expert-plugin-github-')));
+    roots.push(root);
+    // Stands in for Bun: records what the factory process would receive and answers like the factory.
+    const fakeBun = join(root, 'bun');
+    await writeFile(fakeBun, `#!/bin/sh\ncat > "${root}/stdin.json"\nenv > "${root}/env.txt"\nprintf '%s' '{"result":{"kind":"expert_factory","agent_id":"example","status":"planned","next_action":"fixture"}}'\n`, { mode: 0o700 });
+    const profileIds = [`ghp_${'a'.repeat(31)}1`, `ghp_${'b'.repeat(31)}2`];
+    let runtime = runtimeConfig(profileIds[0]!);
+    let found: NativeTool | undefined;
+    plugin.register({
+      pluginConfig: {}, runtime: { state: { resolveStateDir: () => join(root, 'state') } },
+      registerTool: (registration) => {
+        const tool = typeof registration === 'function' ? registration({ senderIsOwner: true, getRuntimeConfig: () => runtime }) : registration;
+        if (tool.name === 'expert_factory') found = tool;
+      },
+    });
+    const ambient = { GH_TOKEN: process.env.GH_TOKEN, GITHUB_TOKEN: process.env.GITHUB_TOKEN, GH_CONFIG_DIR: process.env.GH_CONFIG_DIR };
+    Object.assign(process.env, { GH_TOKEN: 'synthetic-ambient-token', GITHUB_TOKEN: 'synthetic-ambient-token', GH_CONFIG_DIR: join(root, 'host-gh') });
+    try {
+      for (const profileId of profileIds) {
+        runtime = runtimeConfig(profileId);
+        const output = await found!.execute('fixture', { action: 'status', agent_id: 'example' });
+        expect(output.isError).toBeUndefined();
+        // Read live on each invocation, so a reconnected or changed System identity applies.
+        const envelope = JSON.parse(await readFile(join(root, 'stdin.json'), 'utf8'));
+        expect(envelope.github).toEqual({ profileId, stateDir: join(root, 'state') });
+        const env = (await readFile(join(root, 'env.txt'), 'utf8')).split('\n').filter(Boolean).map((line) => line.split('=')[0]!);
+        expect(env.filter((name) => /^(GH_|GITHUB_)/.test(name))).toEqual([]);
+      }
+    } finally {
+      for (const [name, value] of Object.entries(ambient)) if (value === undefined) delete process.env[name]; else process.env[name] = value;
+    }
+
+    function runtimeConfig(profileId: string) {
+      return {
+        tools: { github: { profileId, kind: 'oauth' } },
+        plugins: { entries: { 'expert-agents': { config: { domainExpert: { enabled: true }, factory: { enabled: true, bunBin: fakeBun } } } } },
+      };
+    }
+  });
+
   test('default-disabled factory reports the actual prerequisite', async () => {
     const output = await factoryTool({}, { senderIsOwner: true }).execute('test', { action: 'status', agent_id: 'example' });
     expect(output.isError).toBe(true);
