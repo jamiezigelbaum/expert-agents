@@ -709,6 +709,7 @@ export class DomainExpertService {
   private roots: Map<string, DomainExpertWorkspaceRootPolicy>;
   private agentRouting: AgentRoutingConfig;
   private registrations: AgentRegistrationStore;
+  private registrationLibrary: LibraryLocationConfig | undefined;
   private corpusEnsureQueue: Promise<unknown> = Promise.resolve();
   private gcpProject: string;
   private google: GoogleRuntimeClient;
@@ -780,7 +781,8 @@ export class DomainExpertService {
     });
     this.dataDir = options.dataDir ?? join(tmpdir(), `expert-agents-domain-expert-${currentUid()}`);
     ensurePrivateDataDirectory(this.dataDir);
-    this.registrations = new AgentRegistrationStore(this.dataDir, this.agentRouting, options.registrationLibrary ?? registrationLibraryFromEnv());
+    this.registrationLibrary = options.registrationLibrary ?? registrationLibraryFromEnv();
+    this.registrations = new AgentRegistrationStore(this.dataDir, this.agentRouting, this.registrationLibrary);
     this.agentRouting = this.registrations.routes();
     this.resolveHostImpl = options.resolveHostImpl ?? defaultResolveHost;
     // Only a configured path is forwarded: an unset value leaves summarize to
@@ -839,8 +841,20 @@ export class DomainExpertService {
     // library is its own subtree, which can never contain the deployment's shared import prefix
     // (2026-10-16: the first factory domain could download a book but not ingest it).
     const acquisitions = manifest.routing.configured ? this.acquisitionDirectory(manifest.domain_id) : undefined;
-    if (!acquisitions || gcsPrefixesCover(manifest.allowed_gcs_prefixes, acquisitions.uri)) return manifest;
+    if (!acquisitions || gcsPrefixesCover(manifest.allowed_gcs_prefixes, acquisitions.uri) || this.acquisitionDirectoryConflicts(acquisitions.uri)) return manifest;
     return { ...manifest, allowed_gcs_prefixes: [...manifest.allowed_gcs_prefixes, acquisitions.uri] };
+  }
+
+  // A domain is granted its acquisition directory only while that directory holds no library: an
+  // import prefix above other libraries (for example a bucket's top level) would otherwise give a
+  // domain whose id names one of them that whole subtree. Every route's library and read-only
+  // roots and the registration library count, including the domain's own library.
+  private acquisitionDirectoryConflicts(uri: string): boolean {
+    const locations = [
+      ...Object.values(this.agentRouting).flatMap((route) => [route.library, ...(route.readOnlySourceRoots ?? [])]),
+      ...(this.registrationLibrary ? [this.registrationLibrary] : []),
+    ];
+    return locations.some((location) => gcsPrefixesCover([uri], `gs://${location.bucket}/${location.prefix}`));
   }
 
   // The domain's own directory under the operator's shared acquisition import prefix. Objects
@@ -860,7 +874,8 @@ export class DomainExpertService {
     const route = this.agentRouting[domainId]!;
     const acquisitions = this.acquisitionDirectory(domainId);
     const roots = [route.library, ...(route.readOnlySourceRoots ?? [])];
-    if (!acquisitions || gcsPrefixesCover(roots.map((root) => `gs://${root.bucket}/${root.prefix}`), acquisitions.uri)) return route;
+    if (!acquisitions || gcsPrefixesCover(roots.map((root) => `gs://${root.bucket}/${root.prefix}`), acquisitions.uri)
+      || this.acquisitionDirectoryConflicts(acquisitions.uri)) return route;
     return { ...route, readOnlySourceRoots: [...(route.readOnlySourceRoots ?? []), { bucket: acquisitions.bucket, prefix: acquisitions.prefix }] };
   }
 
@@ -3459,6 +3474,8 @@ export class DomainExpertService {
       status: annasAcquisitionStatus('downloaded', String(ragIngest.status)),
       domain_id: manifest.domain_id,
       download,
+      // Content-free measured scale, so a failed import can be explained by its page count.
+      scale,
       rag_ingest: ragIngest,
       registry,
       policy: domainPolicy(),
@@ -3507,6 +3524,8 @@ export class DomainExpertService {
       status: annasAcquisitionStatus('ingested_existing', String(ragIngest.status)),
       domain_id: manifest.domain_id,
       download,
+      // Content-free measured scale, so a failed import can be explained by its page count.
+      scale,
       rag_ingest: ragIngest,
       registry,
       policy: domainPolicy(),
@@ -3876,7 +3895,11 @@ export class DomainExpertService {
     if (!prefix) throw new DomainExpertWorkerError(503, 'annas_archive_not_configured', 'EXPERT_AGENTS_DOMAIN_EXPERT_ANNAS_IMPORT_GCS_PREFIX is required for direct RAG imports.');
     const parsed = parseGcsPrefix(prefix);
     const directory = `${parsed.prefix}${manifest.domain_id}/`;
-    assertAllowedGcsDestination(`gs://${parsed.bucket}/${directory}`, manifest.allowed_gcs_prefixes);
+    const uri = `gs://${parsed.bucket}/${directory}`;
+    if (!gcsPrefixesCover(manifest.allowed_gcs_prefixes, uri) && this.acquisitionDirectoryConflicts(uri.slice(0, -1))) {
+      throw new DomainExpertWorkerError(503, 'annas_import_prefix_conflict', 'The acquisition import prefix places this domain\'s directory over another library. Configure EXPERT_AGENTS_DOMAIN_EXPERT_ANNAS_IMPORT_GCS_PREFIX as a dedicated directory.');
+    }
+    assertAllowedGcsDestination(uri, manifest.allowed_gcs_prefixes);
     return { bucket: parsed.bucket, directory };
   }
 
@@ -8610,6 +8633,10 @@ function gcsPrefixesCover(prefixes: string[], uri: string): boolean {
 export function assertAllowedGcsDestination(destinationUri: string, allowedPrefixes: string[]): void {
   if (!destinationUri.startsWith('gs://')) {
     throw new DomainExpertWorkerError(400, 'invalid_gcs_prefix', 'GCS destination must start with gs://.');
+  }
+  // Allowlist checks compare string prefixes; a dot segment must never reach one.
+  if (destinationUri.slice('gs://'.length).split('/').some((segment) => segment === '.' || segment === '..')) {
+    throw new DomainExpertWorkerError(400, 'invalid_gcs_prefix', 'GCS destination must not contain . or .. path segments.');
   }
   const allowed = allowedPrefixes.some((prefix) => {
     const normalizedPrefix = prefix.replace(/\/+$/g, '');

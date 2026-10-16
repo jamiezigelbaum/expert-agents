@@ -25,6 +25,7 @@ import {
   type Sha256Id,
 } from '@expert-agents/library';
 import { validateAgentRoutingConfig } from '../src/core/agent-routing.ts';
+import { AgentRegistrationStore } from '../src/core/agent-registration.ts';
 import { domainManifest } from '../src/core/domain-expert.ts';
 import {
   ALLOW_UNAUTHENTICATED_ENV,
@@ -5859,6 +5860,19 @@ describe('rag_corpus imports record their verified outcome in the source registr
   });
 });
 
+// Stored GCS objects (upload, then metadata reads) in front of another fake, so dedupe can find them.
+function storingGcs(calls: CapturedCall[], next: typeof fetch): typeof fetch {
+  const objects: FakeGcsObjects = new Map();
+  return (async (input: string | URL | Request, init?: RequestInit) => {
+    const url = input instanceof Request ? input.url : String(input);
+    const method = init?.method ?? (input instanceof Request ? input.method : 'GET');
+    const stored = fakeGcsObjectResponse(url, method, init, objects);
+    if (!stored) return next(input as string, init);
+    calls.push({ url, method, body: '', headers: {} });
+    return stored;
+  }) as typeof fetch;
+}
+
 // A registered (factory-created) domain owns its own library subtree, which can never contain
 // the deployment's shared acquisition import prefix. Its own directory under that prefix is
 // allowed for the upload and the import, and nothing else under the prefix is.
@@ -5900,6 +5914,8 @@ describe('acquisition imports for a registered domain', () => {
     try {
       const response = await postDomain(f.worker, 'annas_archive_import', { ...PARAMS, ingest: true, corpus_id: CORPUS });
       expect(response).toMatchObject({ status: 'downloaded', rag_ingest: { status: 'imported', gcs_uri: `${IMPORT_PREFIX}research/author---the-fixture-monograph-1989.pdf` } });
+      // The measured scale is returned, so a later failure can be explained by its page count.
+      expect(response.scale).toMatchObject({ measured: true, pages: 64 });
       expect(uploadedObjectNames(f.googleCalls)).toEqual(['v1/book-imports/research/author---the-fixture-monograph-1989.pdf']);
       const imports = f.googleCalls.filter((call) => call.url.endsWith('/ragFiles:import'));
       expect(imports).toHaveLength(1);
@@ -5922,8 +5938,42 @@ describe('acquisition imports for a registered domain', () => {
         expect(refused.status).toBe(403);
         expect((await refused.json() as any).error.code).toMatch(/^(domain_expert_policy_violation|gcs_destination_not_allowed)$/);
       }
+      // A dot segment cannot walk out of the directory.
+      const walked = await postDomainResponse(f.worker, 'rag_corpus', { domain_id: 'research', action: 'import', corpus_id: CORPUS, gcs_uri: `${IMPORT_PREFIX}research/../history/a.pdf`, dry_run: false });
+      expect(walked.status).toBe(400);
       expect(f.googleCalls.filter((call) => call.url.endsWith('/ragFiles:import'))).toEqual([]);
     } finally { f.cleanup(); }
+  });
+
+  test('an import prefix that would cover other libraries grants no directory', async () => {
+    const calls: CapturedCall[] = [];
+    const booksRoot = mkdtempSync(join(tmpdir(), 'expert-books-'));
+    try {
+      // A prefix at the bucket's version root, above the registration library: a domain named
+      // `factory` would otherwise receive every registered domain's library.
+      const worker = createDomainExpertWorker({
+        gcpProject: 'fixture-project',
+        registrationLibrary: { bucket: 'fixture-shared-library', prefix: 'v1/factory' },
+        agentRouting: validateAgentRoutingConfig({
+          factory: { library: { bucket: 'fixture-shared-library', prefix: 'v1/factory/factory' }, targetCorpusDisplayName: 'research-library' },
+          history: { library: { bucket: 'fixture-shared-library', prefix: 'v1/factory/history' }, targetCorpusDisplayName: 'history-library' },
+          example: { library: { bucket: 'fixture-shared-library', prefix: 'v1/factory/example' }, targetCorpusDisplayName: 'example-library' },
+        }),
+        annas: { apiKey: 'fixture-acquisition-token', baseUrl: 'https://annas.example', booksRoot, importGcsPrefix: 'gs://fixture-shared-library/v1/' },
+        google: { accessToken: 'fixture-google-token', fetchImpl: fakeIngestGoogleFetch(calls) },
+        fetchImpl: fakeAnnasArtifactFetch([], syntheticPdfBytes(64), 'application/pdf'),
+      });
+      const plan = await postDomain(worker, 'rag_corpus', { domain_id: 'factory', action: 'import', dry_run: true });
+      expect(plan.allowed_gcs_prefixes).toEqual(['gs://fixture-shared-library/v1/factory/factory']);
+      const refused = await postDomainResponse(worker, 'rag_corpus', { domain_id: 'factory', action: 'import', corpus_id: CORPUS, gcs_uri: 'gs://fixture-shared-library/v1/factory/history/a.pdf', dry_run: false });
+      expect(refused.status).toBe(403);
+      const response = await postDomain(worker, 'annas_archive_import', { ...PARAMS, domain_id: 'factory', ingest: true, corpus_id: CORPUS });
+      expect(response.rag_ingest).toMatchObject({ status: 'blocked', error: { code: 'annas_import_prefix_conflict' } });
+      expect(uploadedObjectNames(calls)).toEqual([]);
+      // Negative control: a domain whose directory holds no library is granted it.
+      const granted = await postDomain(worker, 'rag_corpus', { domain_id: 'example', action: 'import', dry_run: true });
+      expect(granted.allowed_gcs_prefixes).toEqual(['gs://fixture-shared-library/v1/factory/example', 'gs://fixture-shared-library/v1/example']);
+    } finally { rmSync(booksRoot, { recursive: true, force: true }); }
   });
 
   test('a domain with no routing gains no acquisition directory', async () => {
@@ -5945,14 +5995,60 @@ describe('acquisition imports for a registered domain', () => {
     } finally { f.cleanup(); }
   });
 
-  test('a domain whose library already contains the prefix keeps a single allowlist entry and the same objects', async () => {
+  test('a domain whose library already contains the prefix keeps a single allowlist entry', async () => {
     const calls: CapturedCall[] = [];
     const worker = createDomainExpertWorker({
       gcpProject: 'fixture-project',
-      annas: { apiKey: 'fixture-acquisition-token', baseUrl: 'https://annas.example', booksRoot: mkdtempSync(join(tmpdir(), 'expert-books-')), importGcsPrefix: IMPORT_PREFIX },
+      annas: { apiKey: 'fixture-acquisition-token', baseUrl: 'https://annas.example', importGcsPrefix: IMPORT_PREFIX },
       google: { accessToken: 'fixture-google-token', fetchImpl: fakeIngestGoogleFetch(calls) },
     });
     const plan = await postDomain(worker, 'rag_corpus', { domain_id: 'research', action: 'import', corpus_id: CORPUS, gcs_uri: `${IMPORT_PREFIX}research/a.pdf`, dry_run: true });
     expect(plan.allowed_gcs_prefixes).toEqual(['gs://fixture-shared-library/v1']);
+  });
+
+  test('a stored registration records the acquisition, reuses it when re-acquired, and finishes a long import later', async () => {
+    const fixture = workspaceFixture();
+    const dataDir = join(fixture.base, 'data');
+    mkdirSync(dataDir, { mode: 0o700 });
+    mkdirSync(join(fixture.base, 'books'));
+    const registrationLibrary = { bucket: 'fixture-shared-library', prefix: 'v1/factory' };
+    // Exactly what a factory registration persists: display name, its own library and corpus name.
+    new AgentRegistrationStore(dataDir, TEST_AGENT_ROUTING, registrationLibrary).register('example', {
+      displayName: 'Example', library: { bucket: 'fixture-shared-library', prefix: 'v1/factory/example' }, targetCorpusDisplayName: 'expert-example',
+    }, false);
+    const md5 = '0123456789abcdef0123456789abcdef';
+    const corpus = 'projects/fixture-project/locations/us-central1/ragCorpora/2002';
+    const googleCalls: CapturedCall[] = [];
+    let finishAt = Number.POSITIVE_INFINITY;
+    const worker = createDomainExpertWorker({
+      dataDir, registrationLibrary, roots: [rootPolicy(fixture.workspaceRoot)],
+      annas: {
+        apiKey: 'fixture-acquisition-token', baseUrl: 'https://annas.example', booksRoot: join(fixture.base, 'books'),
+        importGcsPrefix: IMPORT_PREFIX, importPollIntervalMs: 1, importPollTimeoutMs: 2_000, responseBudgetMs: 50,
+      },
+      google: { accessToken: 'fixture-google-token', fetchImpl: storingGcs(googleCalls, fakeGoogleFetch(googleCalls, {
+        ragCorpora: [{ name: corpus, displayName: 'expert-example' }],
+        importOperation: (name) => (Date.now() >= finishAt ? { name, done: true, response: { importedRagFilesCount: '1' } } : { name, done: false }),
+      })) },
+      fetchImpl: fakeAnnasArtifactFetch([], syntheticPdfBytes(64), 'application/pdf'),
+    });
+    const params = { ...PARAMS, domain_id: 'example', annas_archive_id: 'stored-registration', md5, ingest: true, corpus_id: corpus };
+    const registryPath = join(fixture.workspaceRoot, domainManifest('example').workspace_relative_path, 'references/source-registry.jsonl');
+    const readRegistry = () => readFileSync(registryPath, 'utf8').split('\n').filter(Boolean).map((line) => JSON.parse(line) as Record<string, unknown>);
+    try {
+      const response = await postDomain(worker, 'annas_archive_import', params);
+      expect(response.status).toBe('downloaded_ingest_in_progress');
+      expect(response.registry).toMatchObject({ status: 'registered', locator: `annas:${md5}` });
+      finishAt = Date.now();
+      const deadline = Date.now() + 3_000;
+      while (readRegistry().length < 2 && Date.now() < deadline) await new Promise((resolveWait) => setTimeout(resolveWait, 10));
+      const uri = `${IMPORT_PREFIX}example/author---the-fixture-monograph-1989.pdf`;
+      expect(readRegistry().map((record) => record.ingest_status)).toEqual(['import_requested', 'imported']);
+      expect(readRegistry()[1]!.gcs_uri).toBe(uri);
+      // A later acquisition of the same record with a different year reuses the stored object.
+      const again = await postDomain(worker, 'annas_archive_import', { ...params, year: '1990' });
+      expect(again.rag_ingest.gcs_uri ?? readRegistry().at(-1)!.gcs_uri).toBe(uri);
+      expect(uploadedObjectNames(googleCalls)).toEqual(['v1/book-imports/example/author---the-fixture-monograph-1989.pdf']);
+    } finally { fixture.cleanup(); }
   });
 });

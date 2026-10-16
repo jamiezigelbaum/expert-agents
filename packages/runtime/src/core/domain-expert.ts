@@ -973,6 +973,10 @@ function validateGcsUri(manifest: DomainManifest, gcsUri: string | undefined): v
   if (!gcsUri.startsWith('gs://')) {
     throw new OperationError('invalid_params', 'gcs_uri must start with gs://.');
   }
+  // The allowlist check below compares string prefixes; a dot segment must never reach it.
+  if (gcsUri.slice('gs://'.length).split('/').some((segment) => segment === '.' || segment === '..')) {
+    throw new OperationError('invalid_params', 'gcs_uri must not contain . or .. path segments.');
+  }
   if (!manifest.allowed_gcs_prefixes.some((prefix) => gcsUri === prefix || gcsUri.startsWith(`${prefix}/`))) {
     throw new OperationError(
       'domain_expert_policy_violation',

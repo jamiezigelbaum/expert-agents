@@ -257,13 +257,13 @@ describe('direct library reading', () => {
 });
 
 describe('domain_read HTTP surface', () => {
-  test('a registered domain reads its own acquisitions, and only its own, from the shared import prefix', async () => {
+  test('a domain with its own library subtree reads its own acquisitions, and only its own, from the shared import prefix', async () => {
     const f = fixture();
     const corpus = 'projects/fixture-project/locations/us-central1/ragCorpora/10';
     const name = corpus + '/ragFiles/20';
     let uri = '';
     const reads: string[] = [];
-    // A registered route: its library is its own subtree, outside the shared import prefix.
+    // A route whose library is its own subtree, outside the shared import prefix.
     const route = { ...f.route, library: { bucket: 'fixture-bucket', prefix: 'library' } };
     const worker = (importGcsPrefix?: string) => createDomainExpertWorker({ gcpProject: 'fixture-project', dataDir: join(f.directory, `runtime-${importGcsPrefix ? 'acq' : 'none'}`),
       agentRouting: validateAgentRoutingConfig({ research: route }),

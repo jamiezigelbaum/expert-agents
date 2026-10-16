@@ -54,8 +54,9 @@ DJVU on a host without `djvutxt`) with `unsupported_ingest_format` — the
 download stays on disk and the refusal names the path.
 
 **Always acquire the EPUB; take a PDF only when no EPUB of the work is
-offered** (owner ruling). Vertex's PDF parser stops at about 500 pages: a longer
-PDF downloads but fails its import (`import_failed`, a Vertex internal error).
+offered** (owner ruling). PDF imports have failed above about 500 pages (observed
+with the parser this deployment uses): a longer PDF downloads but its import
+fails (`import_failed`, a Vertex internal error).
 For a book that long, look harder for an EPUB, a text edition or a volume
 split, and before choosing it tell the owner a long PDF may not ingest. After
 such a failure, report it with the measured page count (`scale.pages`); do not

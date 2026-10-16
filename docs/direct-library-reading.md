@@ -73,6 +73,13 @@ must have a non-root prefix. These locations apply only after current RAG-file
 membership is verified; they never widen ingestion destinations, canonical
 catalog selection, or any other agent's route. No caller can supply a root.
 
+When acquisition imports are configured, a domain's own acquisition directory
+(`<EXPERT_AGENTS_DOMAIN_EXPERT_ANNAS_IMPORT_GCS_PREFIX><domain_id>/`) is an
+implicit read-only root of the same kind, for a route whose library does not
+already contain it. It is never granted when it would contain another library.
+Direct reading still needs a scope manifest, which a stored (factory)
+registration does not have yet.
+
 Supported canonical representations are UTF-8 plain text and Markdown, HTML
 converted with the existing deterministic converter, and PDFs with a readable
 text layer. PDF extraction uses Poppler `pdftotext -layout`, without a model or
