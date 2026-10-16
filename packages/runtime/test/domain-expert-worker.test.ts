@@ -34,6 +34,7 @@ import {
 } from '../src/workers/http.ts';
 import {
   bookObjectStem,
+  assertAllowedGcsDestination,
   createDomainExpertWorker as createRawDomainExpertWorker,
   reciprocalRankFuse,
   type DomainExpertWorkerOptions,
@@ -5938,9 +5939,12 @@ describe('acquisition imports for a registered domain', () => {
         expect(refused.status).toBe(403);
         expect((await refused.json() as any).error.code).toMatch(/^(domain_expert_policy_violation|gcs_destination_not_allowed)$/);
       }
-      // A dot segment cannot walk out of the directory.
-      const walked = await postDomainResponse(f.worker, 'rag_corpus', { domain_id: 'research', action: 'import', corpus_id: CORPUS, gcs_uri: `${IMPORT_PREFIX}research/../history/a.pdf`, dry_run: false });
+      // A dot segment cannot walk out of the directory, at the request check or the destination check.
+      const walked = await postDomainResponse(f.worker, 'rag_corpus', { domain_id: 'research', action: 'import', corpus_id: CORPUS, gcs_uri: `${IMPORT_PREFIX}research/../history/a.pdf`, dry_run: true });
       expect(walked.status).toBe(400);
+      expect(() => assertAllowedGcsDestination(`${IMPORT_PREFIX}research/../history/a.pdf`, [`${IMPORT_PREFIX}research`])).toThrow('path segments');
+      expect(() => assertAllowedGcsDestination(`${IMPORT_PREFIX}research/./a.pdf`, [`${IMPORT_PREFIX}research`])).toThrow('path segments');
+      expect(() => assertAllowedGcsDestination(`${IMPORT_PREFIX}research/a..b.pdf`, [`${IMPORT_PREFIX}research`])).not.toThrow();
       expect(f.googleCalls.filter((call) => call.url.endsWith('/ragFiles:import'))).toEqual([]);
     } finally { f.cleanup(); }
   });
@@ -5970,6 +5974,16 @@ describe('acquisition imports for a registered domain', () => {
       const response = await postDomain(worker, 'annas_archive_import', { ...PARAMS, domain_id: 'factory', ingest: true, corpus_id: CORPUS });
       expect(response.rag_ingest).toMatchObject({ status: 'blocked', error: { code: 'annas_import_prefix_conflict' } });
       expect(uploadedObjectNames(calls)).toEqual([]);
+      // The registration library alone also blocks it, before any domain is registered beneath it.
+      const unregistered = createDomainExpertWorker({
+        gcpProject: 'fixture-project',
+        registrationLibrary: { bucket: 'fixture-shared-library', prefix: 'v1/factory' },
+        agentRouting: validateAgentRoutingConfig({ factory: { library: { bucket: 'fixture-shared-library', prefix: 'v1/elsewhere/factory' }, targetCorpusDisplayName: 'research-library' } }),
+        annas: { apiKey: 'fixture-acquisition-token', baseUrl: 'https://annas.example', importGcsPrefix: 'gs://fixture-shared-library/v1/' },
+        google: { accessToken: 'fixture-google-token', fetchImpl: fakeIngestGoogleFetch([]) },
+      });
+      expect((await postDomain(unregistered, 'rag_corpus', { domain_id: 'factory', action: 'import', dry_run: true })).allowed_gcs_prefixes)
+        .toEqual(['gs://fixture-shared-library/v1/elsewhere/factory']);
       // Negative control: a domain whose directory holds no library is granted it.
       const granted = await postDomain(worker, 'rag_corpus', { domain_id: 'example', action: 'import', dry_run: true });
       expect(granted.allowed_gcs_prefixes).toEqual(['gs://fixture-shared-library/v1/factory/example', 'gs://fixture-shared-library/v1/example']);
