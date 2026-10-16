@@ -41,7 +41,7 @@
           "bunBin": { "type": "string", "description": "Absolute path to Bun 1.3+ for the bundled factory." },
           "model": { "type": "string", "description": "Optional deployment-approved model for newly created agents." },
           "activationCommand": { "type": "string", "description": "Optional absolute path to an owner-approved no-argument activation wrapper. It must enforce the deployment's restart protocol. At most one attempt per creation." },
-          "remoteUrlTemplate": { "type": "string", "description": "Optional https://, ssh:// or file:/// remote URL containing {agentId} exactly once. The factory pushes each new agent's initial commit there and records the resolved remote." },
+          "remoteUrlTemplate": { "type": "string", "description": "Optional https://, ssh:// or file:/// remote URL containing {agentId} exactly once. The factory pushes each new agent's initial commit there and records the resolved remote. An https://github.com/ remote is pushed as the Gateway's System GitHub identity (tools.github)." },
           "remoteCreateCommand": { "type": "string", "description": "Optional absolute path to a deployment-owned executable that creates the remote repository idempotently. It receives the agent id and the resolved remote URL as its only arguments." }
         }
       },

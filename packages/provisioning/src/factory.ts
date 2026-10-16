@@ -6,7 +6,11 @@ import { HIGH_CONFIDENCE_SECRET_PATTERNS } from './secret-patterns.ts';
 import { beginManagedBotProvision, probeManagedBotProvision, runTelegramProvisionCli } from '../../../scripts/expert-telegram-provision.ts';
 import type { FactoryConfig, FactoryRequest, FactoryResult, FactorySpec, FactoryState } from './factory-types.ts';
 
-export type FactoryCommand = (argv: string[], cwd?: string) => Promise<string>;
+export interface FactoryCommandOptions {
+  /** Authenticate this Git network command as the deployment's managed System GitHub identity. */
+  githubIdentity?: boolean;
+}
+export type FactoryCommand = (argv: string[], cwd?: string, options?: FactoryCommandOptions) => Promise<string>;
 export interface FactoryDependencies {
   command: FactoryCommand;
   worker: (tool: 'domain_agent' | 'rag_corpus', params: Record<string, unknown>) => Promise<unknown>;
@@ -114,7 +118,8 @@ export async function runFactory(config: FactoryConfig, request: FactoryRequest,
       await save('committing_repository');
     }
     if (!state.commit) {
-      await io.command(['git', 'init'], workspace);
+      // No host template: it could seed hooks or URL, HTTP or credential settings into the repository.
+      await io.command(['git', 'init', '--template='], workspace);
       await io.command(['git', 'add', '--', '.gitignore', 'agent.json', 'binding.json', 'AGENTS.md', 'HEARTBEAT.md', 'IDENTITY.md', 'SOUL.md', 'TOOLS.md', 'USER.md', 'library/scope-manifest.json', 'library/eval-questions.json', 'references/.gitkeep'], workspace);
       await io.command(['git', '-c', 'user.name=Expert Agent Factory', '-c', 'user.email=factory@expert-agent.invalid', 'commit', '--allow-empty', '-m', 'Initialize independent expert agent'], workspace);
       const commit = (await io.command(['git', 'rev-parse', 'HEAD'], workspace)).trim();
@@ -124,11 +129,15 @@ export async function runFactory(config: FactoryConfig, request: FactoryRequest,
     }
     if (config.remoteUrlTemplate && !state.remotePushed) {
       // Every step here is idempotent, so a crash after the remote exists but before the proof is recorded resumes cleanly.
+      // A resume first records corpus re-checking; a failure here must still report this step.
+      if (state.phase !== 'wiring_remote') await save('wiring_remote');
       const remoteUrl = config.remoteUrlTemplate.replaceAll('{agentId}', spec.agentId);
       if (config.remoteCreateCommand) await io.command([config.remoteCreateCommand, spec.agentId, remoteUrl]);
       const remotes = (await io.command(['git', 'remote'], workspace)).split('\n').map((name) => name.trim()).filter(Boolean);
       await io.command(remotes.includes('origin') ? ['git', 'remote', 'set-url', 'origin', remoteUrl] : ['git', 'remote', 'add', 'origin', remoteUrl], workspace);
-      await io.command(['git', 'push', '--set-upstream', 'origin', 'HEAD'], workspace);
+      // A GitHub HTTPS push authenticates as the deployment's System GitHub identity, never host
+      // credentials. Other remotes keep the host's own transport configuration.
+      await io.command(['git', 'push', '--set-upstream', 'origin', 'HEAD'], workspace, isGitHubHttps(remoteUrl) ? { githubIdentity: true } : undefined);
       const head = (await io.command(['git', 'rev-parse', 'HEAD'], workspace)).trim();
       const upstream = (await io.command(['git', 'rev-parse', '@{upstream}'], workspace)).trim();
       if (!/^[a-f0-9]{40,64}$/.test(head) || upstream !== head) throw new FactoryError('factory_remote_proof_missing', 'The remote did not record the repository head after the push.');
@@ -422,6 +431,9 @@ async function noSymlinksBelow(root: string, target: string): Promise<void> {
   }
 }
 function within(root: string, path: string): boolean { const rel = relative(root, path); return rel === '' || (rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel)); }
+function isGitHubHttps(url: string): boolean {
+  try { const parsed = new URL(url); return parsed.protocol === 'https:' && parsed.hostname === 'github.com'; } catch { return false; }
+}
 function requiredText(value: unknown, field: string, max: number): string {
   if (typeof value !== 'string' || !value.trim() || value.length > max || /[\x00-\x08\x0B\x0C\x0E-\x1F]/.test(value) || HIGH_CONFIDENCE_SECRET_PATTERNS.some((pattern) => pattern.test(value))) throw new FactoryError('factory_invalid_request', `Invalid ${field}; never include credentials in a creation request.`);
   return value.trim();

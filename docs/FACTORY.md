@@ -124,11 +124,57 @@ factory adds it as `origin` right after the initial commit, pushes with
 pushed head. An optional `remoteCreateCommand` names an absolute,
 deployment-owned executable that creates the remote idempotently; it receives
 the agent id and the resolved URL as its only arguments and must succeed when
-the repository already exists. Push authentication is the host's
-responsibility (a credential helper or deploy key reachable from the Gateway's
-environment). Both settings are excluded from the operation fingerprint, so an
+the repository already exists. Both settings are excluded from the operation fingerprint, so an
 operation recorded before wiring existed is adopted on its next resume: an
 `origin` an operator already added by hand is reused, never duplicated.
+
+An `https://github.com/` remote is pushed as the Gateway's System GitHub
+identity (`tools.github`; see OpenClaw's GitHub identity documentation). The
+Gateway gives that credential only to agent exec, not to processes it runs
+itself, so the factory applies it to its own push:
+
+- On every invocation the plugin reads `tools.github.profileId` from the live
+  runtime config and the state directory from OpenClaw, and passes both to the
+  factory on its private stdin. Reconnects, token refreshes and profile changes
+  apply without reconfiguring the factory.
+- Immediately before the push, the factory requires the selected profile to be
+  an owner-only directory, not a symbolic link, whose owner-only `hosts.yml`
+  holds a `github.com` token (and whose optional `config.yml` is owner-only).
+- The push runs with the stock `gh auth git-credential` as the only credential
+  helper and `GH_CONFIG_DIR` pointing at the profile. The token reaches Git
+  only through that helper; it never appears in arguments, environment, state
+  or results.
+- Nothing else on the host can authenticate, redirect or observe that push.
+  Inherited credential helpers, askpass programs and hooks are cleared, and
+  inherited `GIT_*`, `GH_*` and `GITHUB_*` variables (including ambient tokens)
+  are removed. Git reads no global or system configuration, and `HOME` is an
+  empty private directory, so host `.netrc` entries, extra headers and URL
+  rewrites do not apply. The repository is created without a Git template, and
+  the push is refused with `factory_repository_git_config` while the
+  repository's own config (including worktree config and includes) has URL
+  rewrite, HTTP, include, push-URL or remote-helper settings, for example on an
+  `origin` an operator added by hand.
+- Because of that isolation, `gh` must be a real executable on the Gateway's
+  `PATH` (not a shell shim that depends on `HOME`), and Git proxy or CA
+  settings from global or system config do not apply to this push.
+- No other command receives the identity, and host Git configuration is not
+  changed. `remoteCreateCommand` runs with the factory's ordinary environment;
+  a command that creates GitHub repositories resolves its own credentials and
+  must fail closed.
+- A missing, malformed, insecure or tokenless profile stops the operation at
+  `wiring_remote` with `factory_github_identity_missing` or
+  `factory_github_identity_unavailable`. Git does not start, so the host's own
+  `gh` login and credential helpers are never used. Reconnect System GitHub,
+  then resume. An expired or revoked token fails the push itself; reconnect in
+  the same way.
+- `GH_CONFIG_DIR` does not isolate the operating-system keyring. `gh` consults
+  the keyring only for a profile without a token, which the factory excludes
+  immediately before the push. A profile removed in the moment between that
+  check and use could reach a keyring login on a host that runs one.
+
+Other remotes (`ssh://`, `file:///` and HTTPS on other hosts) keep the host's
+own transport configuration, such as a deploy key reachable from the Gateway's
+environment.
 
 ## Conversation and states
 

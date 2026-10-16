@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from 'bun:test';
 import { chmod, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { runFactory, type FactoryDependencies } from '../src/factory.ts';
+import { FactoryError, runFactory, type FactoryCommandOptions, type FactoryDependencies } from '../src/factory.ts';
 import type { FactoryConfig, FactoryRequest } from '../src/factory-types.ts';
 import { probeManagedBotProvision } from '../../../scripts/expert-telegram-provision.ts';
 
@@ -26,7 +26,7 @@ async function fixture() {
   await mkdir(config.rootDir, { mode: 0o700 });
   await mkdir(config.tokenDirectory, { mode: 0o700 });
   await writeFile(config.managerTokenFile, TOKEN, { mode: 0o600 });
-  const calls: { argv: string[]; cwd?: string }[] = [];
+  const calls: { argv: string[]; cwd?: string; options?: FactoryCommandOptions }[] = [];
   const workers: { tool: string; params: Record<string, unknown> }[] = [];
   const state = {
     agents: [] as Record<string, unknown>[], accounts: {} as Record<string, unknown>,
@@ -40,10 +40,12 @@ async function fixture() {
     probeInputs: [] as Record<string, unknown>[],
   };
   const dependencies: FactoryDependencies = {
-    command: async (argv, cwd) => {
-      calls.push({ argv: [...argv], cwd });
+    command: async (argv, cwd, options) => {
+      calls.push({ argv: [...argv], cwd, ...(options ? { options } : {}) });
       if (argv[0] === 'git') {
-        const child = Bun.spawn(argv, { cwd, stdout: 'pipe', stderr: 'pipe', env: { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' } });
+        // HTTPS remotes resolve to local bare repositories under base/https/<host>/.
+        const local = ['github.com', 'git.example.com'].flatMap((host) => ['-c', `url.file://${join(base, 'https', host)}/.insteadOf=https://${host}/`]);
+        const child = Bun.spawn(['git', ...local, ...argv.slice(1)], { cwd, stdout: 'pipe', stderr: 'pipe', env: { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' } });
         const [stdout, stderr, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
         if (code !== 0) throw new Error(`Fixture git failed: ${stderr}`);
         return stdout;
@@ -680,6 +682,61 @@ describe('conversational expert factory', () => {
       await f.resume();
       expect(f.state.remoteCreateCalls).toHaveLength(1);
       expect(f.calls.filter((call) => call.argv[0] === 'git' && call.argv[1] === 'push')).toHaveLength(1);
+      expect(f.calls.filter((call) => call.options)).toEqual([]);
+    }, 60_000);
+
+    test.each([
+      ['https://github.com/example-owner/{agentId}.git', true],
+      ['https://git.example.com/example-owner/{agentId}.git', false],
+    ])('%s pushes with the System GitHub identity: %p, and no other command receives it', async (template, identity) => {
+      const f = await fixture();
+      f.config.remoteUrlTemplate = template;
+      const remote = template.replace('{agentId}', 'example');
+      const bare = join(f.base, 'https', new URL(remote).hostname, 'example-owner', 'example.git');
+      await mkdir(bare, { recursive: true });
+      await gitOutput(f.base, ['init', '--bare', '--quiet', bare]);
+      const result = await f.run();
+      expect(result.repository_remote).toBe(remote);
+      expect(await gitOutput(bare, ['rev-parse', 'HEAD'])).toBe(result.commit!);
+      expect(f.calls.filter((call) => call.options?.githubIdentity).map((call) => call.argv))
+        .toEqual(identity ? [['git', 'push', '--set-upstream', 'origin', 'HEAD']] : []);
+      expect(f.calls.filter((call) => call.options && !call.options.githubIdentity)).toEqual([]);
+    }, 60_000);
+
+    test('the repository is created without a host Git template that could seed its settings', async () => {
+      const f = await fixture();
+      const template = join(f.base, 'template');
+      await mkdir(join(template, 'hooks'), { recursive: true });
+      await writeFile(join(template, 'config'), '[url "file:///decoy/"]\n\tinsteadOf = https://github.com/\n');
+      const previous = process.env.GIT_TEMPLATE_DIR;
+      process.env.GIT_TEMPLATE_DIR = template;
+      try { await f.run(); } finally { if (previous === undefined) delete process.env.GIT_TEMPLATE_DIR; else process.env.GIT_TEMPLATE_DIR = previous; }
+      expect(await readFile(join(f.workspace, '.git', 'config'), 'utf8')).not.toContain('insteadOf');
+    }, 60_000);
+
+    test('an unavailable System GitHub identity stops at wiring_remote and resumes once reconnected', async () => {
+      const f = await fixture();
+      f.config.remoteUrlTemplate = 'https://github.com/example-owner/{agentId}.git';
+      const bare = join(f.base, 'https', 'github.com', 'example-owner', 'example.git');
+      await mkdir(bare, { recursive: true });
+      await gitOutput(f.base, ['init', '--bare', '--quiet', bare]);
+      const command = f.dependencies.command;
+      let connected = false;
+      f.dependencies.command = async (argv, cwd, options) => {
+        if (options?.githubIdentity && !connected) throw new FactoryError('factory_github_identity_unavailable', 'Fixture identity unavailable');
+        return command(argv, cwd, options);
+      };
+      await expect(f.run()).rejects.toMatchObject({ code: 'factory_github_identity_unavailable' });
+      expect((await f.run({ action: 'status', agent_id: 'example' })).status).toBe('wiring_remote');
+      // A resume before reconnecting fails the same way and still reports the step it stopped at.
+      await expect(f.resume()).rejects.toMatchObject({ code: 'factory_github_identity_unavailable' });
+      expect((await f.run({ action: 'status', agent_id: 'example' })).status).toBe('wiring_remote');
+      expect(f.workers.filter((call) => call.params.dry_run === false)).toHaveLength(0);
+      connected = true;
+      const result = await f.resume();
+      expect(result.repository_remote).toBe('https://github.com/example-owner/example.git');
+      expect(await gitOutput(bare, ['rev-parse', 'HEAD'])).toBe(result.commit!);
+      expect(f.calls.filter((call) => call.argv[0] === 'git' && call.argv.includes('commit'))).toHaveLength(1);
     }, 60_000);
 
     test('a failed remote creation retains the commit and resumes without a second commit', async () => {
