@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { lstat, mkdir, open, readFile, readdir, realpath, rename, unlink, writeFile } from 'node:fs/promises';
+import { constants } from 'node:fs';
+import { access, lstat, mkdir, open, readFile, readdir, realpath, rename, stat, unlink, writeFile } from 'node:fs/promises';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { scaffoldExpert } from './scaffold.ts';
 import { HIGH_CONFIDENCE_SECRET_PATTERNS } from './secret-patterns.ts';
@@ -14,6 +15,8 @@ export type FactoryCommand = (argv: string[], cwd?: string, options?: FactoryCom
 export interface FactoryDependencies {
   command: FactoryCommand;
   worker: (tool: 'domain_agent' | 'rag_corpus', params: Record<string, unknown>) => Promise<unknown>;
+  /** The running Gateway's `gateway.reload.mode`; undefined means its default (hybrid). */
+  gatewayReloadMode?: () => Promise<unknown>;
   beginTelegram?: typeof beginManagedBotProvision;
   probeTelegram?: typeof probeManagedBotProvision;
   provisionTelegram?: typeof runTelegramProvisionCli;
@@ -22,8 +25,14 @@ export interface FactoryDependencies {
 const SLUG = /^[a-z][a-z0-9-]{1,47}$/;
 const BOT = /^[A-Za-z][A-Za-z0-9_]{1,28}bot$/i;
 
+/** Content-free causes for a failed command, derived privately from its exit status and output. */
+export const FACTORY_FAILURE_CATEGORIES = ['auth', 'not_found', 'rejected', 'unavailable', 'invalid', 'timeout', 'missing_command', 'failed'] as const;
+export type FactoryFailureCategory = typeof FACTORY_FAILURE_CATEGORIES[number];
+/** Where a failure happened: the recorded phase (or `preflight`), a fixed step label and its category. */
+export interface FactoryErrorDetails { phase?: string; step?: string; category?: FactoryFailureCategory }
+
 export class FactoryError extends Error {
-  constructor(public readonly code: string, message: string) { super(message); }
+  constructor(public readonly code: string, message: string, public readonly details: FactoryErrorDetails = {}) { super(message); }
 }
 
 /** A factory invocation advances only observable, recoverable steps and never waits for a human. */
@@ -60,6 +69,9 @@ export async function runFactory(config: FactoryConfig, request: FactoryRequest,
   let lock;
   try { lock = await open(lockPath, 'wx', 0o600); }
   catch { throw new FactoryError('factory_busy', 'Another factory operation owns the deployment lock. Retry later; an abandoned lock requires operator inspection.'); }
+  // The recorded phase always names the step in progress, so a failure, `status` and the error's
+  // phase agree. Checks before any step report the phase `preflight` instead.
+  let stage: 'preflight' | undefined = 'preflight';
   try {
     // Reread after acquiring the deployment-wide lock: concurrent requests must not overwrite progress.
     const current = await loadState(statePath);
@@ -68,13 +80,58 @@ export async function runFactory(config: FactoryConfig, request: FactoryRequest,
     }
     state = current ?? { schemaVersion: 1, spec, configFingerprint, operationId: randomUUID(), phase: 'preflight' };
     const save = async (phase: string): Promise<void> => { state!.phase = phase; await saveState(statePath, state!); };
+    const advance = () => save(pendingPhase(state!, config));
+    // Each step records itself before it starts, so a failure inside it is reported at that step.
+    const enter = async () => { if (state!.phase !== pendingPhase(state!, config)) await advance(); };
+    const command: FactoryCommand = async (argv, cwd, options) => {
+      try { return await io.command(argv, cwd, options); }
+      catch (error) { throw locate(error, stage ?? state!.phase, stepOf(argv, config), options); }
+    };
     const tokenPath = join(paths.tokens, `${spec.agentId}.token`);
     await noSymlinksBelow(paths.tokens, tokenPath);
     const telegramDeps = { env: { EXPERT_AGENTS_TELEGRAM_MANAGER_TOKEN_FILE: config.managerTokenFile }, log: () => {} };
-    const cli = (args: string[]) => io.command([config.openclawBin, ...args]);
+    const cli = (args: string[]) => command([config.openclawBin, ...args]);
+    // Non-command dependencies report a fixed step label too.
+    const during = async <T>(step: string, run: () => Promise<T>): Promise<T> => {
+      try { return await run(); } catch (error) { throw withPhase(error, stage ?? state!.phase, step); }
+    };
+    const remoteUrl = config.remoteUrlTemplate?.replaceAll('{agentId}', spec.agentId);
+    // Cheap checks that would otherwise fail only after a repository, GitHub repository or
+    // Telegram link exists. Each refuses with a content-free cause before anything changes.
+    const preflight = async (): Promise<void> => {
+      if (!state!.gatewayConfigured && io.gatewayReloadMode) {
+        let mode: unknown;
+        try { mode = await io.gatewayReloadMode(); }
+        catch (error) { throw locate(error, 'preflight', 'gateway reload mode'); }
+        if (mode === 'off') throw new FactoryError('factory_gateway_reload_off', 'preflight: Gateway config reload is off (gateway.reload.mode), so the running Gateway would not load the new agent or its Telegram account and setup would stall. Ask the Gateway operator to use hybrid reload, then repeat this request.', { phase: 'preflight', step: 'gateway reload mode' });
+      }
+      const programs: [string, string | undefined][] = [
+        ['remote creation command', state!.remotePushed ? undefined : config.remoteCreateCommand],
+        // Checked before configuration; afterwards a ready expert no longer needs it.
+        ['activation command', state!.gatewayConfigured ? undefined : config.activationCommand],
+      ];
+      for (const [step, program] of programs) {
+        if (program && !await executable(program)) throw locate(new FactoryError('factory_command_failed', 'missing', { category: 'missing_command' }), 'preflight', step);
+      }
+      if (remoteUrl && !state!.remotePushed && isGitHubHttps(remoteUrl)) {
+        // The same isolated identity, helper and environment as the push. The remote first: it
+        // separates an unreachable service from a refused credential, and GitHub asks for the
+        // credential for an absent or private repository. A remote the factory will create may be
+        // absent. Then the credential itself, which a public repository would not have exercised.
+        try { await command(['git', 'ls-remote', remoteUrl], undefined, { githubIdentity: true }); }
+        catch (error) {
+          if (!(error instanceof FactoryError) || error.details.category !== 'not_found') throw error;
+          if (!config.remoteCreateCommand) throw new FactoryError('factory_remote_missing', 'preflight: git ls-remote: the configured GitHub remote does not exist or is not visible to System GitHub, and no remoteCreateCommand is configured to create it. Create the repository or grant access, then repeat this request.', { phase: 'preflight', step: 'git ls-remote', category: 'not_found' });
+        }
+        await command(['gh', 'auth', 'status', '--active', '--hostname', 'github.com'], undefined, { githubIdentity: true });
+      }
+    };
     if (current) {
+      // A previous readiness receipt is downgraded to the first unfinished step before anything
+      // is inspected, and corpus readiness is re-proven on every resume.
+      const resumeAt = pendingPhase(state, config);
       state.corpusReady = false;
-      await save('waiting_for_corpus');
+      await save(resumeAt);
     }
     await requireUniqueTelegramIdentity(paths.root, state);
 
@@ -82,29 +139,32 @@ export async function runFactory(config: FactoryConfig, request: FactoryRequest,
       if (await exists(workspace) || await exists(tokenPath)) throw new FactoryError('factory_target_exists', 'The agent workspace or token destination already exists; existing agents are never adopted implicitly.');
       await checkGatewayCollisions(cli, spec.agentId, workspace, tokenPath, false);
       await cli(['config', 'validate']);
+      await preflight();
       // Validate the server's registration boundary before creating local or remote resources.
-      const preflight = record(await io.worker('domain_agent', registrationParams(state, config, true)));
-      if (preflight.status !== 'dry_run_registration_ready') throw new FactoryError('factory_registration_preflight_failed', 'The worker did not confirm that domain registration is safe to apply.');
-      const existing = await (io.probeTelegram ?? probeManagedBotProvision)({ username: spec.telegramUsername, ownerUserId: config.ownerTelegramUserId }, telegramDeps);
+      const registration = record(await during('worker registration check', () => io.worker('domain_agent', registrationParams(state!, config, true))));
+      if (registration.status !== 'dry_run_registration_ready') throw new FactoryError('factory_registration_preflight_failed', 'The worker did not confirm that domain registration is safe to apply.');
+      const existing = await during('Telegram manager check', () => (io.probeTelegram ?? probeManagedBotProvision)({ username: spec.telegramUsername, ownerUserId: config.ownerTelegramUserId }, telegramDeps));
       if (existing.status === 'confirmed') throw new FactoryError('factory_telegram_username_taken', 'This Telegram username already has a managed bot confirmation. Choose a new username; existing bots cannot be adopted by a new operation.');
-      const began = await (io.beginTelegram ?? beginManagedBotProvision)({ username: spec.telegramUsername, displayName: spec.displayName }, telegramDeps);
+      const began = await during('Telegram confirmation link', () => (io.beginTelegram ?? beginManagedBotProvision)({ username: spec.telegramUsername, displayName: spec.displayName }, telegramDeps));
       state.deepLink = began.deepLink;
       // Anything already queued predates this link, so it can never be this agent's renamed bot.
       if (Number.isSafeInteger(existing.latestUpdateId) && existing.latestUpdateId >= 0) state.updateWatermark = existing.latestUpdateId;
-      await save('creating_repository');
+      stage = undefined;
+      await advance();
     } else {
-      // A previous success is a receipt, not current routing proof. Downgrade before
-      // inspection so a failed CLI call or a routing conflict cannot leave stale readiness.
-      if (state.gatewayConfigured) await save('waiting_for_activation');
+      // A previous success is a receipt, not current routing proof.
       const observed = await checkGatewayCollisions(cli, spec.agentId, workspace, tokenPath, true);
       if (state.gatewayConfigured) requireGatewayConfiguration(observed, expectedAccount(config, tokenPath));
       if (state.domainRegistered) {
-        const registration = record(await io.worker('domain_agent', registrationParams(state, config, true)));
+        const registration = record(await during('worker registration check', () => io.worker('domain_agent', registrationParams(state!, config, true))));
         if (registration.status !== 'dry_run_registration_ready') throw new FactoryError('factory_registration_preflight_failed', 'The worker did not confirm the recorded domain registration.');
       }
+      await preflight();
+      stage = undefined;
     }
 
     if (!state.scaffolded) {
+      await enter();
       // A process that died halfway through scaffold publication cannot safely guess which files it owns.
       if (await exists(workspace)) throw new FactoryError('factory_partial_scaffold', 'A partial repository exists. Inspect it before recovery; the factory will not overwrite it.');
       await scaffoldExpert({ targetDir: workspace, agentId: spec.agentId, displayName: spec.displayName,
@@ -115,56 +175,55 @@ export async function runFactory(config: FactoryConfig, request: FactoryRequest,
         openclaw: { agentId: spec.agentId, workspacePath: workspace },
         telegram: { tokenFilePath: tokenPath, dmPolicy: 'owner-allowlist' } }, null, 2) + '\n', { mode: 0o600 });
       state.scaffolded = true;
-      await save('committing_repository');
+      await advance();
     }
     if (!state.commit) {
+      await enter();
       // No host template: it could seed hooks or URL, HTTP or credential settings into the repository.
-      await io.command(['git', 'init', '--template='], workspace);
-      await io.command(['git', 'add', '--', '.gitignore', 'agent.json', 'binding.json', 'AGENTS.md', 'HEARTBEAT.md', 'IDENTITY.md', 'SOUL.md', 'TOOLS.md', 'USER.md', 'library/scope-manifest.json', 'library/eval-questions.json', 'references/.gitkeep'], workspace);
-      await io.command(['git', '-c', 'user.name=Expert Agent Factory', '-c', 'user.email=factory@expert-agent.invalid', 'commit', '--allow-empty', '-m', 'Initialize independent expert agent'], workspace);
-      const commit = (await io.command(['git', 'rev-parse', 'HEAD'], workspace)).trim();
+      await command(['git', 'init', '--template='], workspace);
+      await command(['git', 'add', '--', '.gitignore', 'agent.json', 'binding.json', 'AGENTS.md', 'HEARTBEAT.md', 'IDENTITY.md', 'SOUL.md', 'TOOLS.md', 'USER.md', 'library/scope-manifest.json', 'library/eval-questions.json', 'references/.gitkeep'], workspace);
+      await command(['git', '-c', 'user.name=Expert Agent Factory', '-c', 'user.email=factory@expert-agent.invalid', 'commit', '--allow-empty', '-m', 'Initialize independent expert agent'], workspace);
+      const commit = (await command(['git', 'rev-parse', 'HEAD'], workspace)).trim();
       if (!/^[a-f0-9]{40,64}$/.test(commit)) throw new FactoryError('factory_git_proof_missing', 'Git did not return a valid initial commit.');
       state.commit = commit;
-      await save(config.remoteUrlTemplate ? 'wiring_remote' : 'registering_library');
+      await advance();
     }
-    if (config.remoteUrlTemplate && !state.remotePushed) {
+    if (remoteUrl && !state.remotePushed) {
+      await enter();
       // Every step here is idempotent, so a crash after the remote exists but before the proof is recorded resumes cleanly.
-      // A resume first records corpus re-checking; a failure here must still report this step.
-      if (state.phase !== 'wiring_remote') await save('wiring_remote');
-      const remoteUrl = config.remoteUrlTemplate.replaceAll('{agentId}', spec.agentId);
-      if (config.remoteCreateCommand) await io.command([config.remoteCreateCommand, spec.agentId, remoteUrl]);
-      const remotes = (await io.command(['git', 'remote'], workspace)).split('\n').map((name) => name.trim()).filter(Boolean);
-      await io.command(remotes.includes('origin') ? ['git', 'remote', 'set-url', 'origin', remoteUrl] : ['git', 'remote', 'add', 'origin', remoteUrl], workspace);
+      if (config.remoteCreateCommand) await command([config.remoteCreateCommand, spec.agentId, remoteUrl]);
+      const remotes = (await command(['git', 'remote'], workspace)).split('\n').map((name) => name.trim()).filter(Boolean);
+      await command(remotes.includes('origin') ? ['git', 'remote', 'set-url', 'origin', remoteUrl] : ['git', 'remote', 'add', 'origin', remoteUrl], workspace);
       // A GitHub HTTPS push authenticates as the deployment's System GitHub identity, never host
       // credentials. Other remotes keep the host's own transport configuration.
-      await io.command(['git', 'push', '--set-upstream', 'origin', 'HEAD'], workspace, isGitHubHttps(remoteUrl) ? { githubIdentity: true } : undefined);
-      const head = (await io.command(['git', 'rev-parse', 'HEAD'], workspace)).trim();
-      const upstream = (await io.command(['git', 'rev-parse', '@{upstream}'], workspace)).trim();
+      await command(['git', 'push', '--set-upstream', 'origin', 'HEAD'], workspace, isGitHubHttps(remoteUrl) ? { githubIdentity: true } : undefined);
+      const head = (await command(['git', 'rev-parse', 'HEAD'], workspace)).trim();
+      const upstream = (await command(['git', 'rev-parse', '@{upstream}'], workspace)).trim();
       if (!/^[a-f0-9]{40,64}$/.test(head) || upstream !== head) throw new FactoryError('factory_remote_proof_missing', 'The remote did not record the repository head after the push.');
       state.remoteUrl = remoteUrl;
       state.remotePushed = true;
-      await save('registering_library');
+      await advance();
     }
     if (!state.domainRegistered) {
-      const registration = record(await io.worker('domain_agent', registrationParams(state, config, false)));
+      await enter();
+      const registration = record(await during('worker domain registration', () => io.worker('domain_agent', registrationParams(state!, config, false))));
       if (!['registered', 'already_registered'].includes(String(registration.status))) throw new FactoryError('factory_registration_incomplete', 'The worker did not confirm domain registration.');
       state.domainRegistered = true;
-      await save('creating_corpus');
+      await advance();
     }
     if (!state.corpusReady) {
-      const corpus = record(await io.worker('rag_corpus', { action: 'ensure', domain_id: spec.agentId, approval_id: state.operationId, dry_run: false }));
-      if (corpus.status !== 'ready') {
-        await save('waiting_for_corpus');
-        return summarize(state, spec.agentId, workspace);
-      }
-      state.corpusReady = true;
-      await save('waiting_for_telegram');
+      await enter();
+      const corpus = record(await during('worker corpus ensure', () => io.worker('rag_corpus', { action: 'ensure', domain_id: spec.agentId, approval_id: state!.operationId, dry_run: false })));
+      state.corpusReady = corpus.status === 'ready';
+      await advance();
+      if (!state.corpusReady) return summarize(state, spec.agentId, workspace);
     }
     // Only a later invocation may consume a confirmation after its link has been returned.
     if (!current) return summarize(state, spec.agentId, workspace);
     if (!state.botId) {
-      const observed = await (io.probeTelegram ?? probeManagedBotProvision)({ username: spec.telegramUsername, ownerUserId: config.ownerTelegramUserId,
-        ...(state.updateWatermark !== undefined ? { sinceUpdateId: state.updateWatermark } : {}) }, telegramDeps);
+      await enter();
+      const observed = await during('Telegram confirmation check', () => (io.probeTelegram ?? probeManagedBotProvision)({ username: spec.telegramUsername, ownerUserId: config.ownerTelegramUserId,
+        ...(state!.updateWatermark !== undefined ? { sinceUpdateId: state!.updateWatermark } : {}) }, telegramDeps));
       let identity = observed.status === 'confirmed' ? { botId: observed.botId, actualUsername: observed.actualUsername } : undefined;
       if (!identity && observed.candidates?.length) {
         // The suggested name was only a suggestion. If Telegram rejected it as taken, the owner
@@ -182,23 +241,26 @@ export async function runFactory(config: FactoryConfig, request: FactoryRequest,
       state.botId = identity.botId;
       state.botUsername = identity.actualUsername;
       if (identity.actualUsername.toLowerCase() !== spec.telegramUsername.toLowerCase()) state.renamedFrom = spec.telegramUsername;
-      await save('installing_telegram_token');
+      await advance();
     }
     if (!state.tokenInstalled) {
+      await enter();
       // The recorded numeric identity is durable before token installation, so a crash can recover
       // an atomically installed file without repeating bot creation or rotating its credential.
-      const installed = await (io.provisionTelegram ?? runTelegramProvisionCli)([
-        '--username', spec.telegramUsername, '--user-id', String(state.botId), '--token-file', tokenPath,
-        ...(await exists(tokenPath) ? ['--replace'] : []),
+      const replace = await exists(tokenPath);
+      const installed = await during('Telegram token installation', () => (io.provisionTelegram ?? runTelegramProvisionCli)([
+        '--username', spec.telegramUsername, '--user-id', String(state!.botId), '--token-file', tokenPath,
+        ...(replace ? ['--replace'] : []),
         // The numeric id is the identity; the username check would only refuse the owner's own rename.
-        ...(state.renamedFrom !== undefined ? ['--accept-username-change'] : []),
-      ], telegramDeps);
+        ...(state!.renamedFrom !== undefined ? ['--accept-username-change'] : []),
+      ], telegramDeps));
       if (installed.botId !== state.botId) throw new FactoryError('factory_bot_identity_mismatch', 'Telegram returned a different bot identity.');
       state.botUsername = installed.actualUsername;
       state.tokenInstalled = true;
-      await save('configuring_gateway');
+      await advance();
     }
     if (!state.gatewayConfigured) {
+      await enter();
       const observed = await checkGatewayCollisions(cli, spec.agentId, workspace, tokenPath, true);
       const account = expectedAccount(config, tokenPath);
       if (observed.account && !sameAccountPolicy(observed.account, account)) {
@@ -230,7 +292,7 @@ export async function runFactory(config: FactoryConfig, request: FactoryRequest,
       await cli(['config', 'validate']);
       await cli(['doctor', '--lint', '--severity-min', 'error', '--non-interactive']);
       state.gatewayConfigured = true;
-      await save('waiting_for_activation');
+      await advance();
     }
     requireGatewayConfiguration(await checkGatewayCollisions(cli, spec.agentId, workspace, tokenPath, true), expectedAccount(config, tokenPath));
     // Check first: config hot-reload or an external owner may already have activated the account.
@@ -242,11 +304,13 @@ export async function runFactory(config: FactoryConfig, request: FactoryRequest,
     if (config.activationCommand && !state.activationAttempted) {
       state.activationAttempted = true;
       await save('waiting_for_activation');
-      await io.command([config.activationCommand]);
+      await command([config.activationCommand]);
       requireGatewayConfiguration(await checkGatewayCollisions(cli, spec.agentId, workspace, tokenPath, true), expectedAccount(config, tokenPath));
       if (await channelReady(cli, spec.agentId, state.botId!)) await save('ready_empty_library');
     }
     return summarize(state, spec.agentId, workspace);
+  } catch (error) {
+    throw withPhase(error, stage ?? state?.phase ?? 'preflight');
   } finally { await lock.close(); await unlink(lockPath); }
 }
 
@@ -341,13 +405,13 @@ async function channelReady(cli: (args: string[]) => Promise<string>, id: string
 function summarize(state: FactoryState | undefined, id: string, workspace: string): FactoryResult {
   const status = state?.phase ?? 'not_found';
   const next = status === 'ready_empty_library'
-    ? 'Telegram polling and bot identity are verified. The new corpus is empty: import approved sources, run retrieval evaluation, and prove a natural agent answer before claiming a populated expert.'
+    ? 'Telegram polling and bot identity are verified. The owner messaging the bot is the real test. The new corpus is empty: import approved sources, run retrieval evaluation, and prove a natural agent answer before claiming a populated expert.'
     : status === 'waiting_for_telegram'
-      ? 'Open the confirmation link with the configured owner Telegram account and create the bot, then call resume with apply=true. The suggested username is only a suggestion: if Telegram reports it taken, pick any other name in the same flow and the factory adopts the bot you actually created.'
+      ? 'Open the confirmation link with the configured owner Telegram account and create the bot, then call resume with apply=true in the owner\'s next turn. The suggested username is only a suggestion: if Telegram reports it taken, pick any other name in the same flow and the factory adopts the bot you actually created. The bot stays silent until activation completes.'
       : status === 'waiting_for_corpus'
         ? 'Vertex creation is pending. Call resume with apply=true to check it; do not create another corpus.'
         : status === 'waiting_for_activation'
-          ? 'Gateway configuration is validated but the bot is not proven running. The deployment owner must complete the approved activation pathway; resume then checks readiness without repeating an activation attempt.'
+          ? 'Gateway configuration is validated but the bot is not proven running, and it stays silent until then. With hybrid config reload the Gateway starts the new Telegram account after in-flight runs finish, which can take several minutes. Call resume with apply=true in the owner\'s next turn to check readiness; if reload is off, the deployment owner must complete the approved activation pathway first. Resume never repeats an activation attempt.'
           : state ? 'Call resume with apply=true to continue this recorded operation.' : 'No factory operation exists for this id.';
   return { kind: 'expert_factory', agent_id: id, status, ...(state ? { repository_path: workspace,
     domain_id: id, corpus_ready: state.corpusReady === true,
@@ -431,6 +495,98 @@ async function noSymlinksBelow(root: string, target: string): Promise<void> {
   }
 }
 function within(root: string, path: string): boolean { const rel = relative(root, path); return rel === '' || (rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel)); }
+/** The first unfinished step, in order. A resume records it before inspecting anything. */
+function pendingPhase(state: FactoryState, config: FactoryConfig): string {
+  if (!state.scaffolded) return 'creating_repository';
+  if (!state.commit) return 'committing_repository';
+  if (config.remoteUrlTemplate && !state.remotePushed) return 'wiring_remote';
+  if (!state.domainRegistered) return 'registering_library';
+  if (state.corpusReady === undefined) return 'creating_corpus';
+  if (!state.corpusReady) return 'waiting_for_corpus';
+  if (!state.botId) return 'waiting_for_telegram';
+  if (!state.tokenInstalled) return 'installing_telegram_token';
+  if (!state.gatewayConfigured) return 'configuring_gateway';
+  return 'waiting_for_activation';
+}
+
+/** Every phase an operation can record, in step order. */
+export const FACTORY_PHASES = [
+  'creating_repository', 'committing_repository', 'wiring_remote', 'registering_library', 'creating_corpus',
+  'waiting_for_corpus', 'waiting_for_telegram', 'installing_telegram_token', 'configuring_gateway',
+  'waiting_for_activation', 'ready_empty_library',
+] as const;
+
+// A fixed label for each command the factory runs. Arguments such as JSON parameters, paths and
+// URLs never appear in it.
+function stepOf(argv: string[], config: FactoryConfig): string {
+  const [program, ...args] = argv;
+  if (program === config.remoteCreateCommand) return 'remote creation command';
+  if (program === config.activationCommand) return 'activation command';
+  if (program === 'gh') return 'gh auth status';
+  if (program === 'git') {
+    for (let index = 0; index < args.length; index++) {
+      if (args[index] === '-c') index++;
+      else if (!args[index]!.startsWith('-')) return /^[a-z-]+$/.test(args[index]!) ? `git ${args[index]}` : 'git';
+    }
+    return 'git';
+  }
+  if (program !== config.openclawBin) return 'deployment command';
+  if (args[0] === 'gateway' && args[1] === 'call' && /^[a-z]+(?:\.[a-z]+)+$/i.test(args[2] ?? '')) return args[2]!;
+  if (args[0] === 'config' && args[1] === 'get' && /^[a-z]+(?:\.[a-z]+)*$/i.test(args[2] ?? '')) return `openclaw config get ${args[2]}`;
+  if (args[0] === 'config' && args[1] === 'set') return args.includes('--dry-run') ? 'openclaw config set (dry run)' : 'openclaw config set';
+  return ['openclaw', ...args.slice(0, 2).filter((arg) => /^[a-z]+$/.test(arg))].join(' ');
+}
+
+const CATEGORY_HINTS: Record<FactoryFailureCategory, string> = {
+  auth: 'A credential was missing, refused or lacked permission.',
+  not_found: 'Something it needed was not found.',
+  rejected: 'The remote refused the update.',
+  unavailable: 'A service it needs could not be reached; retry when it is available.',
+  invalid: 'It reported invalid input or configuration.',
+  timeout: 'It did not finish within its time limit.',
+  missing_command: 'The program is missing or not executable on the Gateway PATH.',
+  failed: '',
+};
+
+// Names where a command failed without any of its private output: the phase, a fixed step label
+// and a category from a closed set. Other factory errors keep their code and gain the location.
+function locate(error: unknown, phase: string, step: string, options?: FactoryCommandOptions): FactoryError {
+  if (error instanceof FactoryError && error.code !== 'factory_command_failed') {
+    return new FactoryError(error.code, `${phase}: ${step}: ${error.message}`, { ...error.details, phase, step });
+  }
+  const category = error instanceof FactoryError ? error.details.category ?? 'failed' : 'failed';
+  let hint = CATEGORY_HINTS[category];
+  if (options?.githubIdentity && (category === 'auth' || category === 'not_found')) {
+    hint = 'System GitHub (tools.github) was refused, cannot see the repository or cannot write it. Reconnect System GitHub or grant it access.';
+  } else if (step === 'agents.update' && category === 'not_found') {
+    hint = 'The running Gateway does not see the agent; if Gateway config reload is off it never loaded the change.';
+  } else if (step === 'openclaw doctor') {
+    hint = 'The OpenClaw health check failed or exceeded its 180-second budget.';
+  }
+  const next = phase === 'preflight'
+    ? 'Nothing was changed by this check; fix the cause, then repeat the same request.'
+    : 'Fix the cause, then resume this operation; never start another.';
+  return new FactoryError('factory_command_failed', `${phase}: ${step} failed (${category}). ${hint ? `${hint} ` : ''}Its private output was withheld. ${next}`, { phase, step, category });
+}
+
+// Adds the location to an error leaving an applied invocation. Coded factory and worker errors
+// keep their code and model-facing message; anything else may carry private detail and is replaced.
+function withPhase(error: unknown, phase: string, step?: string): FactoryError {
+  const location = { phase, ...(step ? { step } : {}) };
+  if (error instanceof FactoryError) return error.details.phase ? error : new FactoryError(error.code, error.message, { ...error.details, ...location });
+  const { code, message } = record(error);
+  if (typeof code === 'string' && /^[a-z][a-z0-9_]*$/.test(code) && typeof message === 'string') return new FactoryError(code, message, location);
+  const next = phase === 'preflight'
+    ? 'Nothing was created by this call; fix the cause, then repeat the same request.'
+    : 'Progress was retained; inspect the deployment privately, then resume this operation.';
+  return new FactoryError('factory_step_failed', `${phase}: ${step ?? 'a factory step'} failed. Private details were withheld. ${next}`, location);
+}
+
+async function executable(path: string): Promise<boolean> {
+  try { return (await stat(path)).isFile() && await access(path, constants.X_OK).then(() => true, () => false); }
+  catch { return false; }
+}
+
 function isGitHubHttps(url: string): boolean {
   try { const parsed = new URL(url); return parsed.protocol === 'https:' && parsed.hostname === 'github.com'; } catch { return false; }
 }

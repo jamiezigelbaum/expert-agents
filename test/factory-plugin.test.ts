@@ -62,6 +62,8 @@ describe('packaged expert factory', () => {
         // Read live on each invocation, so a reconnected or changed System identity applies.
         const envelope = JSON.parse(await readFile(join(root, 'stdin.json'), 'utf8'));
         expect(envelope.github).toEqual({ profileId, stateDir: join(root, 'state') });
+        // The running Gateway's reload mode travels from the same live snapshot.
+        expect(envelope.gateway).toEqual(profileId === profileIds[0] ? { reloadMode: 'off' } : {});
         const env = (await readFile(join(root, 'env.txt'), 'utf8')).split('\n').filter(Boolean).map((line) => line.split('=')[0]!);
         expect(env.filter((name) => /^(GH_|GITHUB_)/.test(name))).toEqual([]);
       }
@@ -71,10 +73,32 @@ describe('packaged expert factory', () => {
 
     function runtimeConfig(profileId: string) {
       return {
+        ...(profileId === profileIds[0] ? { gateway: { reload: { mode: 'off' } } } : {}),
         tools: { github: { profileId, kind: 'oauth' } },
         plugins: { entries: { 'expert-agents': { config: { domainExpert: { enabled: true }, factory: { enabled: true, bunBin: fakeBun } } } } },
       };
     }
+  });
+
+  test('a turn the owner did not send is told to wait for the owner, distinct from a restricted session', async () => {
+    const tool = (context: FactoryToolContext) => factoryTool({ factory: { enabled: true, bunBin: '/does-not-exist' } }, context);
+    const notOwner = (await tool({ senderIsOwner: false }).execute('test', { action: 'resume', agent_id: 'example', apply: true })).content[0]!.text;
+    expect(notOwner).toContain('factory_owner_required');
+    expect(notOwner).toContain('turn the owner sent directly');
+    const restricted = (await tool({ senderIsOwner: true, sandboxed: true }).execute('test', { action: 'resume', agent_id: 'example', apply: true })).content[0]!.text;
+    expect(restricted).toContain('factory_owner_required');
+    expect(restricted).toContain('host filesystem authority');
+    expect(restricted).not.toContain('turn the owner sent');
+  });
+
+  test('a host without a runtime snapshot sends no reload mode, so the factory reads the configured value', async () => {
+    const root = await realpath(await mkdtemp(join(tmpdir(), 'expert-plugin-github-')));
+    roots.push(root);
+    const fakeBun = join(root, 'bun');
+    await writeFile(fakeBun, `#!/bin/sh\ncat > "${root}/stdin.json"\nprintf '%s' '{"result":{"kind":"expert_factory","agent_id":"example","status":"planned","next_action":"fixture"}}'\n`, { mode: 0o700 });
+    const tool = factoryTool({ domainExpert: { enabled: true }, factory: { enabled: true, bunBin: fakeBun } }, { senderIsOwner: true });
+    expect((await tool.execute('fixture', { action: 'status', agent_id: 'example' })).isError).toBeUndefined();
+    expect(JSON.parse(await readFile(join(root, 'stdin.json'), 'utf8')).gateway).toBeUndefined();
   });
 
   test('default-disabled factory reports the actual prerequisite', async () => {
