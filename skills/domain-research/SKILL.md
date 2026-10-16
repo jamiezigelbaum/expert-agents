@@ -68,8 +68,9 @@ Use `rag_corpus` for dry-run lifecycle plans, then execute only after the plan
 and destination have been approved. If this session does not have `rag_corpus`,
 tell the owner plainly that imports need a session that has it; never
 substitute shell, direct cloud access or another product's tools. Credentials
-stay inside the configured task-scoped adapter. Use `domain_doc` for comments or visibly marked edits;
-direct edits require approval and must remain reviewable.
+stay inside the configured task-scoped adapter. Use `domain_doc` for comments
+or visibly marked edits; direct edits require approval and must remain
+reviewable.
 
 ## Verified intake
 

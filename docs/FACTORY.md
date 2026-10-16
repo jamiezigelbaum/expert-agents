@@ -159,15 +159,16 @@ itself, so the factory applies it to its own push:
   settings from global or system config do not apply to this push.
 - Only that push and the preflight's `git ls-remote` and
   `gh auth status --active --hostname github.com` receive the identity, and
-  host Git configuration is not changed. `remoteCreateCommand` runs with the factory's ordinary environment;
-  a command that creates GitHub repositories resolves its own credentials and
-  must fail closed.
+  host Git configuration is not changed. `remoteCreateCommand` runs with the
+  factory's ordinary environment; a command that creates GitHub repositories
+  resolves its own credentials and must fail closed.
 - A missing, malformed, insecure or tokenless profile refuses with
   `factory_github_identity_missing` or `factory_github_identity_unavailable`:
   at preflight, before anything is created, while the remote is not yet
-  pushed, or at `wiring_remote` if it becomes unavailable during the push. Git does not start, so the host's own
-  `gh` login and credential helpers are never used. Reconnect System GitHub,
-  then resume. An expired or revoked token fails the push itself; reconnect in
+  pushed, or at `wiring_remote` if it becomes unavailable during the push.
+  Git does not start, so the host's own `gh` login and credential helpers are
+  never used. Reconnect System GitHub, then repeat the request (a resume, for
+  an operation that already exists). An expired or revoked token fails the push itself; reconnect in
   the same way.
 - `GH_CONFIG_DIR` does not isolate the operating-system keyring. `gh` consults
   the keyring only for a profile without a token, which the factory excludes
