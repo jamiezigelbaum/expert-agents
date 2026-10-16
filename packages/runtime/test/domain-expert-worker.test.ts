@@ -6067,3 +6067,71 @@ describe('acquisition imports for a registered domain', () => {
     } finally { fixture.cleanup(); }
   });
 });
+
+// LLM-parser imports of PDFs above about 500 pages fail inside Vertex with an internal error
+// (2026-10-16: a 582-page text PDF, every time). A measured PDF above the ceiling is refused
+// before upload with a specific code; the file stays on disk.
+describe('PDF page ceiling for LLM-parser imports', () => {
+  const CORPUS = 'projects/fixture-project/locations/us-central1/ragCorpora/1001';
+  const PARAMS = {
+    domain_id: 'research', annas_archive_id: 'long-fixture', title: 'The Fixture Compendium', author: 'Example Author',
+    year: '1989', topic: 'Research', format: 'pdf', copyright_posture: 'approved_fixture_use', approval_id: 'approval-fixture', dry_run: false,
+  };
+
+  function ceilingFixture(bytes: Uint8Array, options: { maxPdfPages?: number; ragParserModel?: string } = {}) {
+    const fixture = workspaceFixture();
+    const booksRoot = join(fixture.base, 'books');
+    mkdirSync(booksRoot);
+    const googleCalls: CapturedCall[] = [];
+    const worker = createDomainExpertWorker({
+      gcpProject: 'fixture-project',
+      annas: {
+        apiKey: 'fixture-acquisition-token', baseUrl: 'https://annas.example', booksRoot,
+        importGcsPrefix: 'gs://fixture-shared-library/v1/book-imports/',
+        ...(options.maxPdfPages !== undefined ? { maxPdfPages: options.maxPdfPages } : {}),
+      },
+      google: { accessToken: 'fixture-google-token', fetchImpl: fakeIngestGoogleFetch(googleCalls), ...(options.ragParserModel ? { ragParserModel: options.ragParserModel } : {}) },
+      fetchImpl: fakeAnnasArtifactFetch([], bytes, 'application/pdf'),
+    });
+    return { worker, booksRoot, googleCalls, cleanup: fixture.cleanup };
+  }
+
+  test('a PDF above the ceiling is refused before any Google call and stays on disk', async () => {
+    const f = ceilingFixture(syntheticPdfBytes(582));
+    try {
+      const response = await postDomain(f.worker, 'annas_archive_import', { ...PARAMS, ingest: true, corpus_id: CORPUS });
+      expect(response).toMatchObject({
+        status: 'downloaded_ingest_blocked',
+        rag_ingest: {
+          status: 'blocked',
+          error: { code: 'annas_pdf_exceeds_parser_page_limit' },
+          scale: { measured: true, pages: 582, page_signal: 'page_tree_count', max_pdf_pages: 500, above_max_pdf_pages: true },
+        },
+      });
+      expect(response.rag_ingest.error.message).toContain('582 pages');
+      expect(response.rag_ingest.error.suggestion).toContain('EPUB');
+      expect(f.googleCalls).toEqual([]);
+      expect(existsSync(response.download.path)).toBe(true);
+      expect(annasAuditRecords(f.booksRoot)[0]!.scale).toMatchObject({ pages: 582, max_pdf_pages: 500, above_max_pdf_pages: true });
+    } finally { f.cleanup(); }
+  });
+
+  test.each([
+    ['a PDF at the ceiling', syntheticPdfBytes(500), {}],
+    ['a deployment that disables the ceiling', syntheticPdfBytes(582), { maxPdfPages: 0 }],
+    ['a deployment using Google\'s default parser', syntheticPdfBytes(582), { ragParserModel: 'default' }],
+    // Loose page objects alone may overcount; only the page tree's count refuses.
+    ['a PDF whose only page signal is loose page objects', syntheticObjectStreamPdfBytes(582), {}],
+  ] as const)('imports %s', async (_name, bytes, options) => {
+    const f = ceilingFixture(bytes, options);
+    try {
+      const response = await postDomain(f.worker, 'annas_archive_import', { ...PARAMS, ingest: true, corpus_id: CORPUS });
+      expect(response).toMatchObject({ status: 'downloaded', rag_ingest: { status: 'imported' } });
+      expect(f.googleCalls.some((call) => call.url.endsWith('/ragFiles:import'))).toBe(true);
+      expect(response.scale).toBeDefined();
+      expect(response.scale.above_max_pdf_pages).toBeUndefined();
+      // The ceiling in effect is recorded only while it applies.
+      expect(response.scale.max_pdf_pages).toBe('maxPdfPages' in options || 'ragParserModel' in options ? undefined : 500);
+    } finally { f.cleanup(); }
+  });
+});
