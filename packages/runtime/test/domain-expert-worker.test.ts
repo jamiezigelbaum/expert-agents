@@ -6157,6 +6157,7 @@ describe('PDF page ceiling for LLM-parser imports', () => {
     expect(() => domainExpertAnnasConfigFromEnv({ EXPERT_AGENTS_DOMAIN_EXPERT_ANNAS_MAX_PDF_PAGES: 'many' })).toThrow();
     expect(() => createDomainExpertWorker({ annas: { minPdfPages: 600, maxPdfPages: 500 } })).toThrow('floor must not exceed');
     expect(() => createDomainExpertWorker({ annas: { minPdfPages: 600, maxPdfPages: 0 } })).not.toThrow();
+    expect(() => createDomainExpertWorker({ annas: { minPdfPages: 600, maxPdfPages: 500 }, google: { ragParserModel: 'default' } })).not.toThrow();
   });
 
   test('with the default parser the import request carries no LLM parser, which is why no ceiling applies', async () => {

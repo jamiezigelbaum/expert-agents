@@ -781,7 +781,8 @@ export class DomainExpertService {
     this.annasMaxDownloadBytes = normalizePositiveInteger(options.annas?.maxDownloadBytes, DEFAULT_ANNAS_ARCHIVE_MAX_DOWNLOAD_BYTES);
     this.annasMinPdfPages = normalizeNonNegativeInteger(options.annas?.minPdfPages, DEFAULT_ANNAS_MIN_PDF_PAGES);
     this.annasMaxPdfPages = normalizeNonNegativeInteger(options.annas?.maxPdfPages, DEFAULT_ANNAS_MAX_PDF_PAGES);
-    if (this.annasMinPdfPages > 0 && this.annasMaxPdfPages > 0 && this.annasMinPdfPages > this.annasMaxPdfPages) {
+    // Only while the ceiling applies, which is while imports use the LLM parser.
+    if (this.google.ragParserModel() !== undefined && this.annasMinPdfPages > 0 && this.annasMaxPdfPages > 0 && this.annasMinPdfPages > this.annasMaxPdfPages) {
       throw new DomainExpertWorkerError(400, 'invalid_config', 'The PDF page floor must not exceed the PDF page ceiling.');
     }
     this.annasDjvutxtBin = options.annas?.djvutxtBin?.trim() || DEFAULT_ANNAS_DJVUTXT_BIN;
