@@ -257,6 +257,68 @@ describe('direct library reading', () => {
 });
 
 describe('domain_read HTTP surface', () => {
+  test('a domain with its own library subtree reads its own acquisitions, and only its own, from the shared import prefix', async () => {
+    const f = fixture();
+    const corpus = 'projects/fixture-project/locations/us-central1/ragCorpora/10';
+    const name = corpus + '/ragFiles/20';
+    let uri = '';
+    const reads: string[] = [];
+    // A route whose library is its own subtree, outside the shared import prefix.
+    const route = { ...f.route, library: { bucket: 'fixture-bucket', prefix: 'library' } };
+    const worker = (importGcsPrefix?: string) => createDomainExpertWorker({ gcpProject: 'fixture-project', dataDir: join(f.directory, `runtime-${importGcsPrefix ? 'acq' : 'none'}`),
+      agentRouting: validateAgentRoutingConfig({ research: route }),
+      ...(importGcsPrefix ? { annas: { importGcsPrefix } } : {}),
+      google: { accessToken: 'fixture-token', fetchImpl: (async (input: string | URL | Request) => {
+        const url = String(input);
+        if (url.includes('/ragFiles/')) return Response.json({ name, gcsSource: { uris: [uri] }, displayName: 'Acquired Book' });
+        if (url.includes('/ragCorpora')) return Response.json({ ragCorpora: [{ name: corpus, displayName: 'research-library' }] });
+        const objectName = decodeURIComponent(new URL(url).pathname.split('/o/')[1]!);
+        if (objectName.endsWith('master.json')) return new Response(new Uint8Array(f.stored.get(objectName)!));
+        reads.push(objectName);
+        return new Response('Acquired book text.');
+      }) as typeof fetch } });
+    const read = (target: ReturnType<typeof worker>) => target.fetch(new Request('http://worker/v1/domain', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ tool: 'domain_read', params: { domain_id: 'research', action: 'read', rag_file_name: name } }) }));
+    const acquiring = worker('gs://fixture-bucket/book-imports/');
+    uri = 'gs://fixture-bucket/book-imports/research/acquired-book.md';
+    expect(await (await read(acquiring)).json()).toMatchObject({ text: 'Acquired book text.' });
+    expect(reads).toEqual(['book-imports/research/acquired-book.md']);
+    // Another domain's acquisitions and a sibling name sharing the prefix stay unreadable.
+    for (const other of ['gs://fixture-bucket/book-imports/history/acquired-book.md', 'gs://fixture-bucket/book-imports/research-other/acquired-book.md']) {
+      uri = other;
+      expect((await read(acquiring)).status).toBe(404);
+    }
+    // Negative control: without acquisition imports configured, the same file is outside the scope.
+    uri = 'gs://fixture-bucket/book-imports/research/acquired-book.md';
+    expect((await read(worker())).status).toBe(404);
+    expect(reads).toHaveLength(1);
+  });
+
+  test('an acquisition directory that would contain a read-only root is not granted for reading', async () => {
+    const f = fixture();
+    const corpus = 'projects/fixture-project/locations/us-central1/ragCorpora/10';
+    let uri = '';
+    const reads: string[] = [];
+    // An older read-only root sits inside the domain's would-be acquisition directory.
+    const route = { ...f.route, readOnlySourceRoots: [{ bucket: 'fixture-bucket', prefix: 'book-imports/research/older' }] };
+    const worker = createDomainExpertWorker({ gcpProject: 'fixture-project', dataDir: join(f.directory, 'runtime-conflict'),
+      agentRouting: validateAgentRoutingConfig({ research: route }), annas: { importGcsPrefix: 'gs://fixture-bucket/book-imports/' },
+      google: { accessToken: 'fixture-token', fetchImpl: (async (input: string | URL | Request) => {
+        const url = String(input);
+        if (url.includes('/ragFiles/')) return Response.json({ name: corpus + '/ragFiles/20', gcsSource: { uris: [uri] }, displayName: 'Book' });
+        if (url.includes('/ragCorpora')) return Response.json({ ragCorpora: [{ name: corpus, displayName: 'research-library' }] });
+        const objectName = decodeURIComponent(new URL(url).pathname.split('/o/')[1]!);
+        if (objectName.endsWith('master.json')) return new Response(new Uint8Array(f.stored.get(objectName)!));
+        reads.push(objectName);
+        return new Response('Book text.');
+      }) as typeof fetch } });
+    const read = () => worker.fetch(new Request('http://worker/v1/domain', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ tool: 'domain_read', params: { domain_id: 'research', action: 'read', rag_file_name: corpus + '/ragFiles/20' } }) }));
+    uri = 'gs://fixture-bucket/book-imports/research/acquired-book.md';
+    expect((await read()).status).toBe(404);
+    // The declared root itself still reads.
+    uri = 'gs://fixture-bucket/book-imports/research/older/book.md';
+    expect(await (await read()).json()).toMatchObject({ text: 'Book text.' });
+    expect(reads).toEqual(['book-imports/research/older/book.md']);
+  });
   test('a numeric display name cannot authorize a different corpus with that numeric ID', async () => {
     const f = fixture();
     writeFileSync(f.scopePath, serializeScopeManifest({ ...f.scope, targetCorpusDisplayName: '10' }));

@@ -91,6 +91,7 @@ import {
 import {
   agentRoutingConfigFromEnv,
   type AgentRoutingConfig,
+  type AgentRoutingEntry,
   type ExplicitCorpusOperation,
 } from '../../core/agent-routing.ts';
 import {
@@ -708,6 +709,7 @@ export class DomainExpertService {
   private roots: Map<string, DomainExpertWorkspaceRootPolicy>;
   private agentRouting: AgentRoutingConfig;
   private registrations: AgentRegistrationStore;
+  private registrationLibrary: LibraryLocationConfig | undefined;
   private corpusEnsureQueue: Promise<unknown> = Promise.resolve();
   private gcpProject: string;
   private google: GoogleRuntimeClient;
@@ -779,7 +781,8 @@ export class DomainExpertService {
     });
     this.dataDir = options.dataDir ?? join(tmpdir(), `expert-agents-domain-expert-${currentUid()}`);
     ensurePrivateDataDirectory(this.dataDir);
-    this.registrations = new AgentRegistrationStore(this.dataDir, this.agentRouting, options.registrationLibrary ?? registrationLibraryFromEnv());
+    this.registrationLibrary = options.registrationLibrary ?? registrationLibraryFromEnv();
+    this.registrations = new AgentRegistrationStore(this.dataDir, this.agentRouting, this.registrationLibrary);
     this.agentRouting = this.registrations.routes();
     this.resolveHostImpl = options.resolveHostImpl ?? defaultResolveHost;
     // Only a configured path is forwarded: an unset value leaves summarize to
@@ -830,10 +833,50 @@ export class DomainExpertService {
   }
 
   private manifest(domainId?: string, displayName?: string): ReturnType<typeof domainManifest> {
-    return domainManifest(domainId, displayName, {
+    const manifest = domainManifest(domainId, displayName, {
       agentRouting: this.agentRouting,
       env: { EXPERT_AGENTS_GCP_PROJECT: this.gcpProject },
     });
+    // A routed domain may also write and import its own acquisitions. A registered domain's
+    // library is its own subtree, which can never contain the deployment's shared import prefix
+    // (2026-10-16: the first factory domain could download a book but not ingest it).
+    const acquisitions = manifest.routing.configured ? this.acquisitionDirectory(manifest.domain_id) : undefined;
+    if (!acquisitions || gcsPrefixesCover(manifest.allowed_gcs_prefixes, acquisitions.uri) || this.acquisitionDirectoryConflicts(acquisitions.uri)) return manifest;
+    return { ...manifest, allowed_gcs_prefixes: [...manifest.allowed_gcs_prefixes, acquisitions.uri] };
+  }
+
+  // A domain is granted its acquisition directory only while that directory holds no library: an
+  // import prefix above other libraries (for example a bucket's top level) would otherwise give a
+  // domain whose id names one of them that whole subtree. Every route's library and read-only
+  // roots and the registration library count, including the domain's own library.
+  private acquisitionDirectoryConflicts(uri: string): boolean {
+    const locations = [
+      ...Object.values(this.agentRouting).flatMap((route) => [route.library, ...(route.readOnlySourceRoots ?? [])]),
+      ...(this.registrationLibrary ? [this.registrationLibrary] : []),
+    ];
+    return locations.some((location) => gcsPrefixesCover([uri], `gs://${location.bucket}/${location.prefix}`));
+  }
+
+  // The domain's own directory under the operator's shared acquisition import prefix. Objects
+  // already imported there keep their names, so re-acquisitions still find them. Undefined when
+  // acquisition imports are not configured or the configured prefix is invalid.
+  private acquisitionDirectory(domainId: string): { bucket: string; prefix: string; uri: string } | undefined {
+    if (!this.annas.importGcsPrefix) return undefined;
+    let parsed: { bucket: string; prefix: string };
+    try { parsed = parseGcsPrefix(this.annas.importGcsPrefix); } catch { return undefined; }
+    const prefix = `${parsed.prefix}${domainId}`;
+    return { bucket: parsed.bucket, prefix, uri: `gs://${parsed.bucket}/${prefix}` };
+  }
+
+  // The route direct reading uses: the configured route plus the domain's acquisition directory
+  // as a read-only source root, when its library does not already contain it.
+  private readableRoute(domainId: string): Readonly<AgentRoutingEntry> {
+    const route = this.agentRouting[domainId]!;
+    const acquisitions = this.acquisitionDirectory(domainId);
+    const roots = [route.library, ...(route.readOnlySourceRoots ?? [])];
+    if (!acquisitions || gcsPrefixesCover(roots.map((root) => `gs://${root.bucket}/${root.prefix}`), acquisitions.uri)
+      || this.acquisitionDirectoryConflicts(acquisitions.uri)) return route;
+    return { ...route, readOnlySourceRoots: [...(route.readOnlySourceRoots ?? []), { bucket: acquisitions.bucket, prefix: acquisitions.prefix }] };
   }
 
   /**
@@ -918,7 +961,7 @@ export class DomainExpertService {
       const parsed = parseLibraryReadParams(params);
       const manifest = this.manifest(optionalStringField(params.domain_id, 'domainId').domainId);
       requireConfiguredAgent(manifest, 'domain_read');
-      const route = this.agentRouting[manifest.domain_id]!;
+      const route = this.readableRoute(manifest.domain_id);
       const result = await this.libraryReader.run(route, parsed, async (name) => {
         const requested = parseRagFileResourceName(name)!;
         if (requested.location !== manifest.rag_location
@@ -3431,6 +3474,8 @@ export class DomainExpertService {
       status: annasAcquisitionStatus('downloaded', String(ragIngest.status)),
       domain_id: manifest.domain_id,
       download,
+      // Content-free measured scale, so a failed import can be explained by its page count.
+      scale,
       rag_ingest: ragIngest,
       registry,
       policy: domainPolicy(),
@@ -3479,6 +3524,8 @@ export class DomainExpertService {
       status: annasAcquisitionStatus('ingested_existing', String(ragIngest.status)),
       domain_id: manifest.domain_id,
       download,
+      // Content-free measured scale, so a failed import can be explained by its page count.
+      scale,
       rag_ingest: ragIngest,
       registry,
       policy: domainPolicy(),
@@ -3842,11 +3889,18 @@ export class DomainExpertService {
     }
   }
 
-  private annasImportGcsPrefix(manifest: ReturnType<typeof domainManifest>): string {
+  // This domain's directory under the shared acquisition import prefix, which its manifest allows.
+  private annasImportDirectory(manifest: ReturnType<typeof domainManifest>): { bucket: string; directory: string } {
     const prefix = this.annas.importGcsPrefix;
     if (!prefix) throw new DomainExpertWorkerError(503, 'annas_archive_not_configured', 'EXPERT_AGENTS_DOMAIN_EXPERT_ANNAS_IMPORT_GCS_PREFIX is required for direct RAG imports.');
-    assertAllowedGcsDestination(prefix, manifest.allowed_gcs_prefixes);
-    return prefix;
+    const parsed = parseGcsPrefix(prefix);
+    const directory = `${parsed.prefix}${manifest.domain_id}/`;
+    const uri = `gs://${parsed.bucket}/${directory}`;
+    if (!gcsPrefixesCover(manifest.allowed_gcs_prefixes, uri) && this.acquisitionDirectoryConflicts(uri.slice(0, -1))) {
+      throw new DomainExpertWorkerError(503, 'annas_import_prefix_conflict', 'The acquisition import prefix places this domain\'s directory over another library. Configure EXPERT_AGENTS_DOMAIN_EXPERT_ANNAS_IMPORT_GCS_PREFIX as a dedicated directory.');
+    }
+    assertAllowedGcsDestination(uri, manifest.allowed_gcs_prefixes);
+    return { bucket: parsed.bucket, directory };
   }
 
   // Object names an earlier import of this Anna record may have used: the
@@ -3857,8 +3911,8 @@ export class DomainExpertService {
   private async priorAnnasObjectStems(manifest: ReturnType<typeof domainManifest>, params: AnnasArchiveImportParams, format: string): Promise<string[]> {
     const md5 = annasFastDownloadMd5(params);
     if (!md5) return [];
-    const parsed = parseGcsPrefix(this.annasImportGcsPrefix(manifest));
-    const directoryUri = `gs://${parsed.bucket}/${parsed.prefix}${manifest.domain_id}/`;
+    const { bucket, directory } = this.annasImportDirectory(manifest);
+    const directoryUri = `gs://${bucket}/${directory}`;
     const suffix = `.${format}`;
     const stems: string[] = [];
     const root = this.roots.get(manifest.workspace_root_id);
@@ -3909,22 +3963,20 @@ export class DomainExpertService {
   // twice (2026-10-07: a retry with a different year duplicated Syme). Nothing
   // new is ever written under a prior name.
   private async uploadApprovedImportToGcs(manifest: ReturnType<typeof domainManifest>, stem: string, format: string, bytes: Uint8Array, priorStems: string[] = []): Promise<string> {
-    const prefix = this.annasImportGcsPrefix(manifest);
-    const parsed = parseGcsPrefix(prefix);
-    const directory = `${parsed.prefix}${manifest.domain_id}/`;
+    const { bucket, directory } = this.annasImportDirectory(manifest);
     const base = `${directory}${stem}`;
     for (const prior of new Set(priorStems.filter((candidate) => candidate && candidate !== stem))) {
       const priorName = `${directory}${prior}.${format}`;
-      const priorUri = `gs://${parsed.bucket}/${priorName}`;
+      const priorUri = `gs://${bucket}/${priorName}`;
       assertAllowedGcsDestination(priorUri, manifest.allowed_gcs_prefixes);
-      const existing = await this.google.getGcsObjectMetadata(parsed.bucket, priorName);
+      const existing = await this.google.getGcsObjectMetadata(bucket, priorName);
       if (existing && gcsObjectHoldsBytes(existing, bytes)) return priorUri;
     }
     const contentHash = createHash('sha256').update(bytes).digest('hex').slice(0, 12);
     for (const objectName of [`${base}.${format}`, `${base}--${contentHash}.${format}`]) {
-      const gcsUri = `gs://${parsed.bucket}/${objectName}`;
+      const gcsUri = `gs://${bucket}/${objectName}`;
       assertAllowedGcsDestination(gcsUri, manifest.allowed_gcs_prefixes);
-      const existing = await this.google.getGcsObjectMetadata(parsed.bucket, objectName);
+      const existing = await this.google.getGcsObjectMetadata(bucket, objectName);
       if (existing) {
         if (gcsObjectHoldsBytes(existing, bytes)) return gcsUri;
         continue;
@@ -3932,18 +3984,18 @@ export class DomainExpertService {
       try {
         // Generation 0: create only. A concurrent writer that got there first
         // fails this upload instead of being overwritten.
-        await this.google.uploadGcsObject(parsed.bucket, objectName, bytes, { ifGenerationMatch: '0' });
+        await this.google.uploadGcsObject(bucket, objectName, bytes, { ifGenerationMatch: '0' });
         return gcsUri;
       } catch (error) {
         if (!(error instanceof DomainExpertWorkerError && error.status === 412)) throw error;
-        const raced = await this.google.getGcsObjectMetadata(parsed.bucket, objectName);
+        const raced = await this.google.getGcsObjectMetadata(bucket, objectName);
         if (raced && gcsObjectHoldsBytes(raced, bytes)) return gcsUri;
       }
     }
     throw new DomainExpertWorkerError(
       409,
       'gcs_object_name_conflict',
-      `Different files already occupy gs://${parsed.bucket}/${base}.${format} and its content-hash variant. Nothing was uploaded or imported.`,
+      `Different files already occupy gs://${bucket}/${base}.${format} and its content-hash variant. Nothing was uploaded or imported.`,
       'Check the edition metadata (author, title, year) and re-run with the details that distinguish this file.',
     );
   }
@@ -8571,9 +8623,20 @@ function ragFileMatchesTargets(file: Record<string, unknown>, targetUris: string
   return targetUris.some((target) => !target.endsWith('/') && target.split('/').pop() === displayName);
 }
 
+function gcsPrefixesCover(prefixes: string[], uri: string): boolean {
+  return prefixes.some((prefix) => {
+    const normalized = prefix.replace(/\/+$/g, '');
+    return uri === normalized || uri.startsWith(`${normalized}/`);
+  });
+}
+
 export function assertAllowedGcsDestination(destinationUri: string, allowedPrefixes: string[]): void {
   if (!destinationUri.startsWith('gs://')) {
     throw new DomainExpertWorkerError(400, 'invalid_gcs_prefix', 'GCS destination must start with gs://.');
+  }
+  // Allowlist checks compare string prefixes; a dot segment must never reach one.
+  if (destinationUri.slice('gs://'.length).split('/').some((segment) => segment === '.' || segment === '..')) {
+    throw new DomainExpertWorkerError(400, 'invalid_gcs_prefix', 'GCS destination must not contain . or .. path segments.');
   }
   const allowed = allowedPrefixes.some((prefix) => {
     const normalizedPrefix = prefix.replace(/\/+$/g, '');
