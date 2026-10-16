@@ -5858,3 +5858,93 @@ describe('rag_corpus imports record their verified outcome in the source registr
     }
   });
 });
+
+// A registered (factory-created) domain owns its own library subtree, which can never contain
+// the deployment's shared acquisition import prefix. Its own directory under that prefix is
+// allowed for the upload and the import, and nothing else under the prefix is.
+describe('acquisition imports for a registered domain', () => {
+  const IMPORT_PREFIX = 'gs://fixture-shared-library/v1/book-imports/';
+  const CORPUS = 'projects/fixture-project/locations/us-central1/ragCorpora/1001';
+  const PARAMS = {
+    domain_id: 'research', annas_archive_id: 'registered-fixture', title: 'The Fixture Monograph',
+    author: 'Example Author', year: '1989', topic: 'Research', format: 'pdf',
+    copyright_posture: 'approved_fixture_use', approval_id: 'approval-fixture', dry_run: false,
+  };
+  const REGISTERED = validateAgentRoutingConfig({
+    research: { library: { bucket: 'fixture-shared-library', prefix: 'v1/factory/research' }, targetCorpusDisplayName: 'research-library' },
+    history: { library: { bucket: 'fixture-shared-library', prefix: 'v1/factory/history' }, targetCorpusDisplayName: 'history-library' },
+  });
+
+  function registeredFixture(options: { importGcsPrefix?: string; objects?: FakeGcsObjects } = {}) {
+    const fixture = workspaceFixture();
+    const booksRoot = join(fixture.base, 'books');
+    mkdirSync(booksRoot);
+    const annasCalls: CapturedCall[] = [];
+    const googleCalls: CapturedCall[] = [];
+    const objects = options.objects ?? new Map();
+    const worker = createDomainExpertWorker({
+      gcpProject: 'fixture-project',
+      agentRouting: REGISTERED,
+      annas: {
+        apiKey: 'fixture-acquisition-token', baseUrl: 'https://annas.example', booksRoot,
+        ...('importGcsPrefix' in options ? (options.importGcsPrefix ? { importGcsPrefix: options.importGcsPrefix } : {}) : { importGcsPrefix: IMPORT_PREFIX }),
+      },
+      google: { accessToken: 'fixture-google-token', fetchImpl: fakeIngestGoogleFetch(googleCalls, objects) },
+      fetchImpl: fakeAnnasArtifactFetch(annasCalls, syntheticPdfBytes(64), 'application/pdf'),
+    });
+    return { worker, googleCalls, objects, cleanup: fixture.cleanup };
+  }
+
+  test('ingests into its own directory under the shared import prefix, and a re-acquisition reuses it', async () => {
+    const f = registeredFixture();
+    try {
+      const response = await postDomain(f.worker, 'annas_archive_import', { ...PARAMS, ingest: true, corpus_id: CORPUS });
+      expect(response).toMatchObject({ status: 'downloaded', rag_ingest: { status: 'imported', gcs_uri: `${IMPORT_PREFIX}research/author---the-fixture-monograph-1989.pdf` } });
+      expect(uploadedObjectNames(f.googleCalls)).toEqual(['v1/book-imports/research/author---the-fixture-monograph-1989.pdf']);
+      const imports = f.googleCalls.filter((call) => call.url.endsWith('/ragFiles:import'));
+      expect(imports).toHaveLength(1);
+      expect(imports[0]!.body).toContain(`${IMPORT_PREFIX}research/author---the-fixture-monograph-1989.pdf`);
+      // The same bytes again reuse the stored object: nothing new is uploaded.
+      const again = await postDomain(f.worker, 'annas_archive_import', { ...PARAMS, ingest: true, corpus_id: CORPUS });
+      expect(again.rag_ingest.gcs_uri).toBe(response.rag_ingest.gcs_uri);
+      expect(uploadedObjectNames(f.googleCalls)).toHaveLength(1);
+    } finally { f.cleanup(); }
+  });
+
+  test('allows exactly its library and its own acquisition directory', async () => {
+    const f = registeredFixture();
+    try {
+      const plan = await postDomain(f.worker, 'rag_corpus', { domain_id: 'research', action: 'import', corpus_id: CORPUS, gcs_uri: `${IMPORT_PREFIX}research/a.pdf`, dry_run: true });
+      expect(plan.allowed_gcs_prefixes).toEqual(['gs://fixture-shared-library/v1/factory/research', `${IMPORT_PREFIX}research`]);
+      // Another domain's acquisitions, a sibling name sharing the prefix, and the shared root stay outside.
+      for (const gcsUri of [`${IMPORT_PREFIX}history/a.pdf`, `${IMPORT_PREFIX}research-other/a.pdf`, `${IMPORT_PREFIX}a.pdf`]) {
+        const refused = await postDomainResponse(f.worker, 'rag_corpus', { domain_id: 'research', action: 'import', corpus_id: CORPUS, gcs_uri: gcsUri, dry_run: false });
+        expect(refused.status).toBe(403);
+        expect((await refused.json() as any).error.code).toMatch(/^(domain_expert_policy_violation|gcs_destination_not_allowed)$/);
+      }
+      expect(f.googleCalls.filter((call) => call.url.endsWith('/ragFiles:import'))).toEqual([]);
+    } finally { f.cleanup(); }
+  });
+
+  test('without a configured import prefix the allowlist is the library alone and acquisitions stay unconfigured', async () => {
+    const f = registeredFixture({ importGcsPrefix: undefined });
+    try {
+      const plan = await postDomain(f.worker, 'rag_corpus', { domain_id: 'research', action: 'import', corpus_id: CORPUS, gcs_uri: 'gs://fixture-shared-library/v1/factory/research/a.pdf', dry_run: true });
+      expect(plan.allowed_gcs_prefixes).toEqual(['gs://fixture-shared-library/v1/factory/research']);
+      const response = await postDomain(f.worker, 'annas_archive_import', { ...PARAMS, ingest: true, corpus_id: CORPUS });
+      expect(response.rag_ingest).toMatchObject({ status: 'blocked', error: { code: 'annas_archive_not_configured' } });
+      expect(uploadedObjectNames(f.googleCalls)).toEqual([]);
+    } finally { f.cleanup(); }
+  });
+
+  test('a domain whose library already contains the prefix keeps a single allowlist entry and the same objects', async () => {
+    const calls: CapturedCall[] = [];
+    const worker = createDomainExpertWorker({
+      gcpProject: 'fixture-project',
+      annas: { apiKey: 'fixture-acquisition-token', baseUrl: 'https://annas.example', booksRoot: mkdtempSync(join(tmpdir(), 'expert-books-')), importGcsPrefix: IMPORT_PREFIX },
+      google: { accessToken: 'fixture-google-token', fetchImpl: fakeIngestGoogleFetch(calls) },
+    });
+    const plan = await postDomain(worker, 'rag_corpus', { domain_id: 'research', action: 'import', corpus_id: CORPUS, gcs_uri: `${IMPORT_PREFIX}research/a.pdf`, dry_run: true });
+    expect(plan.allowed_gcs_prefixes).toEqual(['gs://fixture-shared-library/v1']);
+  });
+});
