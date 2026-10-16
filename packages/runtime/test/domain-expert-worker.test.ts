@@ -36,6 +36,7 @@ import {
   bookObjectStem,
   assertAllowedGcsDestination,
   createDomainExpertWorker as createRawDomainExpertWorker,
+  domainExpertAnnasConfigFromEnv,
   reciprocalRankFuse,
   type DomainExpertWorkerOptions,
   type DomainExpertReranker, parseLibgenSearchHtml } from '../src/workers/domain-expert/index.ts';
@@ -6068,6 +6069,13 @@ describe('acquisition imports for a registered domain', () => {
   });
 });
 
+// A PDF with one more object placed beside its catalog, where the page-tree scan looks.
+function withPdfObject(pdf: Uint8Array, dictionary: string): Uint8Array {
+  const text = new TextDecoder('latin1').decode(pdf);
+  const at = text.indexOf('2 0 obj');
+  return new TextEncoder().encode(`${text.slice(0, at)}999 0 obj\n${dictionary}\nendobj\n${text.slice(at)}`);
+}
+
 // LLM-parser imports of PDFs above about 500 pages fail inside Vertex with an internal error
 // (2026-10-16: a 582-page text PDF, every time). A measured PDF above the ceiling is refused
 // before upload with a specific code; the file stays on disk.
@@ -6113,6 +6121,67 @@ describe('PDF page ceiling for LLM-parser imports', () => {
       expect(f.googleCalls).toEqual([]);
       expect(existsSync(response.download.path)).toBe(true);
       expect(annasAuditRecords(f.booksRoot)[0]!.scale).toMatchObject({ pages: 582, max_pdf_pages: 500, above_max_pdf_pages: true });
+    } finally { f.cleanup(); }
+  });
+
+  test('the ceiling refuses on the re-ingest path too, and allow_short_artifact does not bypass it', async () => {
+    const f = ceilingFixture(syntheticPdfBytes(501));
+    try {
+      const first = await postDomain(f.worker, 'annas_archive_import', { ...PARAMS, ingest: true, corpus_id: CORPUS, allow_short_artifact: true });
+      expect(first.rag_ingest.error.code).toBe('annas_pdf_exceeds_parser_page_limit');
+      // The file is on disk now, so this is the ingested_existing path.
+      const again = await postDomain(f.worker, 'annas_archive_import', { ...PARAMS, ingest: true, corpus_id: CORPUS });
+      expect(again).toMatchObject({ status: 'skipped_duplicate_ingest_blocked', download: { status: 'skipped_duplicate' }, rag_ingest: { error: { code: 'annas_pdf_exceeds_parser_page_limit' } } });
+      expect(f.googleCalls).toEqual([]);
+    } finally { f.cleanup(); }
+  });
+
+  test.each([
+    // An outline's /Count beside the catalog reads as a page tree count of 620 for 300 pages.
+    ['an outline count larger than the pages', withPdfObject(syntheticPdfBytes(300), '<< /Type /Outlines /Count 620 >>'), 620, 300],
+    // An indirect /Count reference reads as its object number.
+    ['an indirect page-count reference', withPdfObject(syntheticPdfBytes(120), '<< /Type /Pages /Count 900 0 R /Kids [] >>'), 900, 120],
+  ] as const)('an uncorroborated over-count is not refused: %s', async (_name, bytes, read, corroborated) => {
+    const f = ceilingFixture(bytes);
+    try {
+      const response = await postDomain(f.worker, 'annas_archive_import', { ...PARAMS, ingest: true, corpus_id: CORPUS });
+      expect(response).toMatchObject({ status: 'downloaded', rag_ingest: { status: 'imported' }, scale: { pages: read, corroborated_pages: corroborated } });
+      expect(response.scale.above_max_pdf_pages).toBeUndefined();
+    } finally { f.cleanup(); }
+  });
+
+  test('the ceiling is configured from the environment, and a floor above it is refused', () => {
+    expect(domainExpertAnnasConfigFromEnv({ EXPERT_AGENTS_DOMAIN_EXPERT_ANNAS_MAX_PDF_PAGES: '0' }).maxPdfPages).toBe(0);
+    expect(domainExpertAnnasConfigFromEnv({ EXPERT_AGENTS_DOMAIN_EXPERT_ANNAS_MAX_PDF_PAGES: '650' }).maxPdfPages).toBe(650);
+    expect(domainExpertAnnasConfigFromEnv({}).maxPdfPages).toBeUndefined();
+    expect(() => domainExpertAnnasConfigFromEnv({ EXPERT_AGENTS_DOMAIN_EXPERT_ANNAS_MAX_PDF_PAGES: 'many' })).toThrow();
+    expect(() => createDomainExpertWorker({ annas: { minPdfPages: 600, maxPdfPages: 500 } })).toThrow('floor must not exceed');
+    expect(() => createDomainExpertWorker({ annas: { minPdfPages: 600, maxPdfPages: 0 } })).not.toThrow();
+  });
+
+  test('with the default parser the import request carries no LLM parser, which is why no ceiling applies', async () => {
+    const f = ceilingFixture(syntheticPdfBytes(582), { ragParserModel: 'default' });
+    try {
+      await postDomain(f.worker, 'annas_archive_import', { ...PARAMS, ingest: true, corpus_id: CORPUS });
+      const body = JSON.parse(f.googleCalls.find((call) => call.url.endsWith('/ragFiles:import'))!.body);
+      expect(body.importRagFilesConfig.ragFileParsingConfig).toBeUndefined();
+      // Negative control: the LLM parser is requested by default.
+      const g = ceilingFixture(syntheticPdfBytes(400));
+      try {
+        await postDomain(g.worker, 'annas_archive_import', { ...PARAMS, ingest: true, corpus_id: CORPUS });
+        const llm = JSON.parse(g.googleCalls.find((call) => call.url.endsWith('/ragFiles:import'))!.body);
+        expect(llm.importRagFilesConfig.ragFileParsingConfig.llmParser.modelName).toContain('gemini');
+      } finally { g.cleanup(); }
+    } finally { f.cleanup(); }
+  });
+
+  test.each([
+    ['a PDF one page over the ceiling', syntheticPdfBytes(501)],
+  ] as const)('refuses %s', async (_name, bytes) => {
+    const f = ceilingFixture(bytes);
+    try {
+      const response = await postDomain(f.worker, 'annas_archive_import', { ...PARAMS, ingest: true, corpus_id: CORPUS });
+      expect(response.rag_ingest.error.code).toBe('annas_pdf_exceeds_parser_page_limit');
     } finally { f.cleanup(); }
   });
 

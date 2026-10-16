@@ -781,6 +781,9 @@ export class DomainExpertService {
     this.annasMaxDownloadBytes = normalizePositiveInteger(options.annas?.maxDownloadBytes, DEFAULT_ANNAS_ARCHIVE_MAX_DOWNLOAD_BYTES);
     this.annasMinPdfPages = normalizeNonNegativeInteger(options.annas?.minPdfPages, DEFAULT_ANNAS_MIN_PDF_PAGES);
     this.annasMaxPdfPages = normalizeNonNegativeInteger(options.annas?.maxPdfPages, DEFAULT_ANNAS_MAX_PDF_PAGES);
+    if (this.annasMinPdfPages > 0 && this.annasMaxPdfPages > 0 && this.annasMinPdfPages > this.annasMaxPdfPages) {
+      throw new DomainExpertWorkerError(400, 'invalid_config', 'The PDF page floor must not exceed the PDF page ceiling.');
+    }
     this.annasDjvutxtBin = options.annas?.djvutxtBin?.trim() || DEFAULT_ANNAS_DJVUTXT_BIN;
     this.annasImportPollIntervalMs = normalizePositiveInteger(options.annas?.importPollIntervalMs, DEFAULT_ANNAS_IMPORT_POLL_INTERVAL_MS);
     this.annasImportPollTimeoutMs = normalizeNonNegativeInteger(options.annas?.importPollTimeoutMs, DEFAULT_ANNAS_IMPORT_POLL_TIMEOUT_MS);
@@ -3631,23 +3634,24 @@ export class DomainExpertService {
         scale,
       };
     }
-    // Vertex RAG parses PDF, text, Markdown and HTML. On 2026-09-20 sixteen
-    // EPUB/DJVU/MOBI uploads each completed with importedRagFilesCount=0 and
-    // no error, and every one was reported as import_requested. Ebooks are
-    // converted to Markdown here before upload, or refused with a typed code
-    // that says the download is still on disk.
+    // A PDF too long for the LLM parser fails inside Vertex after the upload; refuse it first.
     if (scale.above_max_pdf_pages) {
       return {
         status: 'blocked',
         ...corpusTarget,
         error: {
           code: 'annas_pdf_exceeds_parser_page_limit',
-          message: `Measured ${scale.pages} pages in the downloaded PDF, above the ${scale.max_pdf_pages}-page limit for PDF imports with the LLM parser; Vertex fails longer PDFs with an internal error. Nothing was uploaded or imported; the file is still on disk.`,
-          suggestion: 'Acquire an EPUB, text or Markdown edition of the same work, or a split into volumes; annas_archive_search with ingest_intent: true ranks EPUB first.',
+          message: `Measured ${scale.pages} pages in the downloaded PDF, above this deployment's ${scale.max_pdf_pages}-page ceiling for PDF imports with the LLM parser, which have failed above about 500 pages with a Vertex internal error. Nothing was uploaded or imported; the file is still on disk.`,
+          suggestion: 'Acquire an EPUB edition of the same work, or a PDF split into volumes; annas_archive_search with ingest_intent: true ranks EPUB first.',
         },
         scale,
       };
     }
+    // Vertex RAG parses PDF, text, Markdown and HTML. On 2026-09-20 sixteen
+    // EPUB/DJVU/MOBI uploads each completed with importedRagFilesCount=0 and
+    // no error, and every one was reported as import_requested. Ebooks are
+    // converted to Markdown here before upload, or refused with a typed code
+    // that says the download is still on disk.
     const artifact = await this.prepareAnnasIngestArtifact(format, bytes, sourcePath, params);
     if ('refusal' in artifact) {
       return { status: 'blocked', ...corpusTarget, error: artifact.refusal, source_path: sourcePath };
@@ -8173,6 +8177,8 @@ interface AnnasArtifactScale {
   bytes: number;
   pages?: number;
   page_signal?: 'page_tree_count' | 'page_objects';
+  // Pages both signals report; the ceiling refuses on this alone.
+  corroborated_pages?: number;
   // Byte-based proxy, deliberately not named for extracted text: no text
   // extractor runs here, so this is total artifact bytes divided by pages.
   content_bytes_per_page?: number;
@@ -8366,10 +8372,11 @@ function annasArtifactScale(
   }
   if (format === 'pdf' && policy.maxPdfPages > 0) {
     scale.max_pdf_pages = policy.maxPdfPages;
-    // Only the page tree's own count may refuse: loose page objects can outnumber the pages
-    // (an incrementally updated file keeps superseded ones), and a false refusal would keep a
-    // book out that would have imported. Anything else is let through to Vertex.
-    if (scale.page_signal === 'page_tree_count' && scale.pages !== undefined && scale.pages > policy.maxPdfPages) scale.above_max_pdf_pages = true;
+    // Each signal can over-count, which fails open for the floor but would refuse a book here:
+    // the page tree scan takes the largest nearby /Count (an outline's count qualifies), and
+    // loose page objects include superseded ones in an incrementally updated file. Only pages
+    // both report may refuse; anything uncorroborated is let through to Vertex.
+    if (scale.corroborated_pages !== undefined && scale.corroborated_pages > policy.maxPdfPages) scale.above_max_pdf_pages = true;
   }
   return scale;
 }
@@ -8408,6 +8415,8 @@ function measurePdfArtifactScale(bytes: Uint8Array): AnnasArtifactMeasurement {
     measured: true,
     pages,
     page_signal: pageTreeCount >= pageObjects ? 'page_tree_count' : 'page_objects',
+    // The smaller signal: both must agree before a ceiling refuses. See annasArtifactScale.
+    corroborated_pages: Math.min(pageTreeCount, pageObjects),
     content_bytes_per_page: Math.round(bytes.byteLength / pages),
   };
 }
