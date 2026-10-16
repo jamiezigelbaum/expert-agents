@@ -3760,7 +3760,7 @@ export class DomainExpertService {
     bytes: Uint8Array,
     sourcePath: string,
     scale: AnnasArtifactScale,
-    wholeAlreadyInCorpus: () => Promise<boolean>,
+    wholeAlreadyInCorpus: () => Promise<'present' | 'absent' | { unknown: string }>,
   ): Promise<
     | { parts?: undefined }
     | { pages: number; parts: PdfPart[] }
@@ -3787,7 +3787,18 @@ export class DomainExpertService {
     if (pages <= this.annasPdfSplitPages) return {};
     // A book imported whole before splitting existed stays whole: the parts
     // would put it in the corpus a second time.
-    if (await wholeAlreadyInCorpus()) return {};
+    const whole = await wholeAlreadyInCorpus();
+    if (whole === 'present') return {};
+    if (whole !== 'absent') {
+      return {
+        refusal: {
+          code: 'annas_pdf_whole_copy_unverified',
+          message: `This ${pages}-page PDF is already uploaded whole, and whether that copy is in the corpus could not be read (${whole.unknown}). Splitting it now could import the book twice, so nothing was split or imported; the download is still on disk at ${sourcePath}.`,
+          suggestion: 'Re-run annas_archive_import with ingest: true once the corpus answers; a whole copy already in the corpus is then reported as present, and otherwise the PDF is split.',
+        },
+        split: { pages, max_part_pages: this.annasPdfSplitPages },
+      };
+    }
     const plan = planPdfParts(pages, this.annasPdfSplitPages);
     try {
       return { pages, parts: await splitPdf(qpdf, bytes, plan) };
@@ -3805,30 +3816,45 @@ export class DomainExpertService {
 
   // Whether these exact bytes already sit under the book's whole-file name
   // (or a prior name) with an ACTIVE ragFile. Only a found object costs a
-  // corpus listing; any failure answers no, and the book is split.
+  // corpus listing. Finding no such object means split; finding one whose
+  // corpus state cannot be read is unknown, and splitting then could put the
+  // book in twice, so the caller stops instead.
   private async wholeAnnasPdfInCorpus(
     manifest: ReturnType<typeof domainManifest>,
     params: AnnasArchiveImportParams,
     locator: string,
     corpusId: string,
     bytes: Uint8Array,
-  ): Promise<boolean> {
+  ): Promise<'present' | 'absent' | { unknown: string }> {
+    let candidates: string[];
+    let bucket: string;
+    let directory: string;
     try {
       const { stem, priorStems } = await this.annasObjectStems(manifest, params, locator, 'pdf');
-      const { bucket, directory } = this.annasImportDirectory(manifest);
+      ({ bucket, directory } = this.annasImportDirectory(manifest));
       const contentHash = createHash('sha256').update(bytes).digest('hex').slice(0, 12);
-      for (const candidate of new Set([stem, `${stem}--${contentHash}`, ...priorStems.filter((prior) => prior && !/--part\d+of\d+$/.test(prior))])) {
-        const objectName = `${directory}${candidate}.pdf`;
-        const existing = await this.google.getGcsObjectMetadata(bucket, objectName);
-        if (!existing || !gcsObjectHoldsBytes(existing, bytes)) continue;
-        const resolved = await this.resolveRagCorpus(manifest, corpusId);
-        const [file] = await this.ragFilesForImportedUris(manifest, resolved, [`gs://${bucket}/${objectName}`]);
-        return file?.state === 'ACTIVE';
-      }
+      candidates = [...new Set([stem, `${stem}--${contentHash}`, ...priorStems.filter((prior) => prior && !/--part\d+of\d+$/.test(prior))])];
     } catch {
-      // Unknown means split; a split of a book not in the corpus is the safe direction.
+      return 'absent';
     }
-    return false;
+    const found: string[] = [];
+    for (const candidate of candidates) {
+      const objectName = `${directory}${candidate}.pdf`;
+      try {
+        const existing = await this.google.getGcsObjectMetadata(bucket, objectName);
+        if (existing && gcsObjectHoldsBytes(existing, bytes)) found.push(`gs://${bucket}/${objectName}`);
+      } catch {
+        // An unreadable name is not a whole copy we know of; the upload's own checks still hold.
+      }
+    }
+    if (!found.length) return 'absent';
+    try {
+      const resolved = await this.resolveRagCorpus(manifest, corpusId);
+      const files = await this.ragFilesForImportedUris(manifest, resolved, found);
+      return files.some((file) => file.state === 'ACTIVE') ? 'present' : 'absent';
+    } catch (error) {
+      return { unknown: annasIngestErrorRecord(error).code };
+    }
   }
 
   // Each part is uploaded as `<stem>--partNofM.pdf` and imported on its own,
@@ -5046,7 +5072,7 @@ export class DomainExpertService {
         ...(typeof importOutcome?.operation_name === 'string' ? { rag_operation_name: importOutcome.operation_name } : {}),
         // One record for the book; its parts are the rag_files list a batch import also writes.
         ...(splitParts.length
-          ? { split_parts: splitParts.length, rag_files: annasSplitRegistryFiles(splitParts, previous?.record) }
+          ? { split_parts: splitParts.length, rag_files: annasSplitRegistryFiles(splitParts, annasLatestRecordWithParts(history)) }
           : {}),
         registered_at: registeredAt,
       };
@@ -8495,9 +8521,17 @@ function annasSplitPartRecords(ragIngest: Record<string, unknown>): AnnasSplitPa
   return Array.isArray(ragIngest.parts) ? ragIngest.parts as AnnasSplitPartResult[] : [];
 }
 
+// The latest record that listed parts: an in-progress record written while a
+// split ran past the response budget lists none.
+function annasLatestRecordWithParts(history: DomainSourceRegistryRecord[]): Record<string, unknown> | undefined {
+  const withParts = history.filter((entry) => Array.isArray(entry.record.rag_files));
+  return withParts.length ? latestDomainSourceRecord(withParts).record : undefined;
+}
+
 // A split book's parts for its registry record. A part this run did not
-// import keeps what the previous record knew about the same object, so a
-// re-run stopped early never forgets a part already in the corpus.
+// reach (blocked or not attempted) keeps what the previous record knew about
+// the same object, so a re-run stopped early never forgets a part already in
+// the corpus; a part that ran and failed reports its failure.
 function annasSplitRegistryFiles(parts: AnnasSplitPartResult[], previous: Record<string, unknown> | undefined): Array<Record<string, unknown>> {
   const earlier = new Map<string, Record<string, unknown>>();
   if (Array.isArray(previous?.rag_files)) {
@@ -8509,7 +8543,7 @@ function annasSplitRegistryFiles(parts: AnnasSplitPartResult[], previous: Record
   return parts.flatMap((part) => {
     if (!part.gcs_uri) return [];
     const prior = earlier.get(part.gcs_uri);
-    if (part.status !== 'imported' && prior?.status === 'imported') return [{ ...prior, part: part.name }];
+    if ((part.status === 'not_attempted' || part.status === 'blocked') && prior?.status === 'imported') return [{ ...prior, part: part.name }];
     const present = asOptionalRecord(Array.isArray(part.import_outcome?.rag_files) ? part.import_outcome.rag_files[0] : undefined);
     const ragFileName = part.coverage?.rag_file_name ?? present?.rag_file_name;
     return [{

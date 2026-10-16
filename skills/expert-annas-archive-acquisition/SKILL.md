@@ -65,7 +65,10 @@ probe it with `domain_ask` — `not_covered` or `unverified`). When a part fails
 or is blocked the error is `annas_pdf_split_import_incomplete`, naming each
 part and its pages; re-run the same import once the cause is cleared and only
 the missing parts are imported again. If splitting fails the code is
-`annas_pdf_split_failed` and the file stays on disk. On a host that cannot
+`annas_pdf_split_failed` and the file stays on disk. A book already in the
+corpus whole is not split; when that cannot be checked the import stops with
+`annas_pdf_whole_copy_unverified` — re-run it later rather than splitting by
+hand. On a host that cannot
 split (no qpdf, or splitting disabled) the runtime instead refuses a PDF
 measured above its configured ceiling (default 500) before upload, with
 `annas_pdf_exceeds_parser_page_limit`; the file stays on disk.
