@@ -22,7 +22,7 @@ RUN bun install --frozen-lockfile
 RUN bun run package:deploy
 
 FROM oven/bun:1.3.14-slim
-RUN apt-get update && apt-get install -y --no-install-recommends poppler-utils \
+RUN apt-get update && apt-get install -y --no-install-recommends poppler-utils qpdf \
   && rm -rf /var/lib/apt/lists/*
 # Fixed ids so a deployment can size tmpfs and bind mounts without inspecting
 # the image (deploy/README.md, "Container image").
