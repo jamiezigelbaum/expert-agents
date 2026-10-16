@@ -61,7 +61,7 @@ const args = process.argv.slice(2);
 await Bun.stdin.text();
 appendFileSync(${JSON.stringify(ghLog)}, JSON.stringify({ args, configDir: process.env.GH_CONFIG_DIR ?? null, ghToken: process.env.GH_TOKEN !== undefined, githubToken: process.env.GITHUB_TOKEN !== undefined }) + '\\n');
 let token = process.env.GH_TOKEN || process.env.GITHUB_TOKEN;
-if (args.join(' ') === 'auth status --hostname github.com') {
+if (args.join(' ') === 'auth status --active --hostname github.com') {
   // Like gh: validate the profile's credential against the service, here the fixture's accepted one.
   let stored;
   try { stored = Bun.YAML.parse(readFileSync(process.env.GH_CONFIG_DIR + '/hosts.yml', 'utf8'))?.['github.com']?.oauth_token; } catch {}
@@ -374,13 +374,13 @@ describe('preflight probes use the push identity and environment', () => {
 
   test('gh auth status checks only the System profile credential, with no token in its environment', async () => {
     const f = await fixture();
-    const probe = ['gh', 'auth', 'status', '--hostname', 'github.com'];
+    const probe = ['gh', 'auth', 'status', '--active', '--hostname', 'github.com'];
     const valid = await f.run({ identity: true, argv: probe, env: { ...f.gatewayEnv, GH_TOKEN: HOST, GITHUB_TOKEN: HOST } });
     expect(valid).toMatchObject({ ok: true });
     expect(valid.spawned.map((spawn) => spawn.argv)).toEqual([probe]);
     expect(Object.keys(valid.spawned[0]!.env!).filter((name) => /^(GH_TOKEN|GITHUB_TOKEN)$/.test(name))).toEqual([]);
     const calls = (await f.ghCalls()).filter((call) => call.args[1] === 'status');
-    expect(calls).toEqual([{ args: ['auth', 'status', '--hostname', 'github.com'], configDir: f.profileDir, ghToken: false, githubToken: false }]);
+    expect(calls).toEqual([{ args: ['auth', 'status', '--active', '--hostname', 'github.com'], configDir: f.profileDir, ghToken: false, githubToken: false }]);
     // A credential the service no longer accepts.
     await writeFile(join(f.base, 'accepted-token'), ROTATED);
     const refused = await f.run({ identity: true, argv: probe });
@@ -392,7 +392,8 @@ describe('preflight probes use the push identity and environment', () => {
   }, 30_000);
 
   test.each([
-    [['gh', 'api', 'user']], [['gh', 'auth', 'token']], [['gh', 'auth', 'status']], [['/bin/sh', '-c', 'true']],
+    [['gh', 'api', 'user']], [['gh', 'auth', 'token']], [['gh', 'auth', 'status']], [['gh', 'auth', 'status', '--hostname', 'github.com']],
+    [['gh', 'auth', 'status', '--active', '--hostname', 'github.com', '--show-token']], [['/bin/sh', '-c', 'true']],
   ])('no other program receives the identity: %p', async (argv) => {
     const f = await fixture();
     const result = await f.run({ identity: true, argv });

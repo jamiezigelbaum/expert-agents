@@ -157,13 +157,15 @@ itself, so the factory applies it to its own push:
 - Because of that isolation, `gh` must be a real executable on the Gateway's
   `PATH` (not a shell shim that depends on `HOME`), and Git proxy or CA
   settings from global or system config do not apply to this push.
-- No other command receives the identity, and host Git configuration is not
-  changed. `remoteCreateCommand` runs with the factory's ordinary environment;
+- Only that push and the preflight's `git ls-remote` and
+  `gh auth status --active --hostname github.com` receive the identity, and
+  host Git configuration is not changed. `remoteCreateCommand` runs with the factory's ordinary environment;
   a command that creates GitHub repositories resolves its own credentials and
   must fail closed.
-- A missing, malformed, insecure or tokenless profile stops the operation at
-  `wiring_remote` with `factory_github_identity_missing` or
-  `factory_github_identity_unavailable`. Git does not start, so the host's own
+- A missing, malformed, insecure or tokenless profile refuses with
+  `factory_github_identity_missing` or `factory_github_identity_unavailable`:
+  at preflight, before anything is created, while the remote is not yet
+  pushed, or at `wiring_remote` if it becomes unavailable during the push. Git does not start, so the host's own
   `gh` login and credential helpers are never used. Reconnect System GitHub,
   then resume. An expired or revoked token fails the push itself; reconnect in
   the same way.
@@ -207,27 +209,34 @@ repository or the GitHub repository exists:
   Skipped once the Gateway configuration step has completed.
 - The `remoteCreateCommand` and `activationCommand` programs, when configured
   and still needed, must be executable files (`missing_command`).
-- For an `https://github.com/` remote that is not yet pushed:
-  `gh auth status --hostname github.com` and `git ls-remote` run with exactly
-  the push's System GitHub identity, helper and isolated environment. A refused
-  credential fails with category `auth`. An absent remote is accepted when
+- For an `https://github.com/` remote that is not yet pushed: `git ls-remote`
+  and then `gh auth status --active --hostname github.com` run with exactly the
+  push's System GitHub identity, helper and isolated environment. The remote
+  check comes first, so an unreachable service reports `unavailable` rather
+  than a refused credential (`auth`). An absent remote is accepted when
   `remoteCreateCommand` will create it, and refused with
   `factory_remote_missing` otherwise.
+- The activation program is checked until the Gateway is configured; afterwards
+  a ready expert no longer needs it.
 
 The expert factory acts only in a turn the owner sent directly. A subagent
 completion, another session or a scheduled turn is refused with
 `factory_owner_required`; continue in the owner's next message.
 
 Failures are located without revealing private output. Every factory error
-from an applied invocation names its `phase` (`preflight`, or the recorded step
-below). A failed command also names a fixed `step` label (for example
-`git push` or `agents.update`) and a `category`: `auth`, `not_found`,
-`rejected`, `unavailable`, `invalid`, `timeout`, `missing_command` or `failed`.
-The category is derived privately from the exit status and output; the output
+raised after an applied invocation takes the deployment lock names its `phase`
+(`preflight`, or the recorded step below) and usually a fixed `step` label (for
+example `git push`, `agents.update` or `worker corpus ensure`). Errors before
+the lock (invalid request or configuration, `factory_busy`) carry neither. A
+failed command also names a `category`: `auth`, `not_found`, `rejected`,
+`unavailable`, `invalid`, `timeout`, `missing_command` or `failed`. The
+category is derived privately from the exit status and output; the output
 itself is withheld. The message has the same form, for example
-`configuring_gateway: agents.update failed (not_found)`. Other unexpected
-failures become `factory_step_failed` with their phase. The recorded phase is
-always the step in progress, so `status` and the error agree.
+`configuring_gateway: agents.update failed (not_found)`. Coded worker errors
+keep their code and message; other unexpected failures become
+`factory_step_failed`. A `preflight` failure created nothing: fix the cause and
+repeat the request. The recorded phase is always the step in progress, so
+`status` and the error agree.
 
 After the owner confirms, call:
 

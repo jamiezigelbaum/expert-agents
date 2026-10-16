@@ -73,15 +73,16 @@ only for a missing product decision or an actual deployment prerequisite.
      validated configuration and matching Telegram identity and polling. The
      real test is the owner messaging the bot and getting a reply. The library
      is still empty.
-6. **When a call fails, locate it before retrying.** Factory errors name their
-   `phase`; command failures also name the `step` and a `category` (`auth`,
-   `not_found`, `rejected`, `unavailable`, `invalid`, `timeout`,
-   `missing_command`, `failed`). Private output is always withheld. Phase
-   `preflight` means a check stopped the call before any step ran. Any other
-   phase is where progress stopped. If an error carries no phase, read (never
-   edit) `operations/<agent_id>/state.json` under the factory root, the
-   directory two levels above `repository_path`; its `phase` names the step.
-   Have the cause fixed, then resume the same operation in the owner's turn.
+6. **When a call fails, locate it before retrying.** Factory errors from an
+   applied call name their `phase` and usually a `step`; command failures also
+   name a `category` (`auth`, `not_found`, `rejected`, `unavailable`,
+   `invalid`, `timeout`, `missing_command`, `failed`). Private output is always
+   withheld. Phase `preflight` means a check stopped the call before any step
+   ran: have the cause fixed, then repeat the same request. Any other phase is
+   where progress stopped: have the cause fixed, then resume the same operation
+   in the owner's turn. If an error carries no phase, read (never edit)
+   `operations/<agent_id>/state.json` under the factory root, the directory two
+   levels above `repository_path`; its `phase` names the step.
 
    | Phase | Step to check |
    | --- | --- |

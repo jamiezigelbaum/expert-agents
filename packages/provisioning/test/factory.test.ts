@@ -57,7 +57,7 @@ async function fixture() {
         if (code !== 0) throw new FactoryError('factory_command_failed', `Fixture git failed: ${stderr}`, { category: /does not appear to be a git repository/.test(stderr) ? 'not_found' : 'failed' });
         return stdout;
       }
-      if (argv.join(' ') === 'gh auth status --hostname github.com') {
+      if (argv.join(' ') === 'gh auth status --active --hostname github.com') {
         if (state.githubAuth === 'invalid') throw new FactoryError('factory_command_failed', 'Fixture identity refused', { category: 'auth' });
         return '';
       }
@@ -713,7 +713,7 @@ describe('conversational expert factory', () => {
       expect(await gitOutput(bare, ['rev-parse', 'HEAD'])).toBe(result.commit!);
       // Preflight checks the identity and the remote the same way the push uses them.
       expect(f.calls.filter((call) => call.options?.githubIdentity).map((call) => call.argv)).toEqual(identity
-        ? [['gh', 'auth', 'status', '--hostname', 'github.com'], ['git', 'ls-remote', remote], ['git', 'push', '--set-upstream', 'origin', 'HEAD']]
+        ? [['git', 'ls-remote', remote], ['gh', 'auth', 'status', '--active', '--hostname', 'github.com'], ['git', 'push', '--set-upstream', 'origin', 'HEAD']]
         : []);
       expect(f.calls.filter((call) => call.options && !call.options.githubIdentity)).toEqual([]);
     }, 60_000);
@@ -747,7 +747,7 @@ describe('conversational expert factory', () => {
       await expect(f.run()).rejects.toMatchObject({ code: 'factory_github_identity_unavailable', details: { phase: 'wiring_remote', step: 'git push' } });
       expect((await f.run({ action: 'status', agent_id: 'example' })).status).toBe('wiring_remote');
       // A resume before reconnecting stops at its preflight and still reports the recorded step.
-      await expect(f.resume()).rejects.toMatchObject({ code: 'factory_github_identity_unavailable', details: { phase: 'preflight', step: 'gh auth status' } });
+      await expect(f.resume()).rejects.toMatchObject({ code: 'factory_github_identity_unavailable', details: { phase: 'preflight', step: 'git ls-remote' } });
       expect((await f.run({ action: 'status', agent_id: 'example' })).status).toBe('wiring_remote');
       expect(f.workers.filter((call) => call.params.dry_run === false)).toHaveLength(0);
       connected = true; reconnected = true;
@@ -936,6 +936,23 @@ describe('conversational expert factory', () => {
       expect(f.state.remoteCreateCalls).toHaveLength(1);
     }, 60_000);
 
+    test.each([
+      ['a refused credential', new FactoryError('factory_command_failed', 'refused', { category: 'auth' }), 'factory_command_failed', 'auth'],
+      ['an unreachable service', new FactoryError('factory_command_failed', 'unreachable', { category: 'unavailable' }), 'factory_command_failed', 'unavailable'],
+      ['a redirecting repository setting', new FactoryError('factory_repository_git_config', 'redirect'), 'factory_repository_git_config', undefined],
+    ])('a remote check failing with %s refuses even when the remote will be created', async (_name, failure, code, category) => {
+      const f = await fixture(); githubRemote(f);
+      const command = f.dependencies.command;
+      f.dependencies.command = async (argv, cwd, options) => {
+        if (argv[1] === 'ls-remote') throw failure;
+        return command(argv, cwd, options);
+      };
+      await expect(f.run()).rejects.toMatchObject({ code, details: { phase: 'preflight', step: 'git ls-remote', ...(category ? { category } : {}) } });
+      await nothingCreated(f);
+      // The remote is checked first, so an outage is not reported as a refused credential.
+      expect(f.calls.some((call) => call.argv[0] === 'gh')).toBe(false);
+    }, 60_000);
+
     test('refuses an absent GitHub remote when nothing is configured to create it', async () => {
       const f = await fixture(); githubRemote(f, false);
       await expect(f.run()).rejects.toMatchObject({ code: 'factory_remote_missing', details: { phase: 'preflight', step: 'git ls-remote', category: 'not_found' } });
@@ -963,6 +980,14 @@ describe('conversational expert factory', () => {
       expect((await f.run()).status).toBe('waiting_for_telegram');
     }, 60_000);
   });
+
+  test('an activation program removed after configuration does not block a ready expert', async () => {
+    const f = await fixture(); f.config.activationCommand = f.programs.activate;
+    await f.run(); f.state.confirmed = true;
+    expect((await f.resume()).status).toBe('ready_empty_library');
+    await rm(f.programs.activate);
+    expect((await f.resume()).status).toBe('ready_empty_library');
+  }, 60_000);
 
   describe('diagnosable failures', () => {
     const PRIVATE = `private-output ${TOKEN}`;
@@ -999,7 +1024,16 @@ describe('conversational expert factory', () => {
         return command(argv, cwd, options);
       };
       await expect(f.resume()).rejects.toThrow('Gateway config reload is off');
-      // Negative control: another category on the same step carries no reload hint.
+      // Negative controls: another step, or another category on the same step, carries no reload hint.
+      const g = await fixture(); await g.run(); g.state.confirmed = true;
+      const other = g.dependencies.command;
+      g.dependencies.command = async (argv, cwd, options) => {
+        if (argv[3] === 'agents.create') throw new FactoryError('factory_command_failed', 'model not found', { category: 'not_found' });
+        return other(argv, cwd, options);
+      };
+      const created = await g.resume().catch((caught: unknown) => caught);
+      expect(created).toMatchObject({ details: { step: 'agents.create', category: 'not_found' } });
+      expect(String(created)).not.toContain('reload');
       f.dependencies.command = async (argv, cwd, options) => {
         if (argv[3] === 'agents.update') throw new FactoryError('factory_command_failed', 'refused', { category: 'auth' });
         return command(argv, cwd, options);
@@ -1009,17 +1043,29 @@ describe('conversational expert factory', () => {
       expect(String(error)).not.toContain('reload');
     }, 60_000);
 
-    test('an unexpected failure is replaced with its phase and no private detail', async () => {
+    test('an unexpected failure is replaced with its location and no private detail', async () => {
       const f = await fixture(); await f.run(); f.state.confirmed = true;
       f.dependencies.provisionTelegram = async () => { throw new Error(PRIVATE); };
       const error = await f.resume().catch((caught: unknown) => caught);
-      expect(error).toMatchObject({ code: 'factory_step_failed', details: { phase: 'installing_telegram_token' } });
+      expect(error).toMatchObject({ code: 'factory_step_failed', details: { phase: 'installing_telegram_token', step: 'Telegram token installation' } });
+      expect(String(error)).toContain('resume this operation');
       expect(String(error)).not.toContain('private-output');
       expect((await f.run({ action: 'status', agent_id: 'example' })).status).toBe('installing_telegram_token');
-      // Coded worker errors keep their own code and message.
+      // Coded worker errors keep their own code and message and gain the location.
       const g = await fixture();
       g.dependencies.worker = async () => { throw Object.assign(new Error('Worker refused the plan.'), { code: 'domain_expert_policy_violation' }); };
-      await expect(g.run()).rejects.toMatchObject({ code: 'domain_expert_policy_violation', message: 'Worker refused the plan.' });
+      await expect(g.run()).rejects.toMatchObject({ code: 'domain_expert_policy_violation', message: 'Worker refused the plan.', details: { phase: 'preflight', step: 'worker registration check' } });
+    }, 60_000);
+
+    test('a fresh create stopped before its Telegram link says nothing was created, not resume', async () => {
+      const f = await fixture();
+      f.dependencies.beginTelegram = async () => { throw new Error(PRIVATE); };
+      const error = await f.run().catch((caught: unknown) => caught);
+      expect(error).toMatchObject({ code: 'factory_step_failed', details: { phase: 'preflight', step: 'Telegram confirmation link' } });
+      expect(String(error)).toContain('Nothing was created by this call');
+      expect(String(error)).not.toContain('resume');
+      expect(String(error)).not.toContain('private-output');
+      expect(await Bun.file(join(f.config.rootDir, 'operations', 'example', 'state.json')).exists()).toBe(false);
     }, 60_000);
 
     test('a resume records the step it is in, so a corpus re-check failure is not reported as another step', async () => {
@@ -1030,7 +1076,7 @@ describe('conversational expert factory', () => {
         if (tool === 'rag_corpus') throw Object.assign(new Error('Corpus check unavailable.'), { code: 'rag_corpus_unavailable' });
         return worker(tool, params);
       };
-      await expect(f.resume()).rejects.toMatchObject({ code: 'rag_corpus_unavailable' });
+      await expect(f.resume()).rejects.toMatchObject({ code: 'rag_corpus_unavailable', details: { phase: 'waiting_for_corpus', step: 'worker corpus ensure' } });
       expect((await f.run({ action: 'status', agent_id: 'example' })).status).toBe('waiting_for_corpus');
       f.dependencies.worker = worker;
       expect((await f.resume()).status).toBe('ready_empty_library');
@@ -1040,18 +1086,19 @@ describe('conversational expert factory', () => {
       const f = await fixture(); f.wireRemote(); f.state.running = false;
       const seen = new Set<string>();
       const statePath = join(f.config.rootDir, 'operations', 'example', 'state.json');
-      const command = f.dependencies.command;
-      f.dependencies.command = async (argv, cwd, options) => {
+      const record = async () => {
         const saved = await readFile(statePath, 'utf8').then((text) => JSON.parse(text).phase as string, () => undefined);
         if (saved) seen.add(saved);
-        return command(argv, cwd, options);
       };
+      const command = f.dependencies.command;
+      f.dependencies.command = async (argv, cwd, options) => { await record(); return command(argv, cwd, options); };
+      const worker = f.dependencies.worker;
+      f.dependencies.worker = async (tool, params) => { await record(); return worker(tool, params); };
       for (const status of [(await f.run()).status, ...await (async () => { f.state.confirmed = true; return [(await f.resume()).status]; })()]) seen.add(status);
       f.state.running = true;
       seen.add((await f.resume()).status);
       expect([...seen].filter((phase) => !(FACTORY_PHASES as readonly string[]).includes(phase))).toEqual([]);
-      expect(seen.has('ready_empty_library')).toBe(true);
-      expect(seen.has('configuring_gateway')).toBe(true);
+      for (const phase of ['registering_library', 'creating_corpus', 'configuring_gateway', 'ready_empty_library']) expect(seen.has(phase)).toBe(true);
     }, 60_000);
   });
 });

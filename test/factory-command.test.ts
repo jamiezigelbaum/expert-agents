@@ -72,8 +72,9 @@ describe('failure categories', () => {
     expect(classifyFailure(null, output)).toBe(category as never);
   });
 
-  test('a command killed by its time limit is a timeout whatever it printed', () => {
+  test('a command stopped by its time limit is a timeout whatever it printed; a crash is not', () => {
     expect(classifyFailure('SIGTERM', 'Authentication failed')).toBe('timeout');
+    expect(classifyFailure('SIGSEGV', 'Authentication failed')).toBe('failed');
   });
 
   test('a failed command carries only its category, never its output', async () => {
@@ -85,8 +86,9 @@ describe('failure categories', () => {
     expect(JSON.stringify([String(error), (error as { details: unknown }).details])).not.toContain(secret);
   });
 
-  test('a program that cannot start is missing_command', async () => {
+  test('a program that cannot start is missing_command; a missing working directory is not', async () => {
     await expect(runFactoryCommand(['/nonexistent/expert-factory-program', 'run'])).rejects.toMatchObject({ code: 'factory_command_failed', details: { category: 'missing_command' } });
+    await expect(runFactoryCommand(['git', 'status'], '/nonexistent/expert-factory-workspace')).rejects.toMatchObject({ code: 'factory_command_failed', details: { category: 'not_found' } });
   });
 
   test('a command stopped at its time limit reports timeout', async () => {

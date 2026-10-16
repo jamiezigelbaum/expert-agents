@@ -1,4 +1,4 @@
-import { constants, rmSync } from 'node:fs';
+import { constants, existsSync, rmSync } from 'node:fs';
 import { lstat, mkdtemp, open, rm } from 'node:fs/promises';
 import { devNull, tmpdir } from 'node:os';
 import { dirname, isAbsolute, join } from 'node:path';
@@ -54,6 +54,8 @@ const GITHUB_GIT_CONFIG = ['-c', 'credential.helper=', '-c', 'credential.helper=
 const INHERITED_GIT_SETTINGS = /^(GIT_|GH_|GITHUB_|SSH_ASKPASS$|NETRC$|XDG_CONFIG_HOME$)/i;
 // Repository settings that could still redirect, proxy or authenticate the push: URL rewrites,
 // HTTP settings, includes, and per-remote push URLs, proxies or remote helpers.
+// GitHub CLI's check of the profile's active credential, the only gh command given the identity.
+const GITHUB_PROBE = ['gh', 'auth', 'status', '--active', '--hostname', 'github.com'];
 const REDIRECTING_REPOSITORY_SETTINGS = /^(url\.|http\.|include\.|includeif\.|remote\..+\.(pushurl|proxy|proxyauthmethod|vcs)$)/i;
 
 /** Runs factory commands. Only commands the factory marks as GitHub operations receive the System identity. */
@@ -61,7 +63,7 @@ export function factoryCommand(github?: FactoryGitHubSelection): FactoryCommand 
   return async (argv, cwd, options) => {
     if (!options?.githubIdentity) return runFactoryCommand(argv, cwd);
     // Git, and GitHub CLI's own credential check, are the only programs that receive the identity.
-    const probe = argv.join(' ') === 'gh auth status --hostname github.com';
+    const probe = argv.length === GITHUB_PROBE.length && GITHUB_PROBE.every((arg, index) => argv[index] === arg);
     if (argv[0] !== 'git' && !probe) throw new FactoryError('factory_invalid_command', 'Only Git commands and the GitHub CLI credential check can use the System GitHub identity.');
     const profileDir = await systemGitHubProfile(github);
     // An empty private HOME with no global or system Git config: host netrc entries, extra
@@ -151,6 +153,8 @@ export async function runFactoryCommand(argv: string[], cwd?: string, env?: Reco
   catch (error) {
     const code = (error as { code?: unknown }).code;
     if (code !== 'ENOENT' && code !== 'EACCES') throw error;
+    // Bun reports a missing working directory the same way as a missing program.
+    if (cwd !== undefined && !existsSync(cwd)) throw new FactoryError('factory_command_failed', 'A required command could not start because its working directory is missing.', { category: 'not_found' });
     throw new FactoryError('factory_command_failed', 'A required program could not start; it is missing or not executable.', { category: 'missing_command' });
   }
   const readBounded = async (stream: ReadableStream<Uint8Array>): Promise<string> => {
@@ -209,7 +213,9 @@ const FAILURE_PATTERNS: [FactoryFailureCategory, RegExp][] = [
 ];
 
 export function classifyFailure(signal: string | null, output: string): FactoryFailureCategory {
-  if (signal !== null) return 'timeout';
+  // The time limit stops a command with SIGTERM; a command that crashes on another signal failed.
+  if (signal === 'SIGTERM' || signal === 'SIGKILL') return 'timeout';
+  if (signal !== null) return 'failed';
   return FAILURE_PATTERNS.find(([, pattern]) => pattern.test(output))?.[0] ?? 'failed';
 }
 
