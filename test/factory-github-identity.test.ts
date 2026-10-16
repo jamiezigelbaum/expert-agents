@@ -211,6 +211,9 @@ describe('factory pushes as the System GitHub identity', () => {
       await writeFile(join(f.base, 'global-hooks', 'pre-push'), `#!/bin/sh\necho "$GH_CONFIG_DIR" >> ${JSON.stringify(f.hookLog)}\n`, { mode: 0o755 });
       await writeFile(join(f.home, '.gitconfig'), `[core]\n\thooksPath = ${join(f.base, 'global-hooks')}\n`);
     }],
+    ['a repository credential helper', async (f: Fixture) => {
+      await git(f.workspace, ['config', 'credential.helper', `!${join(f.bin, 'host-helper')}`]);
+    }],
     ['a repository pre-push hook', async (f: Fixture) => {
       await writeFile(join(f.workspace, '.git', 'hooks', 'pre-push'), `#!/bin/sh\necho "$GH_CONFIG_DIR" >> ${JSON.stringify(f.hookLog)}\n`, { mode: 0o755 });
     }],
@@ -221,6 +224,7 @@ describe('factory pushes as the System GitHub identity', () => {
     expect(await f.pushed()).toBe(await f.head());
     expect(f.server.seen).toContain('managed');
     expect(f.server.seen).not.toContain('host');
+    expect(await f.hostCalls()).toEqual([]);
     expect(await exists(f.hookLog)).toBe(false);
     expect((await git(f.base, ['--git-dir', f.decoy, 'for-each-ref'])).stdout).toBe('');
   }, 30_000);
