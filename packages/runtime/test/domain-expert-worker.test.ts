@@ -37,6 +37,7 @@ import {
   bookObjectStem,
   assertAllowedGcsDestination,
   routedPdfStatus,
+  ragFilesByTarget,
   createDomainExpertWorker as createRawDomainExpertWorker,
   domainExpertAnnasConfigFromEnv,
   reciprocalRankFuse,
@@ -7847,6 +7848,16 @@ describe('splitting long PDFs for LLM-parser imports', () => {
         expect(ragFileOf(third)).toEqual(after);
         expect(storageDeletes(f.googleCalls)).toEqual([]);
       } finally { f.cleanup(); }
+    });
+
+    // One ragFile matched by name must not stand for two requested objects that share the name.
+    test('a display name two targets share matches neither, so a missing file is never masked', () => {
+      const listed = [{ name: `${CORPUS}/ragFiles/1`, displayName: 'report.md' }, { name: `${CORPUS}/ragFiles/2`, displayName: 'notes.md' }];
+      const prefix = 'gs://fixture-shared-library/v1/staged/research/batch/';
+      const matched = ragFilesByTarget(listed, [`${prefix}${'a'.repeat(32)}/a/report.md`, `${prefix}${'b'.repeat(32)}/b/report.md`, `${prefix}${'c'.repeat(32)}/notes.md`]);
+      expect(matched.get(`${prefix}${'a'.repeat(32)}/a/report.md`)).toEqual([]);
+      expect(matched.get(`${prefix}${'b'.repeat(32)}/b/report.md`)).toEqual([]);
+      expect(matched.get(`${prefix}${'c'.repeat(32)}/notes.md`)).toEqual([listed[1]]);
     });
 
     // Vertex can list ragFiles by display name alone. A changed file and its previous version

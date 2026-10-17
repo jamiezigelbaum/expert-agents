@@ -10926,8 +10926,9 @@ function importResultSinkUri(allowedPrefixes: string[], domainId: string, batchI
 // the object's file name, and only when exactly one ragFile in the corpus carries that
 // name. Content-addressed objects of one batch share file names across versions, so a
 // name two ragFiles carry matches nothing: the object is then unmatched, never guessed.
+// Nor does a name two targets share, or one ragFile would stand for both.
 // exact: sourceUri only, no display-name fallback.
-function ragFilesByTarget(
+export function ragFilesByTarget(
   files: Array<Record<string, unknown>>,
   targets: string[],
   options: { exact?: boolean } = {},
@@ -10937,6 +10938,9 @@ function ragFilesByTarget(
     if (typeof file.displayName !== 'string') continue;
     byName.set(file.displayName, [...(byName.get(file.displayName) ?? []), file]);
   }
+  const baseName = (target: string) => target.split('/').pop() ?? '';
+  const targetNames = new Map<string, number>();
+  for (const target of new Set(targets)) targetNames.set(baseName(target), (targetNames.get(baseName(target)) ?? 0) + 1);
   const matched = new Map<string, Array<Record<string, unknown>>>();
   for (const target of targets) {
     const directory = target.endsWith('/');
@@ -10946,7 +10950,7 @@ function ragFilesByTarget(
       matched.set(target, exact);
       continue;
     }
-    const named = byName.get(target.split('/').pop() ?? '') ?? [];
+    const named = targetNames.get(baseName(target)) === 1 ? byName.get(baseName(target)) ?? [] : [];
     matched.set(target, named.length === 1 && typeof named[0]!.sourceUri !== 'string' ? named : []);
   }
   return matched;
