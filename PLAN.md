@@ -12,10 +12,10 @@ Open engineering work.
 1. **Large-document ingestion.** The delivered per-PDF ceiling is 100,000,000
    bytes, and with the LLM parser 200 pages per imported PDF
    ([limits](docs/vertex-rag-limits.md)). Acquired PDFs are split into parts
-   with a per-part registry record and resumable retries; other import routes
-   still import long PDFs whole, and citations from parts do not yet map back
-   to original pages. The 1 GB target needs streaming, resumable processing
-   with original-page citations; acceptance criteria are in the
+   by every worker import route, with a per-part registry record, resumable
+   retries and citations in original pages; the materializer rejects them.
+   The 1 GB target needs streaming, resumable processing; acceptance criteria
+   are in the
    [deployment guide](deploy/README.md#ingestion-limits-and-pdf-handling).
 2. **Worker socket transport.** Replace the loopback bearer with a permissioned
    Unix-domain socket, keeping TCP as a config-selectable fallback; see the

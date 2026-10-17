@@ -219,11 +219,30 @@ and coverage-checked (ACTIVE ragFile; text layer read with `pdftotext`); the
 host needs `qpdf` and `pdftotext` (poppler-utils) on PATH, and without `qpdf`,
 or for a file `qpdf` cannot read, such a PDF is refused before upload with
 `pdf_exceeds_parser_page_limit`. Worker health reports `pdf_import` as
-`degraded` while either tool is missing. Only this acquisition path splits: a
-long PDF reaching the corpus through `stage_import`, `rag_corpus import` of a
-GCS object or the library materializer is still imported whole.
+`degraded` while either tool is missing.
 
-Every acquired source has one identity, the sha256 of the original file.
+Every worker route takes the same PDF pipeline: `annas_archive_import`,
+`rag_corpus import` of a GCS PDF (the worker reads the object to identify it
+and count its pages; parts go beside it as `<name>--partNofM.pdf`), and
+`stage_import` and `web_import` (a PDF already in the corpus, one to split or
+one refused leaves the batch and is reported under `pdf_sources`; parts go to
+`staged/<domain>/<batch>--parts/` after the batch import). A PDF imported by
+URI without `source_id` is registered under its sha256 as
+`<domain>-pdf-<sha prefix>`. The library materializer imports each object
+whole and does not split: under the LLM parser its CLI counts each PDF's pages
+with `qpdf` and rejects one over the limit with `pdf_exceeds_parser_page_limit`
+in the receipt's `rejectedImports` (without `qpdf` it warns and does not
+check); import such a PDF through the worker instead.
+
+Citations name the original source: a passage or citation from a registered
+object carries `source_id`, `source_part` for a split's part, and
+`original_pages` (`first_page`, `last_page`, `basis`). For a part the original
+pages are the part's first original page plus the chunk's page span within
+the part (`basis: chunk`), or the part's whole range when Vertex returns no
+span (`basis: part_range`); a whole PDF's span is already original. The
+passage header ends with the pages. An unregistered part claims no pages.
+
+Every source has one identity, the sha256 of the original file.
 Before anything is uploaded the worker looks it up in the domain's
 `references/source-registry.jsonl`: a source the registry records in the
 corpus, whole or as parts of any split, is reported present (when the ragFile

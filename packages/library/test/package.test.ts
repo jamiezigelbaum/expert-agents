@@ -21,11 +21,12 @@ describe("@expert-agents/library package", () => {
       "validatedVertexOperationName",
       "EbookConversionError", "convertEpubToMarkdown", "decodeXmlEntities", "plainTextToMarkdown",
       "resolveArchivePath", "xhtmlToMarkdown",
+      "PdfSplitError", "pdfPartStem", "pdfTextLayer", "planPdfParts", "qpdfPageCount", "splitPdf", "stripPdfPartSuffix",
     ] as const;
     const numbers = [
       "EXTRACTION_MAX_OUTPUT_BYTES", "EXTRACTION_TIMEOUT_MS", "LIBRARY_SCHEMA_VERSION",
       "MATERIALIZATION_LEDGER_SCHEMA_VERSION", "RAG_CHUNK_OVERLAP", "RAG_CHUNK_TOKENS",
-      "RECONCILIATION_PLAN_SCHEMA_VERSION", "SCOPE_SCHEMA_VERSION",
+      "RECONCILIATION_PLAN_SCHEMA_VERSION", "SCOPE_SCHEMA_VERSION", "LLM_PARSER_MAX_PDF_PAGES",
     ] as const;
     const strings = [
       "AGENT_REPO_GITIGNORE", "DEFAULT_RAG_PARSER_MODEL", "EXTRACTION_METHOD",

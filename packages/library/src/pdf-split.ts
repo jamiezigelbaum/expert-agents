@@ -8,7 +8,14 @@ import { execFile } from 'node:child_process';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { allowlistedExtractionEnv } from '@expert-agents/library';
+import { allowlistedExtractionEnv } from './extraction.ts';
+
+/**
+ * The most pages one PDF may hold in an import with the LLM parser; a longer
+ * PDF is split into parts of at most this many pages, or refused before upload
+ * when it cannot be split. Measurements and the choice: docs/vertex-rag-limits.md.
+ */
+export const LLM_PARSER_MAX_PDF_PAGES = 200;
 
 const QPDF_TIMEOUT_MS = 120_000;
 const QPDF_MAX_OUTPUT_BYTES = 1024 * 1024;
