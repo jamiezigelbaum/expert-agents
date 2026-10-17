@@ -7178,6 +7178,22 @@ describe('splitting long PDFs for LLM-parser imports', () => {
       } finally { f.cleanup(); }
     });
 
+    test('a staged PDF answered as in progress is already in the registry as in progress', async () => {
+      const f = splitFixture(LONG, importsAll, { responseBudgetMs: 1 });
+      writeBatch(f.base, { 'long-volume.pdf': LONG });
+      try {
+        const response = await stageBatch(f.worker, 'slow-batch');
+        expect(response.pdf_sources).toMatchObject([{ route: 'split', status: 'import_in_progress' }]);
+        // Before any background write: the source can be found, and it says it is running.
+        const sourceId = `research-pdf-${sha256Hex(LONG).slice(0, 16)}`;
+        const status = await postDomain(f.worker, 'domain_source', { action: 'status', domain_id: 'research', source_id: sourceId });
+        expect(status.history.some((record: Record<string, any>) => record.ingest_status === 'import_requested')).toBe(true);
+        const deadline = Date.now() + 5_000;
+        while (f.readRegistry().at(-1)!.ingest_status !== 'imported' && Date.now() < deadline) await Bun.sleep(10);
+        expect(f.readRegistry().at(-1)).toMatchObject({ source_id: sourceId, ingest_status: 'imported', split_parts: 3 });
+      } finally { f.cleanup(); }
+    });
+
     test('a batch of refused PDFs reports them refused', async () => {
       const f = splitFixture(LONG, importsAll, { qpdfBin: 'qpdf-missing-fixture' });
       writeBatch(f.base, { 'long-volume.pdf': LONG });
@@ -7324,5 +7340,47 @@ describe('citations from split parts', () => {
         if (!expected) expect(result.passages[0].header).not.toContain('pages');
       } finally { fixture.cleanup(); }
     }
+  });
+
+  test('every record shape maps its objects to a source: whole, split and multi-file batch', async () => {
+    const fixture = workspaceFixture();
+    const object = (name: string) => `gs://fixture-shared-library/v1/library/${name}.pdf`;
+    try {
+      const registryPath = join(fixture.workspaceRoot, domainManifest('history').workspace_relative_path, 'references/source-registry.jsonl');
+      mkdirSync(dirname(registryPath), { recursive: true });
+      const at = '2026-10-17T12:00:00.000Z';
+      writeFileSync(registryPath, [
+        { source_id: 'history-whole', domain_id: 'history', ingest_status: 'imported', gcs_uri: object('whole-paper'), registered_at: at },
+        { source_id: 'history-split', domain_id: 'history', ingest_status: 'imported', split_parts: 2, pages: 300, rag_files: [
+          { gcs_uri: object('split-book--part1of2'), part: 'part1of2', first_page: 1, last_page: 150, status: 'imported' },
+          { gcs_uri: object('split-book--part2of2'), part: 'part2of2', first_page: 151, last_page: 300, status: 'imported' },
+        ], registered_at: at },
+        { source_id: 'history-stage-import-batch', domain_id: 'history', kind: 'stage_import', ingest_status: 'imported', rag_files: [
+          { gcs_uri: object('batch-one') }, { gcs_uri: object('batch-two') }, { gcs_uri: object('whole-paper') },
+        ], registered_at: at },
+      ].map((record) => JSON.stringify(record)).join('\n') + '\n');
+      const worker = createDomainExpertWorker({
+        roots: [rootPolicy(fixture.workspaceRoot)],
+        dataDir: join(fixture.base, 'data'),
+        google: {
+          accessToken: 'fixture-google-token',
+          fetchImpl: fakeGoogleFetch([], {
+            ragCorpora: [{ name: corpusResource, displayName: 'history-library' }],
+            contexts: () => ['whole-paper', 'split-book--part2of2', 'batch-one', 'batch-two'].map((name) => ({
+              sourceUri: object(name), sourceDisplayName: name, text: `${name} passage.`, score: 0.1, chunk: { text: 'x', pageSpan: { firstPage: 2, lastPage: 2 } },
+            })),
+          }),
+        },
+      });
+      const result = await postDomain(worker, 'domain_ask', { domain_id: 'history', question: 'Where is it said?', output: 'passages' });
+      const sources = new Map(result.passages.map((passage: Record<string, any>) => [passage.source_display_name, [passage.source_id, passage.original_pages?.first_page]]));
+      expect(sources).toEqual(new Map<string, unknown>([
+        // A source of its own wins over the batch that also lists it.
+        ['whole-paper', ['history-whole', 2]],
+        ['split-book--part2of2', ['history-split', 152]],
+        ['batch-one', ['history-stage-import-batch', 2]],
+        ['batch-two', ['history-stage-import-batch', 2]],
+      ]));
+    } finally { fixture.cleanup(); }
   });
 });

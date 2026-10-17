@@ -1382,6 +1382,7 @@ export class DomainExpertService {
     } catch {
       return holdings;
     }
+    const batchCited = new Set<string>();
     for (const [sourceId, history] of groupDomainSourceRecords(records)) {
       if (latestDomainSourceRecord(history).removed) continue;
       const withObjects = history.filter((entry) => registryRecordGcsUris(entry.record).length > 0);
@@ -1389,6 +1390,15 @@ export class DomainExpertService {
       const record = latestDomainSourceRecord(withObjects).record;
       const holding = recordedSourceHolding(record);
       if (holding?.whole) holdings.set(holding.whole.gcs_uri, { source_id: sourceId });
+      // A batch record lists several whole objects; each is cited under the record's source
+      // unless a source of its own (registered by its sha256) names it too.
+      if (!holding?.parts) {
+        for (const uri of registryRecordGcsUris(record)) if (!holdings.has(uri) || batchCited.has(uri)) {
+          holdings.set(uri, { source_id: sourceId });
+          if (registryRecordGcsUris(record).length > 1) batchCited.add(uri);
+          else batchCited.delete(uri);
+        }
+      }
       // Parts recorded without ranges get them back when the original's page count is recorded.
       const parts = holding?.parts && typeof record.pages === 'number'
         ? recordedPartsWithRanges(holding.parts, record.pages, this.annasPdfSplitPages) ?? holding.parts
@@ -2299,8 +2309,11 @@ export class DomainExpertService {
         llmParserEligible: llmParserEligibleUris(params.gcsUri ? [params.gcsUri] : []),
       });
     });
+    let requestRecorded: () => void = () => {};
+    const requested = new Promise<void>((resolveRequested) => { requestRecorded = resolveRequested; });
     const verifying = sourceRootPath && registeredSource
       ? this.verifyAndRegisterRagImport({
+        onRequestRecorded: requestRecorded,
         manifest,
         rootPath: sourceRootPath,
         resolved: usedResolved,
@@ -2317,6 +2330,8 @@ export class DomainExpertService {
     let verified: Record<string, unknown> = {};
     if (verifying && namedSource) verified = await verifying;
     else if (verifying) {
+      // The import_requested record is written before the call can answer in progress.
+      await Promise.race([requested, verifying]);
       verified = await this.raceResponseBudget(verifying) ?? {
         source_registry: { status: 'recording', source_ids: [String(registeredSource!.source_id)], hint: 'The import outcome is recorded in the source registry when Vertex finishes.' },
       };
@@ -2507,7 +2522,7 @@ export class DomainExpertService {
       };
       const entry = { workspace_relative_path: file.workspaceRelativePath, source_sha256: digest };
       if (named && typeof named.source_sha256 === 'string' && named.source_sha256 !== digest) {
-        routed.push({ entry, route: 'refused', outcome: { status: 'blocked', error: {
+        routed.push({ entry, corpusId, route: 'refused', outcome: { status: 'blocked', error: {
           code: 'source_identity_conflict',
           message: `Source ${String(named.source_id)} records a different file (sha256 ${named.source_sha256.slice(0, 12)}) than ${file.workspaceRelativePath}. Nothing was imported.`,
           suggestion: 'Stage it without source_id, or under the source that is this file.',
@@ -2516,17 +2531,17 @@ export class DomainExpertService {
       }
       const holding = await this.sourceHolding(source);
       if (holding.kind === 'present') {
-        routed.push({ entry, route: 'present', register, outcome: { status: 'imported', target_corpus_id: corpusId, ...holding.result } });
+        routed.push({ entry, corpusId, route: 'present', register, outcome: { status: 'imported', target_corpus_id: corpusId, ...holding.result } });
         continue;
       }
       if (holding.kind === 'unknown' || holding.kind === 'conflict') {
-        routed.push({ entry, route: 'refused', outcome: { status: 'blocked', error: holding.kind === 'unknown' ? sourceHoldingUnverified(source, holding) : sourceIdentityConflict(source, holding) } });
+        routed.push({ entry, corpusId, route: 'refused', outcome: { status: 'blocked', error: holding.kind === 'unknown' ? sourceHoldingUnverified(source, holding) : sourceIdentityConflict(source, holding) } });
         continue;
       }
       const route = await this.routePdf(source, bytes, measurePdfArtifactScale(bytes).corroborated_pages, holding);
       if ('whole' in route) eligible.push(file);
-      else if ('refusal' in route) routed.push({ entry, route: 'refused', outcome: { status: 'blocked', error: route.refusal } });
-      else routed.push({ entry, route: 'split', pages: route.pages, parts: route.plan.length, register, split: () => this.ingestSplitPdf(source, { ...route, bytes }) });
+      else if ('refusal' in route) routed.push({ entry, corpusId, route: 'refused', outcome: { status: 'blocked', error: route.refusal } });
+      else routed.push({ entry, corpusId, route: 'split', pages: route.pages, parts: route.plan.length, register, split: () => this.ingestSplitPdf(source, { ...route, bytes }) });
     }
     return { eligible, routed };
   }
@@ -2545,13 +2560,15 @@ export class DomainExpertService {
       const registry = pdf.register ? await pdf.register(pdf.outcome!, {}) : undefined;
       results.push({ ...pdf.entry, route: pdf.route, ...pdf.outcome, ...(registry ? { source_registry: registry } : {}) });
     }
-    const splits = routed.flatMap((pdf, index) => (pdf.split ? [{ pdf, index }] : []));
+    // Each PDF's registry writes run in order, so an in-progress record never lands after its outcome.
+    const splits = routed.flatMap((pdf, index) => (pdf.split ? [{ pdf, index, ended: false, writes: Promise.resolve() as Promise<unknown> }] : []));
     const work = (async () => {
-      for (const { pdf, index } of splits) {
+      for (const split of splits) {
         // An unexpected throw still ends that PDF's run with a record.
-        const outcome = await pdf.split!().catch((error: unknown): Record<string, unknown> => ({ status: 'blocked', error: ingestErrorRecord(error) }));
-        const registry = await pdf.register!(outcome, {});
-        results[index] = { ...pdf.entry, route: pdf.route, ...outcome, source_registry: registry };
+        const outcome = await split.pdf.split!().catch((error: unknown): Record<string, unknown> => ({ status: 'blocked', error: ingestErrorRecord(error) }));
+        split.ended = true;
+        const registry = await (split.writes = split.writes.then(() => split.pdf.register!(outcome, {})));
+        results[split.index] = { ...split.pdf.entry, route: split.pdf.route, ...outcome, source_registry: registry };
       }
       return true;
     })();
@@ -2559,6 +2576,12 @@ export class DomainExpertService {
       void work.catch((error: unknown) => {
         console.error(JSON.stringify({ kind: 'domain_expert_pdf_split_background_error', code: error instanceof DomainExpertWorkerError ? error.code : 'error' }));
       });
+      // Every PDF answered as in progress is in the registry as in progress first.
+      for (const split of splits) {
+        if (results[split.index]) continue;
+        split.writes = split.writes.then(() => (split.ended ? undefined : split.pdf.register!({ status: 'import_in_progress', target_corpus_id: split.pdf.corpusId }, { inProgress: true })));
+        await split.writes;
+      }
       return routed.map((pdf, index) => results[index] ?? {
         ...pdf.entry,
         route: pdf.route,
@@ -3477,6 +3500,8 @@ export class DomainExpertService {
     source?: Record<string, unknown>;
     // The sha256 of each staged file, recorded with it as its source identity.
     sha256ByUri?: Map<string, string>;
+    // Called once the import_requested record is written.
+    onRequestRecorded?: () => void;
   }): Promise<{ import_outcome: Record<string, unknown>; source_registry: Record<string, unknown> }> {
     const operationName = typeof input.submissionReceipt.operation_name === 'string' ? input.submissionReceipt.operation_name : undefined;
     const registryErrors: string[] = [];
@@ -3495,6 +3520,7 @@ export class DomainExpertService {
       ...(operationName ? { rag_operation_name: operationName } : {}),
       ...ragImportFileFields(input.gcsUris.map((gcsUri) => ({ gcs_uri: gcsUri })), input.sha256ByUri),
     });
+    input.onRequestRecorded?.();
 
     const deadline = Date.now() + this.annasImportPollTimeoutMs;
     const outcome = await this.awaitRagImportOutcome(input.manifest, {
@@ -9314,6 +9340,7 @@ function routedPdfStatus(pdfSources: Array<Record<string, unknown>>): string {
 // refused, or split and imported after the batch.
 interface RoutedStagedPdf {
   entry: { workspace_relative_path: string; source_sha256: string };
+  corpusId: string;
   route: 'present' | 'split' | 'refused';
   pages?: number;
   parts?: number;
