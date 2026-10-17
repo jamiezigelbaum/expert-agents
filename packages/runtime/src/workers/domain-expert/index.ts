@@ -3908,7 +3908,7 @@ export class DomainExpertService {
     let { detail } = settled;
     let changed: string | undefined;
     let unsettled: string | undefined;
-    if (input.pinned && status === 'import_requested') {
+    if (input.pinned && status === 'import_requested' && detail.reason !== RAG_FILE_UNLISTED) {
       // Vertex may still read the object after this run ends, so no later check ties what it imports to the bytes inspected.
       unsettled = 'the import had not settled when the worker stopped waiting, so the bytes Vertex reads cannot be tied to the ones inspected';
       detail = { ...detail, identity_verified: false, source_check: unsettled };
@@ -4007,7 +4007,12 @@ export class DomainExpertService {
       // Vertex counts a file it then failed to embed; the ragFile's own state
       // is the last word on whether it is in the library.
       const states = files.map((file) => file.state).filter((state) => state !== undefined);
-      if (states.length > 0 && !states.includes('ACTIVE') && states.includes('ERROR')) {
+      if (states.length === 0) {
+        // No ragFile listed for it yet: the outcome stays requested, so a later check
+        // reads its operation and ragFile before it counts as present or is imported again.
+        status = 'import_requested';
+        detail = { ...detail, reason: RAG_FILE_UNLISTED, hint: 'Vertex counted the import, but its ragFile is not listed yet; check the source again once the corpus lists it.' };
+      } else if (!states.includes('ACTIVE') && states.includes('ERROR')) {
         status = 'import_failed';
         detail = {
           ...detail,
@@ -10591,6 +10596,9 @@ function requestOutcomeByFile(files: Array<Record<string, unknown>>): { status: 
   if (failed === files.length) return { status: 'import_failed', hint: `Every ragFile of the request is in ERROR. ${rerun}` };
   return { status: 'import_partial', hint: `${active} of ${files.length} files are ACTIVE; ${failed} in ERROR, ${files.length - active - failed} not listed. ${rerun}` };
 }
+
+// The reason a settled import stays import_requested: Vertex counted it, its ragFile is not listed yet.
+const RAG_FILE_UNLISTED = 'rag_file_unlisted';
 
 function ragImportFileFields(files: Array<Record<string, unknown>>, sha256ByUri?: Map<string, string>): Record<string, unknown> {
   if (files.length === 0) return {};

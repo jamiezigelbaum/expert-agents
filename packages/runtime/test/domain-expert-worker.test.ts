@@ -5751,6 +5751,7 @@ describe('rag_corpus imports record their verified outcome in the source registr
     const f = importFixture({
       gcsObjects: { 'v1/objects/slow-paper.pdf': FIXTURE_PDF_TEXT },
       importOperation: (name) => (finished ? { name, done: true, response: { importedRagFilesCount: '1' } } : { name, done: false }),
+      ragFiles: () => (finished ? [{ name: `${CORPUS}/ragFiles/slow-1`, gcsSource: { uris: [gcsUri] }, fileStatus: { state: 'ACTIVE' } }] : []),
     }, { annas: { importPollIntervalMs: 1, importPollTimeoutMs: 5_000, responseBudgetMs: 20 } });
     try {
       const started = Date.now();
@@ -5950,15 +5951,16 @@ describe('rag_corpus imports record their verified outcome in the source registr
     }
   });
 
-  test('an imported ragFile never listed is recorded not listed after the retries', async () => {
+  // Vertex's count is not the file: one never listed stays requested until its ragFile is.
+  test('a counted ragFile never listed after the retries stays import_requested', async () => {
     const f = importFixture({ ragFiles: () => [] });
     try {
       const result = await (await f.stageImport()).json() as Record<string, any>;
-      expect(result.import_outcome).toMatchObject({ status: 'imported', rag_file_listings: 4 });
+      expect(result.import_outcome).toMatchObject({ status: 'import_requested', reason: 'rag_file_unlisted', rag_file_listings: 4 });
       const latest = f.readRegistry().at(-1)!;
-      expect(latest.ingest_status).toBe('imported');
+      expect(latest.ingest_status).toBe('import_requested');
       expect(latest).not.toHaveProperty('rag_file_name');
-      expect(latest.verification).toContain('ragFile not listed; after 4 listings');
+      expect(latest.ingest_reason).toContain('ragFile is not listed yet');
     } finally {
       f.cleanup();
     }
