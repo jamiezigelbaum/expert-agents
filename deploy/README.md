@@ -375,10 +375,11 @@ by N. The worker requires every object to have an ACTIVE ragFile matched by its
 exact source URI, counts each PDF's pages with `qpdf` to record each part's
 original page range, and writes one `imported` record
 (`acquisition: registered_holding`). A whole object must hash to the given
-sha256; a split's parts cannot prove it, so their record says
-`sha256_verified: false` and an import that matches it reports
-`identity_verified: false`. The same call again answers `already_registered`
-(with `identity_verified: false` for such a split) and writes nothing; a different holding for the same sha256, or the same one in
+sha256, but the worker did not import it and Vertex may hold an earlier
+version, and a split's parts cannot prove the sha256 at all, so every
+registered holding says `sha256_verified: false` and an import that matches it
+reports `identity_verified: false`. The same call again answers `already_registered`
+(with `identity_verified: false`) and writes nothing; a different holding for the same sha256, or the same one in
 another corpus, is refused with `source_identity_conflict`. A record written
 before sources carried a sha256 that holds the same objects is updated rather
 than duplicated. A book already imported whole before sources carried their

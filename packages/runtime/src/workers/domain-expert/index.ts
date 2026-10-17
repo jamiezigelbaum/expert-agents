@@ -2062,8 +2062,10 @@ export class DomainExpertService {
       target_corpus_id: corpusId,
       acquisition: 'registered_holding',
       source_sha256: sha256,
-      // A split's parts cannot prove the original's sha256; the operator's word stands for it.
-      sha256_verified: !split,
+      // The worker did not import these objects: a whole object's bytes match the sha256 now,
+      // but Vertex may have read an earlier version, and a split's parts cannot prove it at all.
+      // The operator's word stands for the identity.
+      sha256_verified: false,
       ingest_status: 'imported',
       ...(split
         ? { pages: firstPage - 1, split_parts: ragFiles.length, rag_files: ragFiles }

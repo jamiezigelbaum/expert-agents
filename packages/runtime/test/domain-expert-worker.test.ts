@@ -7094,13 +7094,14 @@ describe('splitting long PDFs for LLM-parser imports', () => {
       } finally { f.cleanup(); }
     });
 
-    test('a whole object must hash to the given sha256, and is then recorded as verified', async () => {
+    // Vertex may hold an earlier version of the object than the bytes read now: only the worker's own import proves it.
+    test('a whole object must hash to the given sha256, and is still recorded unverified', async () => {
       const f = handFixture([`gs://fixture-shared-library/${WHOLE}`]);
       try {
         const wrong = await postDomainResponse(f.worker, 'domain_source', { ...REGISTER, sha256: 'b'.repeat(64), gcs_uris: [`gs://fixture-shared-library/${WHOLE}`] });
         expect(await refusal(wrong)).toEqual({ status: 409, code: 'sha256_mismatch' });
         const registered = await postDomain(f.worker, 'domain_source', { ...REGISTER, gcs_uris: [`gs://fixture-shared-library/${WHOLE}`] });
-        expect(registered.source_record).toMatchObject({ gcs_uri: `gs://fixture-shared-library/${WHOLE}`, sha256_verified: true, pages: 582 });
+        expect(registered.source_record).toMatchObject({ gcs_uri: `gs://fixture-shared-library/${WHOLE}`, sha256_verified: false, pages: 582 });
       } finally { f.cleanup(); }
     });
   });
