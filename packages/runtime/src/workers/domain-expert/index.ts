@@ -4067,29 +4067,25 @@ export class DomainExpertService {
     await mkdir(dirname(registryPath), { recursive: true });
     const registeredAt = new Date().toISOString();
     const written: string[] = [];
-    if (options.outcome) {
-      const removed = new Set([...groupDomainSourceRecords((await readDomainSourceRegistry(registryPath)).records)]
-        .filter(([, history]) => latestDomainSourceRecord(history).removed).map(([sourceId]) => sourceId));
-      const live = (record: Record<string, unknown> | undefined) => (record && removed.has(String(record.source_id)) ? undefined : record);
-      input = { ...input, batchRecord: live(input.batchRecord), source: live(input.source) };
-      if (!input.batchRecord && !input.source) return written;
-    }
+    // A run's later records are not written for a source removed meanwhile (checked under the append lock).
+    const append = (record: Record<string, unknown>) => (options.outcome
+      ? this.appendRegistryJsonLineUnlessRemoved(registryPath, record)
+      : this.appendRegistryJsonLine(registryPath, record).then(() => true));
     if (input.batchRecord) {
-      await this.appendRegistryJsonLine(registryPath, { ...input.batchRecord, ...fields, registered_at: registeredAt });
-      written.push(String(input.batchRecord.source_id));
+      if (await append({ ...input.batchRecord, ...fields, registered_at: registeredAt })) written.push(String(input.batchRecord.source_id));
     }
     if (input.source) {
       // The source keeps its catalogue fields (title, author, posture); the
       // previous import's outcome fields are replaced, not carried forward.
       const carried = Object.fromEntries(Object.entries(input.source).filter(([key]) => !RAG_IMPORT_OUTCOME_FIELDS.has(key)));
-      await this.appendRegistryJsonLine(registryPath, {
+      if (await append({
         ...carried,
         ...fields,
         ...(input.batchRecord ? { import_batch_source_id: input.batchRecord.source_id } : {}),
         registered_at: registeredAt,
-      });
-      written.push(String(input.source.source_id));
+      })) written.push(String(input.source.source_id));
     }
+    if (!written.length) return written;
     const logPath = resolveInside(input.rootPath, `${input.manifest.workspace_relative_path}/references/ingest-log.md`);
     await appendFile(logPath, `- ${registeredAt} ${String(fields.ingest_status)} ${written.join(', ')} (rag_corpus ${input.action})\n`, 'utf8');
     return written;
@@ -6490,7 +6486,13 @@ export class DomainExpertService {
       // while the source still holds any of them; only parts cut here from the
       // original's bytes are proven.
       if (heldUnverified(history, registryRecordGcsUris(record))) record.sha256_verified = false;
-      await this.appendRegistryJsonLine(registryPath, record);
+      if (context.running) {
+        if (!(await this.appendRegistryJsonLineUnlessRemoved(registryPath, record))) {
+          return { status: 'removed', source_id: sourceId, reason: 'The source was removed while this import was running; nothing more was recorded.', registry_relative_path: registryRelativePath };
+        }
+      } else {
+        await this.appendRegistryJsonLine(registryPath, record);
+      }
       context.sourceId = sourceId;
       if (running) context.running = true;
       if (!mode.progress) {
@@ -6520,6 +6522,17 @@ export class DomainExpertService {
 
   private async appendRegistryJsonLine(path: string, record: Record<string, unknown>): Promise<void> {
     await this.withRegistryAppendLock(() => appendCompleteLine(path, JSON.stringify(record)));
+  }
+
+  // Appends a run's later record unless its source was removed meanwhile, checked and written
+  // under the append lock so a removal (whose tombstone takes the same lock) cannot fall between.
+  private async appendRegistryJsonLineUnlessRemoved(path: string, record: Record<string, unknown>): Promise<boolean> {
+    return this.withRegistryAppendLock(async () => {
+      const history = (await readDomainSourceRegistry(path)).records.filter((entry) => entry.sourceId === String(record.source_id));
+      if (history.length && latestDomainSourceRecord(history).removed) return false;
+      await appendCompleteLine(path, JSON.stringify(record));
+      return true;
+    });
   }
 
   private async withRagCorpusMappingLock<T>(operation: () => Promise<T>): Promise<T> {
