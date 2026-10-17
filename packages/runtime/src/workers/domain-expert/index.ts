@@ -1842,7 +1842,8 @@ export class DomainExpertService {
     const existingHolding = recordedSourceHolding(existing?.holding);
     const existingUris = existingHolding?.whole ? [existingHolding.whole.gcs_uri] : existingHolding?.parts.map((part) => part.gcs_uri) ?? [];
     const existingCorpus = existing?.holding ? stringRecordField(existing.holding, 'target_corpus_id') : undefined;
-    if (existing && existingUris.length && (existingUris.join('\n') !== uris.join('\n') || (existingCorpus !== undefined && existingCorpus !== corpusId))) {
+    const sameCorpus = existingCorpus === undefined || await this.corporaMatch(manifest, existingCorpus, corpusId);
+    if (existing && existingUris.length && (existingUris.join('\n') !== uris.join('\n') || !sameCorpus)) {
       throw new DomainExpertWorkerError(
         409,
         'source_identity_conflict',
@@ -1850,7 +1851,7 @@ export class DomainExpertService {
         'If that holding is wrong, remove the source with domain_source remove first; a source keeps one holding.',
       );
     }
-    const settled = existing?.current.ingest_status === 'imported' && existing.current.source_sha256 === sha256 && existingCorpus === corpusId
+    const settled = existing?.current.ingest_status === 'imported' && existing.current.source_sha256 === sha256 && existingCorpus !== undefined && sameCorpus
       && (existingHolding?.whole !== undefined || existingHolding?.parts?.every((part) => part.first_page !== undefined) === true);
     if (existing && existingUris.length && settled) {
       return {
@@ -3822,6 +3823,17 @@ export class DomainExpertService {
     // is uploaded or imported again.
     const holding = await this.annasSourceHolding(manifest, params, corpusId, context);
     if (holding.kind === 'present') return { status: 'imported', ...corpusTarget, source_sha256: context.sha256, ...holding.result };
+    if (holding.kind === 'conflict') {
+      return {
+        status: 'blocked',
+        ...corpusTarget,
+        error: {
+          code: 'source_identity_conflict',
+          message: `The source registry records this file (sha256 ${context.sha256.slice(0, 12)}) as ${holding.source_id}, held in corpus ${holding.corpus}. A source keeps one holding, so nothing was uploaded or imported into ${corpusId}; the download is still on disk at ${sourcePath}.`,
+          suggestion: `Import into ${holding.corpus}, where the source already is, or remove the source with domain_source remove first.`,
+        },
+      };
+    }
     if (holding.kind === 'unknown') {
       return {
         status: 'blocked',
@@ -3925,11 +3937,14 @@ export class DomainExpertService {
       // Registered from a split's parts: the sha256 is the operator's, not measured.
       ...(found.holding?.sha256_verified === false ? { identity_verified: false } : {}),
     };
-    // The registry's word stands in for an unreadable listing only for the corpus it recorded.
-    const sameCorpus = (stringRecordField(found.holding ?? {}, 'target_corpus_id') ?? corpusId) === corpusId;
+    // A source keeps one holding: one recorded in another corpus is not imported again here.
+    const recordedCorpus = stringRecordField(found.holding ?? {}, 'target_corpus_id');
+    if (recordedCorpus && !(await this.corporaMatch(manifest, recordedCorpus, corpusId))) {
+      return { kind: 'conflict', source_id: found.sourceId, corpus: recordedCorpus };
+    }
     if (holding.whole) {
       const file = listed?.[0];
-      if (file?.state === 'ACTIVE' || (!listed && sameCorpus && holding.whole.status === 'imported')) {
+      if (file?.state === 'ACTIVE' || (!listed && holding.whole.status === 'imported')) {
         return {
           kind: 'present',
           result: {
@@ -3944,7 +3959,7 @@ export class DomainExpertService {
     }
     const parts = holding.parts.map((part, position) => {
       const file = listed?.[position];
-      const present = listed ? file?.state === 'ACTIVE' : sameCorpus && part.status === 'imported';
+      const present = listed ? file?.state === 'ACTIVE' : part.status === 'imported';
       const ragFileName = typeof file?.rag_file_name === 'string' ? file.rag_file_name : part.rag_file_name;
       return { ...part, present, ...(ragFileName ? { rag_file_name: ragFileName } : {}) };
     });
@@ -3975,6 +3990,18 @@ export class DomainExpertService {
   // carried one, the latest for the same Anna locator. The holding is the
   // latest record of that source that names corpus objects. A missing or
   // unreadable registry finds nothing; the upload's own checks still hold.
+  // Whether two corpus references name the same corpus: equal, or resolving to
+  // the same resource. One that cannot be resolved is not taken as the same.
+  private async corporaMatch(manifest: ReturnType<typeof domainManifest>, left: string, right: string): Promise<boolean> {
+    if (left === right) return true;
+    try {
+      const [a, b] = await Promise.all([this.resolveRagCorpus(manifest, left), this.resolveRagCorpus(manifest, right)]);
+      return a.resourceName === b.resourceName;
+    } catch {
+      return false;
+    }
+  }
+
   private async registeredSourceForIdentity(
     manifest: ReturnType<typeof domainManifest>,
     sha256: string,
@@ -8931,7 +8958,8 @@ type AnnasSourceHolding =
   | { kind: 'none' }
   | { kind: 'present'; result: Record<string, unknown> }
   | { kind: 'partial'; source_id: string; parts: AnnasRecordedPart[]; listing_error?: string }
-  | { kind: 'unknown'; source_id: string; reason: string };
+  | { kind: 'unknown'; source_id: string; reason: string }
+  | { kind: 'conflict'; source_id: string; corpus: string };
 
 // The registry source for an identity. A source matches by the sha256 any of
 // its records carries; a source none of whose records carries one matches by
@@ -9007,11 +9035,13 @@ function recordedSourceHolding(
 // each named <name>--partNofM.pdf for the same M, N from 1 to M once each.
 function orderedHoldingUris(uris: string[]): string[] {
   if (uris.length <= 1) return uris;
-  const named = uris.map((uri) => ({ uri, match: /--part(\d+)of(\d+)\.pdf$/i.exec(uri) }));
+  const named = uris.map((uri) => ({ uri, match: /^(.*)--part(\d+)of(\d+)\.pdf$/i.exec(uri) }));
   const of = uris.length;
-  const indices = named.map(({ match }) => (match && Number(match[2]) === of ? Number(match[1]) : 0));
-  if (indices.some((index) => index < 1 || index > of) || new Set(indices).size !== of) {
-    throw new DomainExpertWorkerError(400, 'invalid_params', `gcs_uris lists ${of} parts, so each must be a PDF named <name>--partNof${of}.pdf with N from 1 to ${of} once each.`);
+  const indices = named.map(({ match }) => (match && Number(match[3]) === of ? Number(match[2]) : 0));
+  // One split: every part shares the same object path before --partNofM.pdf.
+  const stems = new Set(named.map(({ match }) => match?.[1]));
+  if (indices.some((index) => index < 1 || index > of) || new Set(indices).size !== of || stems.size !== 1) {
+    throw new DomainExpertWorkerError(400, 'invalid_params', `gcs_uris lists ${of} parts, so each must be a PDF named <name>--partNof${of}.pdf with the same <name> and N from 1 to ${of} once each.`);
   }
   return named.map((entry, position) => ({ ...entry, index: indices[position]! })).sort((left, right) => left.index - right.index).map(({ uri }) => uri);
 }
