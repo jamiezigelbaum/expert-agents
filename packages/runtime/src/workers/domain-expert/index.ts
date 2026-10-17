@@ -751,6 +751,7 @@ export class DomainExpertService {
   private annasImportPollIntervalMs: number;
   private annasImportPollTimeoutMs: number;
   private annasResponseBudgetMs: number;
+  private readonly sourceLocks = new SourceIdentityLocks();
   private notion: NotionRuntimeClient;
   private dataDir: string;
   private fetchImpl: typeof fetch;
@@ -1366,7 +1367,8 @@ export class DomainExpertService {
         ...(holding.part ? { sourcePart: holding.part } : {}),
         ...(holding.unverified ? { sourceIdentityVerified: false } : {}),
       } : {};
-      if (!isPdfUri(uri)) return fields;
+      // A PDF is known by its recorded type, else by its key's suffix.
+      if (!holding?.pdf && !isPdfUri(uri)) return fields;
       const span = chunkPageSpan(context);
       // A part recorded without its range (#37): its offset in the original is unknown.
       if (holding?.part && holding.first_page === undefined) return fields;
@@ -1406,7 +1408,9 @@ export class DomainExpertService {
       const holding = recordedSourceHolding(record);
       // An object any record registered without proof of its sha256 (a hand split, an object
       // that changed during its import) is cited with its source marked unverified.
-      const cited = (uri: string) => ({ source_id: sourceId, ...(heldUnverified(history, [uri]) ? { unverified: true } : {}) });
+      // A record of a PDF the pipeline imported says so, whatever the object's key.
+      const pdf = record.content_type === PDF_CONTENT_TYPE;
+      const cited = (uri: string) => ({ source_id: sourceId, ...(heldUnverified(history, [uri]) ? { unverified: true } : {}), ...(pdf ? { pdf: true } : {}) });
       if (holding?.whole) holdings.set(holding.whole.gcs_uri, cited(holding.whole.gcs_uri));
       // A batch record lists several whole objects; each is cited under the record's source
       // unless a source of its own (registered by its sha256) names it too.
@@ -1766,6 +1770,30 @@ export class DomainExpertService {
     }
     if (dryRun) return plan;
     const sourceRecord = (plan as { source_record: Record<string, unknown> }).source_record;
+    // A source given its identity is registered under that identity's lock, like any import of it.
+    const lock = typeof params.sha256 === 'string' && params.sha256.trim()
+      ? await this.sourceLocks.acquire(sourceLockKey(manifest, params.sha256.trim()), 'domain_source add', this.sourceLockDeadline())
+      : undefined;
+    if (lock && 'heldBy' in lock) {
+      const busy = await this.sourceImportBusy(manifest, params.sha256!.trim(), lock.heldBy);
+      const error = busy.error as { code: string; message: string; suggestion: string };
+      throw new DomainExpertWorkerError(409, error.code, error.message.replace('Nothing was imported here.', 'Nothing was registered.'), error.suggestion);
+    }
+    try {
+      return await this.addDomainSource(params, manifest, sourceRecord, rootPath, registryPath, registryRelativePath);
+    } finally {
+      lock?.release();
+    }
+  }
+
+  private async addDomainSource(
+    params: DomainSourceParams,
+    manifest: ReturnType<typeof domainManifest>,
+    sourceRecord: Record<string, unknown>,
+    rootPath: string,
+    registryPath: string,
+    registryRelativePath: string,
+  ): Promise<Record<string, unknown>> {
     if (params.gcsUris?.length) return this.registerSourceHolding(params, manifest, sourceRecord, rootPath, registryPath, registryRelativePath);
     const logPath = resolveInside(rootPath, `${manifest.workspace_relative_path}/references/ingest-log.md`);
     await mkdir(dirname(registryPath), { recursive: true });
@@ -2161,6 +2189,9 @@ export class DomainExpertService {
   private async ragCorpus(params: RagCorpusParams, options: {
     wholeObject?: boolean; sourceSha256?: string; identitySource?: Record<string, unknown>;
     pinned?: { bucket: string; objectName: string; generation: string | undefined };
+    // Given the import's verification while it may still run, so a caller holding the
+    // source's lock keeps it until the outcome is recorded.
+    holdUntil?: (work: Promise<unknown>) => void;
   } = {}): Promise<unknown> {
     if (params.action === 'ensure') return this.ensureRagCorpus(params);
     const dryRun = params.dryRun ?? true;
@@ -2334,7 +2365,8 @@ export class DomainExpertService {
         ...(importResultSink ? { importResultGcsSink: importResultSink } : {}),
         chunkTokens: manifest.chunking.chunk_tokens,
         chunkOverlap: manifest.chunking.chunk_overlap,
-        llmParserEligible: llmParserEligibleUris(params.gcsUri ? [params.gcsUri] : []),
+        // A PDF the pipeline identified by its bytes takes the LLM parser whatever its key says.
+        llmParserEligible: llmParserEligibleUris(params.gcsUri ? [params.gcsUri] : []) || options.identitySource?.content_type === PDF_CONTENT_TYPE,
       });
     });
     let requestRecorded: () => void = () => {};
@@ -2356,6 +2388,7 @@ export class DomainExpertService {
     // A source the caller named is verified before answering, as before. A PDF the
     // pipeline identified answers within the response budget and records its
     // outcome when the import settles.
+    if (verifying) options.holdUntil?.(verifying);
     let verified: Record<string, unknown> = {};
     if (verifying && namedSource) verified = await verifying;
     else if (verifying) {
@@ -2424,12 +2457,14 @@ export class DomainExpertService {
     }
     const context: SourceImportContext = { sha256: digest, ...(namedSource ? { sourceId: String(namedSource.source_id) } : {}) };
     const named = parseObjectNameUri(gcsUri);
+    // The record says the object is a PDF, so readers need not trust its key's suffix.
     const catalogue = namedSource
-      ? { ...Object.fromEntries(Object.entries(namedSource).filter(([key]) => !RAG_IMPORT_OUTCOME_FIELDS.has(key))), source_id: String(namedSource.source_id) }
+      ? { ...Object.fromEntries(Object.entries(namedSource).filter(([key]) => !RAG_IMPORT_OUTCOME_FIELDS.has(key))), source_id: String(namedSource.source_id), content_type: PDF_CONTENT_TYPE }
       : {
           source_id: `${manifest.domain_id}-pdf-${digest.slice(0, 16)}`,
           domain_id: manifest.domain_id,
           kind: 'pdf',
+          content_type: PDF_CONTENT_TYPE,
           ...(named?.title ? { title: named.title } : {}),
           ...(named?.creator ? { author: named.creator } : {}),
           locator: gcsUri,
@@ -2449,43 +2484,61 @@ export class DomainExpertService {
       recordProgress: (snapshot) => register(snapshot, { progress: true }),
     };
     const base = { kind: 'rag_corpus_result', domain_id: manifest.domain_id, resolved_corpus: resolvedCorpusRecord(resolved), requested_gcs_uri: gcsUri, source_sha256: digest };
-    const holding = await this.sourceHolding(source);
-    if (holding.kind === 'present') {
-      const present = { status: 'imported', ...corpusTarget, ...holding.result };
-      return { ...base, ...holding.result, status: 'already_present', source_registry: await register(present, {}), policy: domainPolicy() };
+    // From the holding check until this import's outcome (or in-progress record) is
+    // written, no other import of this file runs: it waits, then sees what this one recorded.
+    const lock = await this.sourceLocks.acquire(sourceLockKey(manifest, digest), `rag_corpus import of ${gcsUri}`, this.sourceLockDeadline());
+    if ('heldBy' in lock) return { ...base, ...(await this.sourceImportBusy(manifest, digest, lock.heldBy)), policy: domainPolicy() };
+    let handedOff = false;
+    try {
+      const holding = await this.sourceHolding(source);
+      if (holding.kind === 'present') {
+        const present = { status: 'imported', ...corpusTarget, ...holding.result };
+        return { ...base, ...holding.result, status: 'already_present', source_registry: await register(present, {}), policy: domainPolicy() };
+      }
+      if (holding.kind === 'unknown' || holding.kind === 'conflict') {
+        const refusal = holding.kind === 'unknown' ? sourceHoldingUnverified(source, holding) : sourceIdentityConflict(source, holding);
+        throw new DomainExpertWorkerError(409, refusal.code, refusal.message, refusal.suggestion);
+      }
+      const route = await this.routePdf(source, bytes, measurePdfArtifactScale(bytes).corroborated_pages, holding);
+      if ('refusal' in route) throw new DomainExpertWorkerError(422, route.refusal.code, route.refusal.message, route.refusal.suggestion);
+      if ('whole' in route) {
+        let verifying: Promise<unknown> | undefined;
+        const result = await this.ragCorpus(params, {
+          wholeObject: true, sourceSha256: digest, identitySource: { ...catalogue, source_id: context.sourceId ?? catalogue.source_id },
+          pinned: { bucket, objectName, generation: inspected.generation },
+          holdUntil: (work) => { verifying = work; },
+        });
+        if (verifying) {
+          handedOff = true;
+          void verifying.catch(() => undefined).finally(lock.release);
+        }
+        return { ...asOptionalRecord(result), source_sha256: digest };
+      }
+      // An unexpected throw still ends the run with a record.
+      const work = this.ingestSplitPdf(source, { ...route, bytes })
+        .catch((error: unknown): Record<string, unknown> => ({ status: 'blocked', ...corpusTarget, error: ingestErrorRecord(error) }));
+      const settled = await this.raceResponseBudget(work);
+      if (settled) return { ...base, ...settled, source_registry: await register(settled, {}), policy: domainPolicy() };
+      const registry = await register(context.snapshot ?? { status: 'import_in_progress', ...corpusTarget }, { inProgress: true });
+      // The split keeps the lock until its outcome is recorded.
+      handedOff = true;
+      void work
+        .then((outcome) => register(outcome, { recordOutcome: true }))
+        .catch((error: unknown) => {
+          console.error(JSON.stringify({ kind: 'domain_expert_pdf_split_background_error', domain_id: manifest.domain_id, code: error instanceof DomainExpertWorkerError ? error.code : 'error' }));
+        })
+        .finally(lock.release);
+      return {
+        ...base,
+        status: 'import_in_progress',
+        response_budget_ms: this.annasResponseBudgetMs,
+        hint: 'The split is still importing on the worker and records its outcome in the source registry when Vertex finishes. Check domain_source status for this source before acting; do not import it again.',
+        source_registry: registry,
+        policy: domainPolicy(),
+      };
+    } finally {
+      if (!handedOff) lock.release();
     }
-    if (holding.kind === 'unknown' || holding.kind === 'conflict') {
-      const refusal = holding.kind === 'unknown' ? sourceHoldingUnverified(source, holding) : sourceIdentityConflict(source, holding);
-      throw new DomainExpertWorkerError(409, refusal.code, refusal.message, refusal.suggestion);
-    }
-    const route = await this.routePdf(source, bytes, measurePdfArtifactScale(bytes).corroborated_pages, holding);
-    if ('refusal' in route) throw new DomainExpertWorkerError(422, route.refusal.code, route.refusal.message, route.refusal.suggestion);
-    if ('whole' in route) {
-      const result = await this.ragCorpus(params, {
-        wholeObject: true, sourceSha256: digest, identitySource: { ...catalogue, source_id: context.sourceId ?? catalogue.source_id },
-        pinned: { bucket, objectName, generation: inspected.generation },
-      });
-      return { ...asOptionalRecord(result), source_sha256: digest };
-    }
-    // An unexpected throw still ends the run with a record.
-    const work = this.ingestSplitPdf(source, { ...route, bytes })
-      .catch((error: unknown): Record<string, unknown> => ({ status: 'blocked', ...corpusTarget, error: ingestErrorRecord(error) }));
-    const settled = await this.raceResponseBudget(work);
-    if (settled) return { ...base, ...settled, source_registry: await register(settled, {}), policy: domainPolicy() };
-    const registry = await register(context.snapshot ?? { status: 'import_in_progress', ...corpusTarget }, { inProgress: true });
-    void work
-      .then((outcome) => register(outcome, { recordOutcome: true }))
-      .catch((error: unknown) => {
-        console.error(JSON.stringify({ kind: 'domain_expert_pdf_split_background_error', domain_id: manifest.domain_id, code: error instanceof DomainExpertWorkerError ? error.code : 'error' }));
-      });
-    return {
-      ...base,
-      status: 'import_in_progress',
-      response_budget_ms: this.annasResponseBudgetMs,
-      hint: 'The split is still importing on the worker and records its outcome in the source registry when Vertex finishes. Check domain_source status for this source before acting; do not import it again.',
-      source_registry: registry,
-      policy: domainPolicy(),
-    };
   }
 
   // The work's result if it settles within the response budget, else undefined
@@ -2512,21 +2565,39 @@ export class DomainExpertService {
     action: 'stage_import' | 'web_import',
     // The source the import names: it is the PDF's source when the PDF is the batch's only file.
     namedSource?: Record<string, unknown>,
+    // A live run's source locks (a dry run takes none): each PDF is routed under its sha256's lock.
+    held?: HeldSources,
   ): Promise<{ eligible: StageImportEligibleFile[]; routed: RoutedStagedPdf[] }> {
     const { manifest } = stage;
     const corpusId = stage.resolved.requested;
     const eligible: StageImportEligibleFile[] = [];
     const routed: RoutedStagedPdf[] = [];
     const named = namedSource && stage.eligible.length === 1 ? namedSource : undefined;
+    // A dry run's derived files are not written; they carry their bytes.
+    const pdfBytes = new Map<StageImportEligibleFile, { bytes: Uint8Array; digest: string }>();
+    for (const file of stage.eligible) {
+      if (!isPdfUri(file.workspaceRelativePath)) continue;
+      const bytes = file.content ?? new Uint8Array(await readFile(file.absolutePath));
+      pdfBytes.set(file, { bytes, digest: sha256(bytes) });
+    }
+    // Locks are taken in sha256 order, so two batches sharing PDFs never wait on each other in a cycle.
+    const busy = new Map<string, Record<string, unknown>>();
+    if (held) {
+      const deadline = this.sourceLockDeadline();
+      for (const digest of [...new Set([...pdfBytes.values()].map((pdf) => pdf.digest))].sort()) {
+        const lock = await this.sourceLocks.acquire(sourceLockKey(manifest, digest), `rag_corpus ${action} batch`, deadline);
+        if ('heldBy' in lock) busy.set(digest, await this.sourceImportBusy(manifest, digest, lock.heldBy));
+        else held.add(digest, lock.release);
+      }
+    }
     const firstOfDigest = new Map<string, string>();
     for (const file of stage.eligible) {
-      if (!isPdfUri(file.workspaceRelativePath)) {
+      const pdf = pdfBytes.get(file);
+      if (!pdf) {
         eligible.push(file);
         continue;
       }
-      // A dry run's derived files are not written; they carry their bytes.
-      const bytes = file.content ?? new Uint8Array(await readFile(file.absolutePath));
-      const digest = sha256(bytes);
+      const { bytes, digest } = pdf;
       // One source, one holding: a later file with the same bytes is this batch's duplicate.
       const first = firstOfDigest.get(digest);
       if (first) {
@@ -2537,15 +2608,24 @@ export class DomainExpertService {
         continue;
       }
       firstOfDigest.set(digest, file.workspaceRelativePath);
+      const entry = { workspace_relative_path: file.workspaceRelativePath, source_sha256: digest };
+      // Another operation on this file held it past the response budget: it records the outcome.
+      const elsewhere = busy.get(digest);
+      if (elsewhere) {
+        routed.push({ entry, corpusId, route: 'in_progress', outcome: elsewhere });
+        continue;
+      }
       const context: SourceImportContext = { sha256: digest, ...(named ? { sourceId: String(named.source_id) } : {}) };
       const name = basename(file.uploadRelativePath).replace(/\.pdf$/i, '');
       const catalogue = named ? {
         ...Object.fromEntries(Object.entries(named).filter(([key]) => !RAG_IMPORT_OUTCOME_FIELDS.has(key))),
         source_id: String(named.source_id),
+        content_type: PDF_CONTENT_TYPE,
       } : {
         source_id: `${manifest.domain_id}-pdf-${digest.slice(0, 16)}`,
         domain_id: manifest.domain_id,
         kind: 'pdf',
+        content_type: PDF_CONTENT_TYPE,
         title: name,
         workspace_relative_path: file.workspaceRelativePath,
         acquisition: action,
@@ -2567,7 +2647,6 @@ export class DomainExpertService {
         }),
         recordProgress: (snapshot) => register(snapshot, { progress: true }),
       };
-      const entry = { workspace_relative_path: file.workspaceRelativePath, source_sha256: digest };
       const otherIdentity = named ? otherRecordedIdentity(named, digest) : undefined;
       if (otherIdentity) {
         routed.push({ entry, corpusId, route: 'refused', outcome: { status: 'blocked', error: {
@@ -2592,26 +2671,8 @@ export class DomainExpertService {
       else {
         routed.push({
           entry, corpusId, route: 'split', pages: route.pages, parts: route.plan.length, register,
-          // Checked again right before the split runs. The plan stands only while the source
-          // is as routing found it; anything another import changed meanwhile is reported, never split over.
-          split: async () => {
-            const now = await this.sourceHolding(source);
-            if (now.kind === holding.kind && (now.kind === 'none' || now.kind === 'partial')) return this.ingestSplitPdf(source, { ...route, bytes });
-            if (now.kind === 'present') return { status: 'imported', target_corpus_id: corpusId, ...now.result };
-            if (now.kind === 'conflict') return { status: 'blocked', target_corpus_id: corpusId, error: sourceIdentityConflict(source, now) };
-            if (now.kind === 'unknown') return { status: 'blocked', target_corpus_id: corpusId, error: sourceHoldingUnverified(source, now) };
-            const held = now.kind === 'partial' ? now : undefined;
-            return {
-              status: 'blocked',
-              target_corpus_id: corpusId,
-              ...(held ? { gcs_uris: held.parts.map((part) => part.gcs_uri) } : {}),
-              error: {
-                code: 'source_import_in_progress',
-                message: `Another import of this file (${held?.source_id ?? 'its source'}) began while this batch ran: ${held ? `${held.parts.filter((part) => part.present).length} of ${held.parts.length} parts are in the corpus` : 'its holding changed'}. Nothing was split or imported here; ${source.kept}.`,
-                suggestion: `${source.rerun} once that import settles; it then resumes the recorded parts.`,
-              },
-            };
-          },
+          // The source's lock is held from routing through the split, so nothing changed it meanwhile.
+          split: () => this.ingestSplitPdf(source, { ...route, bytes }),
         });
       }
     }
@@ -2622,28 +2683,43 @@ export class DomainExpertService {
   // or refused is reported and registered at once; the split PDFs import one at a
   // time after the batch import, and past the response budget they finish on the
   // worker and record their outcomes there.
-  private async importRoutedStagedPdfs(routed: RoutedStagedPdf[]): Promise<Array<Record<string, unknown>>> {
+  // Each PDF's source lock (held) is released once its outcome is recorded.
+  private async importRoutedStagedPdfs(routed: RoutedStagedPdf[], held?: HeldSources): Promise<Array<Record<string, unknown>>> {
     const results: Array<Record<string, unknown> | undefined> = [];
     for (const pdf of routed) {
       if (pdf.split) {
         results.push(undefined);
         continue;
       }
-      const registry = pdf.register ? await pdf.register(pdf.outcome!, {}) : undefined;
-      results.push({ ...pdf.entry, route: pdf.route, ...pdf.outcome, ...(registry ? { source_registry: registry } : {}) });
+      // A duplicate's lock is its first file's; one in progress elsewhere holds none here.
+      try {
+        const registry = pdf.register ? await pdf.register(pdf.outcome!, {}) : undefined;
+        results.push({ ...pdf.entry, route: pdf.route, ...pdf.outcome, ...(registry ? { source_registry: registry } : {}) });
+      } finally {
+        if (pdf.route !== 'duplicate') held?.release(pdf.entry.source_sha256);
+      }
     }
     // Each PDF's registry writes run in order, so an in-progress record never lands after its outcome.
     const splits = routed.flatMap((pdf, index) => (pdf.split ? [{ pdf, index, ended: false, writes: Promise.resolve() as Promise<unknown> }] : []));
+    // The splits may outlive the request: they keep their locks and release each once its outcome is recorded.
+    for (const split of splits) held?.handOff(split.pdf.entry.source_sha256);
     const work = (async () => {
       for (const split of splits) {
-        // An unexpected throw still ends that PDF's run with a record.
-        const outcome = await split.pdf.split!().catch((error: unknown): Record<string, unknown> => ({ status: 'blocked', error: ingestErrorRecord(error) }));
-        split.ended = true;
-        const registry = await (split.writes = split.writes.then(() => split.pdf.register!(outcome, {})));
-        results[split.index] = { ...split.pdf.entry, route: split.pdf.route, ...outcome, source_registry: registry };
+        try {
+          // An unexpected throw still ends that PDF's run with a record.
+          const outcome = await split.pdf.split!().catch((error: unknown): Record<string, unknown> => ({ status: 'blocked', error: ingestErrorRecord(error) }));
+          split.ended = true;
+          const registry = await (split.writes = split.writes.then(() => split.pdf.register!(outcome, {})));
+          results[split.index] = { ...split.pdf.entry, route: split.pdf.route, ...outcome, source_registry: registry };
+        } finally {
+          held?.release(split.pdf.entry.source_sha256);
+        }
       }
       return true;
-    })();
+    })().finally(() => {
+      // A throw that ended the loop early must not leave a later split's lock held.
+      for (const split of splits) held?.release(split.pdf.entry.source_sha256);
+    });
     if (splits.length && await this.raceResponseBudget(work) === undefined) {
       void work.catch((error: unknown) => {
         console.error(JSON.stringify({ kind: 'domain_expert_pdf_split_background_error', code: error instanceof DomainExpertWorkerError ? error.code : 'error' }));
@@ -2672,12 +2748,22 @@ export class DomainExpertService {
       ...pdf.entry,
       route: pdf.route,
       ...(pdf.route === 'split' ? { pages: pdf.pages, parts: pdf.parts } : {}),
-      ...(pdf.route === 'refused' ? { error: pdf.outcome!.error } : {}),
+      ...(pdf.route === 'refused' || pdf.route === 'in_progress' ? { error: pdf.outcome!.error } : {}),
       ...(pdf.route === 'duplicate' ? { duplicate_of: pdf.outcome!.duplicate_of } : {}),
     }));
   }
 
   private async stageRagImport(params: RagCorpusParams, dryRun: boolean): Promise<unknown> {
+    // The batch's source locks: whatever is not handed to a background split is released when the call ends.
+    const held = new HeldSources();
+    try {
+      return await this.stageRagImportHolding(params, dryRun, held);
+    } finally {
+      held.releaseRest();
+    }
+  }
+
+  private async stageRagImportHolding(params: RagCorpusParams, dryRun: boolean, held: HeldSources): Promise<unknown> {
     const manifest = this.manifest(params.domainId);
     const corpusId = params.corpusId ?? defaultCorpusId(manifest);
     const root = this.rootFor(manifest.workspace_root_id);
@@ -2704,7 +2790,7 @@ export class DomainExpertService {
     }
     const registeredSource = dryRun ? undefined : await this.registeredImportSource(manifest, rootPath, params.sourceId);
     // The PDFs take the shared pipeline first; the batch is what stays.
-    const pdfs = await this.routeStagedPdfs(stage, 'stage_import', registeredSource);
+    const pdfs = await this.routeStagedPdfs(stage, 'stage_import', registeredSource, dryRun ? undefined : held);
     // The batch cap counts only what the batch stages.
     const batch = capStagedBatch(pdfs.eligible);
     const destination = stage.destination;
@@ -2753,7 +2839,7 @@ export class DomainExpertService {
       };
     }
     if (!eligible.length) {
-      const pdfSources = await this.importRoutedStagedPdfs(pdfs.routed);
+      const pdfSources = await this.importRoutedStagedPdfs(pdfs.routed, held);
       return { kind: 'rag_corpus_stage_import_result', status: routedPdfStatus(pdfSources), ...base, pdf_sources: pdfSources };
     }
     const { stagedFiles, warnings: stagingWarnings } = await this.executeStageImport({ ...stage, destination, eligible });
@@ -2777,6 +2863,8 @@ export class DomainExpertService {
       }),
       ...(registeredSource ? { source: registeredSource } : {}),
     });
+    // The batch record now holds each whole PDF's outcome.
+    for (const file of eligible) if (file.sha256) held.release(file.sha256);
     const importResolvedCorpus = resolvedCorpusRecord(imported.resolved);
     const warnings = [...stagingWarnings, ...imported.warnings];
     return {
@@ -2789,7 +2877,7 @@ export class DomainExpertService {
       ...imported.receipt,
       import_outcome: imported.import_outcome,
       source_registry: imported.source_registry,
-      ...(pdfs.routed.length ? { pdf_sources: await this.importRoutedStagedPdfs(pdfs.routed) } : {}),
+      ...(pdfs.routed.length ? { pdf_sources: await this.importRoutedStagedPdfs(pdfs.routed, held) } : {}),
     };
   }
 
@@ -2814,6 +2902,16 @@ export class DomainExpertService {
   }
 
   private async webRagImport(params: RagCorpusParams, dryRun: boolean): Promise<unknown> {
+    // The batch's source locks: whatever is not handed to a background split is released when the call ends.
+    const held = new HeldSources();
+    try {
+      return await this.webRagImportHolding(params, dryRun, held);
+    } finally {
+      held.releaseRest();
+    }
+  }
+
+  private async webRagImportHolding(params: RagCorpusParams, dryRun: boolean, held: HeldSources): Promise<unknown> {
     const manifest = this.manifest(params.domainId);
     this.requireExplicitCorpus(manifest, 'web_import', params.corpusId);
     const corpusId = params.corpusId ?? defaultCorpusId(manifest);
@@ -2890,7 +2988,7 @@ export class DomainExpertService {
       });
     // The PDFs take the shared pipeline first; the batch is what stays.
     const pdfs = stage
-      ? await this.routeStagedPdfs(stage, 'web_import', registeredSource)
+      ? await this.routeStagedPdfs(stage, 'web_import', registeredSource, dryRun ? undefined : held)
       : { eligible: [], routed: [] as RoutedStagedPdf[] };
     // The batch cap counts only what the batch stages.
     const batch = capStagedBatch(pdfs.eligible);
@@ -2979,7 +3077,7 @@ export class DomainExpertService {
       };
     }
     if (!eligible.length) {
-      const pdfSources = await this.importRoutedStagedPdfs(pdfs.routed);
+      const pdfSources = await this.importRoutedStagedPdfs(pdfs.routed, held);
       return { kind: 'rag_corpus_web_import_result', status: routedPdfStatus(pdfSources), ...base, pdf_sources: pdfSources };
     }
     const { stagedFiles, warnings: stagingWarnings } = await this.executeStageImport({ ...stage, destination, eligible });
@@ -3004,6 +3102,8 @@ export class DomainExpertService {
       }),
       ...(registeredSource ? { source: registeredSource } : {}),
     });
+    // The batch record now holds each whole PDF's outcome.
+    for (const file of eligible) if (file.sha256) held.release(file.sha256);
     const importResolvedCorpus = resolvedCorpusRecord(imported.resolved);
     const warnings = [...stagingWarnings, ...imported.warnings];
     return {
@@ -3016,7 +3116,7 @@ export class DomainExpertService {
       ...imported.receipt,
       import_outcome: imported.import_outcome,
       source_registry: imported.source_registry,
-      ...(pdfs.routed.length ? { pdf_sources: await this.importRoutedStagedPdfs(pdfs.routed) } : {}),
+      ...(pdfs.routed.length ? { pdf_sources: await this.importRoutedStagedPdfs(pdfs.routed, held) } : {}),
     };
   }
 
@@ -4585,6 +4685,26 @@ export class DomainExpertService {
     return { kind: 'partial', source_id: found.sourceId, parts, ...(listingError ? { listing_error: listingError } : {}) };
   }
 
+  // How long an operation waits for a source's lock: its response budget, or as long as it takes without one.
+  private sourceLockDeadline(): number | undefined {
+    return this.annasResponseBudgetMs > 0 ? Date.now() + this.annasResponseBudgetMs : undefined;
+  }
+
+  // The answer when another operation holds this file's lock past the response budget:
+  // in progress, pointing at the source that operation records.
+  private async sourceImportBusy(manifest: ReturnType<typeof domainManifest>, sha256: string, heldBy: string): Promise<Record<string, unknown>> {
+    const found = await this.registeredSourceForIdentity(manifest, sha256, undefined);
+    return {
+      status: 'import_in_progress',
+      ...(found ? { source_id: found.sourceId } : {}),
+      error: {
+        code: 'source_import_in_progress',
+        message: `Another operation on this file (${heldBy}) is still running${found ? ` and records it as ${found.sourceId}` : ''}. Nothing was imported here.`,
+        suggestion: 'Check domain_source status for this source once that operation settles; do not import it again meanwhile.',
+      },
+    };
+  }
+
   // The domain's registry record for a source identity: the latest source
   // whose records carry this sha256, or, for a record written before sources
   // carried one, the latest for the same Anna locator. The holding is the
@@ -5920,9 +6040,37 @@ export class DomainExpertService {
     sourcePath: string,
   ): Promise<{ ragIngest: Record<string, unknown>; registry: Record<string, unknown> }> {
     const context: SourceImportContext = { sha256 };
+    // The source's lock is held until this ingest's outcome is recorded (see SourceIdentityLocks).
+    const lock = await this.sourceLocks.acquire(sourceLockKey(manifest, sha256), `annas_archive_import of ${locator}`, this.sourceLockDeadline());
+    if ('heldBy' in lock) {
+      const busy = await this.sourceImportBusy(manifest, sha256, lock.heldBy);
+      return {
+        ragIngest: { ...busy, ...(params.corpusId ? { target_corpus_id: params.corpusId } : {}) },
+        registry: { status: 'not_recorded', reason: 'Another operation on this file holds it and records its outcome.' },
+      };
+    }
     // An unexpected throw still ends the run with a record, like any other outcome.
     const work = this.tryAnnasRagIngest(manifest, params, locator, format, bytes, scale, sourcePath, context)
       .catch((error: unknown): Record<string, unknown> => ({ status: 'blocked', error: ingestErrorRecord(error) }));
+    let handedOff = false;
+    try {
+      return await this.answerAnnasIngest(manifest, params, locator, format, context, sourcePath, work, () => { handedOff = true; return lock.release; });
+    } finally {
+      if (!handedOff) lock.release();
+    }
+  }
+
+  private async answerAnnasIngest(
+    manifest: ReturnType<typeof domainManifest>,
+    params: AnnasArchiveImportParams,
+    locator: string,
+    format: string,
+    context: SourceImportContext,
+    sourcePath: string,
+    work: Promise<Record<string, unknown>>,
+    // Hands the lock to the background work, which releases it once the outcome is recorded.
+    handOff: () => () => void,
+  ): Promise<{ ragIngest: Record<string, unknown>; registry: Record<string, unknown> }> {
     const settled = await this.raceResponseBudget(work);
     if (settled) {
       return { ragIngest: settled, registry: await this.registerAnnasIngest(manifest, params, locator, format, context, settled) };
@@ -5935,6 +6083,7 @@ export class DomainExpertService {
     };
     // A split already running has written its parts; the in-progress record keeps them.
     const registry = await this.registerAnnasIngest(manifest, params, locator, format, context, context.snapshot ?? ragIngest, { inProgress: true });
+    const release = handOff();
     void work
       .then(async (outcome) => {
         await this.registerAnnasIngest(manifest, params, locator, format, context, outcome, { recordOutcome: true });
@@ -5957,7 +6106,8 @@ export class DomainExpertService {
           domain_id: manifest.domain_id,
           code: error instanceof DomainExpertWorkerError ? error.code : 'error',
         }));
-      });
+      })
+      .finally(release);
     return { ragIngest, registry };
   }
 
@@ -9608,7 +9758,7 @@ interface SourceImportContext {
 // A batch whose every file was a routed PDF: imported (or present, or still
 // importing) when any was, refused when every one was.
 function routedPdfStatus(pdfSources: Array<Record<string, unknown>>): string {
-  return pdfSources.every((pdf) => pdf.status === 'blocked' || pdf.status === 'skipped_duplicate') ? 'pdf_sources_refused' : 'pdf_sources_routed';
+  return pdfSources.every((pdf) => pdf.status === 'blocked' || pdf.status === 'skipped_duplicate' || pdf.route === 'in_progress') ? 'pdf_sources_refused' : 'pdf_sources_routed';
 }
 
 // A staged PDF the shared pipeline took out of its batch: reported present or
@@ -9616,7 +9766,7 @@ function routedPdfStatus(pdfSources: Array<Record<string, unknown>>): string {
 interface RoutedStagedPdf {
   entry: { workspace_relative_path: string; source_sha256: string };
   corpusId: string;
-  route: 'present' | 'split' | 'refused' | 'duplicate';
+  route: 'present' | 'split' | 'refused' | 'duplicate' | 'in_progress';
   pages?: number;
   parts?: number;
   outcome?: Record<string, unknown>;
@@ -9672,6 +9822,71 @@ interface RecordedPart {
   pages?: number;
   rag_file_name?: string;
   present?: boolean;
+}
+
+// One operation at a time per source identity. Every path that routes or imports a
+// file (acquisition, rag_corpus import, staged routing and its deferred splits,
+// domain_source add) holds its sha256's lock from checking the holding until it has
+// written the outcome or an in-progress record, so the next one sees that record
+// instead of a stale holding. A holder that answers in progress keeps the lock in the
+// background until its outcome is recorded. A waiter waits at most the response budget
+// (forever when there is none) and then answers in progress, naming the holder. The
+// worker is one process, so the lock is in memory; several worker processes on one
+// registry would need a distributed lock.
+class SourceIdentityLocks {
+  readonly #held = new Map<string, { holder: string; wake: Array<() => void> }>();
+
+  // deadline: when to stop waiting (ms since epoch); undefined waits as long as it takes.
+  async acquire(key: string, holder: string, deadline: number | undefined): Promise<{ release: () => void } | { heldBy: string }> {
+    deadline ??= Number.POSITIVE_INFINITY;
+    for (;;) {
+      const current = this.#held.get(key);
+      if (!current) {
+        const entry = { holder, wake: [] as Array<() => void> };
+        this.#held.set(key, entry);
+        let released = false;
+        return {
+          release: () => {
+            if (released) return;
+            released = true;
+            if (this.#held.get(key) === entry) this.#held.delete(key);
+            for (const wake of entry.wake) wake();
+          },
+        };
+      }
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) return { heldBy: current.holder };
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      await new Promise<void>((resolveWait) => {
+        current.wake.push(resolveWait);
+        if (Number.isFinite(remaining)) timer = setTimeout(resolveWait, remaining);
+      });
+      clearTimeout(timer);
+    }
+  }
+}
+
+// The source locks a staged batch holds, by sha256. Each is released once that PDF's
+// outcome (or in-progress record) is written; a split running past the response budget
+// is handed off and releases its own when its outcome is recorded.
+class HeldSources {
+  readonly #releases = new Map<string, () => void>();
+  readonly #handedOff = new Set<string>();
+
+  add(sha256: string, release: () => void): void { this.#releases.set(sha256, release); }
+  handOff(sha256: string): void { this.#handedOff.add(sha256); }
+  release(sha256: string): void {
+    this.#releases.get(sha256)?.();
+    this.#releases.delete(sha256);
+  }
+  // Everything not handed off to background work: the batch is done with it.
+  releaseRest(): void {
+    for (const sha256 of [...this.#releases.keys()]) if (!this.#handedOff.has(sha256)) this.release(sha256);
+  }
+}
+
+function sourceLockKey(manifest: ReturnType<typeof domainManifest>, sha256: string): string {
+  return `${manifest.domain_id}:${sha256.toLowerCase()}`;
 }
 
 type SourceHolding =
@@ -9858,7 +10073,7 @@ function heldUnverified(history: DomainSourceRegistryRecord[], uris: string[]): 
 
 // A corpus object as citations attribute it: its source, a split's part and range, and
 // whether the registry ever recorded it without proof of the source's sha256.
-interface CitedHolding { source_id: string; part?: string; first_page?: number; last_page?: number; unverified?: boolean }
+interface CitedHolding { source_id: string; part?: string; first_page?: number; last_page?: number; unverified?: boolean; pdf?: boolean }
 
 // The objects a registry record holds: its gcs_uri, or each entry of its rag_files list.
 function registryRecordGcsUris(record: Record<string, unknown>): string[] {
@@ -10055,6 +10270,7 @@ const RAG_IMPORT_OUTCOME_FIELDS = new Set([
 // One imported object is recorded flat, the shape the hand-corrected records
 // use; a batch of several keeps a rag_files list.
 const PDF_HEADER = '%PDF-';
+const PDF_CONTENT_TYPE = 'application/pdf';
 
 function isPdfUri(uri: string): boolean {
   return /\.pdf$/i.test(uri);

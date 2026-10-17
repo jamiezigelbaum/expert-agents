@@ -242,7 +242,8 @@ split or one refused leaves the batch. The plan's `pdf_routing` and the
 receipt's `pdf_sources` list each such PDF with its route (`present`, `split`,
 `refused`, or `duplicate` for a later file with the same bytes as an earlier
 one in the batch, reported `duplicate_in_batch` with `duplicate_of` and not
-imported; a split also checks the corpus again right before it runs); `eligible_files` lists only what the batch stages, and a batch of
+imported; or `in_progress` when another operation on the same file still holds
+it past the response budget); `eligible_files` lists only what the batch stages, and a batch of
 refused PDFs answers `pdf_sources_refused`. The 100 MiB batch cap counts only
 the files the batch stages; a routed PDF is bounded by the per-file limit alone
 (web_import's 100 MiB fetch budget still covers everything it fetches). Each staged file is
@@ -275,7 +276,18 @@ A PDF imported by URI without `source_id` is registered under its sha256 as
 `<domain>-pdf-<sha prefix>` and answers within the response budget. A
 single object is a PDF when its key ends in `.pdf` or, under any other key, when
 its first five bytes are `%PDF-` (a ranged read; an unreadable object answers
-502 `gcs_object_unreadable`). A `rag_corpus import` of a GCS directory
+502 `gcs_object_unreadable`). Its record then says `content_type:
+application/pdf`, so it takes the LLM parser and its citations carry pages
+whatever its key. One operation at a time works on a file: every route that
+checks or imports a source (acquisition, `rag_corpus import`, staged routing
+and its deferred splits, `domain_source add` with a sha256) holds a lock on its
+sha256 from checking the holding until it has written the outcome or an
+in-progress record, and a split that outlives its request keeps the lock until
+its outcome is recorded. Another operation on the same file waits for it, then
+sees what it recorded; past the response budget it answers
+`import_in_progress` (`source_import_in_progress`, naming the holder and the
+source) instead. The lock lives in the worker process: running several worker
+processes against one registry would need a distributed lock. A `rag_corpus import` of a GCS directory
 (`gs://…/prefix/`) or a Drive file does not take the pipeline: it is imported as before, so a long PDF in it is not
 split. The library materializer imports each object whole and does not split:
 under the LLM parser its CLI counts each PDF's pages with `qpdf`, in a plan as
