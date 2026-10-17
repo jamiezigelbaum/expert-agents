@@ -36,7 +36,7 @@ describe('packaged expert factory', () => {
     expect(output.content[0]!.text).toContain('factory_owner_required');
   });
 
-  test('passes the live System GitHub selection on private stdin and no GitHub credential in the environment', async () => {
+  test('passes the live System GitHub selection on private stdin, the host proxy and CA settings, and no GitHub credential in the environment', async () => {
     const root = await realpath(await mkdtemp(join(tmpdir(), 'expert-plugin-github-')));
     roots.push(root);
     // Stands in for Bun: records what the factory process would receive and answers like the factory.
@@ -52,8 +52,15 @@ describe('packaged expert factory', () => {
         if (tool.name === 'expert_factory') found = tool;
       },
     });
-    const ambient = { GH_TOKEN: process.env.GH_TOKEN, GITHUB_TOKEN: process.env.GITHUB_TOKEN, GH_CONFIG_DIR: process.env.GH_CONFIG_DIR };
-    Object.assign(process.env, { GH_TOKEN: 'synthetic-ambient-token', GITHUB_TOKEN: 'synthetic-ambient-token', GH_CONFIG_DIR: join(root, 'host-gh') });
+    // A host behind a proxy: these reach the factory with their values unchanged.
+    const network = {
+      HTTPS_PROXY: 'http://proxy.example.invalid:3128', https_proxy: 'http://proxy.example.invalid:3129',
+      NO_PROXY: 'localhost,127.0.0.1', no_proxy: '127.0.0.1', SSL_CERT_FILE: join(root, 'ca.pem'), SSL_CERT_DIR: join(root, 'certs'),
+      GIT_SSL_CAINFO: join(root, 'git-ca.pem'), NODE_EXTRA_CA_CERTS: join(root, 'node-ca.pem'),
+    };
+    const injected = { GH_TOKEN: 'synthetic-ambient-token', GITHUB_TOKEN: 'synthetic-ambient-token', GH_CONFIG_DIR: join(root, 'host-gh'), EXAMPLE_UNLISTED_SETTING: 'withheld', ...network };
+    const ambient = Object.fromEntries(Object.keys(injected).map((name) => [name, process.env[name]]));
+    Object.assign(process.env, injected);
     try {
       for (const profileId of profileIds) {
         runtime = runtimeConfig(profileId);
@@ -64,8 +71,12 @@ describe('packaged expert factory', () => {
         expect(envelope.github).toEqual({ profileId, stateDir: join(root, 'state') });
         // The running Gateway's reload mode travels from the same live snapshot.
         expect(envelope.gateway).toEqual(profileId === profileIds[0] ? { reloadMode: 'off' } : {});
-        const env = (await readFile(join(root, 'env.txt'), 'utf8')).split('\n').filter(Boolean).map((line) => line.split('=')[0]!);
-        expect(env.filter((name) => /^(GH_|GITHUB_)/.test(name))).toEqual([]);
+        const env = Object.fromEntries((await readFile(join(root, 'env.txt'), 'utf8')).split('\n').filter((line) => line.includes('='))
+          .map((line) => [line.slice(0, line.indexOf('=')), line.slice(line.indexOf('=') + 1)]));
+        expect(Object.keys(env).filter((name) => /^(GH_|GITHUB_)/.test(name))).toEqual([]);
+        expect(env).toMatchObject(network);
+        expect(env.EXAMPLE_UNLISTED_SETTING).toBeUndefined();
+        expect(output.content[0]!.text).not.toContain('environment_withheld');
       }
     } finally {
       for (const [name, value] of Object.entries(ambient)) if (value === undefined) delete process.env[name]; else process.env[name] = value;
@@ -77,6 +88,39 @@ describe('packaged expert factory', () => {
         tools: { github: { profileId, kind: 'oauth' } },
         plugins: { entries: { 'expert-agents': { config: { domainExpert: { enabled: true }, factory: { enabled: true, bunBin: fakeBun } } } } },
       };
+    }
+  });
+
+  test('withholds a proxy URL that carries a credential from every factory command, naming it but never its value', async () => {
+    const root = await realpath(await mkdtemp(join(tmpdir(), 'expert-plugin-proxy-')));
+    roots.push(root);
+    const fakeBun = join(root, 'bun');
+    await writeFile(fakeBun, `#!/bin/sh\ncat > "${root}/stdin.json"\nenv > "${root}/env.txt"\nprintf '%s' '{"result":{"kind":"expert_factory","agent_id":"example","status":"planned","next_action":"fixture"}}'\n`, { mode: 0o700 });
+    const runtime = { plugins: { entries: { 'expert-agents': { config: { domainExpert: { enabled: true }, factory: { enabled: true, bunBin: fakeBun } } } } } };
+    let found: NativeTool | undefined;
+    plugin.register({
+      pluginConfig: {}, runtime: { state: { resolveStateDir: () => join(root, 'state') } },
+      registerTool: (registration) => {
+        const tool = typeof registration === 'function' ? registration({ senderIsOwner: true, getRuntimeConfig: () => runtime }) : registration;
+        if (tool.name === 'expert_factory') found = tool;
+      },
+    });
+    const secret = 'synthetic-proxy-password';
+    const injected = { HTTPS_PROXY: `http://proxy-user:${secret}@proxy.example.invalid:3128`, https_proxy: 'http://proxy.example.invalid:3129', NO_PROXY: '127.0.0.1' };
+    const ambient = Object.fromEntries(Object.keys(injected).map((name) => [name, process.env[name]]));
+    Object.assign(process.env, injected);
+    try {
+      const output = await found!.execute('fixture', { action: 'status', agent_id: 'example' });
+      const env = await readFile(join(root, 'env.txt'), 'utf8');
+      expect(env).not.toContain(secret);
+      expect(env).not.toMatch(/^HTTPS_PROXY=/m);
+      expect(env).toContain('https_proxy=http://proxy.example.invalid:3129');
+      expect(env).toContain('NO_PROXY=127.0.0.1');
+      expect(JSON.parse(output.content[0]!.text)).toMatchObject({ environment_withheld: ['HTTPS_PROXY'] });
+      expect(output.content[0]!.text).not.toContain(secret);
+      expect(await readFile(join(root, 'stdin.json'), 'utf8')).not.toContain(secret);
+    } finally {
+      for (const [name, value] of Object.entries(ambient)) if (value === undefined) delete process.env[name]; else process.env[name] = value;
     }
   });
 
