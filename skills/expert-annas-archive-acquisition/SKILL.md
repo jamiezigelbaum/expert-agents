@@ -63,12 +63,12 @@ how many parts imported; `rag_ingest.parts` lists each part's page range in
 the original, status and coverage (`covered`, `text_layer_absent` for a scan
 the parser read from images — probe it with `domain_ask` — `not_covered` or
 `unverified`). When a part fails or is blocked the error is
-`annas_pdf_split_import_incomplete`, naming each part and its pages; re-run
+`pdf_split_import_incomplete`, naming each part and its pages; re-run
 the same import once the cause is cleared: parts already in the corpus are
 kept, a failed part's leftover ragFile is removed, and only the parts not yet
 imported are imported again. The registry records each part as it goes, so a
 re-run after a worker restart also resumes where the split stopped. If
-splitting fails the code is `annas_pdf_split_failed` and the file stays on
+splitting fails the code is `pdf_split_failed` and the file stays on
 disk. A book already in the corpus whole is not split; when that cannot be
 checked the import stops with `annas_pdf_whole_copy_unverified` — re-run it
 later rather than splitting by hand. On a host that cannot split (no qpdf, or

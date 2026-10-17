@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import { createHash } from 'node:crypto';
 import {
+  appendFileSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -35,12 +36,13 @@ import {
 import {
   bookObjectStem,
   assertAllowedGcsDestination,
+  stagedRunId,
   createDomainExpertWorker as createRawDomainExpertWorker,
   domainExpertAnnasConfigFromEnv,
   reciprocalRankFuse,
   type DomainExpertWorkerOptions,
   type DomainExpertReranker, parseLibgenSearchHtml } from '../src/workers/domain-expert/index.ts';
-import { pdfPartStem, planPdfParts, qpdfPageCount, splitPdf, stripPdfPartSuffix } from '../src/workers/domain-expert/pdf-split.ts';
+import { pdfPartStem, planPdfParts, qpdfPageCount, splitPdf, stripPdfPartSuffix } from '@expert-agents/library';
 import { TEST_AGENT_ROUTING } from './routing-fixture.ts';
 import { buildEpub } from '../../library/test/epub-fixture.ts';
 
@@ -664,6 +666,9 @@ describe('ported retrieval regressions', () => {
   });
 });
 
+// The smallest object a PDF import can read: a header and nothing qpdf can count.
+const FIXTURE_PDF_TEXT = '%PDF-1.7\n% fixture object\n';
+
 describe('RAG ingestion configuration', () => {
   const corpusResource = 'projects/fixture-project/locations/us-central1/ragCorpora/1001';
 
@@ -678,6 +683,8 @@ describe('RAG ingestion configuration', () => {
         accessToken: 'fixture-google-token',
         fetchImpl: fakeGoogleFetch(calls, {
           ragCorpora: [{ name: corpusResource, displayName: 'history-library' }],
+          // A PDF import reads the object to identify it and count its pages.
+          gcsObjects: { [gcsUri.replace('gs://fixture-shared-library/', '')]: FIXTURE_PDF_TEXT },
         }),
         ...google,
       },
@@ -793,6 +800,7 @@ describe('RAG ingestion configuration', () => {
         accessToken: 'fixture-google-token',
         fetchImpl: fakeGoogleFetch(calls, {
           ragCorpora: [{ name: corpusResource, displayName: 'history-library' }],
+          gcsObjects: { 'v1/objects/book.pdf': FIXTURE_PDF_TEXT },
           ragFiles: [
             // The failed record for this exact object: Vertex dedupes against
             // it and would otherwise return skippedRagFilesCount and no-op.
@@ -826,6 +834,7 @@ describe('RAG ingestion configuration', () => {
         accessToken: 'fixture-google-token',
         fetchImpl: fakeGoogleFetch(calls, {
           ragCorpora: [{ name: corpusResource, displayName: 'history-library' }],
+          gcsObjects: { 'v1/objects/book.pdf': FIXTURE_PDF_TEXT },
           ragFiles: [
             { name: `${corpusResource}/ragFiles/healthy-1`, gcsSource: { uris: ['gs://fixture-shared-library/v1/objects/book.pdf'] }, fileStatus: { state: 'ACTIVE' } },
           ],
@@ -843,10 +852,12 @@ describe('RAG ingestion configuration', () => {
     expect(calls.filter((call) => call.method === 'DELETE')).toHaveLength(0);
   });
 
-  test('a staged re-import clears ERROR records anywhere under its staging directory', async () => {
+  test('a staged re-import clears ERROR records anywhere under its run directory', async () => {
     const fixture = workspaceFixture();
     const calls: CapturedCall[] = [];
     const stagedErrorFile = 'projects/fixture-project/locations/us-central1/ragCorpora/1234567890123456789/ragFiles/staged-error';
+    // The same bytes again stage into the same run directory, so its earlier ERROR record is in the way.
+    const runDirectory = stagedRunDirectory('gs://fixture-shared-library/v1/staged/research/retry-fixture/', { 'note.md': 'retry' });
     try {
       const sourceDir = join(fixture.workspaceRoot, 'experts', 'research', 'sources', 'retry');
       mkdirSync(sourceDir, { recursive: true });
@@ -859,8 +870,14 @@ describe('RAG ingestion configuration', () => {
             ragFiles: [
               {
                 name: stagedErrorFile,
-                gcsSource: { uris: ['gs://fixture-shared-library/v1/staged/research/retry-fixture/note.md'] },
+                gcsSource: { uris: [`${runDirectory}note.md`] },
                 fileStatus: { state: 'ERROR', errorStatus: 'failed to insert chunks' },
+              },
+              {
+                // Another run of the batch, which staged other bytes: its directory is never imported here.
+                name: 'projects/fixture-project/locations/us-central1/ragCorpora/1234567890123456789/ragFiles/other-run',
+                gcsSource: { uris: ['gs://fixture-shared-library/v1/staged/research/retry-fixture/run-0000000000000000/note.md'] },
+                fileStatus: { state: 'ERROR' },
               },
               {
                 name: 'projects/fixture-project/locations/us-central1/ragCorpora/1234567890123456789/ragFiles/elsewhere',
@@ -892,7 +909,12 @@ describe('RAG ingestion configuration', () => {
     const fixture = workspaceFixture();
     const calls: CapturedCall[] = [];
     const longStem = `${'games-and-puzzles-as-computational-systems-'.repeat(2)}essay-writings`;
-    const stagedPrefix = 'v1/staged/research/long-names/';
+    // The run's directory, named by the shortened names and their bytes.
+    const stagedPrefix = stagedRunDirectory('v1/staged/research/long-names/', {
+      [`${longStem.slice(0, 77)}.md`]: '# essay',
+      [`${longStem.slice(0, 76)}.pdf`]: syntheticPdfBytes(1),
+      'short.md': 'short',
+    });
     const stagedErrorFile = 'projects/fixture-project/locations/us-central1/ragCorpora/1234567890123456789/ragFiles/long-error';
     try {
       const sourceDir = join(fixture.workspaceRoot, 'experts', 'research', 'sources', 'long');
@@ -906,8 +928,8 @@ describe('RAG ingestion configuration', () => {
           accessToken: 'fixture-google-token',
           fetchImpl: fakeGoogleFetch(calls, {
             ragFiles: [{
-              // A failed record from an earlier attempt at this batch, staged
-              // under the old mangled name: cleanup still matches it by prefix.
+              // A failed record in this run's directory under the old mangled
+              // name: cleanup still matches it by prefix.
               name: stagedErrorFile,
               gcsSource: { uris: [`gs://fixture-shared-library/${stagedPrefix}${longStem.slice(0, 79)}.m`] },
               fileStatus: { state: 'ERROR' },
@@ -937,7 +959,7 @@ describe('RAG ingestion configuration', () => {
       for (const name of uploaded) expect(name.slice(stagedPrefix.length).length).toBeLessThanOrEqual(80);
       expect((result.staged_files as Array<{ gcs_uri: string }>).map((file) => file.gcs_uri).sort())
         .toEqual(uploaded.map((name) => `gs://fixture-shared-library/${name}`));
-      // The import and the ERROR cleanup both work on the batch directory, so
+      // The import and the ERROR cleanup both work on the run directory, so
       // shortening a file name never moves a file out of their reach.
       const importConfig = JSON.parse(calls.find((call) => call.url.endsWith('/ragFiles:import'))!.body).importRagFilesConfig;
       expect(importConfig.gcsSource.uris).toEqual([`gs://fixture-shared-library/${stagedPrefix}`]);
@@ -1023,8 +1045,14 @@ describe('ported staging regressions', () => {
           pdf_max_file_bytes: 100_000_000,
         },
       });
+      // A plan names the run directory a live run of the same files stages into.
+      const runDirectory = stagedRunDirectory('gs://fixture-shared-library/v1/staged/research/caps-fixture/', {
+        'good.md': 'good', 'large.pdf': new Uint8Array((10 * 1024 * 1024) + 1),
+      });
       expect(result.destination).toMatchObject({
-        gcs_uri_prefix: 'gs://fixture-shared-library/v1/staged/research/caps-fixture/',
+        gcs_uri_prefix: runDirectory,
+        batch_gcs_uri_prefix: 'gs://fixture-shared-library/v1/staged/research/caps-fixture/',
+        run_id: runDirectory.split('/').at(-2),
         allowed_gcs_prefixes: ['gs://fixture-shared-library/v1'],
       });
       expect(result.skipped_files).toEqual([
@@ -4317,7 +4345,12 @@ function fakeGoogleFetch(
       const encodedName = new URL(url).pathname.split('/o/')[1];
       const objectName = encodedName === undefined ? '' : decodeURIComponent(encodedName);
       const value = options.gcsObjects?.[objectName];
-      return value === undefined ? jsonResponse({ error: 'fixture object not found' }, 404) : new Response(value);
+      if (value === undefined) return jsonResponse({ error: 'fixture object not found' }, 404);
+      // A metadata read answers as GCS does; any other read answers the object.
+      if (new URL(url).searchParams.get('fields')?.includes('md5Hash')) {
+        return jsonResponse({ generation: '1', size: String(Buffer.byteLength(value)), md5Hash: createHash('md5').update(value).digest('base64') });
+      }
+      return new Response(value);
     }
     // Staging uploads each eligible file before requesting the corpus import.
     if (method === 'POST' && url.includes('/upload/storage/v1/b/')) {
@@ -4772,6 +4805,16 @@ function fakeIngestGoogleFetch(calls: CapturedCall[], objects: FakeGcsObjects = 
   }) as typeof fetch;
 }
 
+// Each fixture object's generation, which every write bumps, as in GCS.
+const fakeGcsGenerations = new WeakMap<FakeGcsObjects, Map<string, number>>();
+
+function writeFakeGcsObject(objects: FakeGcsObjects, name: string, bytes: Uint8Array): void {
+  objects.set(name, bytes);
+  const generations = fakeGcsGenerations.get(objects) ?? new Map<string, number>();
+  fakeGcsGenerations.set(objects, generations);
+  generations.set(name, (generations.get(name) ?? 1) + 1);
+}
+
 function fakeGcsObjectResponse(url: string, method: string, init: RequestInit | undefined, objects: FakeGcsObjects): Promise<Response> | undefined {
   const parsed = new URL(url);
   if (parsed.hostname !== 'storage.googleapis.com') return undefined;
@@ -4781,7 +4824,7 @@ function fakeGcsObjectResponse(url: string, method: string, init: RequestInit | 
       if (parsed.searchParams.get('ifGenerationMatch') === '0' && objects.has(name)) {
         return jsonResponse({ error: { code: 412, message: 'precondition failed' } }, 412);
       }
-      objects.set(name, new Uint8Array(await new Response(init?.body as BodyInit).arrayBuffer()));
+      writeFakeGcsObject(objects, name, new Uint8Array(await new Response(init?.body as BodyInit).arrayBuffer()));
       return jsonResponse({ name });
     })();
   }
@@ -4794,7 +4837,7 @@ function fakeGcsObjectResponse(url: string, method: string, init: RequestInit | 
     const bytes = objects.get(name);
     if (!bytes) return Promise.resolve(jsonResponse({ error: { code: 404, message: 'No such object' } }, 404));
     return Promise.resolve(jsonResponse({
-      generation: '1',
+      generation: String(fakeGcsGenerations.get(objects)?.get(name) ?? 1),
       size: String(bytes.byteLength),
       md5Hash: createHash('md5').update(bytes).digest('base64'),
     }));
@@ -5497,7 +5540,8 @@ describe('acquisition ingest registers the imported source', () => {
 describe('rag_corpus imports record their verified outcome in the source registry', () => {
   const CORPUS = 'projects/fixture-project/locations/us-central1/ragCorpora/1234567890123456789';
   const OPERATION = `${CORPUS}/operations/import-1`;
-  const stagedUri = (batch: string, file: string) => `gs://fixture-shared-library/v1/staged/research/${batch}/${file}`;
+  // A one-file batch's staged URI: its run directory is named by the file's path and bytes.
+  const stagedUri = (batch: string, file: string, bytes: string = 'staged') => `${stagedRunDirectory(`gs://fixture-shared-library/v1/staged/research/${batch}/`, { [file]: bytes })}${file}`;
 
   function importFixture(google: Parameters<typeof fakeGoogleFetch>[1] = {}, overrides: Partial<DomainExpertWorkerOptions> = {}) {
     const fixture = workspaceFixture();
@@ -5641,6 +5685,7 @@ describe('rag_corpus imports record their verified outcome in the source registr
     const ragFileName = `${CORPUS}/ragFiles/active-3`;
     const f = importFixture({
       ragFiles: [{ name: ragFileName, gcsSource: { uris: [gcsUri] }, fileStatus: { state: 'ACTIVE' } }],
+      gcsObjects: { 'v1/objects/paper.pdf': FIXTURE_PDF_TEXT },
     });
     try {
       await postDomain(f.worker, 'domain_source', {
@@ -5654,21 +5699,76 @@ describe('rag_corpus imports record their verified outcome in the source registr
       expect(result.source_registry).toMatchObject({ status: 'recorded', source_ids: ['source-plain'] });
       const records = f.readRegistry();
       expect(records.map((record) => record.ingest_status)).toEqual(['not_ingested', 'import_requested', 'imported']);
-      expect(records[2]).toMatchObject({ source_id: 'source-plain', title: 'Plain Paper', gcs_uri: gcsUri, rag_file_name: ragFileName });
+      expect(records[2]).toMatchObject({
+        source_id: 'source-plain', title: 'Plain Paper', gcs_uri: gcsUri, rag_file_name: ragFileName,
+        source_sha256: createHash('sha256').update(FIXTURE_PDF_TEXT).digest('hex'),
+      });
       expect(records[2]).not.toHaveProperty('import_batch_source_id');
     } finally {
       f.cleanup();
     }
   });
 
-  test('a plain import without source_id writes no registry record', async () => {
+  test('a plain PDF import without source_id answers within the response budget and records its outcome later', async () => {
+    const gcsUri = 'gs://fixture-shared-library/v1/objects/slow-paper.pdf';
+    let finished = false;
+    const f = importFixture({
+      gcsObjects: { 'v1/objects/slow-paper.pdf': FIXTURE_PDF_TEXT },
+      importOperation: (name) => (finished ? { name, done: true, response: { importedRagFilesCount: '1' } } : { name, done: false }),
+    }, { annas: { importPollIntervalMs: 1, importPollTimeoutMs: 5_000, responseBudgetMs: 20 } });
+    try {
+      const started = Date.now();
+      const result = await postDomain(f.worker, 'rag_corpus', { action: 'import', domain_id: 'research', corpus_id: '1234567890123456789', gcs_uri: gcsUri, dry_run: false });
+      expect(Date.now() - started).toBeLessThan(2_000);
+      expect(result).toMatchObject({ status: 'import_requested', source_registry: { status: 'recording' } });
+      expect(f.readRegistry().at(-1)).toMatchObject({ ingest_status: 'import_requested' });
+      finished = true;
+      const deadline = Date.now() + 5_000;
+      while (f.readRegistry().at(-1)!.ingest_status === 'import_requested' && Date.now() < deadline) await Bun.sleep(10);
+      expect(f.readRegistry().at(-1)!.ingest_status).not.toBe('import_requested');
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  test('a plain import of a non-PDF object without source_id writes no registry record', async () => {
     const f = importFixture();
     try {
       const result = await postDomain(f.worker, 'rag_corpus', {
-        action: 'import', domain_id: 'research', corpus_id: '1234567890123456789', gcs_uri: 'gs://fixture-shared-library/v1/objects/paper.pdf', dry_run: false,
+        action: 'import', domain_id: 'research', corpus_id: '1234567890123456789', gcs_uri: 'gs://fixture-shared-library/v1/objects/paper.md', dry_run: false,
       });
       expect(result).not.toHaveProperty('source_registry');
       expect(() => f.readRegistry()).toThrow();
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  // One identity per source: a PDF imported by URI is registered under its sha256, so any
+  // route that later meets the same file finds it present.
+  test('a plain PDF import without source_id registers the file by its sha256', async () => {
+    const gcsUri = 'gs://fixture-shared-library/v1/objects/example-author---plain-paper-1990.pdf';
+    const f = importFixture({
+      ragFiles: [{ name: `${CORPUS}/ragFiles/active-4`, gcsSource: { uris: [gcsUri] }, fileStatus: { state: 'ACTIVE' } }],
+      gcsObjects: { 'v1/objects/example-author---plain-paper-1990.pdf': FIXTURE_PDF_TEXT },
+    });
+    const digest = createHash('sha256').update(FIXTURE_PDF_TEXT).digest('hex');
+    try {
+      const result = await postDomain(f.worker, 'rag_corpus', {
+        action: 'import', domain_id: 'research', corpus_id: '1234567890123456789', gcs_uri: gcsUri, dry_run: false,
+      });
+      expect(result).toMatchObject({ status: 'import_requested', source_sha256: digest, source_registry: { status: 'recorded', source_ids: [`research-pdf-${digest.slice(0, 16)}`] } });
+      expect(f.readRegistry().at(-1)).toMatchObject({
+        source_id: `research-pdf-${digest.slice(0, 16)}`, kind: 'pdf', title: 'Plain Paper', author: 'Example Author', locator: gcsUri,
+        acquisition: 'rag_corpus_import', source_sha256: digest, ingest_status: 'imported', gcs_uri: gcsUri,
+      });
+      // The same file imported again is present: nothing is submitted.
+      const imports = f.calls.filter((call) => call.url.endsWith('/ragFiles:import')).length;
+      const again = await postDomain(f.worker, 'rag_corpus', {
+        action: 'import', domain_id: 'research', corpus_id: '1234567890123456789', gcs_uri: gcsUri, dry_run: false,
+      });
+      expect(again).toMatchObject({ status: 'already_present', gcs_uri: gcsUri, import_outcome: { already_present: true }, source_registry: { status: 'unchanged' } });
+      expect(f.calls.filter((call) => call.url.endsWith('/ragFiles:import'))).toHaveLength(imports);
     } finally {
       f.cleanup();
     }
@@ -5830,8 +5930,10 @@ describe('rag_corpus imports record their verified outcome in the source registr
 
   test('a web_import batch record settles to imported instead of staying import_requested', async () => {
     const ragFileName = `${CORPUS}/ragFiles/web-1`;
-    const f = importFixture({
-      ragFiles: [{ name: ragFileName, gcsSource: { uris: [stagedUri('web-batch', 'fixture-page.md')] }, fileStatus: { state: 'ACTIVE' } }],
+    // The converted page's staged URI: its run directory is named by bytes the extractor writes.
+    const pageUri = () => `gs://fixture-shared-library/${uploadedObjectNames(f.calls).find((name) => name.endsWith('/fixture-page.md'))}`;
+    const f: ReturnType<typeof importFixture> = importFixture({
+      ragFiles: () => [{ name: ragFileName, gcsSource: { uris: [pageUri()] }, fileStatus: { state: 'ACTIVE' } }],
     }, {
       resolveHostImpl: async () => ['93.184.216.34'],
       webImportFetchImpl: async () => new Response(
@@ -5849,6 +5951,8 @@ describe('rag_corpus imports record their verified outcome in the source registr
         dry_run: false,
       });
       expect(result.import_outcome).toMatchObject({ status: 'imported' });
+      expect(pageUri()).toStartWith(`${result.destination.gcs_uri_prefix}`);
+      expect(result.destination.gcs_uri_prefix).toMatch(/\/v1\/staged\/research\/web-batch\/run-[0-9a-f]{16}\/$/);
       const records = f.readRegistry();
       expect(records.map((record) => [record.source_id, record.ingest_status])).toEqual([
         ['research-web-import-web-batch', 'import_requested'],
@@ -5858,7 +5962,7 @@ describe('rag_corpus imports record their verified outcome in the source registr
         kind: 'web_import',
         urls: ['https://example.com/article'],
         rag_file_name: ragFileName,
-        gcs_uri: stagedUri('web-batch', 'fixture-page.md'),
+        gcs_uri: pageUri(),
         rag_operation_name: OPERATION,
       });
     } finally {
@@ -6312,6 +6416,13 @@ function sha256Hex(bytes: Uint8Array): string {
   return createHash('sha256').update(bytes).digest('hex');
 }
 
+// The directory a run of a batch stages into, named by each staged file's path and bytes.
+function stagedRunDirectory(batchPrefix: string, files: Record<string, string | Uint8Array>): string {
+  return `${batchPrefix}${stagedRunId(Object.entries(files).map(([uploadRelativePath, bytes]) => ({
+    uploadRelativePath, sha256: createHash('sha256').update(bytes).digest('hex'),
+  })))}/`;
+}
+
 // #33: the LLM parser fails PDFs of about 300 pages and more (docs/vertex-rag-limits.md). A
 // longer PDF is split with qpdf into parts of at most 200 pages, each imported and
 // coverage-checked on its own, the workaround that imported 9 of 9 parts by hand.
@@ -6325,13 +6436,13 @@ describe('splitting long PDFs for LLM-parser imports', () => {
   const STEM = 'v1/book-imports/research/author---the-fixture-compendium-1989';
   const partUri = (index: number, of: number) => `gs://fixture-shared-library/${STEM}--part${index}of${of}.pdf`;
 
-  type ImportBehaviour = (part: string, attempt: number) => Record<string, unknown> | Response;
+  type ImportBehaviour = (part: string, attempt: number, objects: FakeGcsObjects) => Record<string, unknown> | Response;
 
   // Vertex as the parts see it: each import names one object and its outcome is chosen per part
   // name. A successful import lists an ACTIVE ragFile; a failed one leaves an ERROR ragFile, and
   // Vertex skips a re-import of any URI it holds a record for, ERROR records included, until
   // that record is deleted.
-  function splitGoogleFetch(calls: CapturedCall[], behaviour: ImportBehaviour, listing: { state?: string; status?: () => number | undefined; displayNameOnly?: boolean } = {}, seed: { objects?: Array<[string, Uint8Array]>; imported?: string[] } = {}): typeof fetch {
+  function splitGoogleFetch(calls: CapturedCall[], behaviour: ImportBehaviour, listing: { state?: string; status?: () => number | undefined; displayNameOnly?: boolean; contexts?: Array<Record<string, unknown>> } = {}, seed: { objects?: Array<[string, Uint8Array]>; imported?: string[] } = {}): typeof fetch {
     const objects: FakeGcsObjects = new Map(seed.objects ?? []);
     const imported = new Map<string, string>((seed.imported ?? []).map((uri, index) => [uri, `${CORPUS}/ragFiles/8000${index}`]));
     const errored = new Map<string, string>();
@@ -6349,14 +6460,22 @@ describe('splitting long PDFs for LLM-parser imports', () => {
         const attempt = (attempts.get(part) ?? 0) + 1;
         attempts.set(part, attempt);
         // A refusal (quota, busy corpus) comes before Vertex looks at the file; a held URI is skipped.
-        const chosen = behaviour(part, attempt);
+        const chosen = behaviour(part, attempt, objects);
         if (chosen instanceof Response) return chosen;
-        const outcome = imported.has(uri) || errored.has(uri) ? { skippedRagFilesCount: '1' } : chosen;
+        // A directory import makes one ragFile per object under it, as Vertex does.
+        const prefix = uri.endsWith('/') ? uri.replace('gs://fixture-shared-library/', '') : undefined;
+        const files = prefix ? [...objects.keys()].filter((name) => name.startsWith(prefix)).map((name) => `gs://fixture-shared-library/${name}`) : [uri];
+        const held = files.length > 0 && files.every((file) => imported.has(file) || errored.has(file));
+        const outcome = held ? { skippedRagFilesCount: String(files.length) } : chosen;
         operations += 1;
-        if ('importedRagFilesCount' in outcome) imported.set(uri, `${CORPUS}/ragFiles/${9000 + operations}`);
-        if ('error' in outcome) errored.set(uri, `${CORPUS}/ragFiles/${7000 + operations}`);
+        for (const [index, file] of files.entries()) {
+          if (imported.has(file) || errored.has(file)) continue;
+          if ('importedRagFilesCount' in outcome) imported.set(file, `${CORPUS}/ragFiles/${9000 + operations}${index ? `-${index}` : ''}`);
+          if ('error' in outcome) errored.set(file, `${CORPUS}/ragFiles/${7000 + operations}${index ? `-${index}` : ''}`);
+        }
         return jsonResponse({ name: `${CORPUS}/operations/split-${operations}`, done: true, ...(('error' in outcome) ? { error: outcome.error } : { response: outcome }) });
       }
+      if (url.endsWith(':retrieveContexts')) return jsonResponse({ contexts: { contexts: listing.contexts ?? [] } });
       if (method === 'DELETE' && url.includes('/ragFiles/')) {
         const name = new URL(url).pathname.replace(/^\/v1\//, '');
         for (const records of [imported, errored]) for (const [uri, file] of records) if (file === name) records.delete(uri);
@@ -6381,17 +6500,20 @@ describe('splitting long PDFs for LLM-parser imports', () => {
   function splitFixture(bytes: Uint8Array, behaviour: ImportBehaviour, options: SplitOptions & {
     listingState?: string; listingStatus?: number | (() => number | undefined); listingDisplayNameOnly?: boolean;
     seed?: { objects?: Array<[string, Uint8Array]>; imported?: string[] };
+    // Stands in front of the fake Google, to act at a chosen call (start an overlapping request, say).
+    wrapGoogleFetch?: (next: typeof fetch) => typeof fetch;
   } = {}) {
     const fixture = workspaceFixture();
     const booksRoot = join(fixture.base, 'books');
     mkdirSync(booksRoot);
     const googleCalls: CapturedCall[] = [];
     const listingStatus = options.listingStatus;
-    const googleFetch = splitGoogleFetch(googleCalls, behaviour, {
+    const fakeGoogle = splitGoogleFetch(googleCalls, behaviour, {
       ...(options.listingState ? { state: options.listingState } : {}),
       ...(listingStatus !== undefined ? { status: typeof listingStatus === 'function' ? listingStatus : () => listingStatus } : {}),
       ...(options.listingDisplayNameOnly ? { displayNameOnly: true } : {}),
     }, options.seed);
+    const googleFetch = options.wrapGoogleFetch ? options.wrapGoogleFetch(fakeGoogle) : fakeGoogle;
     // A fresh worker over the same workspace, books and Google state: a restart or a reconfigured host.
     const workerWith = (overrides: SplitOptions & { bytes?: Uint8Array } = {}) => {
       const settings = { ...options, ...overrides };
@@ -6491,7 +6613,7 @@ describe('splitting long PDFs for LLM-parser imports', () => {
       const response = await postDomain(f.worker, 'annas_archive_import', PARAMS);
       expect(response).toMatchObject({
         status: 'downloaded_ingest_failed',
-        rag_ingest: { status: 'import_failed', split: { parts: 3, imported_parts: 2 }, error: { code: 'annas_pdf_split_import_incomplete' } },
+        rag_ingest: { status: 'import_failed', split: { parts: 3, imported_parts: 2 }, error: { code: 'pdf_split_import_incomplete' } },
       });
       expect(response.rag_ingest.parts.map((part: Record<string, any>) => part.status)).toEqual(['imported', 'import_failed', 'imported']);
       expect(response.rag_ingest.error.message).toContain('2 of 3 parts');
@@ -6499,7 +6621,7 @@ describe('splitting long PDFs for LLM-parser imports', () => {
       expect(response.rag_ingest.error.suggestion).toContain('only the parts not yet imported are imported again');
       expect(response.rag_ingest.parts[1].coverage).toBeUndefined();
       // The two imported parts are in the corpus, so the source is tracked with its real status.
-      expect(f.readRegistry().at(-1)).toMatchObject({ ingest_status: 'import_failed', ingest_reason: 'annas_pdf_split_import_incomplete', split_parts: 3 });
+      expect(f.readRegistry().at(-1)).toMatchObject({ ingest_status: 'import_failed', ingest_reason: 'pdf_split_import_incomplete', split_parts: 3 });
 
       const uploadsBefore = uploadedObjectNames(f.googleCalls).length;
       const callsBefore = f.googleCalls.length;
@@ -6526,7 +6648,7 @@ describe('splitting long PDFs for LLM-parser imports', () => {
       : { importedRagFilesCount: '1' }), { importPollTimeoutMs: 30 });
     try {
       const response = await postDomain(f.worker, 'annas_archive_import', PARAMS);
-      expect(response.rag_ingest).toMatchObject({ status: 'blocked', split: { imported_parts: 1 }, error: { code: 'annas_pdf_split_import_incomplete' } });
+      expect(response.rag_ingest).toMatchObject({ status: 'blocked', split: { imported_parts: 1 }, error: { code: 'pdf_split_import_incomplete' } });
       expect(response.rag_ingest.parts.map((part: Record<string, any>) => part.status)).toEqual(['imported', 'blocked', 'not_attempted']);
       expect(response.rag_ingest.parts[1].error.code).toBe('rag_import_quota_exhausted');
       expect(response.rag_ingest.parts[2].reason).toContain('Part 2 of 3 was blocked');
@@ -6654,7 +6776,7 @@ describe('splitting long PDFs for LLM-parser imports', () => {
       const response = await postDomain(f.worker, 'annas_archive_import', PARAMS);
       expect(response).toMatchObject({
         status: 'downloaded_ingest_blocked',
-        rag_ingest: { status: 'blocked', error: { code: 'annas_pdf_split_failed' }, split: { pages: 450, parts: 3 } },
+        rag_ingest: { status: 'blocked', error: { code: 'pdf_split_failed' }, split: { pages: 450, parts: 3 } },
       });
       expect(response.rag_ingest.error.message).toContain('fixture write failure');
       expect(response.rag_ingest.error.message).toContain('still on disk');
@@ -6906,7 +7028,7 @@ describe('splitting long PDFs for LLM-parser imports', () => {
         expect(response.registry.status).toBe('updated');
         const records = f.readRegistry();
         expect(records[0]!.ingest_status).toBe('import_requested');
-        expect(records.at(-1)).toMatchObject({ ingest_status: status, ingest_reason: 'annas_pdf_split_import_incomplete' });
+        expect(records.at(-1)).toMatchObject({ ingest_status: status, ingest_reason: 'pdf_split_import_incomplete' });
         expect(partStatuses(records.at(-1)!).map(([, part]: [string, string]) => part)).toEqual(parts);
       } finally { f.cleanup(); }
     });
@@ -6952,6 +7074,18 @@ describe('splitting long PDFs for LLM-parser imports', () => {
       rmSync(b.download.path);
       const again = await postDomain(f.worker, 'annas_archive_import', PARAMS);
       expect(again.rag_ingest).toMatchObject({ status: 'imported', gcs_uris: a.rag_ingest.gcs_uris, import_outcome: { already_present: true, source_id: a.registry.source_id } });
+    } finally { f.cleanup(); }
+  });
+
+  // Identity comes before every gate: a source already in the corpus is present, whatever a gate says now.
+  test('a short book imported deliberately is present on a re-run, not refused by the page floor', async () => {
+    const f = splitFixture(textPdfBytes(40), importsAll);
+    try {
+      expect((await postDomain(f.worker, 'annas_archive_import', PARAMS)).rag_ingest.error.code).toBe('annas_artifact_scale_implausible');
+      expect((await postDomain(f.worker, 'annas_archive_import', { ...PARAMS, allow_short_artifact: true })).rag_ingest.status).toBe('imported');
+      const again = await postDomain(f.worker, 'annas_archive_import', PARAMS);
+      expect(again.rag_ingest).toMatchObject({ status: 'imported', import_outcome: { already_present: true } });
+      expect(f.importedUris()).toHaveLength(1);
     } finally { f.cleanup(); }
   });
 
@@ -7005,11 +7139,597 @@ describe('splitting long PDFs for LLM-parser imports', () => {
     } finally { f.cleanup(); }
   });
 
+  // Every route shares the pipeline: a long PDF imported by URI or staged from the workspace
+  // gets the same identity check, split, coverage check and registry record.
+  describe('other import routes', () => {
+    const LONG = textPdfBytes(450);
+    const OBJECT = 'v1/library/example-author---the-long-volume-1990.pdf';
+    const partBeside = (index: number) => `gs://fixture-shared-library/v1/library/example-author---the-long-volume-1990--part${index}of3.pdf`;
+
+    test('rag_corpus import of a long GCS PDF imports it as parts beside the object, once', async () => {
+      const f = splitFixture(LONG, importsAll, { seed: { objects: [[OBJECT, LONG]] } });
+      try {
+        const response = await postDomain(f.worker, 'rag_corpus', { action: 'import', domain_id: 'research', corpus_id: CORPUS, gcs_uri: `gs://fixture-shared-library/${OBJECT}`, dry_run: false });
+        expect(response).toMatchObject({
+          kind: 'rag_corpus_result', status: 'imported', source_sha256: sha256Hex(LONG), requested_gcs_uri: `gs://fixture-shared-library/${OBJECT}`,
+          split: { pages: 450, parts: 3, imported_parts: 3, coverage: { status: 'covered' } },
+          // Progress records came first, so the outcome updates the source.
+          source_registry: { status: 'updated', source_id: `research-pdf-${sha256Hex(LONG).slice(0, 16)}` },
+        });
+        expect(f.importedUris()).toEqual([1, 2, 3].map(partBeside));
+        const record = f.readRegistry().at(-1)!;
+        expect(record).toMatchObject({ ingest_status: 'imported', source_sha256: sha256Hex(LONG), pages: 450, acquisition: 'rag_corpus_import', title: 'The Long Volume', author: 'Example Author' });
+        expect(record.rag_files.map((file: Record<string, any>) => [file.gcs_uri, file.first_page, file.last_page])).toEqual([[partBeside(1), 1, 150], [partBeside(2), 151, 300], [partBeside(3), 301, 450]]);
+        const again = await postDomain(f.worker, 'rag_corpus', { action: 'import', domain_id: 'research', corpus_id: CORPUS, gcs_uri: `gs://fixture-shared-library/${OBJECT}`, dry_run: false });
+        expect(again).toMatchObject({ status: 'already_present', gcs_uris: [1, 2, 3].map(partBeside), source_registry: { status: 'unchanged' } });
+        expect(f.importedUris()).toHaveLength(3);
+      } finally { f.cleanup(); }
+    });
+
+    test('rag_corpus import of a long GCS PDF whose parts all fail records its end', async () => {
+      const f = splitFixture(LONG, () => ({ error: { code: 13, message: 'An internal error occurred processing the file.' } }), { importPollTimeoutMs: 30, seed: { objects: [[OBJECT, LONG]] } });
+      try {
+        const response = await postDomain(f.worker, 'rag_corpus', { action: 'import', domain_id: 'research', corpus_id: CORPUS, gcs_uri: `gs://fixture-shared-library/${OBJECT}`, dry_run: false });
+        expect(response).toMatchObject({ status: 'import_failed', source_registry: { status: 'updated' } });
+        expect(f.readRegistry().at(-1)).toMatchObject({ ingest_status: 'import_failed', ingest_reason: 'pdf_split_import_incomplete' });
+      } finally { f.cleanup(); }
+    });
+
+    test('a named source that records another file is not given this one', async () => {
+      const f = splitFixture(LONG, importsAll, { seed: { objects: [[OBJECT, LONG]] } });
+      try {
+        await postDomain(f.worker, 'domain_source', { action: 'add', domain_id: 'research', source_id: 'other-file', kind: 'pdf', url: 'https://example.com/other', sha256: 'c'.repeat(64), dry_run: false });
+        const refused = await postDomainResponse(f.worker, 'rag_corpus', { action: 'import', domain_id: 'research', corpus_id: CORPUS, gcs_uri: `gs://fixture-shared-library/${OBJECT}`, source_id: 'other-file', dry_run: false });
+        expect(refused.status).toBe(409);
+        expect(((await refused.json()) as Record<string, any>).error.code).toBe('source_identity_conflict');
+        const batchDir = join(f.base, 'workspace', 'experts', 'research', 'sources', 'batch');
+        mkdirSync(batchDir, { recursive: true });
+        writeFileSync(join(batchDir, 'long-volume.pdf'), LONG);
+        const staged = await postDomain(f.worker, 'rag_corpus', {
+          action: 'stage_import', domain_id: 'research', corpus_id: CORPUS, workspace_relative_path: 'experts/research/sources/batch', batch_id: 'named-other', source_id: 'other-file', dry_run: false,
+        });
+        expect(staged).toMatchObject({ status: 'pdf_sources_refused', pdf_sources: [{ route: 'refused', error: { code: 'source_identity_conflict' } }] });
+        expect(f.importedUris()).toEqual([]);
+      } finally { f.cleanup(); }
+    });
+
+    // Vertex reads the URI after the worker inspected it: an overwrite in between must not be claimed as the inspected file.
+    test('a GCS PDF overwritten during its import is recorded with its identity unverified', async () => {
+      const SHORT_NAME = 'v1/library/example-author---a-changing-paper-1992.pdf';
+      const original = textPdfBytes(120);
+      const f = splitFixture(original, (part, _attempt, objects) => {
+        if (part === 'whole') writeFakeGcsObject(objects, SHORT_NAME, textPdfBytes(121));
+        return { importedRagFilesCount: '1' };
+      }, { seed: { objects: [[SHORT_NAME, original]] } });
+      try {
+        const response = await postDomain(f.worker, 'rag_corpus', { action: 'import', domain_id: 'research', corpus_id: CORPUS, gcs_uri: `gs://fixture-shared-library/${SHORT_NAME}`, dry_run: false });
+        expect(response).toMatchObject({ source_sha256: sha256Hex(original), import_outcome: { source_changed_during_import: true } });
+        expect(f.readRegistry().at(-1)).toMatchObject({ source_sha256: sha256Hex(original), sha256_verified: false, source_check: expect.stringContaining('changed during the import') });
+        // An object left alone keeps its identity verified (no flag).
+        const g = splitFixture(original, importsAll, { seed: { objects: [[SHORT_NAME, original]] } });
+        try {
+          await postDomain(g.worker, 'rag_corpus', { action: 'import', domain_id: 'research', corpus_id: CORPUS, gcs_uri: `gs://fixture-shared-library/${SHORT_NAME}`, dry_run: false });
+          expect(g.readRegistry().at(-1)!.sha256_verified).toBeUndefined();
+        } finally { g.cleanup(); }
+      } finally { f.cleanup(); }
+    });
+
+    test('rag_corpus import of a long GCS PDF the worker cannot split is refused before import', async () => {
+      const f = splitFixture(LONG, importsAll, { qpdfBin: 'qpdf-missing-fixture', seed: { objects: [[OBJECT, LONG]] } });
+      try {
+        const refused = await postDomainResponse(f.worker, 'rag_corpus', { action: 'import', domain_id: 'research', corpus_id: CORPUS, gcs_uri: `gs://fixture-shared-library/${OBJECT}`, dry_run: false });
+        expect(refused.status).toBe(422);
+        const body = await refused.json() as Record<string, any>;
+        expect(body.error.code).toBe('pdf_exceeds_parser_page_limit');
+        expect(body.error.message).toContain('Measured 450 pages');
+        expect(f.importedUris()).toEqual([]);
+      } finally { f.cleanup(); }
+    });
+
+    test('an acquisition finds a book imported by rag_corpus import present', async () => {
+      const f = splitFixture(LONG, importsAll, { seed: { objects: [[OBJECT, LONG]] } });
+      try {
+        await postDomain(f.worker, 'rag_corpus', { action: 'import', domain_id: 'research', corpus_id: CORPUS, gcs_uri: `gs://fixture-shared-library/${OBJECT}`, dry_run: false });
+        const acquired = await postDomain(f.worker, 'annas_archive_import', PARAMS);
+        expect(acquired.rag_ingest).toMatchObject({ status: 'imported', gcs_uris: [1, 2, 3].map(partBeside), import_outcome: { already_present: true } });
+        expect(uploadedObjectNames(f.googleCalls)).toEqual([1, 2, 3].map((index) => partBeside(index).replace('gs://fixture-shared-library/', '')));
+        expect(f.importedUris()).toHaveLength(3);
+      } finally { f.cleanup(); }
+    });
+
+    const SHORT = textPdfBytes(120);
+    const SHORT_OBJECT = 'v1/library/example-author---a-short-volume-1991.pdf';
+    const stageBatch = (worker: { fetch(request: Request): Promise<Response> }, batchId: string, extra: Record<string, unknown> = {}) => postDomain(worker, 'rag_corpus', {
+      action: 'stage_import', domain_id: 'research', corpus_id: CORPUS, workspace_relative_path: 'experts/research/sources/batch', batch_id: batchId, dry_run: false, ...extra,
+    });
+    const writeBatch = (base: string, files: Record<string, Uint8Array | string>) => {
+      const directory = join(base, 'workspace', 'experts', 'research', 'sources', 'batch');
+      mkdirSync(directory, { recursive: true });
+      for (const [name, bytes] of Object.entries(files)) writeFileSync(join(directory, name), bytes);
+    };
+
+    test('a batch receipt keeps a present PDF while a long one is still splitting, and the dry run shows the routing', async () => {
+      const f = splitFixture(LONG, importsAll, { seed: { objects: [[SHORT_OBJECT, SHORT]], imported: [`gs://fixture-shared-library/${SHORT_OBJECT}`] } });
+      writeBatch(f.base, { 'note.md': '# A note', 'short-volume.pdf': SHORT, 'long-volume.pdf': LONG });
+      try {
+        await postDomain(f.worker, 'domain_source', {
+          action: 'add', domain_id: 'research', kind: 'book', title: 'A Short Volume', corpus_id: CORPUS, sha256: sha256Hex(SHORT),
+          gcs_uris: [`gs://fixture-shared-library/${SHORT_OBJECT}`], dry_run: false,
+        });
+        const plan = await stageBatch(f.worker, 'mixed-batch', { dry_run: true });
+        expect(plan.status).toBe('dry_run_stage_import_ready');
+        expect(plan.eligible_files.map((file: Record<string, any>) => file.workspace_relative_path)).toEqual(['experts/research/sources/batch/note.md']);
+        expect(plan.eligible_file_count).toBe(1);
+        expect(plan.pdf_routing.map((pdf: Record<string, any>) => [pdf.workspace_relative_path.split('/').pop(), pdf.route])).toEqual([['long-volume.pdf', 'split'], ['short-volume.pdf', 'present']]);
+        expect(plan.pdf_routing[0]).toMatchObject({ pages: 450, parts: 3 });
+        expect(f.importedUris()).toEqual([]);
+        const response = await stageBatch(f.workerWith({ responseBudgetMs: 1 }), 'mixed-batch');
+        const byName = new Map<string, Record<string, any>>(response.pdf_sources.map((pdf: Record<string, any>) => [pdf.workspace_relative_path.split('/').pop(), pdf]));
+        expect(byName.get('short-volume.pdf')).toMatchObject({ route: 'present', status: 'imported', import_outcome: { already_present: true }, source_registry: { status: 'unchanged' } });
+        expect(byName.get('long-volume.pdf')).toMatchObject({ route: 'split', status: 'import_in_progress' });
+      } finally { f.cleanup(); }
+    });
+
+    test('a staged PDF answered as in progress is already in the registry as in progress', async () => {
+      const f = splitFixture(LONG, importsAll, { responseBudgetMs: 1 });
+      writeBatch(f.base, { 'long-volume.pdf': LONG });
+      try {
+        const response = await stageBatch(f.worker, 'slow-batch');
+        expect(response.pdf_sources).toMatchObject([{ route: 'split', status: 'import_in_progress' }]);
+        // Before any background write: the source can be found, and it says it is running.
+        const sourceId = `research-pdf-${sha256Hex(LONG).slice(0, 16)}`;
+        const status = await postDomain(f.worker, 'domain_source', { action: 'status', domain_id: 'research', source_id: sourceId });
+        expect(status.history.some((record: Record<string, any>) => record.ingest_status === 'import_requested')).toBe(true);
+        const deadline = Date.now() + 5_000;
+        while (f.readRegistry().at(-1)!.ingest_status !== 'imported' && Date.now() < deadline) await Bun.sleep(10);
+        expect(f.readRegistry().at(-1)).toMatchObject({ source_id: sourceId, ingest_status: 'imported', split_parts: 3 });
+      } finally { f.cleanup(); }
+    });
+
+    // A PDF padded to `size` bytes with an object nothing references, so qpdf's parts stay small.
+    const paddedPdf = (pages: number, size: number) => {
+      const pdf = new TextDecoder('latin1').decode(textPdfBytes(pages));
+      const at = pdf.lastIndexOf('trailer');
+      const filler = size - pdf.length - 64;
+      return new TextEncoder().encode(`${pdf.slice(0, at)}999 0 obj\n<< /Length ${filler} >>\nstream\n${'x'.repeat(filler)}\nendstream\nendobj\n${pdf.slice(at)}`);
+    };
+    const NEAR_HALF_CAP = 55_000_000;
+
+    test('the batch cap counts only what the batch stages: two long PDFs over it combined are both routed', async () => {
+      const first = paddedPdf(450, NEAR_HALF_CAP);
+      const second = paddedPdf(460, NEAR_HALF_CAP);
+      const f = splitFixture(first, importsAll);
+      writeBatch(f.base, { 'note.md': '# A note', 'long-a.pdf': first, 'long-b.pdf': second });
+      try {
+        const response = await stageBatch(f.worker, 'two-long');
+        expect(response.skipped_files).toEqual([]);
+        expect(response.staged_files.map((file: Record<string, any>) => file.workspace_relative_path)).toEqual(['experts/research/sources/batch/note.md']);
+        expect(response.pdf_sources.map((pdf: Record<string, any>) => [pdf.workspace_relative_path.split('/').pop(), pdf.route, pdf.status])).toEqual([
+          ['long-a.pdf', 'split', 'imported'], ['long-b.pdf', 'split', 'imported'],
+        ]);
+      } finally { f.cleanup(); }
+    }, 60_000);
+
+    test('the batch cap still applies to PDFs that stay in the batch', async () => {
+      const first = paddedPdf(150, NEAR_HALF_CAP);
+      const second = paddedPdf(160, NEAR_HALF_CAP);
+      const f = splitFixture(first, importsAll);
+      writeBatch(f.base, { 'short-a.pdf': first, 'short-b.pdf': second });
+      try {
+        const response = await stageBatch(f.worker, 'two-short');
+        expect(response.staged_files.map((file: Record<string, any>) => file.workspace_relative_path)).toEqual(['experts/research/sources/batch/short-a.pdf']);
+        expect(response.skipped_files).toEqual([{ workspace_relative_path: 'experts/research/sources/batch/short-b.pdf', reason: 'batch_size_limit_exceeded', bytes: second.byteLength }]);
+        expect(response.pdf_sources).toBeUndefined();
+      } finally { f.cleanup(); }
+    }, 60_000);
+
+    // A dry run writes nothing, so a planned PDF carries its own bytes; a long name the staging
+    // path shortens must not lose them.
+    test('a web_import dry run routes a fetched long PDF whose name staging shortens', async () => {
+      const fixture = workspaceFixture();
+      const name = `${'a-very-long-fixture-volume-title-'.repeat(4)}final.pdf`;
+      try {
+        const worker = createDomainExpertWorker({
+          roots: [rootPolicy(fixture.workspaceRoot)],
+          dataDir: join(fixture.base, 'data'),
+          google: { accessToken: 'fixture-google-token', fetchImpl: splitGoogleFetch([], importsAll) },
+          resolveHostImpl: async () => ['93.184.216.34'],
+          webImportFetchImpl: async () => new Response(new Blob([LONG as Uint8Array<ArrayBuffer>]), { status: 200, headers: { 'content-type': 'application/pdf' } }),
+        });
+        const plan = await postDomain(worker, 'rag_corpus', {
+          action: 'web_import', domain_id: 'research', corpus_id: CORPUS, urls: [`https://files.example/${name}`], batch_id: 'long-name', dry_run: true,
+        });
+        expect(plan.status).toBe('dry_run_web_import_ready');
+        expect(plan.pdf_routing).toMatchObject([{ route: 'split', pages: 450, parts: 3, source_sha256: sha256Hex(LONG) }]);
+        expect(plan.eligible_files).toEqual([]);
+        expect(existsSync(join(fixture.workspaceRoot, 'experts', 'research', 'sources', 'web-imports'))).toBe(false);
+      } finally { fixture.cleanup(); }
+    });
+
+    // One source, one holding: the same bytes twice in a batch are imported once.
+    test('two identical long PDFs in one batch: the first is split and imported, the second is its duplicate', async () => {
+      const parts = [1, 2, 3].map((index) => `gs://fixture-shared-library/v1/staged/research/twin-batch--parts/volume-a--part${index}of3.pdf`);
+      const fixture = workspaceFixture();
+      const calls: CapturedCall[] = [];
+      try {
+        writeBatch(fixture.base, { 'volume-a.pdf': LONG, 'volume-b.pdf': LONG });
+        const worker = createDomainExpertWorker({
+          gcpProject: 'fixture-project',
+          dataDir: join(fixture.base, 'data'),
+          roots: [rootPolicy(fixture.workspaceRoot)],
+          annas: { importPollIntervalMs: 1, importPollTimeoutMs: 2_000, responseBudgetMs: 0 },
+          google: {
+            accessToken: 'fixture-google-token',
+            fetchImpl: splitGoogleFetch(calls, importsAll, {
+              contexts: [{ sourceUri: parts[1], sourceDisplayName: 'part', text: 'Passage.', score: 0.1, chunk: { text: 'x', pageSpan: { firstPage: 1, lastPage: 1 } } }],
+            }),
+          },
+        });
+        const response = await stageBatch(worker, 'twin-batch');
+        expect(response.pdf_sources).toMatchObject([
+          { workspace_relative_path: 'experts/research/sources/batch/volume-a.pdf', route: 'split', status: 'imported', gcs_uris: parts },
+          { workspace_relative_path: 'experts/research/sources/batch/volume-b.pdf', route: 'duplicate', status: 'skipped_duplicate', reason: 'duplicate_in_batch', duplicate_of: 'experts/research/sources/batch/volume-a.pdf' },
+        ]);
+        const imported = calls.filter((call) => call.url.endsWith('/ragFiles:import')).map((call) => JSON.parse(call.body).importRagFilesConfig.gcsSource.uris[0]);
+        expect(imported).toEqual(parts);
+        // The citation still maps the first file's parts to the source and its pages.
+        const result = await postDomain(worker, 'domain_ask', { domain_id: 'research', question: 'Where is it said?', output: 'passages' });
+        expect(result.passages[0]).toMatchObject({ source_id: `research-pdf-${sha256Hex(LONG).slice(0, 16)}`, source_part: 'part2of3', original_pages: { first_page: 151, last_page: 151 } });
+      } finally { fixture.cleanup(); }
+    });
+
+    test('two identical short PDFs in one batch stage once', async () => {
+      const short = textPdfBytes(120);
+      const f = splitFixture(short, importsAll);
+      writeBatch(f.base, { 'paper-a.pdf': short, 'paper-b.pdf': short });
+      try {
+        const response = await stageBatch(f.worker, 'twin-short');
+        expect(response.staged_files.map((file: Record<string, any>) => file.workspace_relative_path)).toEqual(['experts/research/sources/batch/paper-a.pdf']);
+        expect(response.pdf_sources).toMatchObject([{ route: 'duplicate', status: 'skipped_duplicate', duplicate_of: 'experts/research/sources/batch/paper-a.pdf' }]);
+      } finally { f.cleanup(); }
+    });
+
+    // A second batch whose PDF another import started meanwhile must not split it again.
+    test('a deferred split whose source another import started meanwhile is reported, not split again', async () => {
+      let registryPath = '';
+      const other = [1, 2, 3].map((index) => `gs://fixture-shared-library/v1/staged/research/first-batch--parts/long-volume--part${index}of3.pdf`);
+      // When this batch's directory import runs, another import has just written its progress.
+      const f = splitFixture(LONG, (part) => {
+        if (part === 'whole') {
+          appendFileSync(registryPath, `${JSON.stringify({
+            source_id: `research-pdf-${sha256Hex(LONG).slice(0, 16)}`, domain_id: 'research', kind: 'pdf', source_sha256: sha256Hex(LONG),
+            ingest_status: 'import_requested', target_corpus_id: CORPUS, pages: 450, split_parts: 3,
+            rag_files: other.map((uri, index) => ({ gcs_uri: uri, part: `part${index + 1}of3`, first_page: index * 150 + 1, last_page: index * 150 + 150, status: 'uploaded' })),
+            registered_at: new Date().toISOString(),
+          })}\n`);
+        }
+        return { importedRagFilesCount: '1' };
+      });
+      registryPath = f.registryPath;
+      writeBatch(f.base, { 'note.md': '# A note', 'long-volume.pdf': LONG });
+      try {
+        mkdirSync(dirname(registryPath), { recursive: true });
+        writeFileSync(registryPath, '');
+        const response = await stageBatch(f.worker, 'second-batch');
+        expect(response.pdf_sources).toMatchObject([{ route: 'split', status: 'blocked', gcs_uris: other, error: { code: 'source_import_in_progress' } }]);
+        // Only the batch directory was imported; no second split.
+        expect(f.importedUris()).toEqual([stagedRunDirectory('gs://fixture-shared-library/v1/staged/research/second-batch/', { 'note.md': '# A note' })]);
+        // The other import's record is left as the source's latest.
+        expect(f.readRegistry().filter((record) => record.source_sha256 === sha256Hex(LONG)).at(-1)!.rag_files.map((file: Record<string, any>) => file.gcs_uri)).toEqual(other);
+      } finally { f.cleanup(); }
+    });
+
+    // A batch imports its whole run directory, so what Vertex sees there is what it imports.
+    const directoryImports = () => {
+      const seen: Array<{ uri: string; objects: string[] }> = [];
+      let calls: CapturedCall[] = [];
+      const behaviour: ImportBehaviour = (part, _attempt, objects) => {
+        const uri = JSON.parse(calls.filter((call) => call.url.endsWith('/ragFiles:import')).at(-1)!.body).importRagFilesConfig.gcsSource.uris[0] as string;
+        if (part === 'whole' && uri.endsWith('/')) {
+          const prefix = uri.replace('gs://fixture-shared-library/', '');
+          seen.push({ uri, objects: [...objects.keys()].filter((name) => name.startsWith(prefix)).map((name) => `gs://fixture-shared-library/${name}`).sort() });
+        }
+        return { importedRagFilesCount: '1' };
+      };
+      return { seen, behaviour, watch: (googleCalls: CapturedCall[]) => { calls = googleCalls; } };
+    };
+    const stagedUris = (result: Record<string, any>) => result.staged_files.map((file: Record<string, any>) => file.gcs_uri as string).sort();
+    const BATCH = 'gs://fixture-shared-library/v1/staged/research/retry-batch/';
+
+    // A retry of the same batch_id must not let an earlier attempt's object ride along.
+    test('a retried batch whose PDF became long splits it and never imports the earlier whole copy', async () => {
+      const imports = directoryImports();
+      const f = splitFixture(LONG, imports.behaviour);
+      imports.watch(f.googleCalls);
+      const short = textPdfBytes(120);
+      try {
+        writeBatch(f.base, { 'note.md': '# A note', 'volume.pdf': short });
+        const first = await stageBatch(f.worker, 'retry-batch');
+        const firstRun = stagedRunDirectory(BATCH, { 'note.md': '# A note', 'volume.pdf': short });
+        expect(first.destination).toMatchObject({ gcs_uri_prefix: firstRun, batch_gcs_uri_prefix: BATCH });
+        expect(stagedUris(first)).toEqual([`${firstRun}note.md`, `${firstRun}volume.pdf`]);
+        // The same batch again, now with the PDF replaced by a long one the pipeline splits.
+        writeBatch(f.base, { 'volume.pdf': LONG });
+        const second = await stageBatch(f.worker, 'retry-batch');
+        const secondRun = stagedRunDirectory(BATCH, { 'note.md': '# A note' });
+        expect(secondRun).not.toBe(firstRun);
+        expect(stagedUris(second)).toEqual([`${secondRun}note.md`]);
+        expect(second.pdf_sources).toMatchObject([{ route: 'split', status: 'imported' }]);
+        // Each run imported its own directory, which held exactly what that run staged.
+        expect(imports.seen).toEqual([
+          { uri: firstRun, objects: stagedUris(first) },
+          { uri: secondRun, objects: stagedUris(second) },
+        ]);
+        expect(f.importedUris().filter((uri) => uri.endsWith('.pdf'))).toEqual([1, 2, 3].map((index) => `gs://fixture-shared-library/v1/staged/research/retry-batch--parts/volume--part${index}of3.pdf`));
+        // Nothing is deleted: the earlier run's directory stays in place, never imported again.
+        expect(f.googleCalls.filter((call) => call.method === 'DELETE' && call.url.includes('storage.googleapis.com'))).toEqual([]);
+        expect(f.readRegistry().filter((record) => record.source_id === 'research-stage-import-retry-batch').at(-1)).toMatchObject({ gcs_uri: `${secondRun}note.md`, ingest_status: 'imported' });
+        // A retry that stages the same bytes again lands on the same URIs, so Vertex skips what it holds.
+        const third = await stageBatch(f.worker, 'retry-batch');
+        expect(stagedUris(third)).toEqual(stagedUris(second));
+        expect(third.import_outcome).toMatchObject({ status: 'imported', already_present: true });
+        expect(f.importedUris().filter((uri) => uri.endsWith('/'))).toEqual([firstRun, secondRun, secondRun]);
+      } finally { f.cleanup(); }
+    });
+
+    test('two overlapping runs of one batch_id each import exactly their own objects', async () => {
+      const imports = directoryImports();
+      const short = textPdfBytes(120);
+      let overlapping: Promise<Record<string, any>> | undefined;
+      let worker: { fetch(request: Request): Promise<Response> } | undefined;
+      let base = '';
+      const f = splitFixture(LONG, imports.behaviour, {
+        // The first run has staged and is about to import when the second run of the batch starts and finishes.
+        wrapGoogleFetch: (next) => (async (input: string | URL | Request, init?: RequestInit) => {
+          if (!overlapping && String(input).endsWith('/ragFiles:import')) {
+            writeBatch(base, { 'volume.pdf': LONG });
+            overlapping = stageBatch(worker!, 'retry-batch');
+            await overlapping;
+          }
+          return next(input, init);
+        }) as typeof fetch,
+      });
+      imports.watch(f.googleCalls);
+      worker = f.worker;
+      base = f.base;
+      try {
+        writeBatch(f.base, { 'note.md': '# A note', 'volume.pdf': short });
+        const first = await stageBatch(f.worker, 'retry-batch');
+        const second = await overlapping!;
+        const firstRun = stagedRunDirectory(BATCH, { 'note.md': '# A note', 'volume.pdf': short });
+        const secondRun = stagedRunDirectory(BATCH, { 'note.md': '# A note' });
+        expect(stagedUris(first)).toEqual([`${firstRun}note.md`, `${firstRun}volume.pdf`]);
+        expect(stagedUris(second)).toEqual([`${secondRun}note.md`]);
+        // The second run imported first, while the first run's objects sat staged; neither saw the other's.
+        expect(imports.seen).toEqual([
+          { uri: secondRun, objects: stagedUris(second) },
+          { uri: firstRun, objects: stagedUris(first) },
+        ]);
+        expect(first.import_outcome).toMatchObject({ status: 'imported' });
+        expect(second.import_outcome).toMatchObject({ status: 'imported' });
+        expect(second.pdf_sources).toMatchObject([{ route: 'split', status: 'imported' }]);
+        expect(f.googleCalls.filter((call) => call.method === 'DELETE' && call.url.includes('storage.googleapis.com'))).toEqual([]);
+      } finally { f.cleanup(); }
+    });
+
+    test('a batch of refused PDFs reports them refused', async () => {
+      const f = splitFixture(LONG, importsAll, { qpdfBin: 'qpdf-missing-fixture' });
+      writeBatch(f.base, { 'long-volume.pdf': LONG });
+      try {
+        const response = await stageBatch(f.worker, 'refused-batch');
+        expect(response).toMatchObject({ status: 'pdf_sources_refused', eligible_file_count: 0, eligible_files: [] });
+        expect(response.pdf_sources).toMatchObject([{ route: 'refused', status: 'blocked', error: { code: 'pdf_exceeds_parser_page_limit' } }]);
+        expect(f.importedUris()).toEqual([]);
+      } finally { f.cleanup(); }
+    });
+
+    test('a single staged PDF imported under a named source registers under that source', async () => {
+      const f = splitFixture(LONG, importsAll);
+      writeBatch(f.base, { 'long-volume.pdf': LONG });
+      try {
+        await postDomain(f.worker, 'domain_source', { action: 'add', domain_id: 'research', source_id: 'named-volume', kind: 'book', title: 'The Long Volume', url: 'https://example.com/long', dry_run: false });
+        const response = await stageBatch(f.worker, 'named-batch', { source_id: 'named-volume' });
+        expect(response.pdf_sources).toMatchObject([{ route: 'split', status: 'imported', source_registry: { source_id: 'named-volume' } }]);
+        const ids = new Set(f.readRegistry().map((record) => record.source_id));
+        expect([...ids]).toEqual(['named-volume']);
+        expect(f.readRegistry().at(-1)).toMatchObject({ source_id: 'named-volume', title: 'The Long Volume', canonical_url: 'https://example.com/long', split_parts: 3, source_sha256: sha256Hex(LONG) });
+      } finally { f.cleanup(); }
+    });
+
+    test('stage_import leaves a long PDF out of the batch and imports it as parts after it', async () => {
+      const f = splitFixture(LONG, importsAll);
+      const batchDir = join(f.base, 'workspace', 'experts', 'research', 'sources', 'batch');
+      mkdirSync(batchDir, { recursive: true });
+      writeFileSync(join(batchDir, 'note.md'), '# A note');
+      writeFileSync(join(batchDir, 'long-volume.pdf'), LONG);
+      const stage = (batchId: string) => postDomain(f.worker, 'rag_corpus', {
+        action: 'stage_import', domain_id: 'research', corpus_id: CORPUS, workspace_relative_path: 'experts/research/sources/batch', batch_id: batchId, dry_run: false,
+      });
+      try {
+        const response = await stage('long-batch');
+        expect(response.status).toBe('staged_and_import_requested');
+        expect(response.staged_files.map((file: Record<string, any>) => file.workspace_relative_path)).toEqual(['experts/research/sources/batch/note.md']);
+        const parts = [1, 2, 3].map((index) => `gs://fixture-shared-library/v1/staged/research/long-batch--parts/long-volume--part${index}of3.pdf`);
+        expect(response.pdf_sources).toMatchObject([{
+          workspace_relative_path: 'experts/research/sources/batch/long-volume.pdf', source_sha256: sha256Hex(LONG), status: 'imported',
+          gcs_uris: parts, split: { pages: 450, parts: 3, imported_parts: 3 }, source_registry: { status: 'updated' },
+        }]);
+        // The batch directory first, then each part on its own.
+        expect(f.importedUris()).toEqual([stagedRunDirectory('gs://fixture-shared-library/v1/staged/research/long-batch/', { 'note.md': '# A note' }), ...parts]);
+        const record = f.readRegistry().find((entry) => entry.source_id === `research-pdf-${sha256Hex(LONG).slice(0, 16)}` && entry.ingest_status === 'imported')!;
+        expect(record).toMatchObject({ acquisition: 'stage_import', workspace_relative_path: 'experts/research/sources/batch/long-volume.pdf', pages: 450 });
+        // Staged again, the PDF is present and only the note is staged.
+        const again = await stage('long-batch-2');
+        expect(again.pdf_sources).toMatchObject([{ status: 'imported', import_outcome: { already_present: true } }]);
+        expect(f.importedUris().slice(4)).toEqual([stagedRunDirectory('gs://fixture-shared-library/v1/staged/research/long-batch-2/', { 'note.md': '# A note' })]);
+      } finally { f.cleanup(); }
+    });
+  });
+
   test('the split size is configured from the environment', () => {
     expect(domainExpertAnnasConfigFromEnv({ EXPERT_AGENTS_DOMAIN_EXPERT_ANNAS_PDF_SPLIT_PAGES: '150' }).pdfSplitPages).toBe(150);
     expect(domainExpertAnnasConfigFromEnv({}).pdfSplitPages).toBeUndefined();
     expect(() => domainExpertAnnasConfigFromEnv({ EXPERT_AGENTS_DOMAIN_EXPERT_ANNAS_PDF_SPLIT_PAGES: 'some' })).toThrow();
     expect(domainExpertAnnasConfigFromEnv({ EXPERT_AGENTS_DOMAIN_EXPERT_ANNAS_QPDF_BIN: '/opt/qpdf/bin/qpdf' }).qpdfBin).toBe('/opt/qpdf/bin/qpdf');
     expect(domainExpertAnnasConfigFromEnv({ EXPERT_AGENTS_DOMAIN_EXPERT_ANNAS_PDFTOTEXT_BIN: '/opt/poppler/pdftotext' }).pdftotextBin).toBe('/opt/poppler/pdftotext');
+  });
+});
+
+// Citations from a split's parts resolve to the original source and its original page numbers.
+describe('citations from split parts', () => {
+  const corpusResource = 'projects/fixture-project/locations/us-central1/ragCorpora/1001';
+  const PART_NAMES = [1, 2, 3].map((index) => `v1/book-imports/history/hand-split-volume--part${index}of3.pdf`);
+  const PART_URIS = PART_NAMES.map((name) => `gs://fixture-shared-library/${name}`);
+  const WHOLE_URI = 'gs://fixture-shared-library/v1/library/example-author---a-short-paper-2001.pdf';
+  const UNREGISTERED_PART = 'gs://fixture-shared-library/v1/library/unknown-book--part2of2.pdf';
+
+  test('a part page span maps to original pages through the registry; a part without a span reports its range', async () => {
+    const fixture = workspaceFixture();
+    const calls: CapturedCall[] = [];
+    const context = (uri: string, text: string, span?: [number, number]) => ({
+      sourceUri: uri, sourceDisplayName: uri.split('/').pop(), text, score: 0.1,
+      ...(span ? { chunk: { text, pageSpan: { firstPage: span[0], lastPage: span[1] } } } : {}),
+    });
+    try {
+      const worker = createDomainExpertWorker({
+        roots: [rootPolicy(fixture.workspaceRoot)],
+        dataDir: join(fixture.base, 'data'),
+        google: {
+          accessToken: 'fixture-google-token',
+          fetchImpl: fakeGoogleFetch(calls, {
+            ragCorpora: [{ name: corpusResource, displayName: 'history-library' }],
+            gcsObjects: Object.fromEntries(PART_NAMES.map((name) => [name, new TextDecoder().decode(textPdfBytes(194))])),
+            ragFiles: PART_URIS.map((uri, index) => ({ name: `${corpusResource}/ragFiles/50${index}`, gcsSource: { uris: [uri] }, fileStatus: { state: 'ACTIVE' } })),
+            contexts: () => [
+              context(PART_URIS[1]!, 'Second volume passage.', [3, 4]),
+              context(PART_URIS[2]!, 'Third volume passage.'),
+              context(WHOLE_URI, 'Short paper passage.', [7, 7]),
+              context(UNREGISTERED_PART, 'Unregistered part passage.', [5, 5]),
+            ],
+          }),
+        },
+      });
+      const registered = await postDomain(worker, 'domain_source', {
+        action: 'add', domain_id: 'history', kind: 'book', title: 'The Long Volume', author: 'Example Author', corpus_id: 'history-library',
+        sha256: 'a'.repeat(64), gcs_uris: PART_URIS, dry_run: false,
+      });
+      expect(registered.status).toBe('registered');
+      const result = await postDomain(worker, 'domain_ask', { domain_id: 'history', question: 'Where is it said?', output: 'passages' });
+      const byUri = new Map<string, Record<string, any>>(result.passages.map((passage: Record<string, any>) => [passage.source_uri, passage]));
+      // Part 2 holds original pages 195-388, so its pages 3-4 are pages 197-198 of the book.
+      expect(byUri.get(PART_URIS[1])).toMatchObject({ source_id: registered.source_id, source_part: 'part2of3', original_pages: { first_page: 197, last_page: 198, basis: 'chunk' } });
+      expect(byUri.get(PART_URIS[1])!.header).toEndWith(', pages 197-198');
+      expect(byUri.get(PART_URIS[2])).toMatchObject({ source_id: registered.source_id, original_pages: { first_page: 389, last_page: 582, basis: 'part_range' } });
+      expect(byUri.get(WHOLE_URI)).toMatchObject({ original_pages: { first_page: 7, last_page: 7, basis: 'chunk' } });
+      expect(byUri.get(WHOLE_URI)!.header).toEndWith(', page 7');
+      // An unregistered part's offset is unknown, so no page is claimed.
+      expect(byUri.get(UNREGISTERED_PART)!.original_pages).toBeUndefined();
+      const citation = result.citations.find((entry: Record<string, any>) => entry.source_uri === PART_URIS[1]);
+      expect(citation).toMatchObject({ source_id: registered.source_id, original_pages: { first_page: 197, last_page: 198 } });
+    } finally { fixture.cleanup(); }
+  });
+
+  test('a part recorded without its range claims no pages, unless the original page count rebuilds it', async () => {
+    for (const [pages, expected] of [[undefined, undefined], [582, { first_page: 197, last_page: 198, basis: 'chunk' }]] as const) {
+      const fixture = workspaceFixture();
+      try {
+        const registryPath = join(fixture.workspaceRoot, domainManifest('history').workspace_relative_path, 'references/source-registry.jsonl');
+        mkdirSync(dirname(registryPath), { recursive: true });
+        // As #37 recorded a split: part names, no ranges.
+        writeFileSync(registryPath, `${JSON.stringify({
+          source_id: 'history-annas-legacy', domain_id: 'history', ingest_status: 'imported', split_parts: 3, ...(pages ? { pages } : {}),
+          rag_files: PART_URIS.map((uri, index) => ({ gcs_uri: uri, part: `part${index + 1}of3`, status: 'imported' })),
+          registered_at: '2026-10-16T12:00:00.000Z',
+        })}\n`);
+        const worker = createDomainExpertWorker({
+          roots: [rootPolicy(fixture.workspaceRoot)],
+          dataDir: join(fixture.base, 'data'),
+          google: {
+            accessToken: 'fixture-google-token',
+            fetchImpl: fakeGoogleFetch([], {
+              ragCorpora: [{ name: corpusResource, displayName: 'history-library' }],
+              contexts: () => [{ sourceUri: PART_URIS[1], sourceDisplayName: 'part', text: 'Second volume passage.', score: 0.1, chunk: { text: 'x', pageSpan: { firstPage: 3, lastPage: 4 } } }],
+            }),
+          },
+        });
+        const result = await postDomain(worker, 'domain_ask', { domain_id: 'history', question: 'Where is it said?', output: 'passages' });
+        expect(result.passages[0]).toMatchObject({ source_id: 'history-annas-legacy', source_part: 'part2of3' });
+        expect(result.passages[0].original_pages).toEqual(expected);
+        if (!expected) expect(result.passages[0].header).not.toContain('pages');
+      } finally { fixture.cleanup(); }
+    }
+  });
+
+  test('every record shape maps its objects to a source: whole, split and multi-file batch', async () => {
+    const fixture = workspaceFixture();
+    const object = (name: string) => `gs://fixture-shared-library/v1/library/${name}.pdf`;
+    try {
+      const registryPath = join(fixture.workspaceRoot, domainManifest('history').workspace_relative_path, 'references/source-registry.jsonl');
+      mkdirSync(dirname(registryPath), { recursive: true });
+      const at = '2026-10-17T12:00:00.000Z';
+      writeFileSync(registryPath, [
+        { source_id: 'history-whole', domain_id: 'history', ingest_status: 'imported', gcs_uri: object('whole-paper'), registered_at: at },
+        { source_id: 'history-split', domain_id: 'history', ingest_status: 'imported', split_parts: 2, pages: 300, rag_files: [
+          { gcs_uri: object('split-book--part1of2'), part: 'part1of2', first_page: 1, last_page: 150, status: 'imported' },
+          { gcs_uri: object('split-book--part2of2'), part: 'part2of2', first_page: 151, last_page: 300, status: 'imported' },
+        ], registered_at: at },
+        { source_id: 'history-stage-import-batch', domain_id: 'history', kind: 'stage_import', ingest_status: 'imported', rag_files: [
+          { gcs_uri: object('batch-one') }, { gcs_uri: object('batch-two') }, { gcs_uri: object('whole-paper') },
+        ], registered_at: at },
+      ].map((record) => JSON.stringify(record)).join('\n') + '\n');
+      const worker = createDomainExpertWorker({
+        roots: [rootPolicy(fixture.workspaceRoot)],
+        dataDir: join(fixture.base, 'data'),
+        google: {
+          accessToken: 'fixture-google-token',
+          fetchImpl: fakeGoogleFetch([], {
+            ragCorpora: [{ name: corpusResource, displayName: 'history-library' }],
+            contexts: () => ['whole-paper', 'split-book--part2of2', 'batch-one', 'batch-two'].map((name) => ({
+              sourceUri: object(name), sourceDisplayName: name, text: `${name} passage.`, score: 0.1, chunk: { text: 'x', pageSpan: { firstPage: 2, lastPage: 2 } },
+            })),
+          }),
+        },
+      });
+      const result = await postDomain(worker, 'domain_ask', { domain_id: 'history', question: 'Where is it said?', output: 'passages' });
+      const sources = new Map(result.passages.map((passage: Record<string, any>) => [passage.source_display_name, [passage.source_id, passage.original_pages?.first_page]]));
+      expect(sources).toEqual(new Map<string, unknown>([
+        // A source of its own wins over the batch that also lists it.
+        ['whole-paper', ['history-whole', 2]],
+        ['split-book--part2of2', ['history-split', 152]],
+        ['batch-one', ['history-stage-import-batch', 2]],
+        ['batch-two', ['history-stage-import-batch', 2]],
+      ]));
+    } finally { fixture.cleanup(); }
+  });
+
+  // A context's citation fields depend only on that context and the registry, never on the rest of the result set.
+  test('a registered non-PDF source is cited by source alone, whether or not a PDF is retrieved with it', async () => {
+    const note = 'gs://fixture-shared-library/v1/library/field-notes.md';
+    const paper = 'gs://fixture-shared-library/v1/library/whole-paper.pdf';
+    for (const withPdf of [false, true]) {
+      const fixture = workspaceFixture();
+      try {
+        const registryPath = join(fixture.workspaceRoot, domainManifest('history').workspace_relative_path, 'references/source-registry.jsonl');
+        mkdirSync(dirname(registryPath), { recursive: true });
+        writeFileSync(registryPath, `${JSON.stringify({ source_id: 'history-notes', domain_id: 'history', ingest_status: 'imported', gcs_uri: note, registered_at: '2026-10-17T12:00:00.000Z' })}\n`);
+        const context = (uri: string) => ({ sourceUri: uri, sourceDisplayName: uri.split('/').pop(), text: 'Passage.', score: 0.1, chunk: { text: 'x', pageSpan: { firstPage: 4, lastPage: 4 } } });
+        const worker = createDomainExpertWorker({
+          roots: [rootPolicy(fixture.workspaceRoot)],
+          dataDir: join(fixture.base, 'data'),
+          google: {
+            accessToken: 'fixture-google-token',
+            fetchImpl: fakeGoogleFetch([], {
+              ragCorpora: [{ name: corpusResource, displayName: 'history-library' }],
+              contexts: () => (withPdf ? [context(note), context(paper)] : [context(note)]),
+            }),
+          },
+        });
+        const result = await postDomain(worker, 'domain_ask', { domain_id: 'history', question: 'Where is it said?', output: 'passages' });
+        const passage = result.passages.find((entry: Record<string, any>) => entry.source_uri === note);
+        expect(passage).toMatchObject({ source_id: 'history-notes' });
+        // Pages are claimed only for PDFs.
+        expect(passage.original_pages).toBeUndefined();
+      } finally { fixture.cleanup(); }
+    }
   });
 });

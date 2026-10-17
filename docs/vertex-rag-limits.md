@@ -47,6 +47,12 @@ What the worker does with it, while imports use the LLM parser:
 - a longer PDF the worker cannot split (no `qpdf`, or a file `qpdf` cannot
   read) is refused before upload with `pdf_exceeds_parser_page_limit`.
 
+The worker applies this to acquisitions, to `rag_corpus import` of one GCS PDF
+object, and to the PDFs of `stage_import` and `web_import` batches. A
+`rag_corpus import` of a GCS directory or a Drive file is imported as before,
+without the check. The library materializer does not split; it rejects a
+longer PDF, or one it cannot count, before import.
+
 Worker health reports `pdf_import.status: degraded` while the LLM parser is
 configured and `qpdf` or `pdftotext` is missing.
 
@@ -63,6 +69,12 @@ those records were deleted. The worker deletes ERROR records for a URI before
 importing it, so a failed import (a failed split part included) can be
 retried, and it reports a skipped import as present only when the URI's
 ragFile is ACTIVE.
+
+A staged batch relies on this dedupe across retries: each run stages into
+`staged/<domain>/<batch>/<run-id>/`, a directory named by its files' paths and
+sha256s, so a retry of the same bytes imports the same URIs and is skipped,
+while a run that stages anything else imports only its own directory. A
+superseded run's directory is left in place and never imported again.
 
 ## Sources
 

@@ -5,6 +5,7 @@ export * from "./rag-ingestion.ts";
 export * from "./retrieval-preferences.ts";
 export * from "./vertex-operation.ts";
 export * from "./ebook-text.ts";
+export * from "./pdf-split.ts";
 export * from "./serialization.ts";
 export * from "./types.ts";
 export * from "./update.ts";
