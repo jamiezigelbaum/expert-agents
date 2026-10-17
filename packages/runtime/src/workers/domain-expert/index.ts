@@ -2558,11 +2558,25 @@ export class DomainExpertService {
       else {
         routed.push({
           entry, corpusId, route: 'split', pages: route.pages, parts: route.plan.length, register,
-          // Checked again right before the split runs: another import may have brought the source in meanwhile.
+          // Checked again right before the split runs. The plan stands only while the source
+          // is as routing found it; anything another import changed meanwhile is reported, never split over.
           split: async () => {
             const now = await this.sourceHolding(source);
+            if (now.kind === holding.kind && (now.kind === 'none' || now.kind === 'partial')) return this.ingestSplitPdf(source, { ...route, bytes });
             if (now.kind === 'present') return { status: 'imported', target_corpus_id: corpusId, ...now.result };
-            return this.ingestSplitPdf(source, { ...route, bytes });
+            if (now.kind === 'conflict') return { status: 'blocked', target_corpus_id: corpusId, error: sourceIdentityConflict(source, now) };
+            if (now.kind === 'unknown') return { status: 'blocked', target_corpus_id: corpusId, error: sourceHoldingUnverified(source, now) };
+            const held = now.kind === 'partial' ? now : undefined;
+            return {
+              status: 'blocked',
+              target_corpus_id: corpusId,
+              ...(held ? { gcs_uris: held.parts.map((part) => part.gcs_uri) } : {}),
+              error: {
+                code: 'source_import_in_progress',
+                message: `Another import of this file (${held?.source_id ?? 'its source'}) began while this batch ran: ${held ? `${held.parts.filter((part) => part.present).length} of ${held.parts.length} parts are in the corpus` : 'its holding changed'}. Nothing was split or imported here; ${source.kept}.`,
+                suggestion: `${source.rerun} once that import settles; it then resumes the recorded parts.`,
+              },
+            };
           },
         });
       }

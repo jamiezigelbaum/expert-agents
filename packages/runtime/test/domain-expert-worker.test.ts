@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import { createHash } from 'node:crypto';
 import {
+  appendFileSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -7307,6 +7308,36 @@ describe('splitting long PDFs for LLM-parser imports', () => {
         const response = await stageBatch(f.worker, 'twin-short');
         expect(response.staged_files.map((file: Record<string, any>) => file.workspace_relative_path)).toEqual(['experts/research/sources/batch/paper-a.pdf']);
         expect(response.pdf_sources).toMatchObject([{ route: 'duplicate', status: 'skipped_duplicate', duplicate_of: 'experts/research/sources/batch/paper-a.pdf' }]);
+      } finally { f.cleanup(); }
+    });
+
+    // A second batch whose PDF another import started meanwhile must not split it again.
+    test('a deferred split whose source another import started meanwhile is reported, not split again', async () => {
+      let registryPath = '';
+      const other = [1, 2, 3].map((index) => `gs://fixture-shared-library/v1/staged/research/first-batch--parts/long-volume--part${index}of3.pdf`);
+      // When this batch's directory import runs, another import has just written its progress.
+      const f = splitFixture(LONG, (part) => {
+        if (part === 'whole') {
+          appendFileSync(registryPath, `${JSON.stringify({
+            source_id: `research-pdf-${sha256Hex(LONG).slice(0, 16)}`, domain_id: 'research', kind: 'pdf', source_sha256: sha256Hex(LONG),
+            ingest_status: 'import_requested', target_corpus_id: CORPUS, pages: 450, split_parts: 3,
+            rag_files: other.map((uri, index) => ({ gcs_uri: uri, part: `part${index + 1}of3`, first_page: index * 150 + 1, last_page: index * 150 + 150, status: 'uploaded' })),
+            registered_at: new Date().toISOString(),
+          })}\n`);
+        }
+        return { importedRagFilesCount: '1' };
+      });
+      registryPath = f.registryPath;
+      writeBatch(f.base, { 'note.md': '# A note', 'long-volume.pdf': LONG });
+      try {
+        mkdirSync(dirname(registryPath), { recursive: true });
+        writeFileSync(registryPath, '');
+        const response = await stageBatch(f.worker, 'second-batch');
+        expect(response.pdf_sources).toMatchObject([{ route: 'split', status: 'blocked', gcs_uris: other, error: { code: 'source_import_in_progress' } }]);
+        // Only the batch directory was imported; no second split.
+        expect(f.importedUris()).toEqual(['gs://fixture-shared-library/v1/staged/research/second-batch/']);
+        // The other import's record is left as the source's latest.
+        expect(f.readRegistry().filter((record) => record.source_sha256 === sha256Hex(LONG)).at(-1)!.rag_files.map((file: Record<string, any>) => file.gcs_uri)).toEqual(other);
       } finally { f.cleanup(); }
     });
 
