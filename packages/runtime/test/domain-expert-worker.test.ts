@@ -6483,7 +6483,7 @@ describe('splitting long PDFs for LLM-parser imports', () => {
     const readRegistry = () => readFileSync(registryPath, 'utf8').split('\n').filter(Boolean).map((line) => JSON.parse(line) as Record<string, any>);
     const importedUris = () => googleCalls.filter((call) => call.url.endsWith('/ragFiles:import'))
       .map((call) => JSON.parse(call.body).importRagFilesConfig.gcsSource.uris[0] as string);
-    return { worker: workerWith(), workerWith, googleCalls, booksRoot, base: fixture.base, registryPath, readRegistry, importedUris, cleanup: fixture.cleanup };
+    return { worker: workerWith(), workerWith, googleCalls, booksRoot, base: fixture.base, registryPath, readRegistry, importedUris, fetchImpl: googleFetch, cleanup: fixture.cleanup };
   }
 
   const importsAll: ImportBehaviour = () => ({ importedRagFilesCount: '1' });
@@ -6856,6 +6856,23 @@ describe('splitting long PDFs for LLM-parser imports', () => {
         expect(uploadedObjectNames(f.googleCalls)).toEqual([]);
         expect(f.importedUris()).toEqual([]);
         expect(f.readRegistry()).toHaveLength(1);
+      } finally { f.cleanup(); }
+    });
+
+    test('a resumed hand split stays unverified while it keeps any hand-made part', async () => {
+      const f = handFixture();
+      try {
+        await postDomain(f.worker, 'domain_source', REGISTER);
+        // Part 3's ragFile goes away; the next import resumes that part from the original.
+        await f.fetchImpl(`https://us-central1-aiplatform.googleapis.com/v1/${CORPUS}/ragFiles/80002`, { method: 'DELETE' });
+        const resumed = await postDomain(f.worker, 'annas_archive_import', PARAMS);
+        expect(resumed.rag_ingest).toMatchObject({ status: 'imported', split: { imported_parts: 3 } });
+        expect(f.importedUris()).toEqual([partUri(3, 3)]);
+        const latest = f.readRegistry().at(-1)!;
+        expect(latest.rag_files.map((file: Record<string, any>) => file.gcs_uri)).toEqual([HAND_URIS[0], HAND_URIS[1], partUri(3, 3)]);
+        expect(latest.sha256_verified).toBe(false);
+        const again = await postDomain(f.worker, 'annas_archive_import', PARAMS);
+        expect(again.rag_ingest.import_outcome).toMatchObject({ already_present: true, identity_verified: false });
       } finally { f.cleanup(); }
     });
 
