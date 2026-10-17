@@ -7848,6 +7848,27 @@ describe('splitting long PDFs for LLM-parser imports', () => {
       } finally { f.cleanup(); }
     });
 
+    // A request that imported some files may hold this one in a ragFile not listed yet.
+    test('a retry waits on a recorded import that finished partly imported while the file is unlisted', async () => {
+      const PENDING = `${CORPUS}/operations/pending-1`;
+      let operation: Record<string, unknown> = { name: PENDING, done: false };
+      const short = textPdfBytes(120);
+      const f = splitFixture(LONG, (part, attempt) => (part === 'whole' && attempt === 1 ? jsonResponse({ name: PENDING, done: false }) : { importedRagFilesCount: '1' }), {
+        importPollTimeoutMs: 60,
+        wrapGoogleFetch: (next) => (async (input: string | URL | Request, init?: RequestInit) => (String(input).includes('/operations/pending-1')
+          ? jsonResponse(operation)
+          : next(input, init))) as typeof fetch,
+      });
+      try {
+        writeBatch(f.base, { 'volume.pdf': short });
+        expect((await stageBatch(f.worker, 'batch-a')).import_outcome).toMatchObject({ status: 'import_requested' });
+        operation = { name: PENDING, done: true, response: { importedRagFilesCount: '1', failedRagFilesCount: '1' } };
+        const retry = await stageBatch(f.worker, 'batch-b');
+        expect(JSON.stringify(retry)).toContain('source_holding_unverified');
+        expect(f.importedUris()).toHaveLength(1);
+      } finally { f.cleanup(); }
+    });
+
     // An operation is asked only about the objects its own request named.
     test('a PDF in a request that was never submitted is imported on retry, not held by the running one', async () => {
       const PENDING = `${CORPUS}/operations/pending-1`;

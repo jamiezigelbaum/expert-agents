@@ -4815,7 +4815,7 @@ export class DomainExpertService {
         return { kind: 'unknown', source_id: found.sourceId, reason: `a part's import operation is unreadable (${ingestErrorRecord(error).code})` };
       }
       if (outcomes.some((outcome) => outcome === undefined)) return { kind: 'in_progress', source_id: found.sourceId, operations: pendingNames };
-      if (outcomes.some((outcome) => outcome!.status === 'imported')) {
+      if (outcomes.some((outcome) => mayHaveImported(outcome!.status))) {
         return { kind: 'unknown', source_id: found.sourceId, reason: "a part's import finished but its ragFile is not listed yet" };
       }
     }
@@ -4862,7 +4862,9 @@ export class DomainExpertService {
       return { kind: 'unknown', source_id: found.sourceId, reason: `import operation unreadable (${ingestErrorRecord(error).code})` };
     }
     if (outcomes.some((outcome) => outcome === undefined)) return { kind: 'in_progress', source_id: found.sourceId, operations: names };
-    const failed = file?.state === 'ERROR' || outcomes.every((outcome) => outcome!.status !== 'imported');
+    // Only this file's ERROR, or operations that imported nothing, prove it failed: a partly
+    // imported request may hold it in a ragFile the listing does not show yet.
+    const failed = file?.state === 'ERROR' || outcomes.every((outcome) => !mayHaveImported(outcome!.status));
     if (!failed) return { kind: 'unknown', source_id: found.sourceId, reason: 'its import finished but its ragFile is not listed yet' };
     // The record's outcome is written only when these were all its operations: another one
     // may still be importing other files the record lists.
@@ -10595,6 +10597,11 @@ function requestOutcomeByFile(files: Array<Record<string, unknown>>): { status: 
   const rerun = 'Re-run the batch: files already in the corpus keep their URIs and are skipped, and the rest are imported again.';
   if (failed === files.length) return { status: 'import_failed', hint: `Every ragFile of the request is in ERROR. ${rerun}` };
   return { status: 'import_partial', hint: `${active} of ${files.length} files are ACTIVE; ${failed} in ERROR, ${files.length - active - failed} not listed. ${rerun}` };
+}
+
+// Whether an operation with this outcome may have imported a given file of its request.
+function mayHaveImported(status: string): boolean {
+  return status === 'imported' || status === 'import_partial';
 }
 
 // The reason a settled import stays import_requested: Vertex counted it, its ragFile is not listed yet.
