@@ -4789,6 +4789,24 @@ export class DomainExpertService {
         },
       };
     }
+    // A missing part whose recorded import may still be running is asked about first: a retry
+    // under another batch cuts parts under new URIs, so resuming now could import its range twice.
+    const pendingNames = [...new Set(parts.filter((part) => !part.present && part.status === 'import_requested')
+      .map((part) => part.rag_operation_name).filter((name): name is string => name !== undefined))];
+    if (pendingNames.length) {
+      let outcomes: Array<ReturnType<typeof classifyRagImportOperation>>;
+      try {
+        const resolved = await this.resolveRagCorpus(manifest, corpusId);
+        const scope = { project: manifest.gcp_project, location: manifest.rag_location, corpusName: resolved.resourceName };
+        outcomes = await Promise.all(pendingNames.map(async (name) => classifyRagImportOperation(await this.google.getRagImportOperation(scope, name), name, 'pdf')));
+      } catch (error) {
+        return { kind: 'unknown', source_id: found.sourceId, reason: `a part's import operation is unreadable (${ingestErrorRecord(error).code})` };
+      }
+      if (outcomes.some((outcome) => outcome === undefined)) return { kind: 'in_progress', source_id: found.sourceId, operations: pendingNames };
+      if (outcomes.some((outcome) => outcome!.status === 'imported')) {
+        return { kind: 'unknown', source_id: found.sourceId, reason: "a part's import finished but its ragFile is not listed yet" };
+      }
+    }
     return { kind: 'partial', source_id: found.sourceId, parts, ...(listingError ? { listing_error: listingError } : {}) };
   }
 
@@ -10017,6 +10035,8 @@ interface RecordedPart {
   last_page?: number;
   pages?: number;
   rag_file_name?: string;
+  // The operation a part recorded as import_requested was submitted in.
+  rag_operation_name?: string;
   present?: boolean;
 }
 
@@ -10225,6 +10245,7 @@ function recordedSourceHolding(
         status: typeof file.status === 'string' ? file.status : status,
         ...range,
         ...(typeof file.rag_file_name === 'string' ? { rag_file_name: file.rag_file_name } : {}),
+        ...(typeof file.rag_operation_name === 'string' ? { rag_operation_name: file.rag_operation_name } : {}),
       }];
     });
     return parts.length ? { parts: parts.sort((left, right) => left.index - right.index) } : undefined;

@@ -7682,6 +7682,34 @@ describe('splitting long PDFs for LLM-parser imports', () => {
       } finally { f.cleanup(); }
     });
 
+    // Parts of a retry under another batch get new URIs, so a part import still running is asked about first.
+    test('a split retried under a new batch id waits for a part import still running, then resumes once it failed', async () => {
+      const PENDING = `${CORPUS}/operations/pending-part`;
+      let operation: Record<string, unknown> = { name: PENDING, done: false };
+      const f = splitFixture(LONG, (part, attempt) => (part === 'part2of3' && attempt === 1 ? jsonResponse({ name: PENDING, done: false }) : { importedRagFilesCount: '1' }), {
+        importPollTimeoutMs: 60,
+        wrapGoogleFetch: (next) => (async (input: string | URL | Request, init?: RequestInit) => (String(input).includes('/operations/pending-part')
+          ? jsonResponse(operation)
+          : next(input, init))) as typeof fetch,
+      });
+      try {
+        writeBatch(f.base, { 'volume.pdf': LONG });
+        await stageBatch(f.worker, 'batch-a');
+        const firstImports = f.importedUris().length;
+        expect(f.importedUris().filter((uri) => uri.includes('part2of3'))).toHaveLength(1);
+        // Still running: the retry cuts and imports nothing.
+        const retry = await stageBatch(f.worker, 'batch-b');
+        expect(JSON.stringify(retry)).toContain('source_import_in_progress');
+        expect(f.importedUris()).toHaveLength(firstImports);
+        // Finished and failed: the retry imports the missing part only.
+        operation = { name: PENDING, done: true, error: { code: 13, message: 'An internal error occurred processing the file.' } };
+        await stageBatch(f.worker, 'batch-c');
+        const added = f.importedUris().slice(firstImports);
+        expect(added).toHaveLength(1);
+        expect(added[0]).toContain('part2of3');
+      } finally { f.cleanup(); }
+    });
+
     // The listing lags imports: a copy recorded imported before it was ever listed may be there.
     test('a PDF recorded imported but never listed is held as unknown; one listed before and gone now is imported again', async () => {
       const short = textPdfBytes(120);
