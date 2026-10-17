@@ -231,7 +231,9 @@ and `stage_import` and `web_import`, where a PDF already in the corpus, one to
 split or one refused leaves the batch. The plan's `pdf_routing` and the
 receipt's `pdf_sources` list each such PDF with its route (`present`, `split`,
 `refused`); `eligible_files` lists only what the batch stages, and a batch of
-refused PDFs answers `pdf_sources_refused`. Parts go to
+refused PDFs answers `pdf_sources_refused`. The 100 MiB batch cap counts only
+the files the batch stages; a routed PDF is bounded by the per-file limit alone
+(web_import's 100 MiB fetch budget still covers everything it fetches). Parts go to
 `staged/<domain>/<batch>--parts/` after the batch import, and a staged PDF that
 is the batch's only file is registered under the `source_id` the import names.
 A PDF imported by URI without `source_id` is registered under its sha256 as

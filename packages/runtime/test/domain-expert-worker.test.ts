@@ -7194,6 +7194,43 @@ describe('splitting long PDFs for LLM-parser imports', () => {
       } finally { f.cleanup(); }
     });
 
+    // A PDF padded to `size` bytes with an object nothing references, so qpdf's parts stay small.
+    const paddedPdf = (pages: number, size: number) => {
+      const pdf = new TextDecoder('latin1').decode(textPdfBytes(pages));
+      const at = pdf.lastIndexOf('trailer');
+      const filler = size - pdf.length - 64;
+      return new TextEncoder().encode(`${pdf.slice(0, at)}999 0 obj\n<< /Length ${filler} >>\nstream\n${'x'.repeat(filler)}\nendstream\nendobj\n${pdf.slice(at)}`);
+    };
+    const NEAR_HALF_CAP = 55_000_000;
+
+    test('the batch cap counts only what the batch stages: two long PDFs over it combined are both routed', async () => {
+      const first = paddedPdf(450, NEAR_HALF_CAP);
+      const second = paddedPdf(460, NEAR_HALF_CAP);
+      const f = splitFixture(first, importsAll);
+      writeBatch(f.base, { 'note.md': '# A note', 'long-a.pdf': first, 'long-b.pdf': second });
+      try {
+        const response = await stageBatch(f.worker, 'two-long');
+        expect(response.skipped_files).toEqual([]);
+        expect(response.staged_files.map((file: Record<string, any>) => file.workspace_relative_path)).toEqual(['experts/research/sources/batch/note.md']);
+        expect(response.pdf_sources.map((pdf: Record<string, any>) => [pdf.workspace_relative_path.split('/').pop(), pdf.route, pdf.status])).toEqual([
+          ['long-a.pdf', 'split', 'imported'], ['long-b.pdf', 'split', 'imported'],
+        ]);
+      } finally { f.cleanup(); }
+    }, 60_000);
+
+    test('the batch cap still applies to PDFs that stay in the batch', async () => {
+      const first = paddedPdf(150, NEAR_HALF_CAP);
+      const second = paddedPdf(160, NEAR_HALF_CAP);
+      const f = splitFixture(first, importsAll);
+      writeBatch(f.base, { 'short-a.pdf': first, 'short-b.pdf': second });
+      try {
+        const response = await stageBatch(f.worker, 'two-short');
+        expect(response.staged_files.map((file: Record<string, any>) => file.workspace_relative_path)).toEqual(['experts/research/sources/batch/short-a.pdf']);
+        expect(response.skipped_files).toEqual([{ workspace_relative_path: 'experts/research/sources/batch/short-b.pdf', reason: 'batch_size_limit_exceeded', bytes: second.byteLength }]);
+        expect(response.pdf_sources).toBeUndefined();
+      } finally { f.cleanup(); }
+    }, 60_000);
+
     test('a batch of refused PDFs reports them refused', async () => {
       const f = splitFixture(LONG, importsAll, { qpdfBin: 'qpdf-missing-fixture' });
       writeBatch(f.base, { 'long-volume.pdf': LONG });

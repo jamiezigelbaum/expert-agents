@@ -2618,8 +2618,9 @@ export class DomainExpertService {
       batchId,
       corpusId,
       includeMedia: params.includeMedia ?? false,
+      deferBatchCap: true,
     });
-    const { skipped, destination, resolvedCorpus } = stage;
+    const { destination, resolvedCorpus } = stage;
     const resolutionWarnings = ragCorpusWarnings(stage.resolved);
     if (stage.eligible.length === 0) {
       throw new DomainExpertWorkerError(
@@ -2631,8 +2632,11 @@ export class DomainExpertService {
     const registeredSource = dryRun ? undefined : await this.registeredImportSource(manifest, rootPath, params.sourceId);
     // The PDFs take the shared pipeline first; the batch is what stays.
     const pdfs = await this.routeStagedPdfs(stage, 'stage_import', registeredSource);
-    const eligible = pdfs.eligible;
-    const totalBytes = eligible.reduce((total, file) => total + file.bytes, 0);
+    // The batch cap counts only what the batch stages.
+    const batch = capStagedBatch(pdfs.eligible);
+    const eligible = batch.eligible;
+    const skipped = [...stage.skipped, ...batch.skipped];
+    const totalBytes = batch.totalBytes;
     const base = {
       action: 'stage_import',
       domain_id: manifest.domain_id,
@@ -2684,7 +2688,7 @@ export class DomainExpertService {
       const pdfSources = await this.importRoutedStagedPdfs(pdfs.routed);
       return { kind: 'rag_corpus_stage_import_result', status: routedPdfStatus(pdfSources), ...base, pdf_sources: pdfSources };
     }
-    const { stagedFiles, operation, warnings, resolved, importResultSink, submissionReceipt } = await this.executeStageImport({ ...stage, eligible: pdfs.eligible });
+    const { stagedFiles, operation, warnings, resolved, importResultSink, submissionReceipt } = await this.executeStageImport({ ...stage, eligible });
     const importResolvedCorpus = resolvedCorpusRecord(resolved);
     const verified = await this.verifyAndRegisterRagImport({
       manifest,
@@ -2802,6 +2806,7 @@ export class DomainExpertService {
         corpusId,
         includeMedia,
         files: writePreflight.files,
+        deferBatchCap: true,
       })
       : await this.planStageImportDirectory({
         manifest,
@@ -2810,6 +2815,7 @@ export class DomainExpertService {
         batchId,
         corpusId,
         includeMedia,
+        deferBatchCap: true,
       }).catch((error) => {
         if (writePreflight.files.length === 0 && error instanceof DomainExpertWorkerError && error.code === 'workspace_path_not_found') {
           return undefined;
@@ -2821,9 +2827,11 @@ export class DomainExpertService {
     const pdfs = stage
       ? await this.routeStagedPdfs(stage, 'web_import', registeredSource, dryRun ? (file) => derivedBytes.get(file.uploadRelativePath) : undefined)
       : { eligible: [], routed: [] as RoutedStagedPdf[] };
-    const eligible = pdfs.eligible;
-    const skipped = [...writePreflight.skipped, ...(stage?.skipped ?? [])];
-    const totalBytes = eligible.reduce((total, file) => total + file.bytes, 0);
+    // The batch cap counts only what the batch stages.
+    const batch = capStagedBatch(pdfs.eligible);
+    const eligible = batch.eligible;
+    const skipped = [...writePreflight.skipped, ...(stage?.skipped ?? []), ...batch.skipped];
+    const totalBytes = batch.totalBytes;
     const destination = stage?.destination ?? mediaDestination;
     const resolved = stage?.resolved ?? await this.resolveRagCorpus(manifest, corpusId);
     const resolvedCorpus = stage?.resolvedCorpus ?? resolvedCorpusRecord(resolved);
@@ -2915,7 +2923,7 @@ export class DomainExpertService {
       const pdfSources = await this.importRoutedStagedPdfs(pdfs.routed);
       return { kind: 'rag_corpus_web_import_result', status: routedPdfStatus(pdfSources), ...base, pdf_sources: pdfSources };
     }
-    const { stagedFiles, operation, warnings, resolved: importResolved, importResultSink, submissionReceipt } = await this.executeStageImport({ ...stage, eligible: pdfs.eligible });
+    const { stagedFiles, operation, warnings, resolved: importResolved, importResultSink, submissionReceipt } = await this.executeStageImport({ ...stage, eligible });
     const importResolvedCorpus = resolvedCorpusRecord(importResolved);
     const verified = await this.verifyAndRegisterRagImport({
       manifest,
@@ -2963,6 +2971,7 @@ export class DomainExpertService {
     corpusId: string;
     includeMedia: boolean;
     files: WebImportDerivedFile[];
+    deferBatchCap?: boolean;
   }): Promise<{
     destination: ReturnType<typeof stageDestination>;
     batchId: string;
@@ -2984,7 +2993,7 @@ export class DomainExpertService {
       candidates,
       destination.bucket,
       destination.objectPrefix,
-      { includeMedia: input.includeMedia },
+      { includeMedia: input.includeMedia, ...(input.deferBatchCap ? { deferBatchCap: true } : {}) },
     );
     const resolved = await this.resolveRagCorpus(input.manifest, input.corpusId);
     return {
@@ -3235,6 +3244,7 @@ export class DomainExpertService {
     batchId: string;
     corpusId: string;
     includeMedia: boolean;
+    deferBatchCap?: boolean;
   }): Promise<{
     destination: ReturnType<typeof stageDestination>;
     batchId: string;
@@ -3252,7 +3262,7 @@ export class DomainExpertService {
       targetPath,
       destination.bucket,
       destination.objectPrefix,
-      { includeMedia: input.includeMedia },
+      { includeMedia: input.includeMedia, ...(input.deferBatchCap ? { deferBatchCap: true } : {}) },
     );
     const resolved = await this.resolveRagCorpus(input.manifest, input.corpusId);
     return {
@@ -8057,7 +8067,7 @@ async function planStageImportFiles(
   targetPath: string,
   destinationBucket: string,
   destinationObjectPrefix: string,
-  options: { includeMedia?: boolean } = {},
+  options: { includeMedia?: boolean; deferBatchCap?: boolean } = {},
 ): Promise<{ eligible: StageImportEligibleFile[]; skipped: StageImportSkippedFile[]; totalBytes: number }> {
   const files = await collectStageImportFiles(rootPath, targetPath);
   return planStageImportCandidates(files, destinationBucket, destinationObjectPrefix, options);
@@ -8093,7 +8103,8 @@ function planStageImportCandidates(
   }>,
   destinationBucket: string,
   destinationObjectPrefix: string,
-  options: { includeMedia?: boolean } = {},
+  // deferBatchCap: the batch cap is applied later, to the files actually staged (capStagedBatch).
+  options: { includeMedia?: boolean; deferBatchCap?: boolean } = {},
 ): { eligible: StageImportEligibleFile[]; skipped: StageImportSkippedFile[]; totalBytes: number } {
   const eligible: StageImportEligibleFile[] = [];
   const skipped: StageImportSkippedFile[] = [];
@@ -8127,7 +8138,7 @@ function planStageImportCandidates(
       continue;
     }
     const countsAgainstTextBatchCap = !isTranscribableMediaPath(file.workspaceRelativePath);
-    if (countsAgainstTextBatchCap && totalBytes + file.bytes > STAGE_IMPORT_MAX_BATCH_BYTES) {
+    if (!options.deferBatchCap && countsAgainstTextBatchCap && totalBytes + file.bytes > STAGE_IMPORT_MAX_BATCH_BYTES) {
       skipped.push({
         workspace_relative_path: file.workspaceRelativePath,
         reason: 'batch_size_limit_exceeded',
@@ -8146,6 +8157,25 @@ function planStageImportCandidates(
       objectName,
       gcsUri: `gs://${destinationBucket}/${objectName}`,
     });
+  }
+  return { eligible, skipped, totalBytes };
+}
+
+// The batch cap over the files a batch actually stages, in order: a PDF the
+// shared pipeline routed out is bounded only by the per-file limit. Media do not
+// count against the text batch cap.
+function capStagedBatch(files: StageImportEligibleFile[]): { eligible: StageImportEligibleFile[]; skipped: StageImportSkippedFile[]; totalBytes: number } {
+  const eligible: StageImportEligibleFile[] = [];
+  const skipped: StageImportSkippedFile[] = [];
+  let totalBytes = 0;
+  for (const file of files) {
+    const counts = !isTranscribableMediaPath(file.workspaceRelativePath);
+    if (counts && totalBytes + file.bytes > STAGE_IMPORT_MAX_BATCH_BYTES) {
+      skipped.push({ workspace_relative_path: file.workspaceRelativePath, reason: 'batch_size_limit_exceeded', bytes: file.bytes });
+      continue;
+    }
+    if (counts) totalBytes += file.bytes;
+    eligible.push(file);
   }
   return { eligible, skipped, totalBytes };
 }
