@@ -1413,8 +1413,9 @@ export class DomainExpertService {
         const holding = recordedSourceHolding(record);
         // An object any record registered without proof of its sha256 (a hand split, an object
         // that changed during its import) is cited with its source marked unverified.
-        // A record of a PDF the pipeline imported says so, whatever the object's key.
-        const pdf = record.content_type === PDF_CONTENT_TYPE;
+        // A record of a PDF says so, whatever the object's key: the pipeline records its
+        // content type, a hand registration (domain_source add) its kind.
+        const pdf = record.content_type === PDF_CONTENT_TYPE || record.kind === 'pdf';
         const cited = (uri: string) => ({ source_id: sourceId, ...(heldUnverified(history, [uri]) ? { unverified: true } : {}), ...(pdf ? { pdf: true } : {}) });
         if (holding?.whole) holdings.set(holding.whole.gcs_uri, cited(holding.whole.gcs_uri));
         // A batch record lists several whole objects; each is cited under the record's source

@@ -8430,6 +8430,8 @@ describe('citations from split parts', () => {
       writeFileSync(registryPath, [
         { source_id: 'history-scanned', domain_id: 'history', kind: 'pdf', content_type: 'application/pdf', ingest_status: 'imported', gcs_uri: object('scanned-paper'), source_sha256: 'a'.repeat(64), registered_at: '2026-10-17T12:00:00.000Z' },
         { source_id: 'history-notes', domain_id: 'history', ingest_status: 'imported', gcs_uri: object('field-notes'), registered_at: '2026-10-17T12:00:00.000Z' },
+        // A hand registration (domain_source add) records the kind, not the content type.
+        { source_id: 'history-registered', domain_id: 'history', kind: 'pdf', ingest_status: 'imported', acquisition: 'registered_holding', gcs_uri: object('registered-scan'), source_sha256: 'b'.repeat(64), registered_at: '2026-10-17T12:00:00.000Z' },
       ].map((record) => JSON.stringify(record)).join('\n') + '\n');
       const worker = createDomainExpertWorker({
         roots: [rootPolicy(fixture.workspaceRoot)],
@@ -8438,7 +8440,7 @@ describe('citations from split parts', () => {
           accessToken: 'fixture-google-token',
           fetchImpl: fakeGoogleFetch([], {
             ragCorpora: [{ name: corpusResource, displayName: 'history-library' }],
-            contexts: () => ['scanned-paper', 'field-notes'].map((name) => ({
+            contexts: () => ['scanned-paper', 'field-notes', 'registered-scan'].map((name) => ({
               sourceUri: object(name), sourceDisplayName: name, text: `${name} passage.`, score: 0.1, chunk: { text: 'x', pageSpan: { firstPage: 5, lastPage: 6 } },
             })),
           }),
@@ -8448,6 +8450,7 @@ describe('citations from split parts', () => {
       const byName = new Map<string, Record<string, any>>(result.passages.map((passage: Record<string, any>) => [passage.source_display_name, passage]));
       expect(byName.get('scanned-paper')).toMatchObject({ source_id: 'history-scanned', original_pages: { first_page: 5, last_page: 6, basis: 'chunk' } });
       expect(byName.get('scanned-paper')!.header).toEndWith(', pages 5-6');
+      expect(byName.get('registered-scan')).toMatchObject({ source_id: 'history-registered', original_pages: { first_page: 5, last_page: 6, basis: 'chunk' } });
       expect(byName.get('field-notes')).toMatchObject({ source_id: 'history-notes' });
       expect(byName.get('field-notes')!.original_pages).toBeUndefined();
     } finally { fixture.cleanup(); }
