@@ -700,7 +700,7 @@ describe('RAG ingestion configuration', () => {
 
     expect(config.ragFileParsingConfig).toEqual({
       llmParser: {
-        modelName: 'projects/fixture-project/locations/us-central1/publishers/google/models/gemini-2.5-flash',
+        modelName: 'projects/fixture-project/locations/global/publishers/google/models/gemini-3.5-flash-lite',
       },
     });
     expect(config.ragFileTransformationConfig).toEqual({
@@ -711,12 +711,12 @@ describe('RAG ingestion configuration', () => {
   test('a configured parser model overrides the default', async () => {
     const config = await importConfig(
       'gs://fixture-shared-library/v1/objects/book.pdf',
-      { ragParserModel: 'gemini-2.5-flash-lite' },
+      { ragParserModel: 'gemini-3.1-flash-lite' },
     );
 
     expect(config.ragFileParsingConfig).toEqual({
       llmParser: {
-        modelName: 'projects/fixture-project/locations/us-central1/publishers/google/models/gemini-2.5-flash-lite',
+        modelName: 'projects/fixture-project/locations/global/publishers/google/models/gemini-3.1-flash-lite',
       },
     });
   });
@@ -954,7 +954,7 @@ describe('RAG ingestion configuration', () => {
     expect(manifest.embedding_model).toBe('text-embedding-005');
     expect(manifest.chunking).toEqual({
       parser: 'llm',
-      parser_model: 'gemini-2.5-flash',
+      parser_model: 'gemini-3.5-flash-lite',
       chunk_tokens: 1024,
       chunk_overlap: 256,
     });

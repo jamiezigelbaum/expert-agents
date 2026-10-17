@@ -37,9 +37,9 @@ describe("RAG parser configuration", () => {
   test("the model expands to a publisher resource name unless one was configured", () => {
     const base = { project: "neutral-project", location: "europe-west1", llmParserEligible: true };
 
-    expect(ragIngestionConfig({ ...base, parserModel: "gemini-2.5-flash" }).ragFileParsingConfig).toEqual({
+    expect(ragIngestionConfig({ ...base, parserModel: "gemini-3.5-flash-lite" }).ragFileParsingConfig).toEqual({
       llmParser: {
-        modelName: "projects/neutral-project/locations/europe-west1/publishers/google/models/gemini-2.5-flash",
+        modelName: "projects/neutral-project/locations/global/publishers/google/models/gemini-3.5-flash-lite",
       },
     });
     const configured = "projects/other/locations/us-central1/publishers/google/models/gemini-2.5-pro";
@@ -55,7 +55,7 @@ describe("RAG parser configuration", () => {
     const ineligible = ragIngestionConfig({
       project: "neutral-project",
       location: "europe-west1",
-      parserModel: "gemini-2.5-flash",
+      parserModel: "gemini-3.5-flash-lite",
       llmParserEligible: false,
     });
 
