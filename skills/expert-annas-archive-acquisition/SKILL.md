@@ -87,9 +87,11 @@ the remaining parts cannot be cut the code is
 `source_parts_resume_unavailable`. A book that reached the corpus outside the
 worker (split by hand and imported straight into Vertex) is registered with
 `domain_source add` giving `sha256` (of the original file) and `gcs_uris`
-(its objects, parts in page order); the runtime checks each object has an
-ACTIVE ragFile and records each part's page range, and registering it again
-changes nothing.
+(its objects; parts named `<name>--partNofM.pdf`); the runtime checks each
+object has an ACTIVE ragFile and records each part's page range, and
+registering it again changes nothing. A match with such a split reports
+`identity_verified: false`, since parts cannot prove the original's sha256:
+say so when you report the book as present.
 
 Report a refusal or failure with the measured page count (`scale.pages`) and,
 for a split, the failing parts; do not substitute another copy without telling

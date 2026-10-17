@@ -734,6 +734,9 @@ export class DomainExpertService {
   private annasMaxDownloadBytes: number;
   private annasMinPdfPages: number;
   private annasPdfSplitPages: number;
+  // EXPERT_AGENTS_DOMAIN_EXPERT_ANNAS_PDF_SPLIT_PAGES=0: no PDF is split, and one longer than
+  // the parser-safe default is refused before upload.
+  private annasPdfSplitDisabled: boolean;
   private annasQpdfBin: string;
   private annasPdftotextBin: string;
   private annasDjvutxtBin: string;
@@ -790,7 +793,9 @@ export class DomainExpertService {
     this.annasMaxDownloadBytes = normalizePositiveInteger(options.annas?.maxDownloadBytes, DEFAULT_ANNAS_ARCHIVE_MAX_DOWNLOAD_BYTES);
     this.annasMinPdfPages = normalizeNonNegativeInteger(options.annas?.minPdfPages, DEFAULT_ANNAS_MIN_PDF_PAGES);
     this.annasDjvutxtBin = options.annas?.djvutxtBin?.trim() || DEFAULT_ANNAS_DJVUTXT_BIN;
-    this.annasPdfSplitPages = normalizePositiveInteger(options.annas?.pdfSplitPages, DEFAULT_ANNAS_PDF_SPLIT_PAGES);
+    const splitPages = pdfSplitPagesSetting(options.annas?.pdfSplitPages);
+    this.annasPdfSplitDisabled = splitPages === 0;
+    this.annasPdfSplitPages = splitPages || DEFAULT_ANNAS_PDF_SPLIT_PAGES;
     this.annasQpdfBin = options.annas?.qpdfBin?.trim() || DEFAULT_ANNAS_QPDF_BIN;
     this.annasPdftotextBin = options.annas?.pdftotextBin?.trim() || DEFAULT_ANNAS_PDFTOTEXT_BIN;
     this.annasImportPollIntervalMs = normalizePositiveInteger(options.annas?.importPollIntervalMs, DEFAULT_ANNAS_IMPORT_POLL_INTERVAL_MS);
@@ -864,13 +869,14 @@ export class DomainExpertService {
     const qpdf = Bun.which(this.annasQpdfBin) !== null;
     const pdftotext = Bun.which(this.annasPdftotextBin) !== null;
     const issues = [
+      ...(this.annasPdfSplitDisabled ? [{ code: 'pdf_split_disabled', message: `EXPERT_AGENTS_DOMAIN_EXPERT_ANNAS_PDF_SPLIT_PAGES is 0: PDFs longer than ${this.annasPdfSplitPages} pages are refused instead of split.` }] : []),
       ...(qpdf ? [] : [{ code: 'qpdf_unavailable', message: `${this.annasQpdfBin} is not on PATH: PDFs longer than ${this.annasPdfSplitPages} pages are refused instead of split.` }]),
       ...(pdftotext ? [] : [{ code: 'pdftotext_unavailable', message: `${this.annasPdftotextBin} is not on PATH: split parts are imported without the text-layer coverage check.` }]),
     ];
     return {
       parser: 'llm',
       max_pages_per_pdf: this.annasPdfSplitPages,
-      long_pdfs: qpdf ? 'split' : 'refused',
+      long_pdfs: qpdf && !this.annasPdfSplitDisabled ? 'split' : 'refused',
       qpdf,
       pdftotext,
       status: issues.length ? 'degraded' : 'ready',
@@ -1818,28 +1824,33 @@ export class DomainExpertService {
     requireConfiguredAgent(manifest, 'domain_source');
     requireGoogleProject(manifest.gcp_project);
     const sha256 = requireString(params.sha256, 'sha256');
-    const uris = params.gcsUris ?? [];
     const corpusTarget = resolveTargetCorpus(params.corpusId, manifest);
     if (!corpusTarget) throw new DomainExpertWorkerError(400, 'needs_corpus_decision', NO_TARGET_CORPUS_REASON);
-    for (const uri of uris) assertAllowedGcsDestination(uri, manifest.allowed_gcs_prefixes);
+    const corpusId = corpusTarget.target_corpus_id;
+    for (const uri of params.gcsUris ?? []) {
+      assertAllowedGcsDestination(uri, manifest.allowed_gcs_prefixes);
+      if (uri.endsWith('/') || !parseGcsPrefix(uri).prefix.replace(/\/$/, '')) {
+        throw new DomainExpertWorkerError(400, 'invalid_params', `${uri} names a directory or a bucket, not an object; gcs_uris lists objects.`);
+      }
+    }
+    const uris = orderedHoldingUris(params.gcsUris ?? []);
     const isPdf = (uri: string) => uri.toLowerCase().endsWith('.pdf');
     const split = uris.length > 1;
-    if (split && !uris.every(isPdf)) {
-      throw new DomainExpertWorkerError(400, 'invalid_params', 'gcs_uris names more than one object, the parts of a split, so every one must be a PDF.');
-    }
     const registry = await readDomainSourceRegistry(registryPath);
-    const existing = sourceForIdentity(registry.records, sha256, undefined);
+    // The source this sha256 names, else one written before sources carried a sha256 that holds these objects.
+    const existing = sourceForIdentity(registry.records, sha256, undefined) ?? sourceHoldingObjects(registry.records, uris);
     const existingHolding = recordedSourceHolding(existing?.holding);
     const existingUris = existingHolding?.whole ? [existingHolding.whole.gcs_uri] : existingHolding?.parts.map((part) => part.gcs_uri) ?? [];
-    if (existing && existingUris.length && existingUris.join('\n') !== uris.join('\n')) {
+    const existingCorpus = existing?.holding ? stringRecordField(existing.holding, 'target_corpus_id') : undefined;
+    if (existing && existingUris.length && (existingUris.join('\n') !== uris.join('\n') || (existingCorpus !== undefined && existingCorpus !== corpusId))) {
       throw new DomainExpertWorkerError(
         409,
         'source_identity_conflict',
-        `Source ${existing.sourceId} already records this sha256 with a different corpus holding (${existingUris.join(', ')}). Nothing was registered.`,
+        `Source ${existing.sourceId} already records this source with a different corpus holding (${existingUris.join(', ')}${existingCorpus ? ` in corpus ${existingCorpus}` : ''}). Nothing was registered.`,
         'If that holding is wrong, remove the source with domain_source remove first; a source keeps one holding.',
       );
     }
-    const settled = existing?.current.ingest_status === 'imported'
+    const settled = existing?.current.ingest_status === 'imported' && existing.current.source_sha256 === sha256 && existingCorpus === corpusId
       && (existingHolding?.whole !== undefined || existingHolding?.parts?.every((part) => part.first_page !== undefined) === true);
     if (existing && existingUris.length && settled) {
       return {
@@ -1854,28 +1865,30 @@ export class DomainExpertService {
       };
     }
     const pageCounts: number[] = [];
-    if (uris.some(isPdf)) {
-      const qpdf = Bun.which(this.annasQpdfBin);
-      if (!qpdf) throw new DomainExpertWorkerError(503, 'qpdf_unavailable', `Counting the PDF's pages needs ${this.annasQpdfBin} (qpdf) on the worker host. Nothing was registered.`);
-      for (const uri of uris.filter(isPdf)) {
-        const { bucket, prefix } = parseGcsPrefix(uri);
-        const objectName = prefix.replace(/\/$/, '');
-        let bytes: Uint8Array | null;
-        try {
-          bytes = await this.google.downloadLibraryObject(bucket, objectName, PDF_PROCESSING_MAX_BYTES, GOOGLE_LONG_GENERATION_TIMEOUT_MS);
-        } catch (error) {
-          throw new DomainExpertWorkerError(502, 'gcs_object_unreadable', `${uri} could not be read (${error instanceof Error ? error.message : String(error)}). Nothing was registered.`);
-        }
-        if (!bytes) throw new DomainExpertWorkerError(404, 'gcs_object_not_found', `${uri} does not exist. Nothing was registered.`);
-        try {
-          pageCounts.push(await qpdfPageCount(qpdf, bytes));
-        } catch (error) {
-          throw new DomainExpertWorkerError(422, 'pdf_page_count_failed', `${uri}: ${error instanceof Error ? error.message : String(error)} Nothing was registered.`);
-        }
+    const qpdf = uris.some(isPdf) ? Bun.which(this.annasQpdfBin) : null;
+    if (uris.some(isPdf) && !qpdf) throw new DomainExpertWorkerError(503, 'qpdf_unavailable', `Counting the PDF's pages needs ${this.annasQpdfBin} (qpdf) on the worker host. Nothing was registered.`);
+    for (const uri of uris) {
+      const { bucket, prefix } = parseGcsPrefix(uri);
+      let bytes: Uint8Array | null;
+      try {
+        bytes = await this.google.downloadLibraryObject(bucket, prefix.replace(/\/$/, ''), PDF_PROCESSING_MAX_BYTES, GOOGLE_LONG_GENERATION_TIMEOUT_MS);
+      } catch (error) {
+        throw new DomainExpertWorkerError(502, 'gcs_object_unreadable', `${uri} could not be read (${error instanceof Error ? error.message : String(error)}). Nothing was registered.`);
+      }
+      if (!bytes) throw new DomainExpertWorkerError(404, 'gcs_object_not_found', `${uri} does not exist. Nothing was registered.`);
+      // A whole object is the original file, so its bytes prove the sha256; parts cannot.
+      if (!split && createHash('sha256').update(bytes).digest('hex') !== sha256) {
+        throw new DomainExpertWorkerError(409, 'sha256_mismatch', `${uri} does not hash to the given sha256, so it is not that file. Nothing was registered.`, 'Give the sha256 of the object itself (sha256sum of the original file).');
+      }
+      if (!isPdf(uri)) continue;
+      try {
+        pageCounts.push(await qpdfPageCount(qpdf!, bytes));
+      } catch (error) {
+        throw new DomainExpertWorkerError(422, 'pdf_page_count_failed', `${uri}: ${error instanceof Error ? error.message : String(error)} Nothing was registered.`);
       }
     }
-    const corpusId = corpusTarget.target_corpus_id;
-    const files = await this.ragFilesForImportedUris(manifest, await this.resolveRagCorpus(manifest, corpusId), uris);
+    // Matched by exact source URI only: a display name can belong to another object.
+    const files = await this.ragFilesForImportedUris(manifest, await this.resolveRagCorpus(manifest, corpusId), uris, { exact: true });
     const inactive = files.filter((file) => file.state !== 'ACTIVE');
     if (inactive.length) {
       throw new DomainExpertWorkerError(
@@ -1908,6 +1921,8 @@ export class DomainExpertService {
       target_corpus_id: corpusId,
       acquisition: 'registered_holding',
       source_sha256: sha256,
+      // A split's parts cannot prove the original's sha256; the operator's word stands for it.
+      sha256_verified: !split,
       ingest_status: 'imported',
       ...(split
         ? { pages: firstPage - 1, split_parts: ragFiles.length, rag_files: ragFiles }
@@ -3251,7 +3266,11 @@ export class DomainExpertService {
     manifest: ReturnType<typeof domainManifest>,
     resolved: ResolvedRagCorpus,
     gcsUris: string[],
+    options: { exact?: boolean } = {},
   ): Promise<Array<Record<string, unknown>>> {
+    const matches = (file: Record<string, unknown>, targets: string[]) => (options.exact
+      ? typeof file.sourceUri === 'string' && targets.includes(file.sourceUri)
+      : ragFileMatchesTargets(file, targets));
     const listed: Array<Record<string, unknown>> = [];
     let pageToken: string | undefined;
     do {
@@ -3261,12 +3280,12 @@ export class DomainExpertService {
         corpusName: resolved.resourceName,
         ...(pageToken ? { pageToken } : {}),
       });
-      listed.push(...page.files.filter((file) => ragFileMatchesTargets(file, gcsUris)));
+      listed.push(...page.files.filter((file) => matches(file, gcsUris)));
       pageToken = page.nextPageToken;
     } while (pageToken);
     return gcsUris.map((gcsUri) => {
-      const matches = listed.filter((file) => ragFileMatchesTargets(file, [gcsUri]));
-      const file = matches.find((candidate) => candidate.state === 'ACTIVE') ?? matches[0];
+      const found = listed.filter((file) => matches(file, [gcsUri]));
+      const file = found.find((candidate) => candidate.state === 'ACTIVE') ?? found[0];
       if (!file) return { gcs_uri: gcsUri };
       return {
         gcs_uri: gcsUri,
@@ -3831,7 +3850,7 @@ export class DomainExpertService {
         return this.ingestSplitAnnasPdf({
           manifest, params, locator, corpusId, corpusTarget, context, sourcePath,
           bytes: artifact.bytes, qpdf: route.qpdf, pages: route.pages, plan: route.plan,
-          recorded: holding.kind === 'partial' ? holding.parts : [],
+          recorded: route.recorded,
         });
       }
     }
@@ -3901,7 +3920,11 @@ export class DomainExpertService {
       listingError = annasIngestErrorRecord(error).code;
     }
     const verification = listed ? 'corpus' : 'registry';
-    const unverified = listingError ? { corpus_check_error: listingError } : {};
+    const unverified = {
+      ...(listingError ? { corpus_check_error: listingError } : {}),
+      // Registered from a split's parts: the sha256 is the operator's, not measured.
+      ...(found.holding?.sha256_verified === false ? { identity_verified: false } : {}),
+    };
     // The registry's word stands in for an unreadable listing only for the corpus it recorded.
     const sameCorpus = (stringRecordField(found.holding ?? {}, 'target_corpus_id') ?? corpusId) === corpusId;
     if (holding.whole) {
@@ -3925,7 +3948,7 @@ export class DomainExpertService {
       const ragFileName = typeof file?.rag_file_name === 'string' ? file.rag_file_name : part.rag_file_name;
       return { ...part, present, ...(ragFileName ? { rag_file_name: ragFileName } : {}) };
     });
-    if (parts.every((part) => part.present)) {
+    if (parts.every((part) => part.present) && completeRecordedSplit(parts)) {
       const pages = parts.every((part) => part.last_page !== undefined) ? parts.at(-1)!.last_page : undefined;
       return {
         kind: 'present',
@@ -3986,10 +4009,11 @@ export class DomainExpertService {
     holding: AnnasSourceHolding,
   ): Promise<
     | { whole: true }
-    | { pages: number; plan: PdfPartPlan[]; qpdf: string }
+    | { pages: number; plan: PdfPartPlan[]; qpdf: string; recorded: AnnasRecordedPart[] }
     | { refusal: { code: string; message: string; suggestion: string }; split?: Record<string, unknown> }
   > {
     const limit = this.annasPdfSplitPages;
+    const disabled = 'splitting is disabled (EXPERT_AGENTS_DOMAIN_EXPERT_ANNAS_PDF_SPLIT_PAGES=0)';
     const qpdf = Bun.which(this.annasQpdfBin) ?? undefined;
     let pages: number | undefined;
     let unreadable: string | undefined;
@@ -4000,21 +4024,26 @@ export class DomainExpertService {
         unreadable = error instanceof Error ? error.message : String(error);
       }
     }
-    if (holding.kind === 'partial') {
-      const plan = recordedPartPlan(holding.parts, pages);
-      if (!qpdf || pages === undefined || !plan) {
-        const why = !qpdf ? `${this.annasQpdfBin} (qpdf) is not installed on the worker host`
-          : pages === undefined ? String(unreadable)
-            : `the recorded parts do not cover the ${pages}-page file page for page`;
+    // A split recorded before parts carried page ranges (#37) whose ranges cannot be
+    // rebuilt is split afresh, as before; the same split reproduces the same parts.
+    const legacy = holding.kind === 'partial' && holding.parts.every((part) => part.first_page === undefined);
+    const recorded = holding.kind === 'partial' ? recordedPartsWithRanges(holding.parts, pages, limit) : undefined;
+    if (holding.kind === 'partial' && !(legacy && !recorded && qpdf && pages !== undefined && !this.annasPdfSplitDisabled)) {
+      const plan = recorded ? recordedPartPlan(recorded, pages) : undefined;
+      if (!qpdf || pages === undefined || !plan || this.annasPdfSplitDisabled) {
+        const why = this.annasPdfSplitDisabled ? disabled
+          : !qpdf ? `${this.annasQpdfBin} (qpdf) is not installed on the worker host`
+            : pages === undefined ? String(unreadable)
+              : `the recorded parts do not cover the ${pages}-page file page for page`;
         return {
           refusal: {
             code: 'source_parts_resume_unavailable',
             message: `The source registry records ${holding.parts.filter((part) => part.present).length} of ${holding.parts.length} parts of this file (${holding.source_id}) in the corpus, and the remaining parts cannot be cut: ${why}. Nothing was uploaded or imported; the download is still on disk at ${sourcePath}.`,
-            suggestion: 'Install qpdf on the worker host and re-run; if the recorded parts are wrong, correct the registry with domain_source add (sha256 and gcs_uris) before re-running.',
+            suggestion: 'Install qpdf on the worker host (and enable splitting) and re-run. If the recorded parts are wrong, remove the source with domain_source remove and import it again.',
           },
         };
       }
-      return { pages, plan, qpdf };
+      return { pages, plan, qpdf, recorded: recorded! };
     }
     if (this.google.ragParserModel() === undefined) return { whole: true };
     if (pages === undefined || !qpdf) {
@@ -4026,6 +4055,7 @@ export class DomainExpertService {
       return { whole: true };
     }
     if (pages <= limit) return { whole: true };
+    if (this.annasPdfSplitDisabled) return { refusal: pdfPageLimitRefusal(pages, limit, disabled, sourcePath) };
     // A long book imported whole before the registry carried its identity stays
     // whole: the parts would put it in the corpus a second time.
     const whole = await this.wholeAnnasPdfInCorpus(manifest, params, locator, corpusId, bytes);
@@ -4040,7 +4070,7 @@ export class DomainExpertService {
         split: { pages, max_part_pages: limit },
       };
     }
-    return { pages, plan: planPdfParts(pages, limit), qpdf };
+    return { pages, plan: planPdfParts(pages, limit), qpdf, recorded: [] };
   }
 
   // Whether these exact bytes already sit under the book's whole-file name
@@ -6859,7 +6889,7 @@ export function domainExpertAnnasConfigFromEnv(env: Record<string, string | unde
       : {}),
     ...(env.EXPERT_AGENTS_DOMAIN_EXPERT_ANNAS_DJVUTXT_BIN ? { djvutxtBin: env.EXPERT_AGENTS_DOMAIN_EXPERT_ANNAS_DJVUTXT_BIN } : {}),
     ...(env.EXPERT_AGENTS_DOMAIN_EXPERT_ANNAS_PDF_SPLIT_PAGES
-      ? { pdfSplitPages: normalizePositiveInteger(env.EXPERT_AGENTS_DOMAIN_EXPERT_ANNAS_PDF_SPLIT_PAGES, DEFAULT_ANNAS_PDF_SPLIT_PAGES) }
+      ? { pdfSplitPages: pdfSplitPagesSetting(env.EXPERT_AGENTS_DOMAIN_EXPERT_ANNAS_PDF_SPLIT_PAGES) }
       : {}),
     ...(env.EXPERT_AGENTS_DOMAIN_EXPERT_ANNAS_QPDF_BIN ? { qpdfBin: env.EXPERT_AGENTS_DOMAIN_EXPERT_ANNAS_QPDF_BIN } : {}),
     ...(env.EXPERT_AGENTS_DOMAIN_EXPERT_ANNAS_PDFTOTEXT_BIN ? { pdftotextBin: env.EXPERT_AGENTS_DOMAIN_EXPERT_ANNAS_PDFTOTEXT_BIN } : {}),
@@ -8971,6 +9001,55 @@ function recordedSourceHolding(
   }
   const whole = stringRecordField(record, 'gcs_uri', 'gcsUri') ?? (files.length === 1 && typeof files[0]!.gcs_uri === 'string' ? files[0]!.gcs_uri : undefined);
   return whole ? { whole: { gcs_uri: whole, status } } : undefined;
+}
+
+// A holding's objects in page order: one whole object, or the parts of a split,
+// each named <name>--partNofM.pdf for the same M, N from 1 to M once each.
+function orderedHoldingUris(uris: string[]): string[] {
+  if (uris.length <= 1) return uris;
+  const named = uris.map((uri) => ({ uri, match: /--part(\d+)of(\d+)\.pdf$/i.exec(uri) }));
+  const of = uris.length;
+  const indices = named.map(({ match }) => (match && Number(match[2]) === of ? Number(match[1]) : 0));
+  if (indices.some((index) => index < 1 || index > of) || new Set(indices).size !== of) {
+    throw new DomainExpertWorkerError(400, 'invalid_params', `gcs_uris lists ${of} parts, so each must be a PDF named <name>--partNof${of}.pdf with N from 1 to ${of} once each.`);
+  }
+  return named.map((entry, position) => ({ ...entry, index: indices[position]! })).sort((left, right) => left.index - right.index).map(({ uri }) => uri);
+}
+
+// A source written before sources carried a sha256 whose latest holding is exactly these objects.
+function sourceHoldingObjects(records: DomainSourceRegistryRecord[], uris: string[]): ReturnType<typeof sourceForIdentity> {
+  for (const history of groupDomainSourceRecords(records).values()) {
+    const current = latestDomainSourceRecord(history);
+    if (current.removed || history.some((entry) => registryRecordSha256s(entry.record).length)) continue;
+    const holdings = history.filter((entry) => registryRecordGcsUris(entry.record).length > 0);
+    if (!holdings.length) continue;
+    const holding = latestDomainSourceRecord(holdings).record;
+    const recorded = recordedSourceHolding(holding);
+    const held = recorded?.whole ? [recorded.whole.gcs_uri] : recorded?.parts.map((part) => part.gcs_uri) ?? [];
+    if (held.join('\n') === uris.join('\n')) return { sourceId: current.sourceId, current: current.record, holding };
+  }
+  return undefined;
+}
+
+// Parts 1 to N of one N-part split, each recorded once.
+function completeRecordedSplit(parts: AnnasRecordedPart[]): boolean {
+  const of = parts[0]?.of;
+  return of !== undefined && parts.length === of && parts.every((part, position) => part.of === of && part.index === position + 1);
+}
+
+// The recorded parts with their page ranges in the original. A split recorded
+// before parts carried ranges (#37) gets them back the way it was made: balanced
+// parts at the split size, or at ceil(pages / parts) when the split size gives
+// another number of parts. Undefined when the parts are not one complete split or
+// no plan with that many parts exists.
+function recordedPartsWithRanges(parts: AnnasRecordedPart[], pages: number | undefined, splitPages: number): AnnasRecordedPart[] | undefined {
+  if (pages === undefined || !completeRecordedSplit(parts)) return undefined;
+  if (parts.every((part) => part.first_page !== undefined)) return parts;
+  if (parts.some((part) => part.first_page !== undefined)) return undefined;
+  const plan = [splitPages, Math.ceil(pages / parts.length)]
+    .map((size) => planPdfParts(pages, size))
+    .find((candidate) => candidate.length === parts.length);
+  return plan?.map((range, position) => ({ ...parts[position]!, first_page: range.firstPage, last_page: range.lastPage, pages: range.pages }));
 }
 
 // The recorded parts as a split plan, when their page ranges cover a file of
@@ -11609,6 +11688,15 @@ function rootFromRecord(record: Record<string, unknown>): DomainExpertWorkspaceR
     ...(typeof record.audit_path === 'string' ? { auditPath: record.audit_path } : {}),
     ...(typeof record.auditPath === 'string' ? { auditPath: record.auditPath } : {}),
   });
+}
+
+// The split size: a positive page count, or 0 to split nothing. A bad value names the setting.
+function pdfSplitPagesSetting(value: unknown): number {
+  try {
+    return normalizeNonNegativeInteger(value, DEFAULT_ANNAS_PDF_SPLIT_PAGES);
+  } catch {
+    throw new DomainExpertWorkerError(400, 'invalid_config', `EXPERT_AGENTS_DOMAIN_EXPERT_ANNAS_PDF_SPLIT_PAGES must be a whole number of pages (default ${DEFAULT_ANNAS_PDF_SPLIT_PAGES}), or 0 to split no PDF; got ${JSON.stringify(String(value)).slice(0, 40)}.`);
+  }
 }
 
 function normalizePositiveInteger(value: unknown, fallback: number): number {

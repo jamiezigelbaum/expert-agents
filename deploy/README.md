@@ -241,16 +241,32 @@ and imported straight into Vertex) is registered without importing anything:
 {"tool": "domain_source", "params": {"action": "add", "domain_id": "<domain>", "kind": "book",
   "title": "<title>", "author": "<author>", "corpus_id": "<corpus>",
   "sha256": "<sha256sum of the original file>",
-  "gcs_uris": ["gs://<bucket>/<dir>/<part 1>.pdf", "gs://<bucket>/<dir>/<part 2>.pdf"],
+  "gcs_uris": ["gs://<bucket>/<dir>/<name>--part1of2.pdf", "gs://<bucket>/<dir>/<name>--part2of2.pdf"],
   "dry_run": false}}
 ```
 
-The worker requires every object to have an ACTIVE ragFile, counts each PDF's
-pages with `qpdf` to record each part's original page range, and writes one
-`imported` record (`acquisition: registered_holding`); the same call again
-answers `already_registered` and writes nothing, and a different holding for
-the same sha256 is refused with `source_identity_conflict`. A book already
-imported whole before sources carried their sha256 is left whole. After submission
+Each entry names an object, not a directory or bucket. The parts of a split are
+named `<name>--partNofM.pdf` for one M, N from 1 to M once each, and are ordered
+by N. The worker requires every object to have an ACTIVE ragFile matched by its
+exact source URI, counts each PDF's pages with `qpdf` to record each part's
+original page range, and writes one `imported` record
+(`acquisition: registered_holding`). A whole object must hash to the given
+sha256; a split's parts cannot prove it, so their record says
+`sha256_verified: false` and an import that matches it reports
+`identity_verified: false`. The same call again answers `already_registered`
+and writes nothing; a different holding for the same sha256, or the same one in
+another corpus, is refused with `source_identity_conflict`. A record written
+before sources carried a sha256 that holds the same objects is updated rather
+than duplicated. A book already imported whole before sources carried their
+sha256 is left whole, and a split recorded before parts carried page ranges
+gets its ranges back from the part names and the original's page count, so a
+re-run imports only the unfinished parts. Two imports of the same book at once
+are not locked against each other: Vertex skips the URI the other import holds
+and registry writes are serialized.
+
+Upgrading from a release with `EXPERT_AGENTS_DOMAIN_EXPERT_ANNAS_PDF_SPLIT_PAGES=0`:
+0 still disables splitting, and a PDF over 200 pages is then refused before
+upload; health reports `pdf_split_disabled`. After submission
 the worker polls the Vertex operation, starting at
 `EXPERT_AGENTS_DOMAIN_EXPERT_ANNAS_IMPORT_POLL_INTERVAL_MS` (default 5000) and
 growing ×1.5 per read up to 30 s while the import runs (each read counts
