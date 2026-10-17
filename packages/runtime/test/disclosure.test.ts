@@ -729,6 +729,9 @@ describe('disclosure parity for an agent with no declared posture', () => {
         cloud_corpus_requires_source_review: true,
         direct_google_doc_edits_require_approval: true,
       },
+      // Stage timings are an additive operational field on every ask, not a
+      // disclosure key; their shape is pinned in the worker timing test.
+      timings: expect.any(Object),
     });
     expect(Object.keys(body)).not.toContain('disclosure');
   });
@@ -768,7 +771,11 @@ describe('disclosure parity for an agent with no declared posture', () => {
       session_id: 'ignored-when-no-posture-is-declared',
     });
 
-    expect(withId).toEqual(plain);
+    // Wall-clock stage timings differ between any two asks; everything else must not.
+    const { timings: plainTimings, ...plainRest } = plain as Record<string, unknown>;
+    const { timings: withIdTimings, ...withIdRest } = withId as Record<string, unknown>;
+    expect(Object.keys(withIdTimings as object)).toEqual(Object.keys(plainTimings as object));
+    expect(withIdRest).toEqual(plainRest);
     expect(withSession.map((call) => ({ url: call.url, method: call.method, body: call.body })))
       .toEqual(withoutSession.map((call) => ({ url: call.url, method: call.method, body: call.body })));
   });

@@ -42,6 +42,10 @@ and compares only these response fields:
 - `retrieval_plan`, deep-compared after object keys are sorted, with only
   differing JSON paths written to the receipt.
 
+Other response fields, including the per-stage `timings` object, are not
+compared; timings vary from run to run and are measured by the retrieval eval
+instead (see `RETRIEVAL_EVAL.md`).
+
 The runner never compares answer prose. It omits answer text from the receipt
 and records only its SHA-256 digest and Unicode character count for each side.
 An error response is expected to use

@@ -163,6 +163,32 @@ export interface DomainExpertGoogleConfig {
 export type DomainExpertReranker = DomainAskReranker;
 export type DomainAskOutput = 'answer' | 'passages';
 
+/** Wall-clock milliseconds per domain_ask stage, rounded to integers. */
+export interface DomainAskTimings {
+  /** Agent, preference profile and corpus resolution. */
+  setup_ms: number;
+  /** Multi-query reformulation; zero when multi-query is off. */
+  rewrite_ms: number;
+  /** Every corpus x query retrieveContexts call, run concurrently. */
+  retrieve_ms: number;
+  /** Cross-corpus ranking; zero for a single corpus. */
+  rerank_ms: number;
+  /** Rank fusion, retrieval preferences and the profile-corpus floor. */
+  fuse_ms: number;
+  /** Sentence completion and the disclosure bound. */
+  complete_ms: number;
+  /** Citation source metadata resolution. */
+  cite_ms: number;
+  /** Answer synthesis; present only on domain_answer. */
+  synthesize_ms?: number;
+  /** The whole ask, from request handling to response assembly. */
+  total_ms: number;
+}
+
+function elapsedStageMs(startedAt: number, endedAt: number): number {
+  return Math.max(0, Math.round(endedAt - startedAt));
+}
+
 type GoogleConfigurationStatus = 'ready' | 'unreadable' | 'not_configured';
 
 export interface DomainExpertAnnasConfig {
@@ -1336,6 +1362,20 @@ export class DomainExpertService {
   }
 
   private async domainAsk(params: DomainAskRequestParams): Promise<unknown> {
+    // Wall-clock stage timings travel with every ask so an operator eval can
+    // see where latency goes without reading the journal. Stages that do not
+    // run report zero; synthesis is reported only when an answer is written.
+    const askStartedAt = performance.now();
+    let stageStartedAt = askStartedAt;
+    const timings: DomainAskTimings = {
+      setup_ms: 0, rewrite_ms: 0, retrieve_ms: 0, rerank_ms: 0, fuse_ms: 0,
+      complete_ms: 0, cite_ms: 0, total_ms: 0,
+    };
+    const endStage = (stage: Exclude<keyof DomainAskTimings, 'total_ms'>) => {
+      const now = performance.now();
+      timings[stage] = elapsedStageMs(stageStartedAt, now);
+      stageStartedAt = now;
+    };
     const manifest = this.manifest(params.domainId);
     requireConfiguredAgent(manifest, 'domain_ask');
     const plan = planDomainAsk(params, manifest);
@@ -1401,6 +1441,7 @@ export class DomainExpertService {
         'Configured retrieval preferences do not match the resolved corpus.',
         'Repair the operator profile or explicitly request retrieval_mode history.');
     }
+    endStage('setup_ms');
     let queries = [question];
     if (retrievalOverrides?.multiQuery ?? this.google.multiQueryEnabled()) {
       try {
@@ -1425,6 +1466,7 @@ export class DomainExpertService {
         }));
       }
     }
+    endStage('rewrite_ms');
     let rankedLists: Array<Array<Record<string, unknown> & { corpus_id: string }>> = [];
     const queryLists: Array<Array<Record<string, unknown> & { corpus_id: string }>> = queries.map(() => []);
     // The profile corpus's own per-query lists, before pooling with other shelves.
@@ -1441,6 +1483,7 @@ export class DomainExpertService {
         topK,
         ...(retrievalOverrides?.reranker ? { reranker: retrievalOverrides.reranker } : {}),
       })).then((value) => ({ ok: true as const, value }), (error: unknown) => ({ ok: false as const, error }))))));
+    endStage('retrieve_ms');
     // A corpus whose original question fails is lost to this answer. With one
     // corpus that fails the request; with shelves, the others still answer and
     // the loss is reported, so one bad shelf cannot take a library down.
@@ -1490,6 +1533,7 @@ export class DomainExpertService {
       })));
       rankedLists = rankedLists.filter((list) => list.length > 0);
     }
+    endStage('rerank_ms');
     if (preference && ![...usedCorpora.values()].some((corpus) => corpus.resourceName === preference.profile.corpus)) {
       throw new DomainExpertWorkerError(409, 'retrieval_preferences_corpus_mismatch',
         'Configured retrieval preferences do not match the retrieved corpus.');
@@ -1546,6 +1590,7 @@ export class DomainExpertService {
     }
     // Sentence completion runs before the disclosure bound, so a declared
     // posture measures, and may still trim, the completed text.
+    endStage('fuse_ms');
     const completedContexts = await this.completePassageSentences(fusedContexts);
     const boundedContexts = disclosure ? boundDisclosedContexts(disclosure, completedContexts) : completedContexts;
     const retrieved: Array<Record<string, unknown> & { citation_id: string; corpus_id: string }> = boundedContexts.map((context) => {
@@ -1556,7 +1601,9 @@ export class DomainExpertService {
         citation_id: `${context.corpus_id}:${ordinal}`,
       };
     });
+    endStage('complete_ms');
     const citationSources = await this.resolveCitationSources(retrieved, manifest);
+    endStage('cite_ms');
     const cited: typeof retrieved = retrieved.map((context, index) => {
       const source = citationSources.metadata[index];
       return {
@@ -1614,7 +1661,21 @@ export class DomainExpertService {
         : (plan as Record<string, unknown>).retrieval,
       policy: domainPolicy(),
     };
+    const logTimings = (output: DomainAskOutput) => {
+      timings.total_ms = elapsedStageMs(askStartedAt, performance.now());
+      console.info(JSON.stringify({
+        kind: 'domain_expert_ask_timings',
+        domain_id: manifest.domain_id,
+        output,
+        query_count: queries.length,
+        corpus_count: usedCorpora.size,
+        selected_context_count: retrieved.length,
+        timings,
+      }));
+      return { ...timings };
+    };
     if (params.output === 'passages') {
+      const passageTimings = logTimings('passages');
       return {
         kind: 'domain_passages',
         status: 'retrieved',
@@ -1630,6 +1691,7 @@ export class DomainExpertService {
           source_uri: context.sourceUri,
           score: context.score,
         })),
+        timings: passageTimings,
       };
     }
     const answer = await this.google.generateAnswer({
@@ -1639,11 +1701,14 @@ export class DomainExpertService {
       question,
       contexts: cited,
     });
+    timings.synthesize_ms = elapsedStageMs(stageStartedAt, performance.now());
+    const answerTimings = logTimings('answer');
     return {
       kind: 'domain_answer',
       status: 'answered',
       ...shared,
       answer,
+      timings: answerTimings,
     };
   }
 

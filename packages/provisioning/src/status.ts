@@ -1,7 +1,7 @@
 import { readdir, readFile, stat } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { validateScopeManifest, type ScopeManifest } from "../../library/src/index.ts";
-import { parseRetrievalEvalSet, type RetrievalEvalSet } from "../../../scripts/retrieval-eval.ts";
+import { parseRetrievalEvalSet, type AnyRetrievalEvalSet } from "../../../scripts/retrieval-eval.ts";
 import {
   DERIVED_ARTIFACT_CONTENT_FILE,
   DERIVED_ARTIFACT_DIRECTORY,
@@ -426,7 +426,7 @@ function parseEval(
   text: string | undefined,
   items: ContractItemStatus[],
   findings: ContractFinding[],
-): RetrievalEvalSet | undefined {
+): AnyRetrievalEvalSet | undefined {
   if (text === undefined || text.trim().length === 0) return undefined;
   try {
     const evalSet = parseRetrievalEvalSet(text);
