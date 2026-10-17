@@ -230,7 +230,9 @@ it and count its pages (the worker's service account needs
 and `stage_import` and `web_import`, where a PDF already in the corpus, one to
 split or one refused leaves the batch. The plan's `pdf_routing` and the
 receipt's `pdf_sources` list each such PDF with its route (`present`, `split`,
-`refused`); `eligible_files` lists only what the batch stages, and a batch of
+`refused`, or `duplicate` for a later file with the same bytes as an earlier
+one in the batch, reported `duplicate_in_batch` with `duplicate_of` and not
+imported; a split also checks the corpus again right before it runs); `eligible_files` lists only what the batch stages, and a batch of
 refused PDFs answers `pdf_sources_refused`. The 100 MiB batch cap counts only
 the files the batch stages; a routed PDF is bounded by the per-file limit alone
 (web_import's 100 MiB fetch budget still covers everything it fetches). Parts go to

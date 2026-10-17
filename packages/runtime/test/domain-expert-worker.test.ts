@@ -6394,7 +6394,7 @@ describe('splitting long PDFs for LLM-parser imports', () => {
   // name. A successful import lists an ACTIVE ragFile; a failed one leaves an ERROR ragFile, and
   // Vertex skips a re-import of any URI it holds a record for, ERROR records included, until
   // that record is deleted.
-  function splitGoogleFetch(calls: CapturedCall[], behaviour: ImportBehaviour, listing: { state?: string; status?: () => number | undefined; displayNameOnly?: boolean } = {}, seed: { objects?: Array<[string, Uint8Array]>; imported?: string[] } = {}): typeof fetch {
+  function splitGoogleFetch(calls: CapturedCall[], behaviour: ImportBehaviour, listing: { state?: string; status?: () => number | undefined; displayNameOnly?: boolean; contexts?: Array<Record<string, unknown>> } = {}, seed: { objects?: Array<[string, Uint8Array]>; imported?: string[] } = {}): typeof fetch {
     const objects: FakeGcsObjects = new Map(seed.objects ?? []);
     const imported = new Map<string, string>((seed.imported ?? []).map((uri, index) => [uri, `${CORPUS}/ragFiles/8000${index}`]));
     const errored = new Map<string, string>();
@@ -6420,6 +6420,7 @@ describe('splitting long PDFs for LLM-parser imports', () => {
         if ('error' in outcome) errored.set(uri, `${CORPUS}/ragFiles/${7000 + operations}`);
         return jsonResponse({ name: `${CORPUS}/operations/split-${operations}`, done: true, ...(('error' in outcome) ? { error: outcome.error } : { response: outcome }) });
       }
+      if (url.endsWith(':retrieveContexts')) return jsonResponse({ contexts: { contexts: listing.contexts ?? [] } });
       if (method === 'DELETE' && url.includes('/ragFiles/')) {
         const name = new URL(url).pathname.replace(/^\/v1\//, '');
         for (const records of [imported, errored]) for (const [uri, file] of records) if (file === name) records.delete(uri);
@@ -7264,6 +7265,49 @@ describe('splitting long PDFs for LLM-parser imports', () => {
         expect(plan.eligible_files).toEqual([]);
         expect(existsSync(join(fixture.workspaceRoot, 'experts', 'research', 'sources', 'web-imports'))).toBe(false);
       } finally { fixture.cleanup(); }
+    });
+
+    // One source, one holding: the same bytes twice in a batch are imported once.
+    test('two identical long PDFs in one batch: the first is split and imported, the second is its duplicate', async () => {
+      const parts = [1, 2, 3].map((index) => `gs://fixture-shared-library/v1/staged/research/twin-batch--parts/volume-a--part${index}of3.pdf`);
+      const fixture = workspaceFixture();
+      const calls: CapturedCall[] = [];
+      try {
+        writeBatch(fixture.base, { 'volume-a.pdf': LONG, 'volume-b.pdf': LONG });
+        const worker = createDomainExpertWorker({
+          gcpProject: 'fixture-project',
+          dataDir: join(fixture.base, 'data'),
+          roots: [rootPolicy(fixture.workspaceRoot)],
+          annas: { importPollIntervalMs: 1, importPollTimeoutMs: 2_000, responseBudgetMs: 0 },
+          google: {
+            accessToken: 'fixture-google-token',
+            fetchImpl: splitGoogleFetch(calls, importsAll, {
+              contexts: [{ sourceUri: parts[1], sourceDisplayName: 'part', text: 'Passage.', score: 0.1, chunk: { text: 'x', pageSpan: { firstPage: 1, lastPage: 1 } } }],
+            }),
+          },
+        });
+        const response = await stageBatch(worker, 'twin-batch');
+        expect(response.pdf_sources).toMatchObject([
+          { workspace_relative_path: 'experts/research/sources/batch/volume-a.pdf', route: 'split', status: 'imported', gcs_uris: parts },
+          { workspace_relative_path: 'experts/research/sources/batch/volume-b.pdf', route: 'duplicate', status: 'skipped_duplicate', reason: 'duplicate_in_batch', duplicate_of: 'experts/research/sources/batch/volume-a.pdf' },
+        ]);
+        const imported = calls.filter((call) => call.url.endsWith('/ragFiles:import')).map((call) => JSON.parse(call.body).importRagFilesConfig.gcsSource.uris[0]);
+        expect(imported).toEqual(parts);
+        // The citation still maps the first file's parts to the source and its pages.
+        const result = await postDomain(worker, 'domain_ask', { domain_id: 'research', question: 'Where is it said?', output: 'passages' });
+        expect(result.passages[0]).toMatchObject({ source_id: `research-pdf-${sha256Hex(LONG).slice(0, 16)}`, source_part: 'part2of3', original_pages: { first_page: 151, last_page: 151 } });
+      } finally { fixture.cleanup(); }
+    });
+
+    test('two identical short PDFs in one batch stage once', async () => {
+      const short = textPdfBytes(120);
+      const f = splitFixture(short, importsAll);
+      writeBatch(f.base, { 'paper-a.pdf': short, 'paper-b.pdf': short });
+      try {
+        const response = await stageBatch(f.worker, 'twin-short');
+        expect(response.staged_files.map((file: Record<string, any>) => file.workspace_relative_path)).toEqual(['experts/research/sources/batch/paper-a.pdf']);
+        expect(response.pdf_sources).toMatchObject([{ route: 'duplicate', status: 'skipped_duplicate', duplicate_of: 'experts/research/sources/batch/paper-a.pdf' }]);
+      } finally { f.cleanup(); }
     });
 
     test('a batch of refused PDFs reports them refused', async () => {

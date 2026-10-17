@@ -2485,6 +2485,7 @@ export class DomainExpertService {
     const eligible: StageImportEligibleFile[] = [];
     const routed: RoutedStagedPdf[] = [];
     const named = namedSource && stage.eligible.length === 1 ? namedSource : undefined;
+    const firstOfDigest = new Map<string, string>();
     for (const file of stage.eligible) {
       if (!isPdfUri(file.workspaceRelativePath)) {
         eligible.push(file);
@@ -2493,6 +2494,16 @@ export class DomainExpertService {
       // A dry run's derived files are not written; they carry their bytes.
       const bytes = file.content ?? new Uint8Array(await readFile(file.absolutePath));
       const digest = sha256(bytes);
+      // One source, one holding: a later file with the same bytes is this batch's duplicate.
+      const first = firstOfDigest.get(digest);
+      if (first) {
+        routed.push({
+          entry: { workspace_relative_path: file.workspaceRelativePath, source_sha256: digest }, corpusId, route: 'duplicate',
+          outcome: { status: 'skipped_duplicate', reason: 'duplicate_in_batch', duplicate_of: first },
+        });
+        continue;
+      }
+      firstOfDigest.set(digest, file.workspaceRelativePath);
       const context: SourceImportContext = { sha256: digest, ...(named ? { sourceId: String(named.source_id) } : {}) };
       const name = basename(file.uploadRelativePath).replace(/\.pdf$/i, '');
       const catalogue = named ? {
@@ -2544,7 +2555,17 @@ export class DomainExpertService {
       const route = await this.routePdf(source, bytes, measurePdfArtifactScale(bytes).corroborated_pages, holding);
       if ('whole' in route) eligible.push(file);
       else if ('refusal' in route) routed.push({ entry, corpusId, route: 'refused', outcome: { status: 'blocked', error: route.refusal } });
-      else routed.push({ entry, corpusId, route: 'split', pages: route.pages, parts: route.plan.length, register, split: () => this.ingestSplitPdf(source, { ...route, bytes }) });
+      else {
+        routed.push({
+          entry, corpusId, route: 'split', pages: route.pages, parts: route.plan.length, register,
+          // Checked again right before the split runs: another import may have brought the source in meanwhile.
+          split: async () => {
+            const now = await this.sourceHolding(source);
+            if (now.kind === 'present') return { status: 'imported', target_corpus_id: corpusId, ...now.result };
+            return this.ingestSplitPdf(source, { ...route, bytes });
+          },
+        });
+      }
     }
     return { eligible, routed };
   }
@@ -2604,6 +2625,7 @@ export class DomainExpertService {
       route: pdf.route,
       ...(pdf.route === 'split' ? { pages: pdf.pages, parts: pdf.parts } : {}),
       ...(pdf.route === 'refused' ? { error: pdf.outcome!.error } : {}),
+      ...(pdf.route === 'duplicate' ? { duplicate_of: pdf.outcome!.duplicate_of } : {}),
     }));
   }
 
@@ -9369,7 +9391,7 @@ interface SourceImportContext {
 // A batch whose every file was a routed PDF: imported (or present, or still
 // importing) when any was, refused when every one was.
 function routedPdfStatus(pdfSources: Array<Record<string, unknown>>): string {
-  return pdfSources.every((pdf) => pdf.status === 'blocked') ? 'pdf_sources_refused' : 'pdf_sources_routed';
+  return pdfSources.every((pdf) => pdf.status === 'blocked' || pdf.status === 'skipped_duplicate') ? 'pdf_sources_refused' : 'pdf_sources_routed';
 }
 
 // A staged PDF the shared pipeline took out of its batch: reported present or
@@ -9377,7 +9399,7 @@ function routedPdfStatus(pdfSources: Array<Record<string, unknown>>): string {
 interface RoutedStagedPdf {
   entry: { workspace_relative_path: string; source_sha256: string };
   corpusId: string;
-  route: 'present' | 'split' | 'refused';
+  route: 'present' | 'split' | 'refused' | 'duplicate';
   pages?: number;
   parts?: number;
   outcome?: Record<string, unknown>;
