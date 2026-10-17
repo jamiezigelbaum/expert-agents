@@ -88,7 +88,7 @@ import {
   type Sha256Id,
   type LibraryLocationConfig,
 } from '@expert-agents/library';
-import { LLM_PARSER_MAX_PDF_PAGES, pdfPartStem, pdfTextLayer, planPdfParts, qpdfPageCount, splitPdf, stripPdfPartSuffix, type PdfPart, type PdfPartPlan, type PdfTextLayer } from '@expert-agents/library';
+import { DEFAULT_QPDF_BIN, LLM_PARSER_MAX_PDF_PAGES, pdfPageLimitSetting, pdfPartStem, pdfTextLayer, planPdfParts, qpdfPageCount, splitPdf, stripPdfPartSuffix, type PdfPart, type PdfPartPlan, type PdfTextLayer } from '@expert-agents/library';
 import {
   agentRoutingConfigFromEnv,
   type AgentRoutingConfig,
@@ -542,7 +542,7 @@ const DEFAULT_ANNAS_MIN_PDF_PAGES = 60;
 // The most pages one PDF may hold in an LLM-parser import; longer PDFs are split
 // into parts of at most this many pages (docs/vertex-rag-limits.md).
 const DEFAULT_ANNAS_PDF_SPLIT_PAGES = LLM_PARSER_MAX_PDF_PAGES;
-const DEFAULT_ANNAS_QPDF_BIN = 'qpdf';
+const DEFAULT_ANNAS_QPDF_BIN = DEFAULT_QPDF_BIN;
 const DEFAULT_ANNAS_PDFTOTEXT_BIN = 'pdftotext';
 const DEFAULT_ANNAS_DJVUTXT_BIN = 'djvutxt';
 const ANNAS_DJVUTXT_TIMEOUT_MS = 120_000;
@@ -1345,14 +1345,16 @@ export class DomainExpertService {
     contexts: Array<Record<string, unknown>>,
   ): Promise<Array<Record<string, unknown>>> {
     const uris = contexts.map((context) => (typeof context.sourceUri === 'string' ? context.sourceUri : undefined));
-    if (!uris.some((uri) => uri && isPdfUri(uri))) return contexts.map(() => ({}));
+    // Every context with a source URI gets its source; only a PDF's context gets pages.
+    if (!uris.some(Boolean)) return contexts.map(() => ({}));
     const holdings = await this.registeredHoldingsByUri(manifest);
     return contexts.map((context, index) => {
       const uri = uris[index];
       if (!uri) return {};
       const holding = holdings.get(uri);
-      const span = chunkPageSpan(context);
       const fields: Record<string, unknown> = holding ? { sourceId: holding.source_id, ...(holding.part ? { sourcePart: holding.part } : {}) } : {};
+      if (!isPdfUri(uri)) return fields;
+      const span = chunkPageSpan(context);
       // A part recorded without its range (#37): its offset in the original is unknown.
       if (holding?.part && holding.first_page === undefined) return fields;
       if (holding?.first_page !== undefined) {
@@ -2282,7 +2284,7 @@ export class DomainExpertService {
         operation,
       };
     }
-    // Every PDF goes through the shared pipeline: identity, page limit, split.
+    // Every PDF object goes through the shared pipeline: identity, page limit, split.
     if (params.gcsUri && isPdfUri(params.gcsUri) && !options.wholeObject) return this.importGcsPdf(params, manifest, corpusId, resolved);
     // A plain import is registered when it names the source it ingests, or
     // when the shared PDF pipeline identified the file; a split's parts and
@@ -4192,23 +4194,6 @@ export class DomainExpertService {
       return { status: 'needs_corpus_decision', reason: NO_TARGET_CORPUS_REASON };
     }
     const corpusId = corpusTarget.target_corpus_id;
-    // The single choke point for every ingest, so the scale gate sits here: a
-    // positively measured sub-book-scale artifact stops before anything is
-    // uploaded or imported, and the downloaded file stays on disk for
-    // inspection. Returned rather than thrown because the catch below carries no
-    // extra facts and the measurement is the whole point of the refusal.
-    if (scale.below_min_pdf_pages && !scale.short_artifact_override) {
-      return {
-        status: 'blocked',
-        ...corpusTarget,
-        error: {
-          code: 'annas_artifact_scale_implausible',
-          message: `Measured ${scale.pages} page(s) in the downloaded ${scale.format}, below the ${scale.min_pdf_pages}-page floor for a book-scale artifact. Nothing was uploaded or imported; the file is still on disk.`,
-          suggestion: 'Confirm the file is the edition its metadata advertised — a source can advertise a monograph and deliver a pamphlet. To ingest it deliberately anyway, re-run annas_archive_import with allow_short_artifact: true.',
-        },
-        scale,
-      };
-    }
     const source: SourceImport = {
       manifest, corpusId, corpusTarget, context,
       ...(annasFastDownloadMd5(params) ? { legacyLocator: `annas:${annasFastDownloadMd5(params)}` } : {}),
@@ -4226,6 +4211,24 @@ export class DomainExpertService {
     if (holding.kind === 'present') return { status: 'imported', ...corpusTarget, source_sha256: context.sha256, ...holding.result };
     if (holding.kind === 'conflict') return { status: 'blocked', ...corpusTarget, error: sourceIdentityConflict(source, holding) };
     if (holding.kind === 'unknown') return { status: 'blocked', ...corpusTarget, error: sourceHoldingUnverified(source, holding) };
+    // The single choke point for every ingest, so the scale gate sits here, after
+    // the identity check (a source already in the corpus is present whatever its
+    // scale): a positively measured sub-book-scale artifact stops before anything
+    // is uploaded or imported, and the downloaded file stays on disk for
+    // inspection. Returned rather than thrown because the catch below carries no
+    // extra facts and the measurement is the whole point of the refusal.
+    if (scale.below_min_pdf_pages && !scale.short_artifact_override) {
+      return {
+        status: 'blocked',
+        ...corpusTarget,
+        error: {
+          code: 'annas_artifact_scale_implausible',
+          message: `Measured ${scale.pages} page(s) in the downloaded ${scale.format}, below the ${scale.min_pdf_pages}-page floor for a book-scale artifact. Nothing was uploaded or imported; the file is still on disk.`,
+          suggestion: 'Confirm the file is the edition its metadata advertised — a source can advertise a monograph and deliver a pamphlet. To ingest it deliberately anyway, re-run annas_archive_import with allow_short_artifact: true.',
+        },
+        scale,
+      };
+    }
     // Vertex RAG parses PDF, text, Markdown and HTML. On 2026-09-20 sixteen
     // EPUB/DJVU/MOBI uploads each completed with importedRagFilesCount=0 and
     // no error, and every one was reported as import_requested. Ebooks are
@@ -12250,12 +12253,14 @@ function rootFromRecord(record: Record<string, unknown>): DomainExpertWorkspaceR
   });
 }
 
-// The split size: a positive page count, or 0 to split nothing. A bad value names the setting.
+// The split size: a positive page count, or 0 to split nothing (pdfPageLimitSetting,
+// shared with the materializer). A bad value names the setting.
 function pdfSplitPagesSetting(value: unknown): number {
   try {
-    return normalizeNonNegativeInteger(value, DEFAULT_ANNAS_PDF_SPLIT_PAGES);
-  } catch {
-    throw new DomainExpertWorkerError(400, 'invalid_config', `EXPERT_AGENTS_DOMAIN_EXPERT_ANNAS_PDF_SPLIT_PAGES must be a whole number of pages (default ${DEFAULT_ANNAS_PDF_SPLIT_PAGES}), or 0 to split no PDF; got ${JSON.stringify(String(value)).slice(0, 40)}.`);
+    const setting = pdfPageLimitSetting(value);
+    return setting.splitDisabled ? 0 : setting.maxPages;
+  } catch (error) {
+    throw new DomainExpertWorkerError(400, 'invalid_config', error instanceof Error ? error.message : String(error));
   }
 }
 

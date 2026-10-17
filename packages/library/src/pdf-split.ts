@@ -17,6 +17,26 @@ import { allowlistedExtractionEnv } from './extraction.ts';
  */
 export const LLM_PARSER_MAX_PDF_PAGES = 200;
 
+/** qpdf, looked up on PATH unless EXPERT_AGENTS_DOMAIN_EXPERT_ANNAS_QPDF_BIN names it (worker and materializer). */
+export const DEFAULT_QPDF_BIN = 'qpdf';
+
+/** The deployment setting for the page limit and split size, shared by the worker and the materializer. */
+export const PDF_SPLIT_PAGES_ENV = 'EXPERT_AGENTS_DOMAIN_EXPERT_ANNAS_PDF_SPLIT_PAGES';
+
+/**
+ * The page knob from its setting: `maxPages` per LLM-parsed PDF (the split size,
+ * default LLM_PARSER_MAX_PDF_PAGES) and whether splitting is disabled (a setting
+ * of 0, which keeps the default limit). A bad value throws, naming the setting.
+ */
+export function pdfPageLimitSetting(value: unknown): { maxPages: number; splitDisabled: boolean } {
+  if (value === undefined || value === null || value === '') return { maxPages: LLM_PARSER_MAX_PDF_PAGES, splitDisabled: false };
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < 0) {
+    throw new RangeError(`${PDF_SPLIT_PAGES_ENV} must be a whole number of pages (default ${LLM_PARSER_MAX_PDF_PAGES}), or 0 to split no PDF; got ${JSON.stringify(String(value)).slice(0, 40)}.`);
+  }
+  return parsed === 0 ? { maxPages: LLM_PARSER_MAX_PDF_PAGES, splitDisabled: true } : { maxPages: parsed, splitDisabled: false };
+}
+
 const QPDF_TIMEOUT_MS = 120_000;
 const QPDF_MAX_OUTPUT_BYTES = 1024 * 1024;
 const PDFTOTEXT_TIMEOUT_MS = 120_000;

@@ -7018,6 +7018,18 @@ describe('splitting long PDFs for LLM-parser imports', () => {
     } finally { f.cleanup(); }
   });
 
+  // Identity comes before every gate: a source already in the corpus is present, whatever a gate says now.
+  test('a short book imported deliberately is present on a re-run, not refused by the page floor', async () => {
+    const f = splitFixture(textPdfBytes(40), importsAll);
+    try {
+      expect((await postDomain(f.worker, 'annas_archive_import', PARAMS)).rag_ingest.error.code).toBe('annas_artifact_scale_implausible');
+      expect((await postDomain(f.worker, 'annas_archive_import', { ...PARAMS, allow_short_artifact: true })).rag_ingest.status).toBe('imported');
+      const again = await postDomain(f.worker, 'annas_archive_import', PARAMS);
+      expect(again.rag_ingest).toMatchObject({ status: 'imported', import_outcome: { already_present: true } });
+      expect(f.importedUris()).toHaveLength(1);
+    } finally { f.cleanup(); }
+  });
+
   // A source keeps one holding: a book held in one corpus is not imported into another.
   test('an import into another corpus than the one holding the source is refused', async () => {
     const f = splitFixture(textPdfBytes(450), importsAll);
@@ -7419,5 +7431,36 @@ describe('citations from split parts', () => {
         ['batch-two', ['history-stage-import-batch', 2]],
       ]));
     } finally { fixture.cleanup(); }
+  });
+
+  // A context's citation fields depend only on that context and the registry, never on the rest of the result set.
+  test('a registered non-PDF source is cited by source alone, whether or not a PDF is retrieved with it', async () => {
+    const note = 'gs://fixture-shared-library/v1/library/field-notes.md';
+    const paper = 'gs://fixture-shared-library/v1/library/whole-paper.pdf';
+    for (const withPdf of [false, true]) {
+      const fixture = workspaceFixture();
+      try {
+        const registryPath = join(fixture.workspaceRoot, domainManifest('history').workspace_relative_path, 'references/source-registry.jsonl');
+        mkdirSync(dirname(registryPath), { recursive: true });
+        writeFileSync(registryPath, `${JSON.stringify({ source_id: 'history-notes', domain_id: 'history', ingest_status: 'imported', gcs_uri: note, registered_at: '2026-10-17T12:00:00.000Z' })}\n`);
+        const context = (uri: string) => ({ sourceUri: uri, sourceDisplayName: uri.split('/').pop(), text: 'Passage.', score: 0.1, chunk: { text: 'x', pageSpan: { firstPage: 4, lastPage: 4 } } });
+        const worker = createDomainExpertWorker({
+          roots: [rootPolicy(fixture.workspaceRoot)],
+          dataDir: join(fixture.base, 'data'),
+          google: {
+            accessToken: 'fixture-google-token',
+            fetchImpl: fakeGoogleFetch([], {
+              ragCorpora: [{ name: corpusResource, displayName: 'history-library' }],
+              contexts: () => (withPdf ? [context(note), context(paper)] : [context(note)]),
+            }),
+          },
+        });
+        const result = await postDomain(worker, 'domain_ask', { domain_id: 'history', question: 'Where is it said?', output: 'passages' });
+        const passage = result.passages.find((entry: Record<string, any>) => entry.source_uri === note);
+        expect(passage).toMatchObject({ source_id: 'history-notes' });
+        // Pages are claimed only for PDFs.
+        expect(passage.original_pages).toBeUndefined();
+      } finally { fixture.cleanup(); }
+    }
   });
 });

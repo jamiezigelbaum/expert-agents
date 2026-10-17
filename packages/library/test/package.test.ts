@@ -21,7 +21,7 @@ describe("@expert-agents/library package", () => {
       "validatedVertexOperationName",
       "EbookConversionError", "convertEpubToMarkdown", "decodeXmlEntities", "plainTextToMarkdown",
       "resolveArchivePath", "xhtmlToMarkdown",
-      "PdfSplitError", "pdfPartStem", "pdfTextLayer", "planPdfParts", "qpdfPageCount", "splitPdf", "stripPdfPartSuffix",
+      "PdfSplitError", "pdfPageLimitSetting", "pdfPartStem", "pdfTextLayer", "planPdfParts", "qpdfPageCount", "splitPdf", "stripPdfPartSuffix",
     ] as const;
     const numbers = [
       "EXTRACTION_MAX_OUTPUT_BYTES", "EXTRACTION_TIMEOUT_MS", "LIBRARY_SCHEMA_VERSION",
@@ -30,7 +30,7 @@ describe("@expert-agents/library package", () => {
     ] as const;
     const strings = [
       "AGENT_REPO_GITIGNORE", "DEFAULT_RAG_PARSER_MODEL", "EXTRACTION_METHOD",
-      "RAG_PARSER_DEFAULT_VALUE", "SUMMARIZE_BINARY", "SUMMARIZE_INSTALL_COMMAND",
+      "RAG_PARSER_DEFAULT_VALUE", "SUMMARIZE_BINARY", "SUMMARIZE_INSTALL_COMMAND", "PDF_SPLIT_PAGES_ENV", "DEFAULT_QPDF_BIN",
     ] as const;
 
     expect(Object.keys(library).sort()).toEqual([...functions, ...numbers, ...strings,
