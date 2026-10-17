@@ -7390,6 +7390,28 @@ describe('splitting long PDFs for LLM-parser imports', () => {
       for (const [name, bytes] of Object.entries(files)) writeFileSync(join(directory, name), bytes);
     };
 
+    // Split PDFs are read again to split, not held in memory while the batch imports: a file
+    // rewritten in between is refused, not split from the bytes routed earlier.
+    test('a long PDF rewritten while the batch imports is refused at its split, not split from stale bytes', async () => {
+      let base = '';
+      const f = splitFixture(LONG, importsAll, {
+        wrapGoogleFetch: (next) => (async (input: string | URL | Request, init?: RequestInit) => {
+          const body = typeof init?.body === 'string' ? init.body : '';
+          if (String(input).endsWith('/ragFiles:import') && body.includes('note.md')) {
+            writeFileSync(join(base, 'workspace', 'experts', 'research', 'sources', 'batch', 'long-volume.pdf'), textPdfBytes(451));
+          }
+          return next(input, init);
+        }) as typeof fetch,
+      });
+      base = f.base;
+      try {
+        writeBatch(f.base, { 'note.md': '# A note', 'long-volume.pdf': LONG });
+        const result = await stageBatch(f.worker, 'rewritten');
+        expect(result.pdf_sources).toMatchObject([{ route: 'split', status: 'blocked', error: { code: 'workspace_file_changed' } }]);
+        expect(f.importedUris().filter((uri) => uri.includes('--parts/'))).toEqual([]);
+      } finally { f.cleanup(); }
+    });
+
     test('a batch receipt keeps a present PDF while a long one is still splitting, and the dry run shows the routing', async () => {
       const f = splitFixture(LONG, importsAll, { seed: { objects: [[SHORT_OBJECT, SHORT]], imported: [`gs://fixture-shared-library/${SHORT_OBJECT}`] } });
       writeBatch(f.base, { 'note.md': '# A note', 'short-volume.pdf': SHORT, 'long-volume.pdf': LONG });

@@ -2604,20 +2604,31 @@ export class DomainExpertService {
     const corpusId = stage.resolved.requested;
     const eligible: StageImportEligibleFile[] = [];
     const routed: RoutedStagedPdf[] = [];
+    // Each PDF's sha256, streamed: a batch of book-sized PDFs is never held in memory at once.
+    // Its bytes are read again one PDF at a time to route it, and once more to split it.
     // A dry run's derived files are not written; they carry their bytes.
-    const pdfBytes = new Map<StageImportEligibleFile, { bytes: Uint8Array; digest: string }>();
+    const pdfDigests = new Map<StageImportEligibleFile, string>();
     for (const file of stage.eligible) {
       // A PDF by its name or, under any other name, by its first bytes (decided when planned).
       if (!(file.pdf ?? isPdfUri(file.workspaceRelativePath))) continue;
-      const bytes = file.content ?? new Uint8Array(await readFile(file.absolutePath));
-      pdfBytes.set(file, { bytes, digest: sha256(bytes) });
+      pdfDigests.set(file, file.content ? sha256(file.content) : await sha256OfFile(file.absolutePath));
     }
+    // The file's bytes, refused when they are no longer the ones hashed.
+    const bytesOf = async (file: StageImportEligibleFile, digest: string): Promise<Uint8Array | { status: string; error: Record<string, string> }> => {
+      const bytes = file.content ?? new Uint8Array(await readFile(file.absolutePath));
+      if (sha256(bytes) === digest) return bytes;
+      return { status: 'blocked', error: {
+        code: 'workspace_file_changed',
+        message: `${file.workspaceRelativePath} changed while the batch was being staged. Nothing was imported from it.`,
+        suggestion: 'Re-run the import once the file is no longer being written.',
+      } };
+    };
     // Locks are taken in one sorted order (each PDF's sha256 and the named source's id), so
     // no two operations wait on each other in a cycle.
     const busy = new Map<string, Record<string, unknown>>();
     if (held) {
       const deadline = this.sourceLockDeadline();
-      const keys = new Map<string, string>([...pdfBytes.values()].map((pdf) => [sourceLockKey(manifest, pdf.digest), pdf.digest]));
+      const keys = new Map<string, string>([...pdfDigests.values()].map((digest) => [sourceLockKey(manifest, digest), digest]));
       if (namedSource) keys.set(sourceIdLockKey(manifest, String(namedSource.source_id)), NAMED_SOURCE_LOCK);
       for (const key of [...keys.keys()].sort()) {
         const entry = keys.get(key)!;
@@ -2639,12 +2650,11 @@ export class DomainExpertService {
     const namedRecords = named ? await this.domainRegistryRecords(manifest) : [];
     const firstOfDigest = new Map<string, string>();
     for (const file of stage.eligible) {
-      const pdf = pdfBytes.get(file);
-      if (!pdf) {
+      const digest = pdfDigests.get(file);
+      if (!digest) {
         eligible.push(file);
         continue;
       }
-      const { bytes, digest } = pdf;
       // One source, one holding: a later file with the same bytes is this batch's duplicate.
       const first = firstOfDigest.get(digest);
       if (first) {
@@ -2717,6 +2727,11 @@ export class DomainExpertService {
         routed.push({ entry, corpusId, route: 'refused', outcome: { status: 'blocked', error: holding.kind === 'unknown' ? sourceHoldingUnverified(source, holding) : sourceIdentityConflict(source, holding) } });
         continue;
       }
+      const bytes = await bytesOf(file, digest);
+      if (!(bytes instanceof Uint8Array)) {
+        routed.push({ entry, corpusId, route: 'refused', outcome: bytes });
+        continue;
+      }
       const route = await this.routePdf(source, bytes, measurePdfArtifactScale(bytes), holding);
       // Staged under a .pdf name, so Vertex parses it as the PDF it is (and the LLM parser takes it).
       if ('whole' in route) eligible.push({ ...file, sha256: digest, ...(isPdfUri(file.uploadRelativePath) ? {} : { uploadRelativePath: safeGcsRelativePath(`${file.uploadRelativePath}.pdf`) }) });
@@ -2724,8 +2739,12 @@ export class DomainExpertService {
       else {
         routed.push({
           entry, corpusId, route: 'split', pages: route.pages, parts: route.plan.length, register,
-          // The source's lock is held from routing through the split, so nothing changed it meanwhile.
-          split: () => this.ingestSplitPdf(source, { ...route, bytes }),
+          // The source's lock is held from routing through the split; the file is read again then,
+          // and refused if it changed, so split PDFs are not held in memory while the batch imports.
+          split: async () => {
+            const again = await bytesOf(file, digest);
+            return again instanceof Uint8Array ? this.ingestSplitPdf(source, { ...route, bytes: again }) : again;
+          },
         });
       }
     }
