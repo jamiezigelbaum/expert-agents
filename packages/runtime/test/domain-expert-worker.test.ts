@@ -7710,6 +7710,38 @@ describe('splitting long PDFs for LLM-parser imports', () => {
       } finally { f.cleanup(); }
     });
 
+    // Vertex can count a part it then failed to embed: a pending part listed in ERROR is resumed, not waited on.
+    test('a pending split part whose ragFile is in ERROR is imported again on retry', async () => {
+      const PENDING = `${CORPUS}/operations/pending-part`;
+      // After the first run ends (a restart, say), the operation finishes and the part's ragFile is in ERROR.
+      let finished = false;
+      const f = splitFixture(LONG, (part, attempt) => (part === 'part2of3' && attempt === 1 ? jsonResponse({ name: PENDING, done: false }) : { importedRagFilesCount: '1' }), {
+        importPollTimeoutMs: 60,
+        wrapGoogleFetch: (next) => (async (input: string | URL | Request, init?: RequestInit) => {
+          const url = String(input);
+          if (url.includes('/operations/pending-part')) return jsonResponse(finished ? { name: PENDING, done: true, response: { importedRagFilesCount: '1' } } : { name: PENDING, done: false });
+          const response = await next(input, init);
+          if (finished && init?.method !== 'POST' && new URL(url).pathname.endsWith('/ragFiles')) {
+            const body = await response.json() as { ragFiles: Array<Record<string, any>> };
+            const uri = f.importRequests().flat().find((candidate) => candidate.includes('part2of3'));
+            return jsonResponse({ ragFiles: [...body.ragFiles, ...(uri ? [{ name: `${CORPUS}/ragFiles/err-2`, gcsSource: { uris: [uri] }, fileStatus: { state: 'ERROR', errorStatus: 'Parsing failed.' } }] : [])] });
+          }
+          return response;
+        }) as typeof fetch,
+      });
+      try {
+        writeBatch(f.base, { 'volume.pdf': LONG });
+        await stageBatch(f.worker, 'batch-a');
+        expect(f.readRegistry().at(-1)!.rag_files[1]).toMatchObject({ status: 'import_requested', rag_operation_name: PENDING });
+        finished = true;
+        const firstImports = f.importedUris().length;
+        await stageBatch(f.worker, 'batch-b');
+        const added = f.importedUris().slice(firstImports);
+        expect(added).toHaveLength(1);
+        expect(added[0]).toContain('part2of3');
+      } finally { f.cleanup(); }
+    });
+
     // The listing lags imports: a copy recorded imported before it was ever listed may be there.
     test('a PDF recorded imported but never listed is held as unknown; one listed before and gone now is imported again', async () => {
       const short = textPdfBytes(120);

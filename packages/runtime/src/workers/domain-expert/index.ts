@@ -4791,7 +4791,8 @@ export class DomainExpertService {
     }
     // A missing part whose recorded import may still be running is asked about first: a retry
     // under another batch cuts parts under new URIs, so resuming now could import its range twice.
-    const pendingNames = [...new Set(parts.filter((part) => !part.present && part.status === 'import_requested')
+    // A part whose ragFile is listed in ERROR failed, whatever its operation reports: it is resumed.
+    const pendingNames = [...new Set(parts.filter((part, position) => !part.present && part.status === 'import_requested' && listed?.[position]?.state !== 'ERROR')
       .map((part) => part.rag_operation_name).filter((name): name is string => name !== undefined))];
     if (pendingNames.length) {
       let outcomes: Array<ReturnType<typeof classifyRagImportOperation>>;
