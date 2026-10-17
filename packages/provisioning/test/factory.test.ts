@@ -684,7 +684,7 @@ describe('conversational expert factory', () => {
       const f = await fixture();
       await writeFile(lockPath(f), owner(await exitedPid()), { mode: 0o600 });
       expect((await f.run()).status).toBe('waiting_for_telegram');
-      expect(await readdir(f.config.rootDir)).toEqual(['agents', 'operations']);
+      expect((await readdir(f.config.rootDir)).sort()).toEqual(['agents', 'operations']);
     }, 60_000);
 
     test('a lock whose process id now belongs to a different process is taken over', async () => {
