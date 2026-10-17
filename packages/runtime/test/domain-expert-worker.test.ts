@@ -6235,12 +6235,35 @@ describe('PDFs longer than the split size when the worker cannot split them', ()
     } finally { f.cleanup(); }
   });
 
-  test('the retired page-ceiling setting is ignored, and the split size must be a positive integer', () => {
+  test('the retired page-ceiling setting is ignored, and a bad split size names its setting', () => {
     // A deployment env file that still sets the #36 ceiling changes nothing.
     expect(domainExpertAnnasConfigFromEnv({ EXPERT_AGENTS_DOMAIN_EXPERT_ANNAS_MAX_PDF_PAGES: '500' })).toEqual(domainExpertAnnasConfigFromEnv({}));
     expect(() => createDomainExpertWorker({ annas: { maxPdfPages: 500 } as Record<string, unknown> })).not.toThrow();
-    expect(() => domainExpertAnnasConfigFromEnv({ EXPERT_AGENTS_DOMAIN_EXPERT_ANNAS_PDF_SPLIT_PAGES: '0' })).toThrow('positive integer');
-    expect(() => createDomainExpertWorker({ annas: { pdfSplitPages: 0 } })).toThrow('positive integer');
+    // 0, which main documented as "disable splitting", still starts the worker.
+    expect(domainExpertAnnasConfigFromEnv({ EXPERT_AGENTS_DOMAIN_EXPERT_ANNAS_PDF_SPLIT_PAGES: '0' }).pdfSplitPages).toBe(0);
+    expect(() => createDomainExpertWorker({ annas: { pdfSplitPages: 0 } })).not.toThrow();
+    for (const bad of ['-5', 'some', '1.5']) {
+      expect(() => domainExpertAnnasConfigFromEnv({ EXPERT_AGENTS_DOMAIN_EXPERT_ANNAS_PDF_SPLIT_PAGES: bad })).toThrow('EXPERT_AGENTS_DOMAIN_EXPERT_ANNAS_PDF_SPLIT_PAGES must be');
+    }
+  });
+
+  test('with splitting disabled (split size 0) a PDF over the parser-safe default is refused, and a shorter one imports', async () => {
+    expect(Bun.which('qpdf'), 'qpdf must be installed for the PDF split tests').toBeTruthy();
+    const f = unsplittableFixture(syntheticPdfBytes(201), { pdfSplitPages: 0, qpdfBin: 'qpdf' });
+    try {
+      const response = await postDomain(f.worker, 'annas_archive_import', { ...PARAMS, ingest: true, corpus_id: CORPUS });
+      expect(response.rag_ingest.error.code).toBe('pdf_exceeds_parser_page_limit');
+      expect(response.rag_ingest.error.message).toContain('at most 200 pages per PDF');
+      expect(response.rag_ingest.error.message).toContain('splitting is disabled (EXPERT_AGENTS_DOMAIN_EXPERT_ANNAS_PDF_SPLIT_PAGES=0)');
+      expect(f.googleCalls).toEqual([]);
+    } finally { f.cleanup(); }
+    const g = unsplittableFixture(syntheticPdfBytes(200), { pdfSplitPages: 0, qpdfBin: 'qpdf' });
+    try {
+      expect((await postDomain(g.worker, 'annas_archive_import', { ...PARAMS, ingest: true, corpus_id: CORPUS })).rag_ingest.status).toBe('imported');
+    } finally { g.cleanup(); }
+    expect((await getHealth(createDomainExpertWorker({ annas: { pdfSplitPages: 0 } }))).pdf_import).toMatchObject({
+      long_pdfs: 'refused', status: 'degraded', issues: [{ code: 'pdf_split_disabled' }],
+    });
   });
 
   test('worker health shows a missing qpdf or pdftotext while imports use the LLM parser', async () => {
@@ -6349,7 +6372,7 @@ describe('splitting long PDFs for LLM-parser imports', () => {
   // name. A successful import lists an ACTIVE ragFile; a failed one leaves an ERROR ragFile, and
   // Vertex skips a re-import of any URI it holds a record for, ERROR records included, until
   // that record is deleted.
-  function splitGoogleFetch(calls: CapturedCall[], behaviour: ImportBehaviour, listing: { state?: string; status?: () => number | undefined } = {}, seed: { objects?: Array<[string, Uint8Array]>; imported?: string[] } = {}): typeof fetch {
+  function splitGoogleFetch(calls: CapturedCall[], behaviour: ImportBehaviour, listing: { state?: string; status?: () => number | undefined; displayNameOnly?: boolean } = {}, seed: { objects?: Array<[string, Uint8Array]>; imported?: string[] } = {}): typeof fetch {
     const objects: FakeGcsObjects = new Map(seed.objects ?? []);
     const imported = new Map<string, string>((seed.imported ?? []).map((uri, index) => [uri, `${CORPUS}/ragFiles/8000${index}`]));
     const errored = new Map<string, string>();
@@ -6384,7 +6407,7 @@ describe('splitting long PDFs for LLM-parser imports', () => {
         const status = listing.status?.();
         if (status) return jsonResponse({ error: { code: status, status: 'UNAVAILABLE', message: 'Listing refused.' } }, status);
         return jsonResponse({ ragFiles: [
-          ...[...imported].map(([uri, name]) => ({ name, gcsSource: { uris: [uri] }, fileStatus: { state: listing.state ?? 'ACTIVE' } })),
+          ...[...imported].map(([uri, name]) => ({ name, ...(listing.displayNameOnly ? { displayName: uri.split('/').pop() } : { gcsSource: { uris: [uri] } }), fileStatus: { state: listing.state ?? 'ACTIVE' } })),
           ...[...errored].map(([uri, name]) => ({ name, gcsSource: { uris: [uri] }, fileStatus: { state: 'ERROR', errorStatus: 'An internal error occurred.' } })),
         ] });
       }
@@ -6397,7 +6420,7 @@ describe('splitting long PDFs for LLM-parser imports', () => {
   }
 
   function splitFixture(bytes: Uint8Array, behaviour: ImportBehaviour, options: SplitOptions & {
-    listingState?: string; listingStatus?: number | (() => number | undefined);
+    listingState?: string; listingStatus?: number | (() => number | undefined); listingDisplayNameOnly?: boolean;
     seed?: { objects?: Array<[string, Uint8Array]>; imported?: string[] };
   } = {}) {
     const fixture = workspaceFixture();
@@ -6408,6 +6431,7 @@ describe('splitting long PDFs for LLM-parser imports', () => {
     const googleFetch = splitGoogleFetch(googleCalls, behaviour, {
       ...(options.listingState ? { state: options.listingState } : {}),
       ...(listingStatus !== undefined ? { status: typeof listingStatus === 'function' ? listingStatus : () => listingStatus } : {}),
+      ...(options.listingDisplayNameOnly ? { displayNameOnly: true } : {}),
     }, options.seed);
     // A fresh worker over the same workspace, books and Google state: a restart or a reconfigured host.
     const workerWith = (overrides: SplitOptions = {}) => {
@@ -6762,15 +6786,18 @@ describe('splitting long PDFs for LLM-parser imports', () => {
   // straight into Vertex, with no registry record.
   describe('a holding imported outside the worker', () => {
     const ORIGINAL = textPdfBytes(582);
-    const HAND = [1, 2, 3].map((index) => `v1/book-imports/research/hand-split-volume-${index}.pdf`);
+    const HAND = [1, 2, 3].map((index) => `v1/book-imports/research/hand-split-volume--part${index}of3.pdf`);
     const HAND_URIS = HAND.map((name) => `gs://fixture-shared-library/${name}`);
     const REGISTER = {
       action: 'add', domain_id: 'research', kind: 'book', title: 'The Fixture Compendium', author: 'Example Author',
       corpus_id: CORPUS, copyright_posture: 'approved_fixture_use', sha256: sha256Hex(ORIGINAL), gcs_uris: HAND_URIS, dry_run: false,
     };
-    const handFixture = (imported = HAND_URIS) => splitFixture(ORIGINAL, importsAll, {
-      seed: { objects: HAND.map((name) => [name, textPdfBytes(194)] as [string, Uint8Array]), imported },
+    const WHOLE = 'v1/book-imports/research/the-whole-volume.pdf';
+    const handFixture = (imported = HAND_URIS, listing: { listingDisplayNameOnly?: boolean } = {}) => splitFixture(ORIGINAL, importsAll, {
+      ...listing,
+      seed: { objects: [...HAND.map((name) => [name, textPdfBytes(194)] as [string, Uint8Array]), [WHOLE, ORIGINAL]], imported },
     });
+    const refusal = async (response: Response) => ({ status: response.status, code: ((await response.json()) as Record<string, any>).error.code as string });
 
     test('is registered once with its parts\' original page ranges, and an import then finds the book present', async () => {
       const f = handFixture();
@@ -6800,7 +6827,9 @@ describe('splitting long PDFs for LLM-parser imports', () => {
             status: 'imported', gcs_uris: HAND_URIS, import_outcome: { already_present: true, source_id: registered.source_id },
           });
           expect(imported.rag_ingest.parts.map((part: Record<string, any>) => [part.first_page, part.last_page])).toEqual([[1, 194], [195, 388], [389, 582]]);
-          expect(imported.registry).toMatchObject({ status: 'unchanged', source_id: registered.source_id });
+            expect(imported.registry).toMatchObject({ status: 'unchanged', source_id: registered.source_id });
+          // Parts cannot prove the original's sha256, so the match says so.
+          expect(imported.rag_ingest.import_outcome.identity_verified).toBe(false);
         }
         expect(uploadedObjectNames(f.googleCalls)).toEqual([]);
         expect(f.importedUris()).toEqual([]);
@@ -6824,12 +6853,93 @@ describe('splitting long PDFs for LLM-parser imports', () => {
       const f = handFixture();
       try {
         await postDomain(f.worker, 'domain_source', REGISTER);
-        const refused = await postDomainResponse(f.worker, 'domain_source', { ...REGISTER, gcs_uris: HAND_URIS.slice(0, 2) });
-        expect(refused.status).toBe(409);
-        expect(((await refused.json()) as Record<string, any>).error.code).toBe('source_identity_conflict');
+        const refused = await postDomainResponse(f.worker, 'domain_source', { ...REGISTER, gcs_uris: [`gs://fixture-shared-library/${WHOLE}`] });
+        expect(await refusal(refused)).toEqual({ status: 409, code: 'source_identity_conflict' });
+        // The same holding in another corpus is a second holding too.
+        const elsewhere = await postDomainResponse(f.worker, 'domain_source', { ...REGISTER, corpus_id: 'research-library' });
+        expect(await refusal(elsewhere)).toEqual({ status: 409, code: 'source_identity_conflict' });
         expect(f.readRegistry()).toHaveLength(1);
       } finally { f.cleanup(); }
     });
+
+    test('parts are ordered by their names, and sets that do not name one split are refused', async () => {
+      const f = handFixture();
+      try {
+        const registered = await postDomain(f.worker, 'domain_source', { ...REGISTER, gcs_uris: [HAND_URIS[2], HAND_URIS[0], HAND_URIS[1]] });
+        expect(registered.source_record.rag_files.map((file: Record<string, any>) => [file.gcs_uri, file.first_page])).toEqual([[HAND_URIS[0], 1], [HAND_URIS[1], 195], [HAND_URIS[2], 389]]);
+        for (const gcsUris of [
+          HAND_URIS.slice(0, 2),
+          [HAND_URIS[0], HAND_URIS[0]!.replace('part1of3', 'part1of2'), HAND_URIS[2]],
+          [HAND_URIS[0], 'gs://fixture-shared-library/v1/book-imports/research/unnamed.pdf', HAND_URIS[2]],
+        ]) {
+          expect(await refusal(await postDomainResponse(f.worker, 'domain_source', { ...REGISTER, gcs_uris: gcsUris }))).toEqual({ status: 400, code: 'invalid_params' });
+        }
+      } finally { f.cleanup(); }
+    });
+
+    test('a directory or bucket is not an object', async () => {
+      const f = handFixture();
+      try {
+        for (const uri of ['gs://fixture-shared-library/v1/book-imports/research/', 'gs://fixture-shared-library/']) {
+          const response = await postDomainResponse(f.worker, 'domain_source', { ...REGISTER, gcs_uris: [uri] });
+          expect([400, 403]).toContain(response.status);
+        }
+        expect(await refusal(await postDomainResponse(f.worker, 'domain_source', { ...REGISTER, gcs_uris: ['gs://fixture-shared-library/v1/book-imports/research/'] })))
+          .toEqual({ status: 400, code: 'invalid_params' });
+        expect(existsSync(f.registryPath)).toBe(false);
+      } finally { f.cleanup(); }
+    });
+
+    test('a ragFile matched only by display name is not taken as the object', async () => {
+      const f = handFixture(HAND_URIS, { listingDisplayNameOnly: true });
+      try {
+        const response = await postDomainResponse(f.worker, 'domain_source', REGISTER);
+        expect(await refusal(response)).toEqual({ status: 409, code: 'source_holding_not_active' });
+        expect(existsSync(f.registryPath)).toBe(false);
+      } finally { f.cleanup(); }
+    });
+
+    test('a whole object must hash to the given sha256, and is then recorded as verified', async () => {
+      const f = handFixture([`gs://fixture-shared-library/${WHOLE}`]);
+      try {
+        const wrong = await postDomainResponse(f.worker, 'domain_source', { ...REGISTER, sha256: 'b'.repeat(64), gcs_uris: [`gs://fixture-shared-library/${WHOLE}`] });
+        expect(await refusal(wrong)).toEqual({ status: 409, code: 'sha256_mismatch' });
+        const registered = await postDomain(f.worker, 'domain_source', { ...REGISTER, gcs_uris: [`gs://fixture-shared-library/${WHOLE}`] });
+        expect(registered.source_record).toMatchObject({ gcs_uri: `gs://fixture-shared-library/${WHOLE}`, sha256_verified: true, pages: 582 });
+      } finally { f.cleanup(); }
+    });
+  });
+
+  // A split recorded by #37 carries part names but no page ranges or sha256. Found through its
+  // Anna locator, its ranges are rebuilt and only the unfinished part is imported, as main did.
+  test('a partial split recorded before parts carried page ranges resumes only the unfinished part', async () => {
+    const md5 = '0123456789abcdef0123456789abcdef';
+    const params = { ...PARAMS, annas_archive_id: md5 };
+    const f = splitFixture(textPdfBytes(450), (part, attempt) => (part === 'part2of3' && attempt === 1
+      ? { error: { code: 13, message: 'An internal error occurred processing the file.' } }
+      : { importedRagFilesCount: '1' }));
+    try {
+      await postDomain(f.worker, 'annas_archive_import', params);
+      // Rewrite the registry as #37 wrote it: no sha256, no ranges, no progress records.
+      const final = f.readRegistry().at(-1)!;
+      const legacy: Record<string, any> = {
+        ...Object.fromEntries(Object.entries(final).filter(([key]) => !['source_sha256', 'pages'].includes(key))),
+        rag_files: final.rag_files.map((file: Record<string, any>) => ({ gcs_uri: file.gcs_uri, part: file.part, status: file.status, ...(file.rag_file_name ? { rag_file_name: file.rag_file_name } : {}) })),
+      };
+      expect(legacy.locator).toBe(`annas:${md5}`);
+      writeFileSync(f.registryPath, `${JSON.stringify(legacy)}\n`);
+      const importsBefore = f.importedUris().length;
+      const uploadsBefore = uploadedObjectNames(f.googleCalls).length;
+      const again = await postDomain(f.workerWith(), 'annas_archive_import', params);
+      expect(again.rag_ingest).toMatchObject({ status: 'imported', split: { imported_parts: 3 } });
+      expect(f.importedUris().slice(importsBefore)).toEqual([partUri(2, 3)]);
+      expect(uploadedObjectNames(f.googleCalls).length).toBe(uploadsBefore);
+      const latest = f.readRegistry().at(-1)!;
+      expect(latest.source_id).toBe(legacy.source_id);
+      expect(latest.rag_files.map((file: Record<string, any>) => [file.part, file.first_page, file.last_page, file.status])).toEqual([
+        ['part1of3', 1, 150, 'imported'], ['part2of3', 151, 300, 'imported'], ['part3of3', 301, 450, 'imported'],
+      ]);
+    } finally { f.cleanup(); }
   });
 
   // Every route shares the pipeline: a long PDF imported by URI or staged from the workspace
@@ -6924,7 +7034,7 @@ describe('splitting long PDFs for LLM-parser imports', () => {
 // Citations from a split's parts resolve to the original source and its original page numbers.
 describe('citations from split parts', () => {
   const corpusResource = 'projects/fixture-project/locations/us-central1/ragCorpora/1001';
-  const PART_NAMES = [1, 2, 3].map((index) => `v1/book-imports/history/hand-split-volume-${index}.pdf`);
+  const PART_NAMES = [1, 2, 3].map((index) => `v1/book-imports/history/hand-split-volume--part${index}of3.pdf`);
   const PART_URIS = PART_NAMES.map((name) => `gs://fixture-shared-library/${name}`);
   const WHOLE_URI = 'gs://fixture-shared-library/v1/library/example-author---a-short-paper-2001.pdf';
   const UNREGISTERED_PART = 'gs://fixture-shared-library/v1/library/unknown-book--part2of2.pdf';
