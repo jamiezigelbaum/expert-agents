@@ -7585,6 +7585,22 @@ describe('splitting long PDFs for LLM-parser imports', () => {
       } finally { f.cleanup(); }
     });
 
+    // The default parser has no page limit, so a new PDF is imported whole without running qpdf.
+    test('under the default parser a new GCS PDF is imported whole without counting its pages', async () => {
+      const NAME = 'v1/library/example-author---a-long-paper-1992.pdf';
+      const directory = mkdtempSync(join(tmpdir(), 'expert-qpdf-count-'));
+      const marker = join(directory, 'ran');
+      const shim = join(directory, 'qpdf-counts');
+      writeFileSync(shim, `#!/bin/sh\ntouch "${marker}"\nexec "${Bun.which('qpdf')}" "$@"\n`, { mode: 0o755 });
+      const f = splitFixture(LONG, importsAll, { ragParserModel: 'default', qpdfBin: shim, seed: { objects: [[NAME, LONG]] } });
+      try {
+        const response = await postDomain(f.worker, 'rag_corpus', { action: 'import', domain_id: 'research', corpus_id: CORPUS, gcs_uri: `gs://fixture-shared-library/${NAME}`, dry_run: false });
+        expect(response.import_outcome).toMatchObject({ status: 'imported' });
+        expect(f.importRequests()).toEqual([[`gs://fixture-shared-library/${NAME}`]]);
+        expect(existsSync(marker)).toBe(false);
+      } finally { f.cleanup(); rmSync(directory, { recursive: true, force: true }); }
+    });
+
     // Vertex skips a URI already in the corpus: an object overwritten in place must not take the old file's place.
     test('a GCS PDF overwritten in place after its import is refused; one in the corpus with no record is not verified', async () => {
       const NAME = 'v1/library/example-author---a-revised-paper-1992.pdf';

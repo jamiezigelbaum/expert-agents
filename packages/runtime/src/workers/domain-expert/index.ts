@@ -4944,6 +4944,9 @@ export class DomainExpertService {
     | { pages: number; plan: PdfPartPlan[]; qpdf: string; recorded: RecordedPart[] }
     | { refusal: { code: string; message: string; suggestion: string }; split?: Record<string, unknown> }
   > {
+    // The default parser has no page limit: a new PDF goes in whole, uncounted. Only a recorded
+    // partial split is still resumed by its parts.
+    if (this.google.ragParserModel() === undefined && holding.kind !== 'partial') return { whole: true };
     const limit = this.annasPdfSplitPages;
     const disabled = 'splitting is disabled (EXPERT_AGENTS_DOMAIN_EXPERT_ANNAS_PDF_SPLIT_PAGES=0)';
     const qpdf = Bun.which(this.annasQpdfBin) ?? undefined;
