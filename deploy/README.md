@@ -219,8 +219,9 @@ and coverage-checked (ACTIVE ragFile; text layer read with `pdftotext`); the
 host needs `qpdf` and `pdftotext` (poppler-utils) on PATH, and without `qpdf`,
 or for a file `qpdf` cannot read, such a PDF is refused before upload with
 `pdf_exceeds_parser_page_limit`. A PDF whose pages nothing can count (no
-`qpdf`, or a file `qpdf` cannot read, and no page count the byte scan can
-corroborate) is refused before upload with `pdf_page_count_unavailable` while
+`qpdf`, or a file `qpdf` cannot read, and neither a page count both byte-scan
+signals report nor a single signal within the limit) is refused before upload
+with `pdf_page_count_unavailable` while
 imports use the LLM parser; under the default parser, which has no page limit,
 it is imported whole. Worker health reports `pdf_import` as
 `degraded` while either tool is missing.

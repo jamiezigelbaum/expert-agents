@@ -2063,6 +2063,14 @@ describe('book-scale sanity gate on acquisition ingest', () => {
         expect(gate.googleCalls.some((call) => call.url.includes('/upload/storage/') || call.url.includes('ragFiles:import'))).toBe(false);
       } finally { gate.cleanup(); }
     }
+    // One byte-scan signal alone is no count: a page tree of 900 with no page objects found corroborates zero.
+    const oneSignal = new TextEncoder().encode('%PDF-1.4\n1 0 obj\n<< /Type /Pages /Count 900 /Kids [] >>\nendobj\n%%EOF\n');
+    const halfCounted = scaleGateFixture(oneSignal, { qpdfBin: 'qpdf-missing-fixture' });
+    try {
+      const response = await postDomain(halfCounted.worker, 'annas_archive_import', { ...PDF_IMPORT_PARAMS, ingest: true, corpus_id: FIXTURE_CORPUS });
+      expect(response.rag_ingest).toMatchObject({ status: 'blocked', error: { code: 'pdf_page_count_unavailable' } });
+      expect(halfCounted.googleCalls.some((call) => call.url.includes('ragFiles:import'))).toBe(false);
+    } finally { halfCounted.cleanup(); }
     const defaultParser = scaleGateFixture(uncountable, { qpdfBin: 'qpdf-missing-fixture' }, { ragParserModel: 'default' });
     try {
       const response = await postDomain(defaultParser.worker, 'annas_archive_import', { ...PDF_IMPORT_PARAMS, ingest: true, corpus_id: FIXTURE_CORPUS });
@@ -5398,7 +5406,7 @@ describe('acquisition ingest registers the imported source', () => {
     corpus_id: CORPUS_RESOURCE,
   };
 
-  function registryFixture(options: { roots: boolean; responseBudgetMs?: number; importOperation?: (name: string) => Record<string, unknown> }) {
+  function registryFixture(options: { roots: boolean; responseBudgetMs?: number; importOperation?: (name: string) => Record<string, unknown>; listsImports?: boolean }) {
     const fixture = workspaceFixture();
     const booksRoot = join(fixture.base, 'books');
     mkdirSync(booksRoot);
@@ -5420,6 +5428,10 @@ describe('acquisition ingest registers the imported source', () => {
         fetchImpl: fakeGoogleFetch(googleCalls, {
           ragCorpora: [{ name: CORPUS_RESOURCE, displayName: 'research-library' }],
           ...(options.importOperation ? { importOperation: options.importOperation } : {}),
+          // A corpus that lists the imported book once Vertex has imported it.
+          ...(options.listsImports ? { ragFiles: (listingsAfterImport: number) => (listingsAfterImport > 0 ? [{
+            name: `${CORPUS_RESOURCE}/ragFiles/1`, gcsSource: { uris: ['gs://fixture-shared-library/v1/book-imports/research/author---the-fixture-book-2005.pdf'] }, fileStatus: { state: 'ACTIVE' },
+          }] : []) } : {}),
         }),
       },
       fetchImpl: fakeAnnasArtifactFetch([], syntheticPdfBytes(64), 'application/pdf'),
@@ -5512,7 +5524,7 @@ describe('acquisition ingest registers the imported source', () => {
   });
 
   test('a re-ingest revises the same source instead of registering a second one', async () => {
-    const gate = registryFixture({ roots: true });
+    const gate = registryFixture({ roots: true, listsImports: true });
     try {
       const first = await postDomain(gate.worker, 'annas_archive_import', PARAMS);
       expect(first.registry.status).toBe('registered');
@@ -5520,13 +5532,13 @@ describe('acquisition ingest registers the imported source', () => {
       const second = await postDomain(gate.worker, 'annas_archive_import', PARAMS);
       expect(second.status).toBe('ingested_existing');
       expect(second.rag_ingest.status).toBe('imported');
-      expect(second.registry).toMatchObject({ status: 'updated', source_id: first.registry.source_id });
+      // The book is listed in the corpus, so the same source answers present and records nothing new.
+      expect(second.registry).toMatchObject({ status: 'unchanged', source_id: first.registry.source_id });
 
       const records = gate.readRegistry();
-      expect(records.map((record) => record.source_id)).toEqual([first.registry.source_id, first.registry.source_id]);
+      expect(new Set(records.map((record) => record.source_id))).toEqual(new Set([first.registry.source_id]));
       const listed = await postDomain(gate.worker, 'domain_source', { action: 'list', domain_id: 'research' });
       expect(listed.sources).toHaveLength(1);
-      expect(listed.sources[0].record_count).toBe(2);
     } finally {
       gate.cleanup();
     }
@@ -6294,14 +6306,23 @@ describe('PDFs longer than the split size when the worker cannot split them', ()
   test.each([
     ['a PDF at the split size', syntheticPdfBytes(200), {}],
     ["a deployment using Google's default parser", syntheticPdfBytes(582), { ragParserModel: 'default' }],
-    // Loose page objects alone may overcount; only pages both signals report refuse.
-    ['a PDF whose only page signal is loose page objects', syntheticObjectStreamPdfBytes(582), {}],
   ] as const)('imports %s whole', async (_name, bytes, options) => {
     const f = unsplittableFixture(bytes, options);
     try {
       const response = await postDomain(f.worker, 'annas_archive_import', { ...PARAMS, ingest: true, corpus_id: CORPUS });
       expect(response).toMatchObject({ status: 'downloaded', rag_ingest: { status: 'imported' } });
       expect(f.googleCalls.filter((call) => call.url.endsWith('/ragFiles:import'))).toHaveLength(1);
+    } finally { f.cleanup(); }
+  });
+
+  // Loose page objects alone may overcount, so they cannot refuse a PDF as too long; nor can a
+  // count past the limit admit it whole, since the LLM parser fails it. It fails closed.
+  test('a PDF whose only page signal is loose page objects past the limit is refused as uncountable', async () => {
+    const f = unsplittableFixture(syntheticObjectStreamPdfBytes(582));
+    try {
+      const response = await postDomain(f.worker, 'annas_archive_import', { ...PARAMS, ingest: true, corpus_id: CORPUS });
+      expect(response.rag_ingest).toMatchObject({ status: 'blocked', error: { code: 'pdf_page_count_unavailable' } });
+      expect(f.googleCalls.filter((call) => call.url.endsWith('/ragFiles:import'))).toHaveLength(0);
     } finally { f.cleanup(); }
   });
 
@@ -7659,6 +7680,31 @@ describe('splitting long PDFs for LLM-parser imports', () => {
         expect(response.import_outcome.source_changed_during_import).toBeUndefined();
         expect(f.readRegistry().at(-1)).toMatchObject({ ingest_status: 'import_requested', source_sha256: sha256Hex(original), sha256_verified: false, source_check: expect.stringContaining('had not settled') });
       } finally { f.cleanup(); }
+    });
+
+    // The listing lags imports: a copy recorded imported before it was ever listed may be there.
+    test('a PDF recorded imported but never listed is held as unknown; one listed before and gone now is imported again', async () => {
+      const short = textPdfBytes(120);
+      const earlier = 'gs://fixture-shared-library/v1/staged/research/batch-a/' + sha256Hex(short).slice(0, 32) + '/volume.pdf';
+      for (const listedBefore of [false, true]) {
+        const f = splitFixture(LONG, importsAll);
+        try {
+          mkdirSync(dirname(f.registryPath), { recursive: true });
+          writeFileSync(f.registryPath, `${JSON.stringify({
+            source_id: 'research-stage-import-batch-a', domain_id: 'research', ingest_status: 'imported', gcs_uri: earlier, source_sha256: sha256Hex(short),
+            ...(listedBefore ? { rag_file_name: `${CORPUS}/ragFiles/1` } : {}), registered_at: '2026-10-17T12:00:00.000Z',
+          })}\n`);
+          writeBatch(f.base, { 'volume.pdf': short });
+          const retry = await stageBatch(f.worker, 'batch-b');
+          if (listedBefore) {
+            expect(retry.import_outcome).toMatchObject({ status: 'imported' });
+            expect(f.importedUris()).toHaveLength(1);
+          } else {
+            expect(JSON.stringify(retry)).toContain('source_holding_unverified');
+            expect(f.importedUris()).toEqual([]);
+          }
+        } finally { f.cleanup(); }
+      }
     });
 
     // Content-addressed URIs carry the batch id, so a retry under another batch would not be

@@ -47,7 +47,8 @@ What the worker does with it, while imports use the LLM parser:
 - a longer PDF the worker cannot split (no `qpdf`, or a file `qpdf` cannot
   read) is refused before upload with `pdf_exceeds_parser_page_limit`;
 - a PDF whose pages nothing can count (no `qpdf` or a file it cannot read, and
-  no corroborated count from the byte scan) is refused before upload with
+  neither a count both byte-scan signals report nor a single signal within the
+  limit) is refused before upload with
   `pdf_page_count_unavailable`. Under Google's default parser, which has no
   page limit, such a PDF is imported whole.
 

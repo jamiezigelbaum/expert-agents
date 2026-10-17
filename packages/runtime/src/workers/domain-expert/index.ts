@@ -2530,7 +2530,7 @@ export class DomainExpertService {
         const refusal = holding.kind === 'unknown' ? sourceHoldingUnverified(source, holding) : sourceIdentityConflict(source, holding);
         throw new DomainExpertWorkerError(409, refusal.code, refusal.message, refusal.suggestion);
       }
-      const route = await this.routePdf(source, bytes, measurePdfArtifactScale(bytes).corroborated_pages, holding);
+      const route = await this.routePdf(source, bytes, measurePdfArtifactScale(bytes), holding);
       if ('refusal' in route) throw new DomainExpertWorkerError(422, route.refusal.code, route.refusal.message, route.refusal.suggestion);
       if ('whole' in route) {
         let verifying: Promise<unknown> | undefined;
@@ -2716,7 +2716,7 @@ export class DomainExpertService {
         routed.push({ entry, corpusId, route: 'refused', outcome: { status: 'blocked', error: holding.kind === 'unknown' ? sourceHoldingUnverified(source, holding) : sourceIdentityConflict(source, holding) } });
         continue;
       }
-      const route = await this.routePdf(source, bytes, measurePdfArtifactScale(bytes).corroborated_pages, holding);
+      const route = await this.routePdf(source, bytes, measurePdfArtifactScale(bytes), holding);
       // Staged under a .pdf name, so Vertex parses it as the PDF it is (and the LLM parser takes it).
       if ('whole' in route) eligible.push({ ...file, sha256: digest, ...(isPdfUri(file.uploadRelativePath) ? {} : { uploadRelativePath: safeGcsRelativePath(`${file.uploadRelativePath}.pdf`) }) });
       else if ('refusal' in route) routed.push({ entry, corpusId, route: 'refused', outcome: { status: 'blocked', error: route.refusal } });
@@ -4662,7 +4662,7 @@ export class DomainExpertService {
     }
     const conversion = artifact.conversion ? { conversion: artifact.conversion } : {};
     if (artifact.format === 'pdf') {
-      const route = await this.routePdf(source, artifact.bytes, scale.corroborated_pages, holding);
+      const route = await this.routePdf(source, artifact.bytes, scale, holding);
       if ('refusal' in route) return { status: 'blocked', ...corpusTarget, error: route.refusal, source_path: sourcePath, ...(route.split ? { split: route.split } : {}) };
       if ('plan' in route) return this.ingestSplitPdf(source, { ...route, bytes: artifact.bytes });
     }
@@ -4753,6 +4753,11 @@ export class DomainExpertService {
         };
       }
       if (!listed) return { kind: 'unknown', source_id: found.sourceId, reason: listingError ?? 'rag_file_listing_failed' };
+      // Recorded imported before the listing ever showed its ragFile: the listing lags imports, so
+      // the copy may be there. One whose ragFile was listed and is gone now was deleted.
+      if (typeof file?.state !== 'string' && holding.whole.status === 'imported' && !holding.whole.rag_file_name) {
+        return { kind: 'unknown', source_id: found.sourceId, reason: 'its import is recorded but the corpus does not list its ragFile yet' };
+      }
       // An import recorded as requested may still be running. A retry under another batch
       // stages another URI, so Vertex would not skip it: the operation decides.
       const pending = await this.pendingImportHolding(manifest, corpusId, found, holding.whole.gcs_uri, file, options.reconcile !== false);
@@ -4912,7 +4917,8 @@ export class DomainExpertService {
   private async routePdf(
     source: SourceImport,
     bytes: Uint8Array,
-    measuredPages: number | undefined,
+    // The byte scan's signals (measurePdfArtifactScale): the larger and the corroborated count.
+    scale: { pages?: number; corroborated_pages?: number },
     holding: SourceHolding,
   ): Promise<
     | { whole: true }
@@ -4955,9 +4961,12 @@ export class DomainExpertService {
     if (this.google.ragParserModel() === undefined) return { whole: true };
     if (pages === undefined || !qpdf) {
       const why = qpdf ? String(unreadable) : `${this.annasQpdfBin} (qpdf) is not installed on the worker host`;
-      // Without qpdf's count only pages both byte-scan signals report may decide.
-      if (measuredPages !== undefined && measuredPages > limit) return { refusal: pdfPageLimitRefusal(measuredPages, limit, why, source.kept) };
-      if (measuredPages !== undefined) return { whole: true };
+      // Without qpdf's count, only pages both byte-scan signals report may refuse a PDF as too
+      // long or admit one an over-counting signal makes look long; zero corroborates nothing. A
+      // PDF whose one signal stays within the limit is short. Any other fails closed below.
+      const corroborated = scale.corroborated_pages || undefined;
+      if (corroborated !== undefined && corroborated > limit) return { refusal: pdfPageLimitRefusal(corroborated, limit, why, source.kept) };
+      if (corroborated !== undefined || (scale.pages !== undefined && scale.pages > 0 && scale.pages <= limit)) return { whole: true };
       // A count nothing can establish fails closed: the LLM parser fails a PDF over its limit.
       return {
         refusal: {
@@ -10197,7 +10206,7 @@ function registryRecordSha256s(record: Record<string, unknown>): string[] {
 function recordedSourceHolding(
   record: Record<string, unknown> | undefined,
   sha256?: string,
-): { whole: { gcs_uri: string; status: string }; parts?: undefined } | { whole?: undefined; parts: RecordedPart[] } | undefined {
+): { whole: { gcs_uri: string; status: string; rag_file_name?: string }; parts?: undefined } | { whole?: undefined; parts: RecordedPart[] } | undefined {
   if (!record) return undefined;
   const status = stringRecordField(record, 'ingest_status') ?? 'unknown';
   const files = Array.isArray(record.rag_files) ? record.rag_files.map((file) => asOptionalRecord(file) ?? {}) : [];
@@ -10223,9 +10232,15 @@ function recordedSourceHolding(
   // A batch record lists each file with its own sha256; this source is the matching entry.
   const entry = sha256 && record.source_sha256 !== sha256 ? files.find((file) => file.source_sha256 === sha256) : undefined;
   // Its own outcome when the record has one per file (a batch that partly imported).
-  if (entry) return typeof entry.gcs_uri === 'string' ? { whole: { gcs_uri: entry.gcs_uri, status: typeof entry.status === 'string' ? entry.status : status } } : undefined;
+  if (entry) {
+    return typeof entry.gcs_uri === 'string' ? { whole: {
+      gcs_uri: entry.gcs_uri, status: typeof entry.status === 'string' ? entry.status : status,
+      ...(typeof entry.rag_file_name === 'string' ? { rag_file_name: entry.rag_file_name } : {}),
+    } } : undefined;
+  }
   const whole = stringRecordField(record, 'gcs_uri', 'gcsUri') ?? (files.length === 1 && typeof files[0]!.gcs_uri === 'string' ? files[0]!.gcs_uri : undefined);
-  return whole ? { whole: { gcs_uri: whole, status } } : undefined;
+  const ragFileName = stringRecordField(record, 'rag_file_name') ?? (files.length === 1 && typeof files[0]!.rag_file_name === 'string' ? files[0]!.rag_file_name : undefined);
+  return whole ? { whole: { gcs_uri: whole, status, ...(ragFileName ? { rag_file_name: ragFileName } : {}) } } : undefined;
 }
 
 // A holding's objects in page order: one whole object, or the parts of a split,
