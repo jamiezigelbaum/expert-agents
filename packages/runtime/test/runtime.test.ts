@@ -622,6 +622,19 @@ describe('bounded worker and client', () => {
     await expect(client.run('domain_agent', { action: 'status' })).rejects.toMatchObject({ code: 'domain_expert_error' });
   });
 
+  test('client reads the worker health report under the same policy contract', async () => {
+    const worker = createDomainExpertWorker();
+    const requests: string[] = [];
+    const config = { domainExpert: { enabled: true, baseUrl: 'http://worker.test/v1', requestTimeoutSeconds: 1 } };
+    const client = new DomainExpertClient(config, { requestJson: async (url, init) => {
+      requests.push(`${init.method} ${url}`);
+      return (await worker.fetch(new Request(url, init))).json();
+    } });
+    expect(await client.health()).toMatchObject({ kind: 'domain_expert_health', configuration_status: { google: expect.any(String) } });
+    expect(requests).toEqual(['GET http://worker.test/v1/health']);
+    await expect(new DomainExpertClient(config, { requestJson: async () => ({}) }).health()).rejects.toMatchObject({ code: 'domain_expert_error' });
+  });
+
   test('client requires the independent worker contract and rejects a legacy endpoint', async () => {
     const clientFor = (policy: Record<string, unknown>) => new DomainExpertClient(
       { domainExpert: { enabled: true, baseUrl: 'http://127.0.0.1:8040/v1', requestTimeoutSeconds: 1 } },

@@ -32,6 +32,10 @@ configuration and credential process. Repository delivery does not enable them.
 - An authenticated Expert Agents worker and a configured Google project with
   Vertex RAG permissions. The GCS library bucket already exists; the factory
   creates a per-agent prefix and corpus, not cloud billing/IAM or a new bucket.
+  The worker's workspace root (`EXPERT_AGENTS_DOMAIN_EXPERT_ROOTS_JSON`) must be
+  configured with `allow_overwrite` false: the factory seeds each new domain's
+  workspace there, and the worker's bootstrap rewrites existing seed files,
+  including the source registry, on a root that allows overwrite.
   Numeric project aliases in provider responses require
   `resourcemanager.projects.get` to verify that they belong to the configured
   project; an unverified alias never authorizes an operation poll.
@@ -123,8 +127,9 @@ factory adds it as `origin` right after the initial commit, pushes with
 `--set-upstream`, and records the remote only after `@{upstream}` proves the
 pushed head. An optional `remoteCreateCommand` names an absolute,
 deployment-owned executable that creates the remote idempotently; it receives
-the agent id and the resolved URL as its only arguments and must succeed when
-the repository already exists. Both settings are excluded from the operation fingerprint, so an
+the agent id and the resolved URL as its only arguments, must create an empty
+repository (no initial commit), and must succeed when the repository already
+exists. Both settings are excluded from the operation fingerprint, so an
 operation recorded before wiring existed is adopted on its next resume: an
 `origin` an operator already added by hand is reused, never duplicated.
 
@@ -155,13 +160,22 @@ itself, so the factory applies it to its own push:
   rewrite, HTTP, include, push-URL or remote-helper settings, for example on an
   `origin` an operator added by hand.
 - Because of that isolation, `gh` must be a real executable on the Gateway's
-  `PATH` (not a shell shim that depends on `HOME`), and Git proxy or CA
-  settings from global or system config do not apply to this push.
+  `PATH` (not a shell shim that depends on `HOME`); a missing `git` or `gh` is
+  reported as `missing_command` before Git starts. Git proxy or CA settings
+  from global or system config do not apply to this push. The Gateway's
+  `HTTPS_PROXY`, `https_proxy`, `NO_PROXY`, `no_proxy`, `SSL_CERT_FILE`,
+  `SSL_CERT_DIR`, `GIT_SSL_CAINFO` and `NODE_EXTRA_CA_CERTS` variables do: the
+  plugin passes them to the factory, and its GitHub commands keep them. A proxy
+  URL that carries a credential (`user:pass@host`) is withheld from the factory
+  and every command it runs; the response names it in `environment_withheld`,
+  never with its value. Use a proxy that authenticates the host another way.
 - Only that push and the preflight's `git ls-remote` and
   `gh auth status --active --hostname github.com` receive the identity, and
-  host Git configuration is not changed. `remoteCreateCommand` runs with the
-  factory's ordinary environment; a command that creates GitHub repositories
-  resolves its own credentials and must fail closed.
+  host Git configuration is not changed. The factory gives
+  `remoteCreateCommand` no credential: it runs with the factory's ordinary
+  environment and its two arguments. A command that creates GitHub repositories
+  resolves its own deployment-approved credential and must fail closed rather
+  than fall back to another identity.
 - A missing, malformed, insecure or tokenless profile refuses with
   `factory_github_identity_missing` or `factory_github_identity_unavailable`:
   at preflight, before anything is created, while the remote is not yet
@@ -196,8 +210,11 @@ Example authorized tool request:
 
 Omitting `apply` makes a read-only plan. It never writes files or contacts
 external services. Creation validates existing identities, authorizes the
-worker route, writes and commits the agent repository, ensures the corpus,
-then returns Telegram's confirmation link. Share that link immediately.
+worker route, writes and commits the agent repository, registers the domain,
+seeds its worker workspace, ensures the corpus, then returns Telegram's
+confirmation link. Share that link immediately. The link is issued before the
+repository is written, so if a later step fails, `status` still returns it as
+`confirmation_url`.
 
 Every applied create and resume first runs a preflight. It checks only what
 the remaining steps need, and it refuses before the Telegram link, the local
@@ -210,13 +227,28 @@ repository or the GitHub repository exists:
   Skipped once the Gateway configuration step has completed.
 - The `remoteCreateCommand` and `activationCommand` programs, when configured
   and still needed, must be executable files (`missing_command`).
+- `factory_workspace_root_missing` and `factory_workspace_root_overwrites`:
+  the worker's health has no workspace root for the domain workspace its
+  registration manifest names, or that root's `allow_overwrite` is not false.
+  Every create and resume checks it, because each one seeds or re-proves the
+  workspace.
+- `factory_google_not_ready`: the worker's authenticated health
+  (`configuration_status.google`) does not report its Google credentials and
+  project as ready, so the corpus could not be created or re-checked. Every
+  create and resume checks it. It proves configuration, not Vertex IAM
+  permissions; a permission failure still surfaces at `creating_corpus`.
 - For an `https://github.com/` remote that is not yet pushed: `git ls-remote`
   and then `gh auth status --active --hostname github.com` run with exactly the
   push's System GitHub identity, helper and isolated environment. The remote
   check comes first, so an unreachable service reports `unavailable` rather
   than a refused credential (`auth`). An absent remote is accepted when
   `remoteCreateCommand` will create it, and refused with
-  `factory_remote_missing` otherwise.
+  `factory_remote_missing` otherwise. A remote that already has history is
+  refused with `factory_remote_has_history`: the factory pushes a new root
+  commit and never adopts or overwrites an existing repository, so an agent id
+  that names an existing repository cannot be used. The only history accepted
+  is this operation's own initial commit, which a push interrupted before its
+  proof was recorded leaves behind.
 - The activation program is checked until the Gateway is configured; afterwards
   a ready expert no longer needs it.
 
@@ -252,7 +284,8 @@ After the owner confirms, call:
 | `committing_repository` | The repository exists; its first commit is being made. |
 | `wiring_remote` | The initial commit exists but the configured remote has not proven the pushed head. Fix the remote or its credentials, then resume; the commit is never repeated. |
 | `registering_library` | The worker is registering the domain. |
-| `creating_corpus` | The Vertex corpus is being requested. |
+| `bootstrapping_workspace` | The worker's domain workspace is being checked with `domain_agent status` and, when seed files are missing, seeded with `domain_agent bootstrap`, which creates only the missing files because preflight refuses a root that allows overwrite; `factory_workspace_seed_incomplete` means the worker did not confirm every seed file. |
+| `creating_corpus` | The Vertex corpus is being requested; no request has been confirmed yet. |
 | `waiting_for_corpus` | A Vertex create operation has been submitted, or a resume is re-checking corpus readiness. Resume checks its result without replaying an uncertain submission. |
 | `waiting_for_telegram` | Use `confirmation_url` with the configured owner account; keep the suggested username or pick another if Telegram reports it taken. Then resume. |
 | `installing_telegram_token` | The confirmed bot's token is being installed. |
@@ -262,8 +295,10 @@ After the owner confirms, call:
 
 `status` reads stored progress only; it is not a live health check. `resume`
 performs a fresh readiness check. A resume first records the first unfinished
-step, which also downgrades an earlier readiness receipt, and re-proves corpus
-readiness. Spec changes for an existing id are refused.
+step, which also downgrades an earlier readiness receipt, and re-proves the
+workspace seed and corpus readiness. A corpus that was never requested stays
+at `creating_corpus`. An operation recorded before the workspace step existed
+is seeded on its next resume. Spec changes for an existing id are refused.
 Never delete and recreate an operation to work around a provider failure.
 
 The route to the new agent is installed before its Telegram account is enabled,
@@ -307,10 +342,23 @@ no literal credential or plugin-disable workaround is needed. A failure after
 agent creation remains resumable without repeating creation or Telegram token
 installation.
 
-The factory serializes creation across the deployment. Ordinary dependency
-errors retain the last recorded step and release the lock. A killed process can
-leave a lock or a partially published scaffold; the owner must inspect those
-artifacts before recovery. Existing arbitrary directories and token files are
+The factory serializes creation across the deployment with `factory.lock`
+under the root, which records its owner's process id and start time. The lock
+needs a filesystem with hard links (`factory_lock_unsupported` otherwise). Ordinary
+dependency errors retain the last recorded step and release the lock, and so
+does the SIGTERM with which the plugin ends a timed-out invocation
+(`factory_timeout`). A lock whose owner process has exited, for example after a
+SIGKILL, is taken over by the next invocation; a lock whose owner is alive is
+never taken (`factory_busy`, retry after it finishes). A takeover claim left by
+an invocation that exited during the takeover is cleared the same way. These
+guarantees hold for invocations on one Linux host in one process-id namespace,
+as the plugin runs them. Without `/proc` start times, a reused process id reads
+as alive and the lock stays busy. A root shared across hosts or process-id
+namespaces is unsupported: a live owner there would read as exited. A lock that names no
+verifiable owner, such as one left by an earlier factory version, is refused
+with `factory_busy` until the deployment owner confirms no factory process runs
+and removes it. A killed process can still leave a partially published
+scaffold; the owner must inspect it before recovery. Existing arbitrary directories and token files are
 never silently adopted. Uncertain Vertex creation remains recorded and is not
 reissued; operator reconciliation may be required after an ambiguous submission.
 When Vertex returns a numeric project alias but Resource Manager lookup is

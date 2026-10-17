@@ -1,5 +1,6 @@
-import { afterEach, describe, expect, test } from 'bun:test';
+import { afterEach, describe, expect, spyOn, test } from 'bun:test';
 import { chmod, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, symlink, writeFile } from 'node:fs/promises';
+import * as fsPromises from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { FACTORY_PHASES, FactoryError, runFactory, type FactoryCommandOptions, type FactoryDependencies } from '../src/factory.ts';
@@ -44,6 +45,9 @@ async function fixture() {
     latestUpdateId: 0, confirmedUsername: 'ExampleFactoryTestBot',
     renamedCandidates: [] as { botId: number; username: string; updateId: number }[],
     probeInputs: [] as Record<string, unknown>[],
+    // The worker's domain workspace: seeded by bootstrap, reported by status.
+    seeded: false, bootstrapCount: 0, googleStatus: 'ready' as unknown,
+    roots: [{ root_id: 'expert_agents_workspace', max_write_bytes: 1_000_000, allow_overwrite: false }] as Record<string, unknown>[],
   };
   const dependencies: FactoryDependencies = {
     command: async (argv, cwd, options) => {
@@ -115,9 +119,17 @@ async function fixture() {
     gatewayReloadMode: async () => state.reloadMode,
     worker: async (tool, params) => {
       workers.push({ tool, params });
-      return tool === 'domain_agent' ? { status: params.dry_run ? 'dry_run_registration_ready' : state.registrationStatus }
-        : { status: state.corpusReady ? 'ready' : 'pending' };
+      if (tool === 'rag_corpus') return { status: state.corpusReady ? 'ready' : 'pending' };
+      if (params.action === 'status') {
+        return { kind: 'domain_agent_status', health: state.seeded ? 'healthy' : 'degraded',
+          workspace: { exists: state.seeded, missing_requirements: state.seeded ? [] : [{ relative_path: 'example/PROPOSAL.md', kind: 'proposal' }] } };
+      }
+      if (params.action === 'bootstrap') { state.bootstrapCount++; state.seeded = true; return { status: 'workspace_bootstrapped' }; }
+      return params.dry_run ? { status: 'dry_run_registration_ready', manifest: { domain_id: params.domain_id, workspace_root_id: 'expert_agents_workspace' } }
+        : { status: state.registrationStatus };
     },
+    workerHealth: async () => ({ kind: 'domain_expert_health', configured: { workspace_roots: state.roots.length },
+      configuration_status: { google: state.googleStatus }, roots: state.roots }),
     beginTelegram: async ({ username }) => {
       state.beginCount++;
       return { managerUsername: 'FactoryManagerBot', requestedUsername: username, deepLink: 'https://t.me/FactoryManagerBot?start=fixture' };
@@ -193,7 +205,8 @@ describe('conversational expert factory', () => {
     expect(f.state.beginCount).toBe(1);
     expect(f.state.provisionCount).toBe(1);
     expect(f.workers.filter((call) => call.tool === 'rag_corpus')).toHaveLength(3);
-    expect(f.workers.filter((call) => call.tool === 'domain_agent' && call.params.dry_run === false)).toHaveLength(1);
+    expect(f.workers.filter((call) => call.params.action === 'register' && call.params.dry_run === false)).toHaveLength(1);
+    expect(f.state.bootstrapCount).toBe(1);
     expect((await stat(join(f.config.rootDir, 'operations', 'example', 'state.json'))).mode & 0o077).toBe(0);
   }, 60_000);
 
@@ -580,7 +593,7 @@ describe('conversational expert factory', () => {
     const status = await f.run({ action: 'status', agent_id: 'example' });
     expect(status.status).not.toBe('ready_empty_library');
     expect(status.corpus_ready).toBe(false);
-    expect(freshCalls).toEqual(failure === 'worker_unavailable' ? ['domain_agent'] : ['domain_agent', 'rag_corpus']);
+    expect(freshCalls).toEqual(failure === 'worker_unavailable' ? ['domain_agent'] : ['domain_agent', 'domain_agent', 'rag_corpus']);
     expect(f.state.provisionCount).toBe(1);
     f.dependencies.worker = worker;
     expect((await f.resume()).status).toBe('ready_empty_library');
@@ -664,6 +677,173 @@ describe('conversational expert factory', () => {
     }
     expect(f.calls).toHaveLength(0);
   });
+  describe('self-healing deployment lock', () => {
+    const lockPath = (f: Awaited<ReturnType<typeof fixture>>) => join(f.config.rootDir, 'factory.lock');
+    const owner = (pid: number, start?: string) => JSON.stringify({ pid, ...(start ? { start } : {}), nonce: '00000000-0000-4000-8000-000000000001' }) + '\n';
+    // A process id that belonged to a process which has since exited.
+    const exitedPid = async () => { const child = Bun.spawn(['true']); await child.exited; return child.pid; };
+    const ownStart = async () => (await readFile('/proc/self/stat', 'utf8')).split(') ')[1]!.split(' ')[19]!;
+
+    test('a lock left by an exited process is taken over, and released afterwards', async () => {
+      const f = await fixture();
+      await writeFile(lockPath(f), owner(await exitedPid()), { mode: 0o600 });
+      expect((await f.run()).status).toBe('waiting_for_telegram');
+      expect((await readdir(f.config.rootDir)).sort()).toEqual(['agents', 'operations']);
+    }, 60_000);
+
+    test('a lock whose process id now belongs to a different process is taken over', async () => {
+      const f = await fixture();
+      // This process is alive, but it started at a different time than the recorded owner.
+      await writeFile(lockPath(f), owner(process.pid, String(Number(await ownStart()) + 1)), { mode: 0o600 });
+      expect((await f.run()).status).toBe('waiting_for_telegram');
+      expect(await Bun.file(lockPath(f)).exists()).toBe(false);
+    }, 60_000);
+
+    test.each([
+      ['a live owner', async () => owner(process.pid, await ownStart()), 'is running'],
+      ['a live owner without a start time', async () => owner(process.pid), 'is running'],
+      ['an unreadable lock from an earlier version', async () => '', 'remove factory.lock'],
+      ['a malformed owner', async () => JSON.stringify({ pid: 'self', nonce: '../escape' }), 'remove factory.lock'],
+    ])('never takes %s', async (_name, content, message) => {
+      const f = await fixture();
+      const text = await content();
+      await writeFile(lockPath(f), text, { mode: 0o600 });
+      const error = await f.run().catch((caught: unknown) => caught);
+      expect(error).toMatchObject({ code: 'factory_busy' });
+      expect(String(error)).toContain(message);
+      expect(await readFile(lockPath(f), 'utf8')).toBe(text);
+      expect(f.state.beginCount).toBe(0);
+      expect(await readdir(join(f.config.rootDir, 'operations'))).toEqual(['example']);
+      expect(await readdir(join(f.config.rootDir, 'operations', 'example'))).toEqual([]);
+    }, 60_000);
+
+    test('a factory root whose filesystem has no hard links refuses with a coded error', async () => {
+      const f = await fixture();
+      const link = spyOn(fsPromises, 'link').mockImplementation(async () => { throw Object.assign(new Error('Operation not permitted'), { code: 'EPERM' }); });
+      try {
+        const error = await f.run().catch((caught: unknown) => caught);
+        expect(error).toMatchObject({ code: 'factory_lock_unsupported' });
+        expect(String(error)).toContain('hard links');
+      } finally { link.mockRestore(); }
+      expect((await readdir(f.config.rootDir)).sort()).toEqual(['operations']);
+      expect(f.state.beginCount).toBe(0);
+    }, 60_000);
+
+    test('a takeover claim left by an exited invocation does not block the lock', async () => {
+      const f = await fixture();
+      const stale = '00000000-0000-4000-8000-000000000001';
+      await writeFile(lockPath(f), owner(await exitedPid()), { mode: 0o600 });
+      // The claim on that lock, by an invocation that exited while holding it.
+      await writeFile(`${lockPath(f)}.${stale}`, JSON.stringify({ pid: await exitedPid(), nonce: '00000000-0000-4000-8000-000000000002' }) + '\n', { mode: 0o600 });
+      expect((await f.run()).status).toBe('waiting_for_telegram');
+      expect((await readdir(f.config.rootDir)).sort()).toEqual(['agents', 'operations']);
+    }, 60_000);
+
+    test('a takeover claim held by a live invocation is respected', async () => {
+      const f = await fixture();
+      await writeFile(lockPath(f), owner(await exitedPid()), { mode: 0o600 });
+      const claim = `${lockPath(f)}.00000000-0000-4000-8000-000000000001`;
+      const live = JSON.stringify({ pid: process.pid, start: await ownStart(), nonce: '00000000-0000-4000-8000-000000000002' }) + '\n';
+      await writeFile(claim, live, { mode: 0o600 });
+      await expect(f.run()).rejects.toMatchObject({ code: 'factory_busy' });
+      expect(await readFile(claim, 'utf8')).toBe(live);
+      expect(f.state.beginCount).toBe(0);
+    }, 60_000);
+
+    test('two invocations finding the same abandoned lock: exactly one takes it over', async () => {
+      const f = await fixture();
+      await writeFile(lockPath(f), owner(await exitedPid()), { mode: 0o600 });
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => { release = resolve; });
+      const begin = f.dependencies.beginTelegram!;
+      f.dependencies.beginTelegram = async (...args) => { await gate; return begin(...args); };
+      const runs = [f.run(), f.run({ ...request, agent_id: 'other-agent', telegram_username: 'OtherFactoryTestBot' })];
+      const first = await Promise.race(runs.map((run) => run.then(() => 'completed', (error: unknown) => error)));
+      expect(first).toMatchObject({ code: 'factory_busy' });
+      release();
+      const outcomes = await Promise.allSettled(runs);
+      expect(outcomes.map((outcome) => outcome.status).sort()).toEqual(['fulfilled', 'rejected']);
+      expect(f.state.beginCount).toBe(1);
+      expect(await Bun.file(lockPath(f)).exists()).toBe(false);
+    }, 60_000);
+  });
+
+  describe('workspace seed', () => {
+    const statePath = (f: Awaited<ReturnType<typeof fixture>>) => join(f.config.rootDir, 'operations', 'example', 'state.json');
+
+    test('creation bootstraps the registered domain workspace once, between registration and the corpus', async () => {
+      const f = await fixture();
+      await f.run();
+      const order = f.workers.filter((call) => call.params.dry_run !== true).map((call) => `${call.tool} ${call.params.action}`);
+      expect(order).toEqual(['domain_agent register', 'domain_agent status', 'domain_agent bootstrap', 'domain_agent status', 'rag_corpus ensure']);
+      expect(f.workers.find((call) => call.params.action === 'bootstrap')!.params).toEqual({ action: 'bootstrap', domain_id: 'example', dry_run: false });
+      // A resume re-proves the seed read-only and never rewrites a seeded workspace.
+      f.state.confirmed = true;
+      expect((await f.resume()).status).toBe('ready_empty_library');
+      expect(f.state.bootstrapCount).toBe(1);
+      expect(f.workers.filter((call) => call.params.action === 'status')).toHaveLength(3);
+    }, 60_000);
+
+    test('a resume re-seeds a workspace whose seed files went missing', async () => {
+      const f = await fixture(); await f.run(); f.state.confirmed = true;
+      expect((await f.resume()).status).toBe('ready_empty_library');
+      f.state.seeded = false;
+      expect((await f.resume()).status).toBe('ready_empty_library');
+      expect(f.state.bootstrapCount).toBe(2);
+      expect(f.state.seeded).toBe(true);
+    }, 60_000);
+
+    test('an operation recorded before the seed step existed is seeded on its next resume', async () => {
+      const f = await fixture(); await f.run(); f.state.confirmed = true;
+      expect((await f.resume()).status).toBe('ready_empty_library');
+      const { workspaceSeeded: _seeded, ...earlier } = JSON.parse(await readFile(statePath(f), 'utf8'));
+      await writeFile(statePath(f), JSON.stringify(earlier) + '\n', { mode: 0o600 });
+      f.state.seeded = false;
+      expect((await f.resume()).status).toBe('ready_empty_library');
+      expect(f.state.bootstrapCount).toBe(2);
+      expect(f.state.provisionCount).toBe(1);
+      expect(JSON.parse(await readFile(statePath(f), 'utf8')).workspaceSeeded).toBe(true);
+    }, 60_000);
+
+    test.each([
+      ['an unconfirmed bootstrap', { status: 'dry_run_scaffold_ready' }, 'factory_workspace_seed_incomplete'],
+      ['a bootstrap that leaves seed files missing', 'still-missing', 'factory_workspace_seed_incomplete'],
+      ['a refused bootstrap', Object.assign(new Error('Workspace root is not configured.'), { code: 'workspace_root_not_configured' }), 'workspace_root_not_configured'],
+    ])('%s stops at bootstrapping_workspace before the corpus and resumes there', async (_name, outcome, code) => {
+      const f = await fixture();
+      const worker = f.dependencies.worker;
+      f.dependencies.worker = async (tool, params) => {
+        if (params.action !== 'bootstrap') return worker(tool, params);
+        f.workers.push({ tool, params });
+        if (outcome instanceof Error) throw outcome;
+        return outcome === 'still-missing' ? { status: 'workspace_bootstrapped' } : outcome;
+      };
+      await expect(f.run()).rejects.toMatchObject({ code, details: { phase: 'bootstrapping_workspace' } });
+      expect((await f.run({ action: 'status', agent_id: 'example' })).status).toBe('bootstrapping_workspace');
+      expect(f.workers.some((call) => call.tool === 'rag_corpus')).toBe(false);
+      f.dependencies.worker = worker;
+      expect((await f.resume()).status).toBe('waiting_for_telegram');
+      expect(f.state.seeded).toBe(true);
+    }, 60_000);
+  });
+
+  test('a corpus that was never requested resumes as creating_corpus, not as a pending Vertex creation', async () => {
+    const f = await fixture();
+    const worker = f.dependencies.worker;
+    f.dependencies.worker = async (tool, params) => {
+      if (tool === 'rag_corpus') throw Object.assign(new Error('Vertex unavailable.'), { code: 'rag_corpus_unavailable' });
+      return worker(tool, params);
+    };
+    await expect(f.run()).rejects.toMatchObject({ code: 'rag_corpus_unavailable', details: { phase: 'creating_corpus', step: 'worker corpus ensure' } });
+    await expect(f.resume()).rejects.toMatchObject({ code: 'rag_corpus_unavailable', details: { phase: 'creating_corpus' } });
+    const status = await f.run({ action: 'status', agent_id: 'example' });
+    expect(status.status).toBe('creating_corpus');
+    expect(status.next_action).not.toContain('pending');
+    expect(status.confirmation_url).toBe('https://t.me/FactoryManagerBot?start=fixture');
+    f.dependencies.worker = worker;
+    expect((await f.resume()).status).toBe('waiting_for_telegram');
+  }, 60_000);
+
   describe('remote history wiring', () => {
     async function gitOutput(cwd: string, args: string[]): Promise<string> {
       const child = Bun.spawn(['git', ...args], { cwd, stdout: 'pipe', stderr: 'pipe', env: { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' } });
@@ -910,6 +1090,66 @@ describe('conversational expert factory', () => {
       }
     }, 60_000);
 
+    test.each([
+      ['not_configured', 'not_configured'], ['project_not_configured', 'project_not_configured'], ['unreadable', 'unreadable'],
+      [undefined, 'not ready'], ['private-detail', 'not ready'],
+    ])('refuses before anything is created when the worker reports Google %p', async (google, reported) => {
+      const f = await fixture(); f.state.googleStatus = google;
+      const error = await f.run().catch((caught: unknown) => caught);
+      expect(error).toMatchObject({ code: 'factory_google_not_ready', details: { phase: 'preflight', step: 'worker health' } });
+      expect(String(error)).toContain(`Google configuration as ${reported},`);
+      expect(String(error)).not.toContain('private-detail');
+      await nothingCreated(f);
+      f.state.googleStatus = 'ready';
+      expect((await f.run()).status).toBe('waiting_for_telegram');
+    }, 60_000);
+
+    test('an unreachable worker health check refuses with its own code before the Telegram link', async () => {
+      const f = await fixture();
+      f.dependencies.workerHealth = async () => { throw Object.assign(new Error('Domain expert worker is unreachable.'), { code: 'domain_expert_unreachable' }); };
+      await expect(f.run()).rejects.toMatchObject({ code: 'domain_expert_unreachable', details: { phase: 'preflight', step: 'worker health' } });
+      await nothingCreated(f);
+    }, 60_000);
+
+    test('a resume also needs Google, since it re-proves the corpus', async () => {
+      const f = await fixture(); await f.run(); f.state.confirmed = true;
+      f.state.googleStatus = 'unreadable';
+      await expect(f.resume()).rejects.toMatchObject({ code: 'factory_google_not_ready', details: { phase: 'preflight' } });
+      expect((await f.run({ action: 'status', agent_id: 'example' })).status).toBe('waiting_for_telegram');
+      expect(f.state.provisionCount).toBe(0);
+      f.state.googleStatus = 'ready';
+      expect((await f.resume()).status).toBe('ready_empty_library');
+    }, 60_000);
+
+    test.each([
+      ['no workspace roots', []],
+      ['only another root', [{ root_id: 'other_root', allow_overwrite: false }]],
+    ])('refuses before anything is created when the worker has %s for the domain workspace', async (_name, roots) => {
+      const f = await fixture(); f.state.roots = roots;
+      const error = await f.run().catch((caught: unknown) => caught);
+      expect(error).toMatchObject({ code: 'factory_workspace_root_missing', details: { phase: 'preflight', step: 'worker health' } });
+      expect(String(error)).toContain('EXPERT_AGENTS_DOMAIN_EXPERT_ROOTS_JSON');
+      await nothingCreated(f);
+    }, 60_000);
+
+    test.each([true, undefined])('refuses a workspace root whose allow_overwrite is %p, so bootstrap can never rewrite owner files', async (allowOverwrite) => {
+      const f = await fixture(); f.state.roots = [{ root_id: 'expert_agents_workspace', ...(allowOverwrite === undefined ? {} : { allow_overwrite: allowOverwrite }) }];
+      await expect(f.run()).rejects.toMatchObject({ code: 'factory_workspace_root_overwrites', details: { phase: 'preflight', step: 'worker health' } });
+      await nothingCreated(f);
+    }, 60_000);
+
+    test('an owner who deleted a seed file on an overwriting root gets a refusal, not a rewritten workspace', async () => {
+      const f = await fixture(); await f.run(); f.state.confirmed = true;
+      expect((await f.resume()).status).toBe('ready_empty_library');
+      f.state.seeded = false;
+      f.state.roots = [{ root_id: 'expert_agents_workspace', allow_overwrite: true }];
+      await expect(f.resume()).rejects.toMatchObject({ code: 'factory_workspace_root_overwrites', details: { phase: 'preflight' } });
+      expect(f.state.bootstrapCount).toBe(1);
+      f.state.roots = [{ root_id: 'expert_agents_workspace', allow_overwrite: false }];
+      expect((await f.resume()).status).toBe('ready_empty_library');
+      expect(f.state.bootstrapCount).toBe(2);
+    }, 60_000);
+
     test('a resume refuses with reload off until the Gateway is configured, then readiness still checks', async () => {
       const f = await fixture(); await f.run(); f.state.confirmed = true; f.state.reloadMode = 'off';
       await expect(f.resume()).rejects.toMatchObject({ code: 'factory_gateway_reload_off', details: { phase: 'preflight' } });
@@ -940,6 +1180,7 @@ describe('conversational expert factory', () => {
       ['a refused credential', new FactoryError('factory_command_failed', 'refused', { category: 'auth' }), 'factory_command_failed', 'auth'],
       ['an unreachable service', new FactoryError('factory_command_failed', 'unreachable', { category: 'unavailable' }), 'factory_command_failed', 'unavailable'],
       ['a redirecting repository setting', new FactoryError('factory_repository_git_config', 'redirect'), 'factory_repository_git_config', undefined],
+      ['a missing gh or git', new FactoryError('factory_command_failed', 'missing', { category: 'missing_command' }), 'factory_command_failed', 'missing_command'],
     ])('a remote check failing with %s refuses even when the remote will be created', async (_name, failure, code, category) => {
       const f = await fixture(); githubRemote(f);
       const command = f.dependencies.command;
@@ -951,6 +1192,59 @@ describe('conversational expert factory', () => {
       await nothingCreated(f);
       // The remote is checked first, so an outage is not reported as a refused credential.
       expect(f.calls.some((call) => call.argv[0] === 'gh')).toBe(false);
+    }, 60_000);
+
+    test('a missing gh is reported as a missing program, not a credential problem', async () => {
+      const f = await fixture(); githubRemote(f);
+      const command = f.dependencies.command;
+      f.dependencies.command = async (argv, cwd, options) => {
+        if (argv[1] === 'ls-remote') throw new FactoryError('factory_command_failed', 'missing', { category: 'missing_command' });
+        return command(argv, cwd, options);
+      };
+      const error = await f.run().catch((caught: unknown) => caught);
+      expect(String(error)).toContain('GitHub CLI (gh)');
+      expect(String(error)).not.toContain('Reconnect System GitHub');
+    }, 60_000);
+
+    const bareWithHistory = async (f: Awaited<ReturnType<typeof fixture>>) => {
+      const bare = join(f.base, 'https', 'github.com', 'example-owner', 'example.git');
+      const source = join(f.base, 'unrelated-history');
+      await mkdir(bare, { recursive: true }); await mkdir(source);
+      const git = (cwd: string, args: string[]) => expect(Bun.spawnSync(['git', ...args], { cwd, env: { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' } }).exitCode).toBe(0);
+      git(f.base, ['init', '--bare', '--quiet', bare]);
+      git(source, ['init', '--quiet']);
+      git(source, ['-c', 'user.name=Other', '-c', 'user.email=other@example.invalid', 'commit', '--quiet', '--allow-empty', '-m', 'Unrelated']);
+      git(source, ['push', '--quiet', bare, 'HEAD:refs/heads/main']);
+      return bare;
+    };
+
+    test.each([true, false])('refuses a GitHub remote that already has other history before anything is created (creation command: %p)', async (create) => {
+      const f = await fixture(); githubRemote(f, create);
+      await bareWithHistory(f);
+      const error = await f.run().catch((caught: unknown) => caught);
+      expect(error).toMatchObject({ code: 'factory_remote_has_history', details: { phase: 'preflight', step: 'git ls-remote' } });
+      expect(String(error)).toContain('never adopts or overwrites');
+      await nothingCreated(f);
+    }, 60_000);
+
+    test('a push whose proof a crash lost resumes, because the only remote history is this operation\'s commit', async () => {
+      const f = await fixture(); githubRemote(f, false);
+      const bare = join(f.base, 'https', 'github.com', 'example-owner', 'example.git');
+      await mkdir(bare, { recursive: true });
+      expect(Bun.spawnSync(['git', 'init', '--bare', '--quiet', bare], { env: { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' } }).exitCode).toBe(0);
+      const command = f.dependencies.command;
+      let crash = true;
+      f.dependencies.command = async (argv, cwd, options) => {
+        if (crash && argv[1] === 'rev-parse' && argv[2] === '@{upstream}') { crash = false; throw new Error('Fixture crash after the push'); }
+        return command(argv, cwd, options);
+      };
+      await expect(f.run()).rejects.toMatchObject({ details: { phase: 'wiring_remote' } });
+      const result = await f.resume();
+      expect(result.status).toBe('waiting_for_telegram');
+      expect(result.repository_remote).toBe('https://github.com/example-owner/example.git');
+      const head = Bun.spawnSync(['git', 'rev-parse', 'HEAD'], { cwd: bare, env: { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' } }).stdout.toString().trim();
+      expect(head).toBe(result.commit!);
+      expect(f.calls.filter((call) => call.argv[0] === 'git' && call.argv.includes('commit'))).toHaveLength(1);
     }, 60_000);
 
     test('refuses an absent GitHub remote when nothing is configured to create it', async () => {
@@ -1098,7 +1392,7 @@ describe('conversational expert factory', () => {
       f.state.running = true;
       seen.add((await f.resume()).status);
       expect([...seen].filter((phase) => !(FACTORY_PHASES as readonly string[]).includes(phase))).toEqual([]);
-      for (const phase of ['registering_library', 'creating_corpus', 'configuring_gateway', 'ready_empty_library']) expect(seen.has(phase)).toBe(true);
+      for (const phase of ['registering_library', 'bootstrapping_workspace', 'creating_corpus', 'configuring_gateway', 'ready_empty_library']) expect(seen.has(phase)).toBe(true);
     }, 60_000);
   });
 });
