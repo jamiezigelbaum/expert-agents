@@ -226,7 +226,12 @@ These worker routes take the same PDF pipeline: `annas_archive_import`;
 it and count its pages (the worker's service account needs
 `storage.objects.get` on it; an unreadable object answers 502
 `gcs_object_unreadable`, one over 100,000,000 bytes 413
-`file_size_limit_exceeded`), with parts beside it as `<name>--partNofM.pdf`;
+`file_size_limit_exceeded`; one that changes while it is read 409
+`gcs_object_changed`), with parts beside it as `<name>--partNofM.pdf`. Vertex
+reads the URI after the worker inspected it, so once the import settles the
+worker reads the object's generation again: if it changed, the record keeps the
+inspected sha256 but says `sha256_verified: false` with `source_check`, and the
+result reports `source_changed_during_import`;
 and `stage_import` and `web_import`, where a PDF already in the corpus, one to
 split or one refused leaves the batch. The plan's `pdf_routing` and the
 receipt's `pdf_sources` list each such PDF with its route (`present`, `split`,
@@ -236,7 +241,12 @@ imported; a split also checks the corpus again right before it runs); `eligible_
 refused PDFs answers `pdf_sources_refused`. The 100 MiB batch cap counts only
 the files the batch stages; a routed PDF is bounded by the per-file limit alone
 (web_import's 100 MiB fetch budget still covers everything it fetches). Parts go to
-`staged/<domain>/<batch>--parts/` after the batch import, and a staged PDF that
+`staged/<domain>/<batch>--parts/` after the batch import. A batch's directory
+import takes exactly the objects that run staged: an object an earlier attempt
+of the same `batch_id` left in `staged/<domain>/<batch>/` is deleted first and
+named in the `stale_staged_objects_removed` warning, so the worker's service
+account needs `storage.objects.list` and `storage.objects.delete` on that
+prefix, and a staged PDF that
 is the batch's only file is registered under the `source_id` the import names.
 A PDF imported by URI without `source_id` is registered under its sha256 as
 `<domain>-pdf-<sha prefix>` and answers within the response budget. A

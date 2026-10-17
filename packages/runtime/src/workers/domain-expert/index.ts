@@ -2142,7 +2142,11 @@ export class DomainExpertService {
 
   // options.wholeObject: import exactly this object, as a split's part or a
   // PDF the shared pipeline already routed whole; sourceSha256 is its identity.
-  private async ragCorpus(params: RagCorpusParams, options: { wholeObject?: boolean; sourceSha256?: string; identitySource?: Record<string, unknown> } = {}): Promise<unknown> {
+  // pinned: the generation of the object whose bytes were inspected, rechecked once the import settles.
+  private async ragCorpus(params: RagCorpusParams, options: {
+    wholeObject?: boolean; sourceSha256?: string; identitySource?: Record<string, unknown>;
+    pinned?: { bucket: string; objectName: string; generation: string | undefined };
+  } = {}): Promise<unknown> {
     if (params.action === 'ensure') return this.ensureRagCorpus(params);
     const dryRun = params.dryRun ?? true;
     const manifest = this.manifest(params.domainId);
@@ -2318,6 +2322,7 @@ export class DomainExpertService {
     const verifying = sourceRootPath && registeredSource
       ? this.verifyAndRegisterRagImport({
         onRequestRecorded: requestRecorded,
+        ...(options.pinned ? { pinned: options.pinned } : {}),
         manifest,
         rootPath: sourceRootPath,
         resolved: usedResolved,
@@ -2374,6 +2379,7 @@ export class DomainExpertService {
     const gcsUri = requireString(params.gcsUri, 'gcs_uri');
     const { bucket, prefix } = parseGcsPrefix(gcsUri);
     const objectName = prefix.replace(/\/$/, '');
+    const inspected = await this.google.getGcsObjectMetadata(bucket, objectName);
     let bytes: Uint8Array | null;
     try {
       bytes = await this.google.downloadLibraryObject(bucket, objectName, PDF_PROCESSING_MAX_BYTES, GOOGLE_LONG_GENERATION_TIMEOUT_MS);
@@ -2383,7 +2389,10 @@ export class DomainExpertService {
       }
       throw new DomainExpertWorkerError(502, 'gcs_object_unreadable', `${gcsUri} could not be read to identify it and count its pages. Nothing was imported.`);
     }
-    if (!bytes) throw new DomainExpertWorkerError(404, 'gcs_object_not_found', `${gcsUri} does not exist. Nothing was imported.`);
+    if (!bytes || !inspected) throw new DomainExpertWorkerError(404, 'gcs_object_not_found', `${gcsUri} does not exist. Nothing was imported.`);
+    if (!gcsObjectHoldsBytes(inspected, bytes)) {
+      throw new DomainExpertWorkerError(409, 'gcs_object_changed', `${gcsUri} changed while it was being read. Nothing was imported.`, 'Re-run the import once the object is stable.');
+    }
     const digest = sha256(bytes);
     const namedSource = params.sourceId
       ? await this.registeredImportSource(manifest, await checkedRootPath(this.rootFor(manifest.workspace_root_id)), params.sourceId)
@@ -2431,7 +2440,10 @@ export class DomainExpertService {
     const route = await this.routePdf(source, bytes, measurePdfArtifactScale(bytes).corroborated_pages, holding);
     if ('refusal' in route) throw new DomainExpertWorkerError(422, route.refusal.code, route.refusal.message, route.refusal.suggestion);
     if ('whole' in route) {
-      const result = await this.ragCorpus(params, { wholeObject: true, sourceSha256: digest, identitySource: { ...catalogue, source_id: context.sourceId ?? catalogue.source_id } });
+      const result = await this.ragCorpus(params, {
+        wholeObject: true, sourceSha256: digest, identitySource: { ...catalogue, source_id: context.sourceId ?? catalogue.source_id },
+        pinned: { bucket, objectName, generation: inspected.generation },
+      });
       return { ...asOptionalRecord(result), source_sha256: digest };
     }
     // An unexpected throw still ends the run with a record.
@@ -3381,6 +3393,16 @@ export class DomainExpertService {
         }
       }
     }
+    // The import takes the whole staging directory, so it must hold exactly what this run
+    // staged: an object an earlier attempt of the same batch left there (a PDF this run
+    // routed out, say) is removed first, or Vertex would import it too.
+    const staged = new Set(stagedFiles.map((file) => String(file.gcs_uri)));
+    const leftovers = (await this.google.listLibraryObjectNames(stage.destination.bucket, stage.destination.objectPrefix, GOOGLE_API_REQUEST_TIMEOUT_MS))
+      .filter((name) => !staged.has(`gs://${stage.destination.bucket}/${name}`));
+    for (const name of leftovers) await this.google.deleteGcsObject(stage.destination.bucket, name);
+    if (leftovers.length) {
+      warnings.push({ code: 'stale_staged_objects_removed', objects: leftovers.map((name) => `gs://${stage.destination.bucket}/${name}`) });
+    }
     const importResultSink = this.agentRouting[stage.manifest.domain_id]?.ingestion?.importResultSink === 'client'
       ? undefined : importResultSinkUri(stage.manifest.allowed_gcs_prefixes, stage.manifest.domain_id, stage.batchId);
     const retry = await this.withRagCorpusRetry(stage.manifest, stage.resolved, async (candidate) => {
@@ -3551,6 +3573,9 @@ export class DomainExpertService {
     sha256ByUri?: Map<string, string>;
     // Called once the import_requested record is written.
     onRequestRecorded?: () => void;
+    // The inspected object's generation. Vertex reads the URI later, so a different
+    // generation once the import settles means the imported bytes were not the ones inspected.
+    pinned?: { bucket: string; objectName: string; generation: string | undefined };
   }): Promise<{ import_outcome: Record<string, unknown>; source_registry: Record<string, unknown> }> {
     const operationName = typeof input.submissionReceipt.operation_name === 'string' ? input.submissionReceipt.operation_name : undefined;
     const registryErrors: string[] = [];
@@ -3617,11 +3642,20 @@ export class DomainExpertService {
         detail = { ...Object.fromEntries(Object.entries(detail).filter(([key]) => key !== 'hint')), already_present: true };
       }
     }
+    let changed: string | undefined;
+    if (input.pinned) {
+      const after = await this.google.getGcsObjectMetadata(input.pinned.bucket, input.pinned.objectName).catch(() => undefined);
+      if (after === undefined) changed = 'the object could not be read back after the import';
+      else if (after?.generation !== input.pinned.generation) changed = `the object changed during the import (generation ${String(input.pinned.generation)} inspected, ${after ? String(after.generation) : 'deleted'} now)`;
+      if (changed) detail = { ...detail, source_changed_during_import: true, source_check: changed };
+    }
     const verifiedAt = new Date().toISOString();
     const written = await record({
       ingest_status: status,
       ...(operationName ? { rag_operation_name: operationName } : {}),
       ...ragImportFileFields(files, input.sha256ByUri),
+      // Identity is claimed only for the bytes inspected.
+      ...(changed ? { sha256_verified: false, source_check: changed } : {}),
       ...(status === 'imported'
         ? { verification: ragImportVerification(detail, files, verifiedAt) }
         : { ingest_reason: ragImportReason(detail) }),
@@ -6773,6 +6807,19 @@ class GoogleRuntimeClient {
       headers: { 'Content-Type': 'application/octet-stream' },
       body: new Blob([copyToArrayBuffer(bytes)], { type: 'application/octet-stream' }),
     });
+  }
+
+  async deleteGcsObject(bucket: string, objectName: string): Promise<void> {
+    const response = await this.authedFetch(
+      `https://storage.googleapis.com/storage/v1/b/${encodeURIComponent(bucket)}/o/${encodeURIComponent(objectName)}`,
+      { method: 'DELETE' },
+    );
+    // Gone is the goal: an object a concurrent run already removed is fine.
+    if (response.status === 404 || response.ok) {
+      await response.body?.cancel();
+      return;
+    }
+    throw googleError(response, await responseTextOrJson(response));
   }
 
   async getGcsObjectMetadata(bucket: string, objectName: string): Promise<GcsObjectMetadata | null> {

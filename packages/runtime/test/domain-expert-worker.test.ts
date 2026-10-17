@@ -4321,11 +4321,21 @@ function fakeGoogleFetch(
     const headers = headersRecord(init?.headers ?? (input instanceof Request ? input.headers : undefined));
     calls.push({ url, method, body, headers });
 
+    // A listing of the staging directory: the fixture objects under the prefix.
+    if (method === 'GET' && new URL(url).pathname.endsWith('/o') && new URL(url).searchParams.has('prefix')) {
+      const prefix = new URL(url).searchParams.get('prefix') ?? '';
+      return jsonResponse({ items: Object.keys(options.gcsObjects ?? {}).filter((name) => name.startsWith(prefix)).map((name) => ({ name })) });
+    }
     if (method === 'GET' && new URL(url).pathname.includes('/storage/v1/b/')) {
       const encodedName = new URL(url).pathname.split('/o/')[1];
       const objectName = encodedName === undefined ? '' : decodeURIComponent(encodedName);
       const value = options.gcsObjects?.[objectName];
-      return value === undefined ? jsonResponse({ error: 'fixture object not found' }, 404) : new Response(value);
+      if (value === undefined) return jsonResponse({ error: 'fixture object not found' }, 404);
+      // A metadata read answers as GCS does; any other read answers the object.
+      if (new URL(url).searchParams.get('fields')?.includes('md5Hash')) {
+        return jsonResponse({ generation: '1', size: String(Buffer.byteLength(value)), md5Hash: createHash('md5').update(value).digest('base64') });
+      }
+      return new Response(value);
     }
     // Staging uploads each eligible file before requesting the corpus import.
     if (method === 'POST' && url.includes('/upload/storage/v1/b/')) {
@@ -4780,6 +4790,16 @@ function fakeIngestGoogleFetch(calls: CapturedCall[], objects: FakeGcsObjects = 
   }) as typeof fetch;
 }
 
+// Each fixture object's generation, which every write bumps, as in GCS.
+const fakeGcsGenerations = new WeakMap<FakeGcsObjects, Map<string, number>>();
+
+function writeFakeGcsObject(objects: FakeGcsObjects, name: string, bytes: Uint8Array): void {
+  objects.set(name, bytes);
+  const generations = fakeGcsGenerations.get(objects) ?? new Map<string, number>();
+  fakeGcsGenerations.set(objects, generations);
+  generations.set(name, (generations.get(name) ?? 1) + 1);
+}
+
 function fakeGcsObjectResponse(url: string, method: string, init: RequestInit | undefined, objects: FakeGcsObjects): Promise<Response> | undefined {
   const parsed = new URL(url);
   if (parsed.hostname !== 'storage.googleapis.com') return undefined;
@@ -4789,9 +4809,17 @@ function fakeGcsObjectResponse(url: string, method: string, init: RequestInit | 
       if (parsed.searchParams.get('ifGenerationMatch') === '0' && objects.has(name)) {
         return jsonResponse({ error: { code: 412, message: 'precondition failed' } }, 412);
       }
-      objects.set(name, new Uint8Array(await new Response(init?.body as BodyInit).arrayBuffer()));
+      writeFakeGcsObject(objects, name, new Uint8Array(await new Response(init?.body as BodyInit).arrayBuffer()));
       return jsonResponse({ name });
     })();
+  }
+  if (method === 'GET' && parsed.pathname.endsWith('/o') && parsed.searchParams.has('prefix')) {
+    const prefix = parsed.searchParams.get('prefix') ?? '';
+    return Promise.resolve(jsonResponse({ items: [...objects.keys()].filter((name) => name.startsWith(prefix)).map((name) => ({ name })) }));
+  }
+  if (method === 'DELETE' && parsed.pathname.includes('/o/')) {
+    objects.delete(decodeURIComponent(parsed.pathname.split('/o/')[1] ?? ''));
+    return Promise.resolve(new Response(null, { status: 204 }));
   }
   if (method === 'GET' && parsed.searchParams.get('alt') === 'media') {
     const bytes = objects.get(decodeURIComponent(parsed.pathname.split('/o/')[1] ?? ''));
@@ -4802,7 +4830,7 @@ function fakeGcsObjectResponse(url: string, method: string, init: RequestInit | 
     const bytes = objects.get(name);
     if (!bytes) return Promise.resolve(jsonResponse({ error: { code: 404, message: 'No such object' } }, 404));
     return Promise.resolve(jsonResponse({
-      generation: '1',
+      generation: String(fakeGcsGenerations.get(objects)?.get(name) ?? 1),
       size: String(bytes.byteLength),
       md5Hash: createHash('md5').update(bytes).digest('base64'),
     }));
@@ -6389,7 +6417,7 @@ describe('splitting long PDFs for LLM-parser imports', () => {
   const STEM = 'v1/book-imports/research/author---the-fixture-compendium-1989';
   const partUri = (index: number, of: number) => `gs://fixture-shared-library/${STEM}--part${index}of${of}.pdf`;
 
-  type ImportBehaviour = (part: string, attempt: number) => Record<string, unknown> | Response;
+  type ImportBehaviour = (part: string, attempt: number, objects: FakeGcsObjects) => Record<string, unknown> | Response;
 
   // Vertex as the parts see it: each import names one object and its outcome is chosen per part
   // name. A successful import lists an ACTIVE ragFile; a failed one leaves an ERROR ragFile, and
@@ -6413,7 +6441,7 @@ describe('splitting long PDFs for LLM-parser imports', () => {
         const attempt = (attempts.get(part) ?? 0) + 1;
         attempts.set(part, attempt);
         // A refusal (quota, busy corpus) comes before Vertex looks at the file; a held URI is skipped.
-        const chosen = behaviour(part, attempt);
+        const chosen = behaviour(part, attempt, objects);
         if (chosen instanceof Response) return chosen;
         const outcome = imported.has(uri) || errored.has(uri) ? { skippedRagFilesCount: '1' } : chosen;
         operations += 1;
@@ -7136,6 +7164,27 @@ describe('splitting long PDFs for LLM-parser imports', () => {
       } finally { f.cleanup(); }
     });
 
+    // Vertex reads the URI after the worker inspected it: an overwrite in between must not be claimed as the inspected file.
+    test('a GCS PDF overwritten during its import is recorded with its identity unverified', async () => {
+      const SHORT_NAME = 'v1/library/example-author---a-changing-paper-1992.pdf';
+      const original = textPdfBytes(120);
+      const f = splitFixture(original, (part, _attempt, objects) => {
+        if (part === 'whole') writeFakeGcsObject(objects, SHORT_NAME, textPdfBytes(121));
+        return { importedRagFilesCount: '1' };
+      }, { seed: { objects: [[SHORT_NAME, original]] } });
+      try {
+        const response = await postDomain(f.worker, 'rag_corpus', { action: 'import', domain_id: 'research', corpus_id: CORPUS, gcs_uri: `gs://fixture-shared-library/${SHORT_NAME}`, dry_run: false });
+        expect(response).toMatchObject({ source_sha256: sha256Hex(original), import_outcome: { source_changed_during_import: true } });
+        expect(f.readRegistry().at(-1)).toMatchObject({ source_sha256: sha256Hex(original), sha256_verified: false, source_check: expect.stringContaining('changed during the import') });
+        // An object left alone keeps its identity verified (no flag).
+        const g = splitFixture(original, importsAll, { seed: { objects: [[SHORT_NAME, original]] } });
+        try {
+          await postDomain(g.worker, 'rag_corpus', { action: 'import', domain_id: 'research', corpus_id: CORPUS, gcs_uri: `gs://fixture-shared-library/${SHORT_NAME}`, dry_run: false });
+          expect(g.readRegistry().at(-1)!.sha256_verified).toBeUndefined();
+        } finally { g.cleanup(); }
+      } finally { f.cleanup(); }
+    });
+
     test('rag_corpus import of a long GCS PDF the worker cannot split is refused before import', async () => {
       const f = splitFixture(LONG, importsAll, { qpdfBin: 'qpdf-missing-fixture', seed: { objects: [[OBJECT, LONG]] } });
       try {
@@ -7338,6 +7387,30 @@ describe('splitting long PDFs for LLM-parser imports', () => {
         expect(f.importedUris()).toEqual(['gs://fixture-shared-library/v1/staged/research/second-batch/']);
         // The other import's record is left as the source's latest.
         expect(f.readRegistry().filter((record) => record.source_sha256 === sha256Hex(LONG)).at(-1)!.rag_files.map((file: Record<string, any>) => file.gcs_uri)).toEqual(other);
+      } finally { f.cleanup(); }
+    });
+
+    // A batch imports its whole staging directory, so a retry of the same batch_id must not
+    // let an earlier attempt's object ride along.
+    test('a retried batch removes what an earlier attempt staged and this one does not', async () => {
+      const f = splitFixture(LONG, importsAll);
+      const stale = 'v1/staged/research/retry-batch/volume.pdf';
+      try {
+        writeBatch(f.base, { 'note.md': '# A note', 'volume.pdf': textPdfBytes(120) });
+        const first = await stageBatch(f.worker, 'retry-batch');
+        expect(first.staged_files.map((file: Record<string, any>) => file.gcs_uri)).toContain(`gs://fixture-shared-library/${stale}`);
+        // The same batch again, now with the PDF replaced by a long one the pipeline splits.
+        writeBatch(f.base, { 'volume.pdf': LONG });
+        const callsBefore = f.googleCalls.length;
+        const second = await stageBatch(f.worker, 'retry-batch');
+        expect(second.staged_files.map((file: Record<string, any>) => file.workspace_relative_path)).toEqual(['experts/research/sources/batch/note.md']);
+        expect(second.warnings).toContainEqual({ code: 'stale_staged_objects_removed', objects: [`gs://fixture-shared-library/${stale}`] });
+        const calls = f.googleCalls.slice(callsBefore);
+        const removed = calls.findIndex((call) => call.method === 'DELETE' && call.url.includes(encodeURIComponent(stale)));
+        const directoryImport = calls.findIndex((call) => call.url.endsWith('/ragFiles:import') && call.body.includes('retry-batch/"'));
+        expect(removed).toBeGreaterThanOrEqual(0);
+        expect(removed).toBeLessThan(directoryImport);
+        expect(second.pdf_sources).toMatchObject([{ route: 'split', status: 'imported' }]);
       } finally { f.cleanup(); }
     });
 

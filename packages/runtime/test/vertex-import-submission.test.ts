@@ -49,6 +49,8 @@ describe('runtime import submission custody', () => {
         if (url.endsWith('/ragCorpora')) return Response.json({ ragCorpora: registered ? [{ name: corpus, displayName: 'neutral-library' }] : [] });
         if (url.endsWith('/ragFiles')) return Response.json({ ragFiles: [] });
         if (url.includes('/upload/storage/')) return Response.json({});
+        // The staging directory holds only what this run staged.
+        if (url.includes('/storage/v1/b/') && new URL(url).searchParams.has('prefix')) return Response.json({ items: [] });
         if (url.endsWith('/ragFiles:import')) {
           const pending = pendingReceipt();
           expect(pending.status).toBe('submission_pending');
