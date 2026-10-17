@@ -27,6 +27,13 @@ export interface FactoryGitHubSelection {
   stateDir?: unknown;
 }
 
+/**
+ * Proxy and CA trust variables the factory needs to reach GitHub, the worker and Telegram from a
+ * host behind a proxy. The plugin passes them to the factory process and the GitHub commands keep
+ * them; none carries a credential, and their values are never logged.
+ */
+export const FACTORY_NETWORK_ENV = ['HTTPS_PROXY', 'https_proxy', 'NO_PROXY', 'no_proxy', 'SSL_CERT_FILE', 'SSL_CERT_DIR', 'GIT_SSL_CAINFO', 'NODE_EXTRA_CA_CERTS'] as const;
+
 /** The running Gateway's `gateway.reload.mode`, read by the plugin from its live runtime config. */
 export interface FactoryGatewaySelection {
   reloadMode?: unknown;
@@ -59,6 +66,8 @@ export interface FactoryState {
   scaffolded?: boolean;
   commit?: string;
   domainRegistered?: boolean;
+  /** The worker reported every required seed file of the domain's workspace present. Re-proven on every resume. */
+  workspaceSeeded?: boolean;
   corpusReady?: boolean;
   botId?: number;
   tokenInstalled?: boolean;

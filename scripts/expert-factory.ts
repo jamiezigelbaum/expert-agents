@@ -2,8 +2,8 @@ import { constants, existsSync, rmSync } from 'node:fs';
 import { lstat, mkdtemp, open, rm } from 'node:fs/promises';
 import { devNull, tmpdir } from 'node:os';
 import { dirname, isAbsolute, join } from 'node:path';
-import { runFactory, FactoryError, type FactoryCommand, type FactoryFailureCategory } from '../packages/provisioning/src/factory.ts';
-import type { FactoryConfig, FactoryGatewaySelection, FactoryGitHubSelection, FactoryRequest } from '../packages/provisioning/src/factory-types.ts';
+import { cleanupOnExit, runFactory, FactoryError, type FactoryCommand, type FactoryFailureCategory } from '../packages/provisioning/src/factory.ts';
+import { FACTORY_NETWORK_ENV, type FactoryConfig, type FactoryGatewaySelection, type FactoryGitHubSelection, type FactoryRequest } from '../packages/provisioning/src/factory-types.ts';
 import { DomainExpertClient } from '../packages/runtime/src/core/domain-expert-client.ts';
 import type { ExpertAgentsConfig } from '../packages/runtime/src/core/config.ts';
 import { OperationError } from '../packages/runtime/src/core/operation-error.ts';
@@ -18,7 +18,7 @@ export async function executeFactoryEnvelope(value: unknown): Promise<unknown> {
     const client = new DomainExpertClient(envelope.worker);
     const command = factoryCommand(envelope.github);
     return { result: await runFactory(envelope.factory, envelope.request, {
-      command, worker: (tool, params) => client.run(tool, params),
+      command, worker: (tool, params) => client.run(tool, params), workerHealth: () => client.health(),
       gatewayReloadMode: () => gatewayReloadMode(envelope.gateway, envelope.factory.openclawBin),
     }) };
   } catch (error) {
@@ -50,8 +50,10 @@ const MANAGED_PROFILE_ID = /^ghp_[a-f0-9]{32}$/;
 // of prompting and nothing else sees the profile.
 const GITHUB_GIT_CONFIG = ['-c', 'credential.helper=', '-c', 'credential.helper=!gh auth git-credential', '-c', 'core.askPass=', '-c', `core.hooksPath=${devNull}`];
 // Like OpenClaw's authenticated worker Git, inherited Git, GitHub CLI and askpass settings never
-// reach the push: they could supply another credential, reroute the remote or trace headers.
+// reach the push: they could supply another credential, reroute the remote or trace headers. The
+// host's proxy and CA trust variables are kept, so a host behind a proxy can still reach GitHub.
 const INHERITED_GIT_SETTINGS = /^(GIT_|GH_|GITHUB_|SSH_ASKPASS$|NETRC$|XDG_CONFIG_HOME$)/i;
+const KEPT_NETWORK_SETTINGS: readonly string[] = FACTORY_NETWORK_ENV;
 // Repository settings that could still redirect, proxy or authenticate the push: URL rewrites,
 // HTTP settings, includes, and per-remote push URLs, proxies or remote helpers.
 // GitHub CLI's check of the profile's active credential, the only gh command given the identity.
@@ -69,13 +71,19 @@ export function factoryCommand(github?: FactoryGitHubSelection): FactoryCommand 
     // An empty private HOME with no global or system Git config: host netrc entries, extra
     // headers, URL rewrites and hooks cannot authenticate or redirect this push.
     const home = await mkdtemp(join(tmpdir(), 'expert-factory-github-'));
-    // The plugin ends a timed-out or interrupted factory with SIGTERM; remove the HOME first.
-    const terminate = () => { rmSync(home, { recursive: true, force: true }); process.exit(143); };
-    process.once('SIGTERM', terminate);
+    // The plugin ends a timed-out or interrupted factory with SIGTERM; the HOME is removed then too.
+    const stopCleanup = cleanupOnExit(() => rmSync(home, { recursive: true, force: true }));
     try {
       const env: Record<string, string> = {};
-      for (const [name, value] of Object.entries(process.env)) if (value !== undefined && !INHERITED_GIT_SETTINGS.test(name)) env[name] = value;
+      for (const [name, value] of Object.entries(process.env)) {
+        if (value !== undefined && (!INHERITED_GIT_SETTINGS.test(name) || KEPT_NETWORK_SETTINGS.includes(name))) env[name] = value;
+      }
       Object.assign(env, { HOME: home, GH_CONFIG_DIR: profileDir, GIT_CONFIG_GLOBAL: devNull, GIT_CONFIG_NOSYSTEM: '1', GIT_TERMINAL_PROMPT: '0' });
+      // Git's credential helper is gh. A missing gh would surface only as a failed credential
+      // prompt, so both programs must resolve on PATH before Git starts.
+      for (const program of ['git', 'gh']) {
+        if (!Bun.which(program, { PATH: env.PATH ?? '' })) throw new FactoryError('factory_command_failed', `${program} is not an executable on PATH.`, { category: 'missing_command' });
+      }
       if (probe) return await runFactoryCommand(argv, home, env);
       // A check against a remote before the repository exists runs outside any repository.
       const workdir = cwd ?? home;
@@ -88,10 +96,10 @@ export function factoryCommand(github?: FactoryGitHubSelection): FactoryCommand 
       }
       return await runFactoryCommand(['git', ...GITHUB_GIT_CONFIG, ...argv.slice(1)], workdir, env);
     } catch (error) {
-      if (!(error instanceof FactoryError) || error.code !== 'factory_command_failed') throw error;
+      if (!(error instanceof FactoryError) || error.code !== 'factory_command_failed' || error.details.category === 'missing_command') throw error;
       throw new FactoryError('factory_command_failed', 'A required command failed as the System GitHub identity. Its private output was withheld; check that System GitHub is connected and can write the remote, then resume.', error.details);
     } finally {
-      process.off('SIGTERM', terminate);
+      stopCleanup();
       await rm(home, { recursive: true, force: true });
     }
   };

@@ -325,6 +325,36 @@ describe('factory pushes as the System GitHub identity', () => {
     expect(await f.pushed()).toBe('');
   }, 30_000);
 
+  test('keeps the host proxy and CA trust settings, unchanged, and no other inherited Git setting', async () => {
+    const f = await fixture();
+    const network = {
+      HTTPS_PROXY: 'http://proxy.example.invalid:3128', https_proxy: 'http://proxy.example.invalid:3129',
+      NO_PROXY: '127.0.0.1', no_proxy: '127.0.0.1', SSL_CERT_FILE: join(f.base, 'ca.pem'), SSL_CERT_DIR: join(f.base, 'certs'),
+      GIT_SSL_CAINFO: join(f.base, 'git-ca.pem'), NODE_EXTRA_CA_CERTS: join(f.base, 'node-ca.pem'),
+    };
+    const result = await f.run({ identity: true, env: { ...f.gatewayEnv, ...network, GIT_SSL_NO_VERIFY: '1', GIT_SSL_CAPATH: join(f.base, 'other') } });
+    expect(result).toMatchObject({ ok: true });
+    expect(await f.pushed()).toBe(await f.head());
+    for (const spawned of result.spawned) {
+      expect(spawned.env).toMatchObject(network);
+      expect(Object.keys(spawned.env!).filter((name) => /^GIT_SSL_(NO_VERIFY|CAPATH)$/.test(name))).toEqual([]);
+    }
+  }, 30_000);
+
+  test.each(['git', 'gh'])('with only %s on PATH, the other is a missing program before Git starts, never a refused credential', async (present) => {
+    const f = await fixture();
+    const only = join(f.base, `only-${present}`);
+    await mkdir(only);
+    await symlink(present === 'git' ? Bun.which('git')! : join(f.bin, 'gh'), join(only, present));
+    for (const argv of [['git', 'ls-remote', f.remote], PUSH]) {
+      const result = await f.run({ identity: true, argv, outsideRepository: argv[1] === 'ls-remote', env: { ...f.gatewayEnv, PATH: only } });
+      expect(result).toMatchObject({ ok: false, code: 'factory_command_failed', details: { category: 'missing_command' } });
+      expect(result.spawned).toEqual([]);
+    }
+    expect(f.server.seen).toEqual([]);
+    expect(await f.ghCalls()).toEqual([]);
+  }, 30_000);
+
   test('reads the profile at use time, so a Gateway token refresh applies to the next push', async () => {
     const f = await fixture();
     expect(await f.run({ identity: true })).toMatchObject({ ok: true });

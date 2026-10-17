@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { constants } from 'node:fs';
-import { access, lstat, mkdir, open, readFile, readdir, realpath, rename, stat, unlink, writeFile } from 'node:fs/promises';
+import { constants, readFileSync, unlinkSync } from 'node:fs';
+import { access, link, lstat, mkdir, open, readFile, readdir, realpath, rename, stat, unlink, writeFile } from 'node:fs/promises';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { scaffoldExpert } from './scaffold.ts';
 import { HIGH_CONFIDENCE_SECRET_PATTERNS } from './secret-patterns.ts';
@@ -15,6 +15,8 @@ export type FactoryCommand = (argv: string[], cwd?: string, options?: FactoryCom
 export interface FactoryDependencies {
   command: FactoryCommand;
   worker: (tool: 'domain_agent' | 'rag_corpus', params: Record<string, unknown>) => Promise<unknown>;
+  /** The worker's authenticated health report; its `configuration_status.google` gates Vertex steps. */
+  workerHealth: () => Promise<unknown>;
   /** The running Gateway's `gateway.reload.mode`; undefined means its default (hybrid). */
   gatewayReloadMode?: () => Promise<unknown>;
   beginTelegram?: typeof beginManagedBotProvision;
@@ -23,6 +25,8 @@ export interface FactoryDependencies {
 }
 
 const SLUG = /^[a-z][a-z0-9-]{1,47}$/;
+// The worker's own names for a Google configuration that is not ready; anything else is not echoed.
+const GOOGLE_NOT_READY: unknown[] = ['not_configured', 'unreadable', 'project_not_configured'];
 const BOT = /^[A-Za-z][A-Za-z0-9_]{1,28}bot$/i;
 
 /** Content-free causes for a failed command, derived privately from its exit status and output. */
@@ -65,10 +69,7 @@ export async function runFactory(config: FactoryConfig, request: FactoryRequest,
   };
   await mkdir(join(paths.root, 'operations'), { recursive: true, mode: 0o700 });
   await mkdir(operation, { recursive: true, mode: 0o700 });
-  const lockPath = join(paths.root, 'factory.lock');
-  let lock;
-  try { lock = await open(lockPath, 'wx', 0o600); }
-  catch { throw new FactoryError('factory_busy', 'Another factory operation owns the deployment lock. Retry later; an abandoned lock requires operator inspection.'); }
+  const releaseLock = await acquireLock(join(paths.root, 'factory.lock'));
   // The recorded phase always names the step in progress, so a failure, `status` and the error's
   // phase agree. Checks before any step report the phase `preflight` instead.
   let stage: 'preflight' | undefined = 'preflight';
@@ -113,24 +114,39 @@ export async function runFactory(config: FactoryConfig, request: FactoryRequest,
       for (const [step, program] of programs) {
         if (program && !await executable(program)) throw locate(new FactoryError('factory_command_failed', 'missing', { category: 'missing_command' }), 'preflight', step);
       }
+      // Every invocation ensures or re-proves the Vertex corpus, which needs the worker's Google
+      // credentials and project. Its authenticated health names that configuration.
+      const google = record(record(await during('worker health', io.workerHealth)).configuration_status).google;
+      if (google !== 'ready') {
+        const reported = GOOGLE_NOT_READY.includes(google) ? google : 'not ready';
+        throw new FactoryError('factory_google_not_ready', `preflight: worker health: the Expert Agents worker reports its Google configuration as ${reported}, so it could not create or check the Vertex corpus. Configure the worker's Google credentials and project, then repeat this request.`, { phase: 'preflight', step: 'worker health' });
+      }
       if (remoteUrl && !state!.remotePushed && isGitHubHttps(remoteUrl)) {
         // The same isolated identity, helper and environment as the push. The remote first: it
         // separates an unreachable service from a refused credential, and GitHub asks for the
         // credential for an absent or private repository. A remote the factory will create may be
         // absent. Then the credential itself, which a public repository would not have exercised.
-        try { await command(['git', 'ls-remote', remoteUrl], undefined, { githubIdentity: true }); }
+        let refs = '';
+        try { refs = await command(['git', 'ls-remote', remoteUrl], undefined, { githubIdentity: true }); }
         catch (error) {
           if (!(error instanceof FactoryError) || error.details.category !== 'not_found') throw error;
           if (!config.remoteCreateCommand) throw new FactoryError('factory_remote_missing', 'preflight: git ls-remote: the configured GitHub remote does not exist or is not visible to System GitHub, and no remoteCreateCommand is configured to create it. Create the repository or grant access, then repeat this request.', { phase: 'preflight', step: 'git ls-remote', category: 'not_found' });
+        }
+        // The push publishes a new root commit, which a remote with other history rejects. Only
+        // this operation's own commit may already be there: a push whose proof a crash lost.
+        if (refs.split('\n').map((line) => line.split('\t')[0]!.trim()).some((id) => id !== '' && id !== state!.commit)) {
+          throw new FactoryError('factory_remote_has_history', 'preflight: git ls-remote: the configured GitHub remote already has history that this operation did not push, so its new initial commit would be rejected. The factory never adopts or overwrites an existing repository. Choose an agent id whose repository does not exist yet, or have the deployment owner empty that repository, then repeat this request.', { phase: 'preflight', step: 'git ls-remote' });
         }
         await command(['gh', 'auth', 'status', '--active', '--hostname', 'github.com'], undefined, { githubIdentity: true });
       }
     };
     if (current) {
       // A previous readiness receipt is downgraded to the first unfinished step before anything
-      // is inspected, and corpus readiness is re-proven on every resume.
+      // is inspected. The workspace seed and corpus readiness are re-proven on every resume; a
+      // corpus that was never requested stays unrequested, so its step keeps its own phase.
       const resumeAt = pendingPhase(state, config);
-      state.corpusReady = false;
+      if (state.workspaceSeeded) state.workspaceSeeded = false;
+      if (state.corpusReady) state.corpusReady = false;
       await save(resumeAt);
     }
     await requireUniqueTelegramIdentity(paths.root, state);
@@ -209,6 +225,22 @@ export async function runFactory(config: FactoryConfig, request: FactoryRequest,
       const registration = record(await during('worker domain registration', () => io.worker('domain_agent', registrationParams(state!, config, false))));
       if (!['registered', 'already_registered'].includes(String(registration.status))) throw new FactoryError('factory_registration_incomplete', 'The worker did not confirm domain registration.');
       state.domainRegistered = true;
+      await advance();
+    }
+    if (!state.workspaceSeeded) {
+      await enter();
+      // Read-only status first, so a seeded workspace is never rewritten. The worker's bootstrap
+      // creates the missing seed files, the recovery its own status recommends.
+      const seeded = async () => {
+        const status = record(await during('worker workspace status', () => io.worker('domain_agent', { action: 'status', domain_id: spec.agentId })));
+        const workspace = record(status.workspace);
+        return workspace.exists === true && Array.isArray(workspace.missing_requirements) && workspace.missing_requirements.length === 0;
+      };
+      if (!await seeded()) {
+        const bootstrap = record(await during('worker workspace bootstrap', () => io.worker('domain_agent', { action: 'bootstrap', domain_id: spec.agentId, dry_run: false })));
+        if (bootstrap.status !== 'workspace_bootstrapped' || !await seeded()) throw new FactoryError('factory_workspace_seed_incomplete', 'The worker did not confirm every required seed file of the domain workspace.');
+      }
+      state.workspaceSeeded = true;
       await advance();
     }
     if (!state.corpusReady) {
@@ -311,7 +343,7 @@ export async function runFactory(config: FactoryConfig, request: FactoryRequest,
     return summarize(state, spec.agentId, workspace);
   } catch (error) {
     throw withPhase(error, stage ?? state?.phase ?? 'preflight');
-  } finally { await lock.close(); await unlink(lockPath); }
+  } finally { releaseLock(); }
 }
 
 function registrationParams(state: FactoryState, config: FactoryConfig, dryRun: boolean): Record<string, unknown> {
@@ -501,6 +533,7 @@ function pendingPhase(state: FactoryState, config: FactoryConfig): string {
   if (!state.commit) return 'committing_repository';
   if (config.remoteUrlTemplate && !state.remotePushed) return 'wiring_remote';
   if (!state.domainRegistered) return 'registering_library';
+  if (!state.workspaceSeeded) return 'bootstrapping_workspace';
   if (state.corpusReady === undefined) return 'creating_corpus';
   if (!state.corpusReady) return 'waiting_for_corpus';
   if (!state.botId) return 'waiting_for_telegram';
@@ -511,7 +544,7 @@ function pendingPhase(state: FactoryState, config: FactoryConfig): string {
 
 /** Every phase an operation can record, in step order. */
 export const FACTORY_PHASES = [
-  'creating_repository', 'committing_repository', 'wiring_remote', 'registering_library', 'creating_corpus',
+  'creating_repository', 'committing_repository', 'wiring_remote', 'registering_library', 'bootstrapping_workspace', 'creating_corpus',
   'waiting_for_corpus', 'waiting_for_telegram', 'installing_telegram_token', 'configuring_gateway',
   'waiting_for_activation', 'ready_empty_library',
 ] as const;
@@ -558,6 +591,8 @@ function locate(error: unknown, phase: string, step: string, options?: FactoryCo
   let hint = CATEGORY_HINTS[category];
   if (options?.githubIdentity && (category === 'auth' || category === 'not_found')) {
     hint = 'System GitHub (tools.github) was refused, cannot see the repository or cannot write it. Reconnect System GitHub or grant it access.';
+  } else if (options?.githubIdentity && category === 'missing_command') {
+    hint = 'Git or the GitHub CLI (gh), which supplies the System GitHub credential, is not an executable on the Gateway PATH.';
   } else if (step === 'agents.update' && category === 'not_found') {
     hint = 'The running Gateway does not see the agent; if Gateway config reload is off it never loaded the change.';
   } else if (step === 'openclaw doctor') {
@@ -609,6 +644,88 @@ async function saveState(path: string, state: FactoryState): Promise<void> {
   const directory = await open(dirname(path), 'r');
   try { await directory.sync(); } finally { await directory.close(); }
 }
+
+interface LockOwner { pid: number; start?: string; nonce: string }
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+/**
+ * Takes the deployment-wide lock, which names its owner process. A lock whose owner has exited (the
+ * plugin ends a timed-out factory with SIGTERM) is taken over; a lock whose owner is alive, or that
+ * names no verifiable owner, never is. Returns the release, which also runs if this process exits.
+ */
+async function acquireLock(path: string): Promise<() => void> {
+  const owner: LockOwner = { pid: process.pid, ...await processStart(process.pid).then((start) => start ? { start } : {}), nonce: randomUUID() };
+  for (let attempt = 0; attempt < 3; attempt++) {
+    if (await createExclusive(path, owner)) {
+      const release = () => {
+        stopCleanup();
+        try { if (lockOwner(readFileSync(path, 'utf8'))?.nonce === owner.nonce) unlinkSync(path); } catch { /* already gone */ }
+      };
+      const stopCleanup = cleanupOnExit(release);
+      return release;
+    }
+    let holder: LockOwner | undefined;
+    try { holder = lockOwner(await readFile(path, 'utf8')); }
+    catch (error) { if (missing(error)) continue; throw error; }
+    if (!holder) throw new FactoryError('factory_busy', 'The deployment lock names no owner process the factory can verify. Ask the deployment owner to confirm that no factory process is running and remove factory.lock under the factory root, then retry.');
+    if (await ownerAlive(holder)) throw new FactoryError('factory_busy', 'Another factory invocation is running. Retry after it finishes.');
+    // Only the invocation that claims this stale lock may remove it. Its owner is gone, so the lock
+    // cannot change while it is claimed, and the removal can never hit a newer lock.
+    const claim = `${path}.${holder.nonce}`;
+    if (!await createExclusive(claim, owner)) throw new FactoryError('factory_busy', 'Another invocation is taking over an abandoned deployment lock. Retry shortly; if this persists, ask the deployment owner to inspect factory.lock files under the factory root.');
+    try { if (lockOwner(await readFile(path, 'utf8').catch(() => ''))?.nonce === holder.nonce) await unlink(path); }
+    finally { await unlink(claim); }
+  }
+  throw new FactoryError('factory_busy', 'Another factory invocation is running. Retry after it finishes.');
+}
+
+/** Creates a file holding the owner record only if none exists, atomically and never partially written. */
+async function createExclusive(path: string, owner: LockOwner): Promise<boolean> {
+  const temporary = `${path}.${randomUUID()}.tmp`;
+  await writeFile(temporary, JSON.stringify(owner) + '\n', { mode: 0o600, flag: 'wx' });
+  try { await link(temporary, path); return true; }
+  catch (error) { if (record(error).code === 'EEXIST') return false; throw error; }
+  finally { await unlink(temporary); }
+}
+
+function lockOwner(text: string): LockOwner | undefined {
+  try {
+    const value = record(JSON.parse(text));
+    if (!Number.isSafeInteger(value.pid) || value.pid <= 0 || typeof value.nonce !== 'string' || !UUID.test(value.nonce)) return undefined;
+    if (value.start !== undefined && (typeof value.start !== 'string' || !/^\d+$/.test(value.start))) return undefined;
+    return { pid: value.pid, ...(value.start !== undefined ? { start: value.start } : {}), nonce: value.nonce };
+  } catch { return undefined; }
+}
+
+async function ownerAlive(owner: LockOwner): Promise<boolean> {
+  try { process.kill(owner.pid, 0); }
+  catch (error) { if (record(error).code === 'ESRCH') return false; }
+  // A reused process id belongs to a different process: compare start times where the host reports them.
+  if (owner.start === undefined) return true;
+  const start = await processStart(owner.pid);
+  return start === undefined || start === owner.start;
+}
+
+// The process start time in clock ticks since boot (field 22 of /proc/<pid>/stat), where available.
+async function processStart(pid: number): Promise<string | undefined> {
+  try {
+    const stat = await readFile(`/proc/${pid}/stat`, 'utf8');
+    const start = stat.slice(stat.lastIndexOf(')') + 2).split(' ')[19];
+    return start && /^\d+$/.test(start) ? start : undefined;
+  } catch { return undefined; }
+}
+
+/**
+ * Runs a synchronous cleanup when this process exits, including when it is ended with SIGTERM, as
+ * the plugin ends a timed-out factory. Returns the function that unregisters it.
+ */
+export function cleanupOnExit(cleanup: () => void): () => void {
+  const terminate = () => process.exit(143);
+  process.on('exit', cleanup);
+  process.on('SIGTERM', terminate);
+  return () => { process.off('exit', cleanup); process.off('SIGTERM', terminate); };
+}
+
 async function exists(path: string): Promise<boolean> { try { await lstat(path); return true; } catch (error) { if (missing(error)) return false; throw error; } }
 function missing(error: unknown): boolean { return record(error).code === 'ENOENT'; }
 function record(value: unknown): Record<string, any> { return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, any> : {}; }

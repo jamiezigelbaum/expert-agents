@@ -1,7 +1,7 @@
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import type { ExpertAgentsConfig } from '../packages/runtime/src/core/config.ts';
-import type { FactoryConfig, FactoryGatewaySelection, FactoryGitHubSelection, FactoryRequest } from '../packages/provisioning/src/factory-types.ts';
+import { FACTORY_NETWORK_ENV, type FactoryConfig, type FactoryGatewaySelection, type FactoryGitHubSelection, type FactoryRequest } from '../packages/provisioning/src/factory-types.ts';
 
 export interface FactoryPluginConfig extends FactoryConfig { bunBin: string }
 export interface FactoryToolContext {
@@ -43,9 +43,10 @@ export async function invokeFactory(
   signal?.throwIfAborted();
   const entry = fileURLToPath(new URL('./factory.js', import.meta.url));
   // No GitHub credential or GH_CONFIG_DIR here: the System GitHub selection travels on private
-  // stdin, and the factory applies it only to its own GitHub Git commands.
+  // stdin, and the factory applies it only to its own GitHub Git commands. Proxy and CA settings
+  // pass through so a host behind a proxy reaches GitHub, the worker and Telegram.
   const env: Record<string, string> = {};
-  for (const name of ['PATH', 'HOME', 'USER', 'TMPDIR', 'XDG_CONFIG_HOME', 'XDG_STATE_HOME', 'OPENCLAW_CONFIG_PATH', 'OPENCLAW_STATE_DIR', 'OPENCLAW_PROFILE']) {
+  for (const name of ['PATH', 'HOME', 'USER', 'TMPDIR', 'XDG_CONFIG_HOME', 'XDG_STATE_HOME', 'OPENCLAW_CONFIG_PATH', 'OPENCLAW_STATE_DIR', 'OPENCLAW_PROFILE', ...FACTORY_NETWORK_ENV]) {
     if (process.env[name]) env[name] = process.env[name]!;
   }
   return new Promise((resolve) => {

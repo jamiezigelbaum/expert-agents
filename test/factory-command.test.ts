@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from 'bun:test';
-import { mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readdir, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { classifyFailure, executeFactoryEnvelope, gatewayReloadMode, runFactoryCommand } from '../scripts/expert-factory.ts';
@@ -166,5 +166,39 @@ describe('packaged factory preflight', () => {
     const hybrid = await envelope({ reloadMode: 'hybrid' });
     expect(hybrid.error?.code).not.toBe('factory_gateway_reload_off');
     expect(hybrid.error?.code).toBeDefined();
+  }, 30_000);
+});
+
+describe('deployment lock under termination', () => {
+  test('a factory ended with SIGTERM, as the plugin ends a timed-out one, releases its lock', async () => {
+    const root = await realpath(await mkdtemp(join(tmpdir(), 'expert-command-test-'))); roots.push(root);
+    const factoryRoot = join(root, 'factory'); const tokens = join(root, 'tokens');
+    await mkdir(factoryRoot, { mode: 0o700 }); await mkdir(tokens, { mode: 0o700 });
+    const manager = join(root, 'manager.token');
+    await writeFile(manager, 'synthetic-manager-placeholder', { mode: 0o600 });
+    const cli = join(root, 'openclaw');
+    await writeFile(cli, `#!${process.execPath}\nconst args = process.argv.slice(2).join(' ');\nif (args === 'agents list --json' || args === 'agents bindings --json') process.stdout.write('[]');\nelse if (args === 'config get channels.telegram --json') process.stdout.write('{}');\nelse if (args === 'config validate') process.stdout.write('ok');\nelse process.exit(64);\n`, { mode: 0o700 });
+    // A worker that holds the preflight health request, so the factory is mid-invocation with its lock.
+    let arrived!: () => void;
+    const reached = new Promise<void>((resolve) => { arrived = resolve; });
+    const worker = Bun.serve({ port: 0, hostname: '127.0.0.1', fetch: () => { arrived(); return new Promise<Response>(() => {}); } });
+    try {
+      const child = Bun.spawn([process.execPath, 'scripts/expert-factory.ts'], {
+        env: { PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: root, TMPDIR: tmpdir() }, stdout: 'pipe', stderr: 'pipe',
+        stdin: new Blob([JSON.stringify({
+          factory: { enabled: true, rootDir: factoryRoot, tokenDirectory: tokens, managerTokenFile: manager, ownerTelegramUserId: 1234,
+            libraryBucket: 'fixture-library', libraryPrefix: 'experts', openclawBin: cli },
+          worker: { domainExpert: { enabled: true, baseUrl: `http://127.0.0.1:${worker.port}/v1`, requestTimeoutSeconds: 60, authToken: 'synthetic-placeholder' } },
+          request: { action: 'create', agent_id: 'example', display_name: 'Example', purpose: 'A neutral purpose', telegram_username: 'ExampleFactoryBot', apply: true },
+          gateway: { reloadMode: 'hybrid' },
+        })]),
+      });
+      await reached;
+      const lock = JSON.parse(await readFile(join(factoryRoot, 'factory.lock'), 'utf8')) as { pid: number };
+      expect(lock.pid).toBe(child.pid);
+      child.kill('SIGTERM');
+      expect(await child.exited).toBe(143);
+      expect(await readdir(factoryRoot)).toEqual(['operations']);
+    } finally { worker.stop(true); }
   }, 30_000);
 });

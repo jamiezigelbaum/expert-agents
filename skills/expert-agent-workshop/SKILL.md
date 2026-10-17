@@ -1,6 +1,6 @@
 ---
 name: expert-agent-workshop
-version: 0.5.0
+version: 0.6.0
 description: Create an independent expert from a conversational request using expert_factory: repository, purpose-based soul, bounded Vertex library and managed Telegram bot, with resumable progress and explicit readiness. Offer the guided identity workshop when the owner wants it.
 tools:
   - expert_factory
@@ -36,10 +36,12 @@ only for a missing product decision or an actual deployment prerequisite.
      is running.
    - With `apply: true`, the factory runs its own preflight before it creates
      anything. A refusal with phase `preflight` (`factory_gateway_reload_off`,
-     `factory_remote_missing`, or `factory_command_failed` such as System
-     GitHub refused or a missing deployment program) means nothing was
+     `factory_google_not_ready`, `factory_remote_missing`,
+     `factory_remote_has_history`, or `factory_command_failed` such as System
+     GitHub refused or a missing `gh` or deployment program) means nothing was
      created. Tell the owner the named cause, have it fixed, then repeat the
-     same create.
+     same create. `factory_remote_has_history` means a repository with that
+     name already exists: pick another `agent_id`; never ask to overwrite it.
 2. Translate the request into `action: "create"`, a new lowercase `agent_id`,
    `display_name`, `purpose`, and a suggested `telegram_username` ending in
    `bot`. Suggest one plausible name and move on: availability cannot be
@@ -53,7 +55,9 @@ only for a missing product decision or an actual deployment prerequisite.
 3. Show `confirmation_url` as soon as it is returned. Telegram's managed-bot
    flow requires the owner to confirm creation with the configured Telegram
    account. Do not impersonate the owner's account or promise unattended bot
-   creation.
+   creation. The link exists before the repository is written: if the create
+   fails at a later phase, call `status` for the same `agent_id`, which returns
+   `confirmation_url`, share it, and resume once the cause is fixed.
 4. **Resume only in the owner's own turn.** After the owner confirms, call
    `action: "resume"` with the same `agent_id` and `apply: true`. If you fixed a
    cause in the background (a subagent or another session), do not resume from
@@ -64,10 +68,8 @@ only for a missing product decision or an actual deployment prerequisite.
 5. Report the returned status literally. `status` reads saved progress only;
    `resume` checks again live.
    - `waiting_for_activation`: configuration is written and validated, but the
-     bot is not proven running, so it is still silent. With hybrid reload, wait
-     a few minutes and resume in the owner's next turn. With reload off, the
-     Gateway owner must complete the approved activation path; the factory never
-     improvises a restart.
+     bot is not proven running, so it is still silent. Wait a few minutes and
+     resume in the owner's next turn; the factory never improvises a restart.
    - `ready_empty_library` is reached only by a resume after the Telegram
      account is live. It proves the committed repository, a ready corpus,
      validated configuration and matching Telegram identity and polling. The
@@ -83,6 +85,11 @@ only for a missing product decision or an actual deployment prerequisite.
    in the owner's turn. If an error carries no phase, read (never edit)
    `operations/<agent_id>/state.json` under the factory root, the directory two
    levels above `repository_path`; its `phase` names the step.
+   - `factory_busy`: another factory call is running. Retry after it
+     finishes; a lock left by a process that exited clears itself. Ask the
+     deployment owner only when the message says the lock names no owner.
+   - `factory_timeout`: the call exceeded five minutes and was stopped.
+     Progress is kept: call `status`, then resume in the owner's turn.
 
    | Phase | Step to check |
    | --- | --- |
@@ -90,6 +97,7 @@ only for a missing product decision or an actual deployment prerequisite.
    | `committing_repository` | The first local Git commit |
    | `wiring_remote` | Creating the GitHub repository and pushing as System GitHub (`tools.github`) |
    | `registering_library` | Worker domain registration |
+   | `bootstrapping_workspace` | Seeding the worker's domain workspace; resume re-checks it |
    | `creating_corpus` | Requesting the Vertex corpus |
    | `waiting_for_corpus` | Vertex corpus readiness; resume checks it again |
    | `waiting_for_telegram` | The owner confirming the bot through the link |
@@ -131,18 +139,19 @@ through a reviewed scope and materialization, follow
 Close with a short report of exactly what now exists, so the owner knows what
 they can hand books to:
 
-- the repository path and its first commit id;
-- the chosen name and agent id;
-- the avatar: its repo-relative path, or that none was chosen;
-- soul and identity: accepted and written, or still pending;
-- the routing snippet from the creation output and whether it was applied; and
+- the repository path, its first commit id and its remote, if any;
+- the chosen name, agent id and Telegram link (and a changed username);
+- soul and identity: accepted and written, or the minimal purpose-based soul;
+- the returned status; and
 - corpus status: created and populated, created and empty, or not yet created.
 
 Report only what a tool result actually shows. Never narrate a step as done
 because it was planned, and state plainly what remains before the expert can be
 populated.
 
-`domain_agent bootstrap` remains available for legacy workspace-internal work;
-do not use it to create an independent agent repository. Never route around a
+The factory seeds each expert's worker workspace with `domain_agent bootstrap`
+itself. If `domain_agent status` later reports a missing workspace seed for a
+factory expert, resume its operation instead of calling bootstrap, and never
+use bootstrap to create an independent agent repository. Never route around a
 missing adapter with raw credentials, direct cloud access, or another product's
 private internals.
