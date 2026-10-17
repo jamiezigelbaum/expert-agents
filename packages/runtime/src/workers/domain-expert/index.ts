@@ -3598,9 +3598,13 @@ export class DomainExpertService {
     const requests: Array<{ uris: string[]; submissionReceipt: Record<string, unknown>; operation: unknown; status: string; detail: Record<string, unknown>; files: Array<Record<string, unknown>> }> = [];
     const registryErrors: string[] = [];
     let recordInput: Parameters<DomainExpertService['appendRagImportRegistryRecords']>[0] | undefined;
+    // Every record after the run's first is its progress or outcome: a source removed since stays removed.
+    let requestRecorded = false;
     const record = async (fields: Record<string, unknown>) => {
       try {
-        return await this.appendRagImportRegistryRecords(recordInput!, fields);
+        const outcome = requestRecorded;
+        requestRecorded = true;
+        return await this.appendRagImportRegistryRecords(recordInput!, fields, { outcome });
       } catch (error) {
         registryErrors.push(error instanceof DomainExpertWorkerError
           ? `${error.code}: ${error.message}`
@@ -3885,9 +3889,9 @@ export class DomainExpertService {
   }): Promise<{ import_outcome: Record<string, unknown>; source_registry: Record<string, unknown> }> {
     const operationName = typeof input.submissionReceipt.operation_name === 'string' ? input.submissionReceipt.operation_name : undefined;
     const registryErrors: string[] = [];
-    const record = async (fields: Record<string, unknown>) => {
+    const record = async (fields: Record<string, unknown>, options: { outcome?: boolean } = {}) => {
       try {
-        return await this.appendRagImportRegistryRecords(input, fields);
+        return await this.appendRagImportRegistryRecords(input, fields, options);
       } catch (error) {
         registryErrors.push(error instanceof DomainExpertWorkerError
           ? `${error.code}: ${error.message}`
@@ -3933,7 +3937,7 @@ export class DomainExpertService {
       ...(status === 'imported'
         ? { verification: ragImportVerification(detail, files, verifiedAt) }
         : { ingest_reason: ragImportReason(detail) }),
-    });
+    }, { outcome: true });
     const registryRelativePath = `${input.manifest.workspace_relative_path}/references/source-registry.jsonl`;
     return {
       import_outcome: {
@@ -4035,11 +4039,20 @@ export class DomainExpertService {
   private async appendRagImportRegistryRecords(
     input: { manifest: ReturnType<typeof domainManifest>; rootPath: string; action: string; batchRecord?: Record<string, unknown>; source?: Record<string, unknown> },
     fields: Record<string, unknown>,
+    // The outcome of a run that already recorded its request: a source removed since stays removed.
+    options: { outcome?: boolean } = {},
   ): Promise<string[]> {
     const registryPath = resolveInside(input.rootPath, `${input.manifest.workspace_relative_path}/references/source-registry.jsonl`);
     await mkdir(dirname(registryPath), { recursive: true });
     const registeredAt = new Date().toISOString();
     const written: string[] = [];
+    if (options.outcome) {
+      const removed = new Set([...groupDomainSourceRecords((await readDomainSourceRegistry(registryPath)).records)]
+        .filter(([, history]) => latestDomainSourceRecord(history).removed).map(([sourceId]) => sourceId));
+      const live = (record: Record<string, unknown> | undefined) => (record && removed.has(String(record.source_id)) ? undefined : record);
+      input = { ...input, batchRecord: live(input.batchRecord), source: live(input.source) };
+      if (!input.batchRecord && !input.source) return written;
+    }
     if (input.batchRecord) {
       await this.appendRegistryJsonLine(registryPath, { ...input.batchRecord, ...fields, registered_at: registeredAt });
       written.push(String(input.batchRecord.source_id));
@@ -6415,6 +6428,11 @@ export class DomainExpertService {
         ? groups.get(context.sourceId) ?? []
         : [...groups.values()].find((entries) => sameSource(entries) && sameIdentityHistory(entries, context.sha256)) ?? [];
       const previous = history.length ? latestDomainSourceRecord(history) : undefined;
+      // Removed (domain_source remove) after this run recorded it running: it stays removed,
+      // and this run's later records are not written. A removal before the run is re-imported as usual.
+      if (context.running && previous?.removed) {
+        return { status: 'removed', source_id: previous.sourceId, reason: 'The source was removed while this import was running; nothing more was recorded.', registry_relative_path: registryRelativePath };
+      }
       const baseId = input.catalogue.source_id;
       const sourceId = previous?.sourceId ?? (groups.has(baseId) ? `${baseId}-${context.sha256.slice(0, 12)}` : baseId);
       // Found present again under the identity it is already registered with: nothing to revise.

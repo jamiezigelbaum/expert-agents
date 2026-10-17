@@ -5768,6 +5768,29 @@ describe('rag_corpus imports record their verified outcome in the source registr
     }
   });
 
+  // A source removed while its import runs in the background stays removed.
+  test('a source removed while its background import runs is not revived by the import', async () => {
+    const gcsUri = 'gs://fixture-shared-library/v1/objects/removed-paper.pdf';
+    let finished = false;
+    const f = importFixture({
+      gcsObjects: { 'v1/objects/removed-paper.pdf': FIXTURE_PDF_TEXT },
+      importOperation: (name) => (finished ? { name, done: true, response: { importedRagFilesCount: '1' } } : { name, done: false }),
+      ragFiles: () => (finished ? [{ name: `${CORPUS}/ragFiles/removed-1`, gcsSource: { uris: [gcsUri] }, fileStatus: { state: 'ACTIVE' } }] : []),
+    }, { annas: { importPollIntervalMs: 1, importPollTimeoutMs: 5_000, responseBudgetMs: 20 } });
+    try {
+      const result = await postDomain(f.worker, 'rag_corpus', { action: 'import', domain_id: 'research', corpus_id: '1234567890123456789', gcs_uri: gcsUri, dry_run: false });
+      expect(result).toMatchObject({ status: 'import_requested' });
+      const sourceId = String(f.readRegistry().at(-1)!.source_id);
+      await postDomain(f.worker, 'domain_source', { action: 'remove', domain_id: 'research', source_id: sourceId, dry_run: false });
+      finished = true;
+      await Bun.sleep(300);
+      const records = f.readRegistry().filter((record) => record.source_id === sourceId);
+      expect(records.at(-1)).toMatchObject({ removed: true });
+    } finally {
+      f.cleanup();
+    }
+  });
+
   test('a plain import of a non-PDF object without source_id writes no registry record', async () => {
     const f = importFixture();
     try {
