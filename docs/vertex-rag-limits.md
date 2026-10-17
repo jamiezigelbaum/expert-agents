@@ -70,6 +70,12 @@ importing it, so a failed import (a failed split part included) can be
 retried, and it reports a skipped import as present only when the URI's
 ragFile is ACTIVE.
 
+A staged batch relies on this dedupe across retries: each run stages into
+`staged/<domain>/<batch>/<run-id>/`, a directory named by its files' paths and
+sha256s, so a retry of the same bytes imports the same URIs and is skipped,
+while a run that stages anything else imports only its own directory. A
+superseded run's directory is left in place and never imported again.
+
 ## Sources
 
 - Issue #33 (2026-10-16): the 582-page failure, the code-13 failure shape and

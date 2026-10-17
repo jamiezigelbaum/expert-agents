@@ -374,10 +374,6 @@ const extractionGoogleFetch = (async (input: string | URL | Request, init?: Requ
       headers: { 'content-type': 'application/json' },
     });
   }
-  // The staging directory holds only what this run staged.
-  if (method === 'GET' && pathname.endsWith('/o') && new URL(url).searchParams.has('prefix')) {
-    return new Response(JSON.stringify({ items: [] }), { status: 200, headers: { 'content-type': 'application/json' } });
-  }
   // A staged import lists the corpus before it submits, so the fixture answers
   // an empty list and a completed operation.
   if (method === 'GET' && pathname.endsWith('/ragFiles')) {

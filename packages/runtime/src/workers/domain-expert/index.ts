@@ -1,7 +1,7 @@
 import { execFile } from 'node:child_process';
 import { createHash, createSign, randomUUID } from 'node:crypto';
 import { lookup } from 'node:dns/promises';
-import { lstatSync, mkdirSync, statSync } from 'node:fs';
+import { createReadStream, lstatSync, mkdirSync, statSync } from 'node:fs';
 import { appendFile, chmod, lstat, mkdir, mkdtemp, open, readFile, readdir, realpath, rename, rm, stat, writeFile } from 'node:fs/promises';
 import type { IncomingMessage } from 'node:http';
 import { request as httpsRequest } from 'node:https';
@@ -392,6 +392,8 @@ interface StageImportEligibleFile {
   bytes: number;
   // The file's bytes, for a planned file not yet written (a dry-run web import's derivatives).
   content?: Uint8Array;
+  // The bytes' sha256, once the run is named by it; staging checks the file still has it.
+  sha256?: string;
   objectName: string;
   gcsUri: string;
 }
@@ -2487,7 +2489,7 @@ export class DomainExpertService {
   // split after the batch import, and one that cannot be split or checked is
   // left out and refused. Every other file stays in the one directory import.
   private async routeStagedPdfs(
-    stage: { manifest: ReturnType<typeof domainManifest>; destination: ReturnType<typeof stageDestination>; eligible: StageImportEligibleFile[]; resolved: ResolvedRagCorpus },
+    stage: { manifest: ReturnType<typeof domainManifest>; destination: StageDestination; eligible: StageImportEligibleFile[]; resolved: ResolvedRagCorpus },
     action: 'stage_import' | 'web_import',
     // The source the import names: it is the PDF's source when the PDF is the batch's only file.
     namedSource?: Record<string, unknown>,
@@ -2540,7 +2542,7 @@ export class DomainExpertService {
         partNames: async () => ({
           bucket: stage.destination.bucket,
           // Beside the batch directory, never in it, so the batch's directory import never takes a part.
-          directory: `${stage.destination.objectPrefix.replace(/\/$/, '')}--parts/`,
+          directory: `${stage.destination.batchPrefix.replace(/\/$/, '')}--parts/`,
           stem: safeObjectName(name),
           priorStems: [],
         }),
@@ -2565,7 +2567,7 @@ export class DomainExpertService {
         continue;
       }
       const route = await this.routePdf(source, bytes, measurePdfArtifactScale(bytes).corroborated_pages, holding);
-      if ('whole' in route) eligible.push(file);
+      if ('whole' in route) eligible.push({ ...file, sha256: digest });
       else if ('refusal' in route) routed.push({ entry, corpusId, route: 'refused', outcome: { status: 'blocked', error: route.refusal } });
       else {
         routed.push({
@@ -2671,7 +2673,7 @@ export class DomainExpertService {
       includeMedia: params.includeMedia ?? false,
       deferBatchCap: true,
     });
-    const { destination, resolvedCorpus } = stage;
+    const { resolvedCorpus } = stage;
     const resolutionWarnings = ragCorpusWarnings(stage.resolved);
     if (stage.eligible.length === 0) {
       throw new DomainExpertWorkerError(
@@ -2685,7 +2687,7 @@ export class DomainExpertService {
     const pdfs = await this.routeStagedPdfs(stage, 'stage_import', registeredSource);
     // The batch cap counts only what the batch stages.
     const batch = capStagedBatch(pdfs.eligible);
-    const eligible = batch.eligible;
+    const { destination, eligible } = await stageRunFor(stage.destination, batch.eligible);
     const skipped = [...stage.skipped, ...batch.skipped];
     const totalBytes = batch.totalBytes;
     const base = {
@@ -2696,13 +2698,7 @@ export class DomainExpertService {
         workspace_relative_path: workspaceRelativePath,
         recursive: true,
       },
-      destination: {
-        gcs_uri_prefix: destination.directoryUri,
-        bucket: destination.bucket,
-        object_prefix: destination.objectPrefix,
-        batch_id: batchId,
-        allowed_gcs_prefixes: manifest.allowed_gcs_prefixes,
-      },
+      destination: stageDestinationRecord(destination, batchId, manifest.allowed_gcs_prefixes),
       resolved_corpus: resolvedCorpus,
       file_policy: {
         recursive: true,
@@ -2739,7 +2735,7 @@ export class DomainExpertService {
       const pdfSources = await this.importRoutedStagedPdfs(pdfs.routed);
       return { kind: 'rag_corpus_stage_import_result', status: routedPdfStatus(pdfSources), ...base, pdf_sources: pdfSources };
     }
-    const { stagedFiles, operation, warnings, resolved, importResultSink, submissionReceipt } = await this.executeStageImport({ ...stage, eligible });
+    const { stagedFiles, operation, warnings, resolved, importResultSink, submissionReceipt } = await this.executeStageImport({ ...stage, destination, eligible });
     const importResolvedCorpus = resolvedCorpusRecord(resolved);
     const verified = await this.verifyAndRegisterRagImport({
       manifest,
@@ -2823,7 +2819,7 @@ export class DomainExpertService {
       budget,
       timeoutMs: this.webImportFetchTimeoutMs,
     });
-    const mediaDestination = stageDestination(manifest.allowed_gcs_prefixes, manifest.domain_id, batchId);
+    const batchDestination = stageDestination(manifest.allowed_gcs_prefixes, manifest.domain_id, batchId);
     const derivation = await deriveWebImportFiles({
       urls,
       includeMedia,
@@ -2879,10 +2875,9 @@ export class DomainExpertService {
       : { eligible: [], routed: [] as RoutedStagedPdf[] };
     // The batch cap counts only what the batch stages.
     const batch = capStagedBatch(pdfs.eligible);
-    const eligible = batch.eligible;
+    const { destination, eligible } = await stageRunFor(stage?.destination ?? batchDestination, batch.eligible);
     const skipped = [...writePreflight.skipped, ...(stage?.skipped ?? []), ...batch.skipped];
     const totalBytes = batch.totalBytes;
-    const destination = stage?.destination ?? mediaDestination;
     const resolved = stage?.resolved ?? await this.resolveRagCorpus(manifest, corpusId);
     const resolvedCorpus = stage?.resolvedCorpus ?? resolvedCorpusRecord(resolved);
     const resolutionWarnings = ragCorpusWarnings(resolved);
@@ -2922,13 +2917,7 @@ export class DomainExpertService {
         // It writes nothing and uploads nothing.
         extraction_performed_in_dry_run: true,
       },
-      destination: {
-        gcs_uri_prefix: destination.directoryUri,
-        bucket: destination.bucket,
-        object_prefix: destination.objectPrefix,
-        batch_id: batchId,
-        allowed_gcs_prefixes: manifest.allowed_gcs_prefixes,
-      },
+      destination: stageDestinationRecord(destination, batchId, manifest.allowed_gcs_prefixes),
       resolved_corpus: resolvedCorpus,
       derived_files: derivation.files.map((file) => ({
         source_url: webImportProvenanceUrl(file.sourceUrl),
@@ -2973,7 +2962,7 @@ export class DomainExpertService {
       const pdfSources = await this.importRoutedStagedPdfs(pdfs.routed);
       return { kind: 'rag_corpus_web_import_result', status: routedPdfStatus(pdfSources), ...base, pdf_sources: pdfSources };
     }
-    const { stagedFiles, operation, warnings, resolved: importResolved, importResultSink, submissionReceipt } = await this.executeStageImport({ ...stage, eligible });
+    const { stagedFiles, operation, warnings, resolved: importResolved, importResultSink, submissionReceipt } = await this.executeStageImport({ ...stage, destination, eligible });
     const importResolvedCorpus = resolvedCorpusRecord(importResolved);
     const verified = await this.verifyAndRegisterRagImport({
       manifest,
@@ -3023,7 +3012,7 @@ export class DomainExpertService {
     files: WebImportDerivedFile[];
     deferBatchCap?: boolean;
   }): Promise<{
-    destination: ReturnType<typeof stageDestination>;
+    destination: StageDestination;
     batchId: string;
     eligible: StageImportEligibleFile[];
     skipped: StageImportSkippedFile[];
@@ -3119,13 +3108,7 @@ export class DomainExpertService {
         media_downloads: false,
         retry_429: true,
       },
-      destination: {
-        gcs_uri_prefix: destination.directoryUri,
-        bucket: destination.bucket,
-        object_prefix: destination.objectPrefix,
-        batch_id: batchId,
-        allowed_gcs_prefixes: manifest.allowed_gcs_prefixes,
-      },
+      destination: stageDestinationRecord(destination, batchId, manifest.allowed_gcs_prefixes),
       corpus: {
         corpus_id: corpusId,
         backend: manifest.rag_backend,
@@ -3207,13 +3190,15 @@ export class DomainExpertService {
           includeMedia: false,
         })
       : undefined;
-    const eligible = stage?.eligible ?? [];
+    const run = stage ? await stageRunFor(stage.destination, stage.eligible) : undefined;
+    const eligible = run?.eligible ?? [];
     const skipped = [...writePreflight.skipped, ...(stage?.skipped ?? [])];
     const totalBytes = stage?.totalBytes ?? 0;
     const resolved = stage?.resolved ?? await this.resolveRagCorpus(manifest, corpusId);
     const resolutionWarnings = ragCorpusWarnings(resolved);
     const liveBase = {
       ...base,
+      ...(run ? { destination: stageDestinationRecord(run.destination, batchId, manifest.allowed_gcs_prefixes) } : {}),
       errors: liveErrors,
       ...(notionWarnings.length ? { notion_warnings: [...new Set(notionWarnings)] } : {}),
       derived_files: markdownFiles.map((file) => ({
@@ -3246,7 +3231,7 @@ export class DomainExpertService {
         ...liveBase,
       };
     }
-    const { stagedFiles, operation, warnings, resolved: importResolved, importResultSink, submissionReceipt } = await this.executeStageImport(stage);
+    const { stagedFiles, operation, warnings, resolved: importResolved, importResultSink, submissionReceipt } = await this.executeStageImport({ ...stage, ...run! });
     const importResolvedCorpus = resolvedCorpusRecord(importResolved);
     const verified = await this.verifyAndRegisterRagImport({
       manifest,
@@ -3297,7 +3282,7 @@ export class DomainExpertService {
     includeMedia: boolean;
     deferBatchCap?: boolean;
   }): Promise<{
-    destination: ReturnType<typeof stageDestination>;
+    destination: StageDestination;
     batchId: string;
     eligible: StageImportEligibleFile[];
     skipped: StageImportSkippedFile[];
@@ -3329,7 +3314,7 @@ export class DomainExpertService {
   }
 
   private async executeStageImport(stage: {
-    destination: ReturnType<typeof stageDestination>;
+    destination: StageDestination;
     batchId: string;
     eligible: StageImportEligibleFile[];
     resolved: ResolvedRagCorpus;
@@ -3339,7 +3324,9 @@ export class DomainExpertService {
     const warnings: Array<Record<string, unknown> | RagCorpusWarning> = [];
     for (const file of stage.eligible) {
       const bytes = new Uint8Array(await readFile(file.absolutePath));
-      if (bytes.byteLength !== file.bytes || bytes.byteLength > maxStageFileBytes(file.workspaceRelativePath)) {
+      // The run's directory is named by these bytes, so they must still be the ones it was named by.
+      if (bytes.byteLength !== file.bytes || bytes.byteLength > maxStageFileBytes(file.workspaceRelativePath)
+        || (file.sha256 !== undefined && sha256(bytes) !== file.sha256)) {
         throw new DomainExpertWorkerError(409, 'stage_import_file_changed', `${file.workspaceRelativePath} changed during staging.`);
       }
       await this.google.uploadGcsObject(stage.destination.bucket, file.objectName, bytes);
@@ -3392,16 +3379,6 @@ export class DomainExpertService {
           });
         }
       }
-    }
-    // The import takes the whole staging directory, so it must hold exactly what this run
-    // staged: an object an earlier attempt of the same batch left there (a PDF this run
-    // routed out, say) is removed first, or Vertex would import it too.
-    const staged = new Set(stagedFiles.map((file) => String(file.gcs_uri)));
-    const leftovers = (await this.google.listLibraryObjectNames(stage.destination.bucket, stage.destination.objectPrefix, GOOGLE_API_REQUEST_TIMEOUT_MS))
-      .filter((name) => !staged.has(`gs://${stage.destination.bucket}/${name}`));
-    for (const name of leftovers) await this.google.deleteGcsObject(stage.destination.bucket, name);
-    if (leftovers.length) {
-      warnings.push({ code: 'stale_staged_objects_removed', objects: leftovers.map((name) => `gs://${stage.destination.bucket}/${name}`) });
     }
     const importResultSink = this.agentRouting[stage.manifest.domain_id]?.ingestion?.importResultSink === 'client'
       ? undefined : importResultSinkUri(stage.manifest.allowed_gcs_prefixes, stage.manifest.domain_id, stage.batchId);
@@ -6807,19 +6784,6 @@ class GoogleRuntimeClient {
       headers: { 'Content-Type': 'application/octet-stream' },
       body: new Blob([copyToArrayBuffer(bytes)], { type: 'application/octet-stream' }),
     });
-  }
-
-  async deleteGcsObject(bucket: string, objectName: string): Promise<void> {
-    const response = await this.authedFetch(
-      `https://storage.googleapis.com/storage/v1/b/${encodeURIComponent(bucket)}/o/${encodeURIComponent(objectName)}`,
-      { method: 'DELETE' },
-    );
-    // Gone is the goal: an object a concurrent run already removed is fine.
-    if (response.status === 404 || response.ok) {
-      await response.body?.cancel();
-      return;
-    }
-    throw googleError(response, await responseTextOrJson(response));
   }
 
   async getGcsObjectMetadata(bucket: string, objectName: string): Promise<GcsObjectMetadata | null> {
@@ -10230,7 +10194,18 @@ function assertReviewedLiveRagImport(manifest: ReturnType<typeof domainManifest>
   }
 }
 
-function stageDestination(allowedPrefixes: string[], domainId: string, batchId: string): { bucket: string; objectPrefix: string; directoryUri: string } {
+interface StageDestination {
+  bucket: string;
+  // The batch's prefix, staged/<domain>/<batch>/: its split parts go beside it, in <batch>--parts/.
+  batchPrefix: string;
+  // The run's directory, staged/<domain>/<batch>/<run-id>/, once stageRunFor has named it;
+  // until then the batch's prefix.
+  objectPrefix: string;
+  directoryUri: string;
+  runId?: string;
+}
+
+function stageDestination(allowedPrefixes: string[], domainId: string, batchId: string): StageDestination {
   const primaryPrefix = allowedPrefixes[0];
   if (!primaryPrefix) {
     throw new DomainExpertWorkerError(403, 'gcs_destination_not_allowed', 'Domain manifest has no allowed_gcs_prefixes entry for stage_import.');
@@ -10239,7 +10214,57 @@ function stageDestination(allowedPrefixes: string[], domainId: string, batchId: 
   const objectPrefix = `${parsed.prefix}staged/${safeObjectName(domainId)}/${batchId}/`;
   const directoryUri = `gs://${parsed.bucket}/${objectPrefix}`;
   assertAllowedGcsDestination(directoryUri, allowedPrefixes);
-  return { bucket: parsed.bucket, objectPrefix, directoryUri };
+  return { bucket: parsed.bucket, batchPrefix: objectPrefix, objectPrefix, directoryUri };
+}
+
+// A run's directory under its batch, named by what the run stages: each file's
+// staged path and sha256. The batch imports that directory whole, so it must hold
+// exactly what this run staged. Another run of the same batch_id that stages
+// anything else, overlapping or not, gets its own directory; one that stages the
+// same bytes gets the same URIs, so Vertex skips what it already holds and a retry
+// does not import a batch twice. Nothing is deleted: a superseded run's directory
+// stays in place and is never imported again.
+export function stagedRunId(files: Array<{ uploadRelativePath: string; sha256: string }>): string {
+  const entries = files.map((file) => [file.uploadRelativePath, file.sha256]).sort(([a], [b]) => (a! < b! ? -1 : a! > b! ? 1 : 0));
+  return `run-${createHash('sha256').update(JSON.stringify(entries)).digest('hex').slice(0, 16)}`;
+}
+
+// A batch that stages nothing names no run directory.
+async function stageRunFor(
+  destination: StageDestination,
+  files: StageImportEligibleFile[],
+): Promise<{ destination: StageDestination; eligible: StageImportEligibleFile[] }> {
+  if (!files.length) return { destination, eligible: files };
+  const hashed: StageImportEligibleFile[] = [];
+  for (const file of files) {
+    hashed.push({ ...file, sha256: file.sha256 ?? (file.content ? sha256(file.content) : await sha256OfFile(file.absolutePath)) });
+  }
+  const runId = stagedRunId(hashed as Array<StageImportEligibleFile & { sha256: string }>);
+  const objectPrefix = `${destination.batchPrefix}${runId}/`;
+  const eligible = hashed.map((file) => {
+    const objectName = `${objectPrefix}${file.objectName.slice(destination.batchPrefix.length)}`;
+    return { ...file, objectName, gcsUri: `gs://${destination.bucket}/${objectName}` };
+  });
+  return { destination: { ...destination, objectPrefix, directoryUri: `gs://${destination.bucket}/${objectPrefix}`, runId }, eligible };
+}
+
+async function sha256OfFile(path: string): Promise<string> {
+  const hash = createHash('sha256');
+  for await (const chunk of createReadStream(path)) hash.update(chunk as Buffer);
+  return hash.digest('hex');
+}
+
+// Where a stage receipt says the batch was staged: the run's directory once it is named.
+function stageDestinationRecord(destination: StageDestination, batchId: string, allowedPrefixes: string[]): Record<string, unknown> {
+  return {
+    gcs_uri_prefix: destination.directoryUri,
+    bucket: destination.bucket,
+    object_prefix: destination.objectPrefix,
+    batch_id: batchId,
+    batch_gcs_uri_prefix: `gs://${destination.bucket}/${destination.batchPrefix}`,
+    ...(destination.runId ? { run_id: destination.runId } : {}),
+    allowed_gcs_prefixes: allowedPrefixes,
+  };
 }
 
 // Where a live import asks Vertex to write its per-file results

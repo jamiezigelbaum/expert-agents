@@ -240,13 +240,20 @@ one in the batch, reported `duplicate_in_batch` with `duplicate_of` and not
 imported; a split also checks the corpus again right before it runs); `eligible_files` lists only what the batch stages, and a batch of
 refused PDFs answers `pdf_sources_refused`. The 100 MiB batch cap counts only
 the files the batch stages; a routed PDF is bounded by the per-file limit alone
-(web_import's 100 MiB fetch budget still covers everything it fetches). Parts go to
-`staged/<domain>/<batch>--parts/` after the batch import. A batch's directory
-import takes exactly the objects that run staged: an object an earlier attempt
-of the same `batch_id` left in `staged/<domain>/<batch>/` is deleted first and
-named in the `stale_staged_objects_removed` warning, so the worker's service
-account needs `storage.objects.list` and `storage.objects.delete` on that
-prefix, and a staged PDF that
+(web_import's 100 MiB fetch budget still covers everything it fetches). Each run stages
+into its own directory, `staged/<domain>/<batch>/<run-id>/`, and the batch
+import takes that directory, so it imports exactly what the run staged. The run
+id (`run-` and 16 hex digits, in the receipt's `destination.run_id`) is named by
+each staged file's path and sha256: a retry that stages the same bytes reuses
+the same URIs, which Vertex skips as already held, and a run that stages
+anything else, overlapping or not, gets its own directory. Nothing is deleted:
+a superseded run's directory, a PDF since routed out of the batch included, is
+left in place and never imported again; whatever it already imported stays in
+the corpus. A batch whose files changed therefore imports every file it stages
+again under the new directory, beside the earlier run's ragFiles; the batch's
+registry record names the latest run's URIs. A plan names the directory a live
+run of the same files stages into. Parts go to `staged/<domain>/<batch>--parts/`, shared by every run
+of the batch, after the batch import, and a staged PDF that
 is the batch's only file is registered under the `source_id` the import names.
 A PDF imported by URI without `source_id` is registered under its sha256 as
 `<domain>-pdf-<sha prefix>` and answers within the response budget. A
