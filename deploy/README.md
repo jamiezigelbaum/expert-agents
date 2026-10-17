@@ -235,10 +235,13 @@ it and count its pages (the worker's service account needs
 reads the URI after the worker inspected it, so once the import settles the
 worker reads the object's generation again: if it changed, the record keeps the
 inspected sha256 but says `sha256_verified: false` with `source_check`, and the
-result reports `source_changed_during_import`. Identity is claimed only for
+result reports `source_changed_during_import`. An import still running when
+the worker stops waiting is recorded the same way (`sha256_verified: false`,
+and `identity_verified: false` in the result), since Vertex may read the
+object after any check the worker could make. Identity is claimed only for
 bytes the registry proved: an object any of its source's records holds with
 `sha256_verified: false` (a hand split's parts, an object that changed during
-its import) is matched with `identity_verified: false` and cited with its
+its import or whose import had not settled) is matched with `identity_verified: false` and cited with its
 `source_id` and `identity_verified: false`, its citation header ending
 `(source identity unverified)`;
 and `stage_import` and `web_import`, where a PDF already in the corpus, one to

@@ -3893,7 +3893,12 @@ export class DomainExpertService {
     const { status, files } = settled;
     let { detail } = settled;
     let changed: string | undefined;
-    if (input.pinned) {
+    let unsettled: string | undefined;
+    if (input.pinned && status === 'import_requested') {
+      // Vertex may still read the object after this run ends, so no later check ties what it imports to the bytes inspected.
+      unsettled = 'the import had not settled when the worker stopped waiting, so the bytes Vertex reads cannot be tied to the ones inspected';
+      detail = { ...detail, identity_verified: false, source_check: unsettled };
+    } else if (input.pinned) {
       const after = await this.google.getGcsObjectMetadata(input.pinned.bucket, input.pinned.objectName).catch(() => undefined);
       if (after === undefined) changed = 'the object could not be read back after the import';
       else if (after?.generation !== input.pinned.generation) changed = `the object changed during the import (generation ${String(input.pinned.generation)} inspected, ${after ? String(after.generation) : 'deleted'} now)`;
@@ -3905,7 +3910,7 @@ export class DomainExpertService {
       ...(operationName ? { rag_operation_name: operationName } : {}),
       ...ragImportFileFields(files, input.sha256ByUri),
       // Identity is claimed only for the bytes inspected.
-      ...(changed ? { sha256_verified: false, source_check: changed } : {}),
+      ...(changed || unsettled ? { sha256_verified: false, source_check: changed ?? unsettled } : {}),
       ...(status === 'imported'
         ? { verification: ragImportVerification(detail, files, verifiedAt) }
         : { ingest_reason: ragImportReason(detail) }),

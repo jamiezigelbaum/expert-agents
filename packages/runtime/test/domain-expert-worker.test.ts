@@ -7558,6 +7558,26 @@ describe('splitting long PDFs for LLM-parser imports', () => {
       } finally { f.cleanup(); }
     });
 
+    // Vertex may read the object after the worker stops waiting: no check then can prove the bytes it imports.
+    test('a GCS PDF whose import is still running when the worker stops waiting is recorded with its identity unverified', async () => {
+      const PENDING = `${CORPUS}/operations/pending-1`;
+      const SHORT_NAME = 'v1/library/example-author---a-slow-paper-1992.pdf';
+      const original = textPdfBytes(120);
+      const f = splitFixture(original, (part) => (part === 'whole' ? jsonResponse({ name: PENDING, done: false }) : { importedRagFilesCount: '1' }), {
+        importPollTimeoutMs: 60,
+        seed: { objects: [[SHORT_NAME, original]] },
+        wrapGoogleFetch: (next) => (async (input: string | URL | Request, init?: RequestInit) => (String(input).includes('/operations/pending-1')
+          ? jsonResponse({ name: PENDING, done: false })
+          : next(input, init))) as typeof fetch,
+      });
+      try {
+        const response = await postDomain(f.worker, 'rag_corpus', { action: 'import', domain_id: 'research', corpus_id: CORPUS, gcs_uri: `gs://fixture-shared-library/${SHORT_NAME}`, dry_run: false });
+        expect(response).toMatchObject({ source_sha256: sha256Hex(original), import_outcome: { status: 'import_requested', identity_verified: false } });
+        expect(response.import_outcome.source_changed_during_import).toBeUndefined();
+        expect(f.readRegistry().at(-1)).toMatchObject({ ingest_status: 'import_requested', source_sha256: sha256Hex(original), sha256_verified: false, source_check: expect.stringContaining('had not settled') });
+      } finally { f.cleanup(); }
+    });
+
     // Content-addressed URIs carry the batch id, so a retry under another batch would not be
     // skipped by Vertex: a recorded import still running is asked about, not imported again.
     test('a retry under a new batch id waits for a recorded import still running, then retries once it failed', async () => {
