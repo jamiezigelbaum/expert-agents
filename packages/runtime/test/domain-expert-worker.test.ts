@@ -7569,6 +7569,55 @@ describe('splitting long PDFs for LLM-parser imports', () => {
       } finally { f.cleanup(); }
     });
 
+    // An operation is asked only about the objects its own request named.
+    test('a PDF in a request that was never submitted is imported on retry, not held by the running one', async () => {
+      const PENDING = `${CORPUS}/operations/pending-1`;
+      const short = textPdfBytes(120);
+      const f = splitFixture(LONG, (part, attempt) => (part === 'whole' && attempt === 1 ? jsonResponse({ name: PENDING, done: false }) : { importedRagFilesCount: '1' }), {
+        importPollTimeoutMs: 60,
+        wrapGoogleFetch: (next) => (async (input: string | URL | Request, init?: RequestInit) => (String(input).includes('/operations/pending-1')
+          ? jsonResponse({ name: PENDING, done: false })
+          : next(input, init))) as typeof fetch,
+      });
+      try {
+        // 29 notes and a PDF that sorts last: the first request takes 25 notes and is still running
+        // when its budget ends, so the second, holding the PDF, is never submitted.
+        writeBatch(f.base, { ...Object.fromEntries(Array.from({ length: 29 }, (_, index) => [`note-${String(index).padStart(2, '0')}.md`, `# Note ${index}`])), 'zz-paper.pdf': short });
+        const first = await stageBatch(f.worker, 'chunked-batch');
+        const pdfUri = stagedObject('gs://fixture-shared-library/v1/staged/research/chunked-batch/', 'zz-paper.pdf', short);
+        expect(first.import_outcome).toMatchObject({ status: 'import_requested', reason: 'request_still_running' });
+        expect(first.import_outcome.not_submitted_uris).toContain(pdfUri);
+        const record = f.readRegistry().filter((entry) => entry.source_id === 'research-stage-import-chunked-batch').at(-1)!;
+        expect(record.rag_operations).toEqual([{ name: PENDING, uris: f.importRequests()[0] }]);
+        expect(record.rag_operations[0].uris).not.toContain(pdfUri);
+        // Retried on its own, under another batch: no submitted request named it, so it is imported.
+        const retryDir = join(f.base, 'workspace', 'experts', 'research', 'sources', 'retry');
+        mkdirSync(retryDir, { recursive: true });
+        writeFileSync(join(retryDir, 'zz-paper.pdf'), short);
+        const retry = await postDomain(f.worker, 'rag_corpus', {
+          action: 'stage_import', domain_id: 'research', corpus_id: CORPUS, workspace_relative_path: 'experts/research/sources/retry', batch_id: 'retry-batch', dry_run: false,
+        });
+        expect(retry.pdf_routing).toBeUndefined();
+        expect(retry.import_outcome).toMatchObject({ status: 'imported' });
+        expect(f.importRequests().at(-1)).toEqual([stagedObject('gs://fixture-shared-library/v1/staged/research/retry-batch/', 'zz-paper.pdf', short)]);
+      } finally { f.cleanup(); }
+    });
+
+    // A PDF's own limit applies to a PDF however it is named: the text cap never sees it.
+    test('a 20 MB PDF named book.txt is routed and split, not skipped as too big', async () => {
+      const f = splitFixture(LONG, importsAll);
+      try {
+        const text = new TextDecoder('latin1').decode(textPdfBytes(450));
+        // Padded past the 10 MB text cap with a comment, which leaves the PDF as it was.
+        const padded = new TextEncoder().encode(text.replace('trailer\n', `%${'x'.repeat(20 * 1024 * 1024)}\ntrailer\n`));
+        expect(padded.byteLength).toBeGreaterThan(20 * 1024 * 1024);
+        writeBatch(f.base, { 'book.txt': padded });
+        const result = await stageBatch(f.worker, 'big-txt');
+        expect(result.skipped_files).toEqual([]);
+        expect(result.pdf_sources).toMatchObject([{ workspace_relative_path: 'experts/research/sources/batch/book.txt', route: 'split', status: 'imported', split: { pages: 450, parts: 3 } }]);
+      } finally { f.cleanup(); }
+    });
+
     test('two concurrent resumes of the same partial split import each part once', async () => {
       const f = splitFixture(LONG, (part, attempt) => (part !== 'part1of3' && attempt === 1
         ? { error: { code: 13, message: 'An internal error occurred processing the file.' } }

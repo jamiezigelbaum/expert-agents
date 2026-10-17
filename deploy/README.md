@@ -280,7 +280,8 @@ file is a PDF when its name ends in `.pdf` or, under any other name, when its
 first bytes carry the PDF header (`%PDF-1.x` or `%PDF-2.x` after nothing but
 whitespace, within the first 1024 bytes): a single GCS object is checked with a
 ranged read (an unreadable object answers 502 `gcs_object_unreadable`), a
-staged file from its bytes. A staged PDF so found that stays whole is staged
+staged file from its first bytes when it is planned, before any size limit, so
+it takes the PDF limit (100,000,000 bytes) rather than the text one. A staged PDF so found that stays whole is staged
 under its name plus `.pdf`. Its record then says `content_type:
 application/pdf`, so it takes the LLM parser and its citations carry pages
 whatever its key. One operation at a time works on a file: every route that
@@ -295,7 +296,9 @@ source) instead. An import that names a `source_id` also locks that id, with
 all keys taken in one sorted order, so two imports naming one new source with
 different files cannot both claim it. A whole holding whose latest record is
 still `import_requested` (an import whose poll budget ran out) is checked
-against its recorded operations: one still running answers
+against the recorded operations whose requests named it (the batch record
+lists each operation with its URIs as `rag_operations`; an object no submitted
+request named is imported normally): one still running answers
 `source_import_in_progress`, since a retry under another batch id stages
 another URI that Vertex would not skip; once they finished without the file in
 the corpus, the failure is recorded and the file is imported again; an

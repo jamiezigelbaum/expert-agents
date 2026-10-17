@@ -394,6 +394,8 @@ interface StageImportEligibleFile {
   content?: Uint8Array;
   // The bytes' sha256, once the object is named by it; staging checks the file still has it.
   sha256?: string;
+  // A PDF by its bytes (hasPdfHeader) or its .pdf name, decided when the file was planned.
+  pdf?: boolean;
   objectName: string;
   gcsUri: string;
 }
@@ -2592,8 +2594,8 @@ export class DomainExpertService {
     // A dry run's derived files are not written; they carry their bytes.
     const pdfBytes = new Map<StageImportEligibleFile, { bytes: Uint8Array; digest: string }>();
     for (const file of stage.eligible) {
-      // A PDF by its name or, under any other name, by its first bytes.
-      if (!isPdfUri(file.workspaceRelativePath) && !hasPdfHeader(file.content ?? await readFileHead(file.absolutePath, PDF_SNIFF_BYTES))) continue;
+      // A PDF by its name or, under any other name, by its first bytes (decided when planned).
+      if (!(file.pdf ?? isPdfUri(file.workspaceRelativePath))) continue;
       const bytes = file.content ?? new Uint8Array(await readFile(file.absolutePath));
       pdfBytes.set(file, { bytes, digest: sha256(bytes) });
     }
@@ -3188,7 +3190,7 @@ export class DomainExpertService {
       bytes: file.bytes.byteLength,
       content: file.bytes,
     }));
-    const { eligible, skipped, totalBytes } = planStageImportCandidates(
+    const { eligible, skipped, totalBytes } = await planStageImportCandidates(
       candidates,
       destination.bucket,
       destination.objectPrefix,
@@ -3481,7 +3483,7 @@ export class DomainExpertService {
     for (const file of stage.eligible) {
       const bytes = new Uint8Array(await readFile(file.absolutePath));
       // The object is named by these bytes, so they must still be the ones it was named by.
-      if (bytes.byteLength !== file.bytes || bytes.byteLength > maxStageFileBytes(file.workspaceRelativePath)
+      if (bytes.byteLength !== file.bytes || bytes.byteLength > (file.pdf ? PDF_PROCESSING_MAX_BYTES : maxStageFileBytes(file.workspaceRelativePath))
         || (file.sha256 !== undefined && sha256(bytes) !== file.sha256)) {
         throw new DomainExpertWorkerError(409, 'stage_import_file_changed', `${file.workspaceRelativePath} changed during staging.`);
       }
@@ -3587,10 +3589,17 @@ export class DomainExpertService {
         return [];
       }
     };
+    // Each operation with the URIs its request named, so a later check of one object asks
+    // only the operation that carried it (pendingImportHolding).
     const operationFields = () => {
-      const names = requests.map((request) => request.submissionReceipt.operation_name).filter((name): name is string => typeof name === 'string');
-      if (!names.length) return {};
-      return names.length === 1 ? { rag_operation_name: names[0] } : { rag_operation_name: names.at(-1), rag_operation_names: names };
+      const operations = requests.flatMap((request) => (typeof request.submissionReceipt.operation_name === 'string'
+        ? [{ name: request.submissionReceipt.operation_name, uris: request.uris }] : []));
+      if (!operations.length) return {};
+      const names = operations.map((operation) => operation.name);
+      return {
+        ...(names.length === 1 ? { rag_operation_name: names[0] } : { rag_operation_name: names.at(-1), rag_operation_names: names }),
+        rag_operations: operations,
+      };
     };
     let stopped: Record<string, unknown> | undefined;
     for (const [index, uris] of chunks.entries()) {
@@ -4700,7 +4709,7 @@ export class DomainExpertService {
       if (!listed) return { kind: 'unknown', source_id: found.sourceId, reason: listingError ?? 'rag_file_listing_failed' };
       // An import recorded as requested may still be running. A retry under another batch
       // stages another URI, so Vertex would not skip it: the operation decides.
-      const pending = await this.pendingImportHolding(manifest, corpusId, found, file, options.reconcile !== false);
+      const pending = await this.pendingImportHolding(manifest, corpusId, found, holding.whole.gcs_uri, file, options.reconcile !== false);
       // Otherwise the recorded copy is not in the corpus: the source is imported as usual.
       return pending ?? { kind: 'none' };
     }
@@ -4746,13 +4755,22 @@ export class DomainExpertService {
     manifest: ReturnType<typeof domainManifest>,
     corpusId: string,
     found: NonNullable<ReturnType<typeof sourceForIdentity>>,
+    gcsUri: string,
     file: Record<string, unknown> | undefined,
     reconcile: boolean,
   ): Promise<SourceHolding | undefined> {
     const record = found.holding;
     if (!record || record.ingest_status !== 'import_requested') return undefined;
-    const names = [...new Set([...(Array.isArray(record.rag_operation_names) ? record.rag_operation_names : []), record.rag_operation_name]
-      .filter((name): name is string => typeof name === 'string'))];
+    // Only an operation whose request named this object can be importing it. A record that
+    // lists each operation's URIs says which; an object none of them named (a request never
+    // submitted) is not being imported. An older record names its operations alone.
+    const listed = Array.isArray(record.rag_operations)
+      ? record.rag_operations.map((operation) => asOptionalRecord(operation)).filter((operation): operation is Record<string, unknown> => operation !== undefined)
+      : undefined;
+    const names = listed
+      ? listed.filter((operation) => Array.isArray(operation.uris) && operation.uris.includes(gcsUri)).map((operation) => operation.name).filter((name): name is string => typeof name === 'string')
+      : [...new Set([...(Array.isArray(record.rag_operation_names) ? record.rag_operation_names : []), record.rag_operation_name]
+        .filter((name): name is string => typeof name === 'string'))];
     if (!names.length) return undefined;
     const outcomes: Array<ReturnType<typeof classifyRagImportOperation>> = [];
     try {
@@ -4765,7 +4783,10 @@ export class DomainExpertService {
     if (outcomes.some((outcome) => outcome === undefined)) return { kind: 'in_progress', source_id: found.sourceId, operations: names };
     const failed = file?.state === 'ERROR' || outcomes.every((outcome) => outcome!.status !== 'imported');
     if (!failed) return { kind: 'unknown', source_id: found.sourceId, reason: 'its import finished but its ragFile is not listed yet' };
-    if (reconcile) {
+    // The record's outcome is written only when these were all its operations: another one
+    // may still be importing other files the record lists.
+    const allOperations = !listed || listed.every((operation) => typeof operation.name === 'string' && names.includes(operation.name));
+    if (reconcile && allOperations) {
       const reason = outcomes.map((outcome) => ragImportReason(outcome!.detail)).join('; ');
       try {
         const root = this.roots.get(manifest.workspace_root_id);
@@ -8558,7 +8579,7 @@ async function planStageImportFiles(
   options: { includeMedia?: boolean; deferBatchCap?: boolean } = {},
 ): Promise<{ eligible: StageImportEligibleFile[]; skipped: StageImportSkippedFile[]; totalBytes: number }> {
   const files = await collectStageImportFiles(rootPath, targetPath);
-  return planStageImportCandidates(files, destinationBucket, destinationObjectPrefix, options);
+  return await planStageImportCandidates(files, destinationBucket, destinationObjectPrefix, options);
 }
 
 function preflightDerivativeWrites<T extends { fileName: string; bytes: Uint8Array }>(
@@ -8582,7 +8603,7 @@ function preflightDerivativeWrites<T extends { fileName: string; bytes: Uint8Arr
   return { files: accepted, skipped };
 }
 
-function planStageImportCandidates(
+async function planStageImportCandidates(
   files: Array<{
     workspaceRelativePath: string;
     uploadRelativePath: string;
@@ -8594,7 +8615,7 @@ function planStageImportCandidates(
   destinationObjectPrefix: string,
   // deferBatchCap: the batch cap is applied later, to the files actually staged (capStagedBatch).
   options: { includeMedia?: boolean; deferBatchCap?: boolean } = {},
-): { eligible: StageImportEligibleFile[]; skipped: StageImportSkippedFile[]; totalBytes: number } {
+): Promise<{ eligible: StageImportEligibleFile[]; skipped: StageImportSkippedFile[]; totalBytes: number }> {
   const eligible: StageImportEligibleFile[] = [];
   const skipped: StageImportSkippedFile[] = [];
   let totalBytes = 0;
@@ -8617,7 +8638,9 @@ function planStageImportCandidates(
       });
       continue;
     }
-    const maxFileBytes = maxStageFileBytes(file.workspaceRelativePath);
+    // A PDF is known by its bytes before any limit applies, so one named .txt takes the PDF limit.
+    const pdf = extension === '.pdf' || hasPdfHeader(file.content ?? await readFileHead(file.absolutePath, PDF_SNIFF_BYTES));
+    const maxFileBytes = pdf ? PDF_PROCESSING_MAX_BYTES : maxStageFileBytes(file.workspaceRelativePath);
     if (file.bytes > maxFileBytes) {
       skipped.push({
         workspace_relative_path: file.workspaceRelativePath,
@@ -8644,6 +8667,7 @@ function planStageImportCandidates(
       absolutePath: file.absolutePath,
       bytes: file.bytes,
       ...(file.content ? { content: file.content } : {}),
+      pdf,
       objectName,
       gcsUri: `gs://${destinationBucket}/${objectName}`,
     });
@@ -10392,7 +10416,7 @@ function classifyRagImportOperation(
 // into a new import drops them, so a re-import never inherits the last one's
 // ragFile or verification.
 const RAG_IMPORT_OUTCOME_FIELDS = new Set([
-  'ingest_status', 'rag_operation_name', 'rag_operation_names', 'rag_file_name', 'rag_files', 'gcs_uri', 'split_parts',
+  'ingest_status', 'rag_operation_name', 'rag_operation_names', 'rag_operations', 'rag_file_name', 'rag_files', 'gcs_uri', 'split_parts',
   'verification', 'ingest_reason', 'import_batch_source_id', 'registered_at',
 ]);
 
