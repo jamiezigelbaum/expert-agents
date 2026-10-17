@@ -36,6 +36,7 @@ import {
 import {
   bookObjectStem,
   assertAllowedGcsDestination,
+  routedPdfStatus,
   createDomainExpertWorker as createRawDomainExpertWorker,
   domainExpertAnnasConfigFromEnv,
   reciprocalRankFuse,
@@ -7478,6 +7479,46 @@ describe('splitting long PDFs for LLM-parser imports', () => {
       } finally { f.cleanup(); }
     });
 
+    test('a batch whose only PDF another operation holds past the response budget answers in progress', async () => {
+      const f = splitFixture(LONG, importsAll, {
+        responseBudgetMs: 30,
+        seed: { objects: [[OBJECT, LONG]] },
+        // Each part import takes a while, so the first import's split outlives its request and keeps the lock.
+        wrapGoogleFetch: (next) => (async (input: string | URL | Request, init?: RequestInit) => {
+          if (String(input).endsWith('/ragFiles:import')) await sleepFor(100);
+          return next(input, init);
+        }) as typeof fetch,
+      });
+      try {
+        const first = await postDomain(f.worker, 'rag_corpus', { action: 'import', domain_id: 'research', corpus_id: CORPUS, gcs_uri: `gs://fixture-shared-library/${OBJECT}`, dry_run: false });
+        expect(first.status).toBe('import_in_progress');
+        writeBatch(f.base, { 'long-volume.pdf': LONG });
+        const batch = await stageBatch(f.worker, 'held-batch');
+        expect(batch).toMatchObject({
+          status: 'pdf_sources_in_progress',
+          pdf_sources: [{ route: 'in_progress', status: 'import_in_progress', source_id: `research-pdf-${sha256Hex(LONG).slice(0, 16)}`, error: { code: 'source_import_in_progress' } }],
+        });
+        // The holder finishes and records the split; the batch imported nothing.
+        for (let waited = 0; waited < 3_000 && f.readRegistry().at(-1)!.ingest_status !== 'imported'; waited += 50) await sleepFor(50);
+        expect(f.readRegistry().at(-1)).toMatchObject({ ingest_status: 'imported', split_parts: 3 });
+        expect(f.importedUris()).toEqual([1, 2, 3].map(partBeside));
+      } finally { f.cleanup(); }
+    });
+
+    // A PDF is known by its bytes, whatever its staged name.
+    test('a staged PDF named .txt is routed like any PDF: split when long, staged as .pdf when whole', async () => {
+      const f = splitFixture(LONG, importsAll);
+      const short = textPdfBytes(120);
+      try {
+        writeBatch(f.base, { 'book.txt': LONG, 'paper.txt': short, 'notes.txt': 'Plain notes.' });
+        const result = await stageBatch(f.worker, 'named-txt');
+        expect(result.pdf_sources).toMatchObject([{ workspace_relative_path: 'experts/research/sources/batch/book.txt', route: 'split', status: 'imported', split: { parts: 3 } }]);
+        const prefix = 'gs://fixture-shared-library/v1/staged/research/named-txt/';
+        expect(stagedUris(result)).toEqual([stagedObject(prefix, 'notes.txt', 'Plain notes.'), stagedObject(prefix, 'paper.txt.pdf', short)].sort());
+        expect(f.importedUris().filter((uri) => uri.includes('--parts/'))).toHaveLength(3);
+      } finally { f.cleanup(); }
+    });
+
     test('two concurrent resumes of the same partial split import each part once', async () => {
       const f = splitFixture(LONG, (part, attempt) => (part !== 'part1of3' && attempt === 1
         ? { error: { code: 13, message: 'An internal error occurred processing the file.' } }
@@ -7736,6 +7777,16 @@ describe('splitting long PDFs for LLM-parser imports', () => {
         expect(f.importedUris().slice(4)).toEqual([stagedObject('gs://fixture-shared-library/v1/staged/research/long-batch-2/', 'note.md', '# A note')]);
       } finally { f.cleanup(); }
     });
+  });
+
+  test('a batch of routed PDFs reports the most actionable state', () => {
+    const inProgress = { route: 'in_progress', status: 'import_in_progress' };
+    const refused = { route: 'refused', status: 'blocked' };
+    expect(routedPdfStatus([inProgress])).toBe('pdf_sources_in_progress');
+    expect(routedPdfStatus([refused, inProgress])).toBe('pdf_sources_in_progress');
+    expect(routedPdfStatus([{ route: 'split', status: 'import_in_progress' }, { route: 'present', status: 'imported' }])).toBe('pdf_sources_in_progress');
+    expect(routedPdfStatus([refused, { route: 'duplicate', status: 'skipped_duplicate' }])).toBe('pdf_sources_refused');
+    expect(routedPdfStatus([refused, { route: 'present', status: 'imported' }])).toBe('pdf_sources_routed');
   });
 
   test('the split size is configured from the environment', () => {

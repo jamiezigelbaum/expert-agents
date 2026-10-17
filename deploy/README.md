@@ -244,7 +244,9 @@ receipt's `pdf_sources` list each such PDF with its route (`present`, `split`,
 one in the batch, reported `duplicate_in_batch` with `duplicate_of` and not
 imported; or `in_progress` when another operation on the same file still holds
 it past the response budget); `eligible_files` lists only what the batch stages, and a batch of
-refused PDFs answers `pdf_sources_refused`. The 100 MiB batch cap counts only
+refused PDFs answers `pdf_sources_refused`; one with any PDF still in progress
+(its split, or another operation holding the file) answers
+`pdf_sources_in_progress`. The 100 MiB batch cap counts only
 the files the batch stages; a routed PDF is bounded by the per-file limit alone
 (web_import's 100 MiB fetch budget still covers everything it fetches). Each staged file is
 addressed by its bytes, `staged/<domain>/<batch>/<first 32 hex of its
@@ -274,9 +276,12 @@ already in. Parts go to `staged/<domain>/<batch>--parts/` after the batch import
 is the batch's only file is registered under the `source_id` the import names.
 A PDF imported by URI without `source_id` is registered under its sha256 as
 `<domain>-pdf-<sha prefix>` and answers within the response budget. A
-single object is a PDF when its key ends in `.pdf` or, under any other key, when
-its first five bytes are `%PDF-` (a ranged read; an unreadable object answers
-502 `gcs_object_unreadable`). Its record then says `content_type:
+file is a PDF when its name ends in `.pdf` or, under any other name, when its
+first bytes carry the PDF header (`%PDF-1.x` or `%PDF-2.x` after nothing but
+whitespace, within the first 1024 bytes): a single GCS object is checked with a
+ranged read (an unreadable object answers 502 `gcs_object_unreadable`), a
+staged file from its bytes. A staged PDF so found that stays whole is staged
+under its name plus `.pdf`. Its record then says `content_type:
 application/pdf`, so it takes the LLM parser and its citations carry pages
 whatever its key. One operation at a time works on a file: every route that
 checks or imports a source (acquisition, `rag_corpus import`, staged routing

@@ -2576,7 +2576,8 @@ export class DomainExpertService {
     // A dry run's derived files are not written; they carry their bytes.
     const pdfBytes = new Map<StageImportEligibleFile, { bytes: Uint8Array; digest: string }>();
     for (const file of stage.eligible) {
-      if (!isPdfUri(file.workspaceRelativePath)) continue;
+      // A PDF by its name or, under any other name, by its first bytes.
+      if (!isPdfUri(file.workspaceRelativePath) && !hasPdfHeader(file.content ?? await readFileHead(file.absolutePath, PDF_SNIFF_BYTES))) continue;
       const bytes = file.content ?? new Uint8Array(await readFile(file.absolutePath));
       pdfBytes.set(file, { bytes, digest: sha256(bytes) });
     }
@@ -2666,7 +2667,8 @@ export class DomainExpertService {
         continue;
       }
       const route = await this.routePdf(source, bytes, measurePdfArtifactScale(bytes).corroborated_pages, holding);
-      if ('whole' in route) eligible.push({ ...file, sha256: digest });
+      // Staged under a .pdf name, so Vertex parses it as the PDF it is (and the LLM parser takes it).
+      if ('whole' in route) eligible.push({ ...file, sha256: digest, ...(isPdfUri(file.uploadRelativePath) ? {} : { uploadRelativePath: safeGcsRelativePath(`${file.uploadRelativePath}.pdf`) }) });
       else if ('refusal' in route) routed.push({ entry, corpusId, route: 'refused', outcome: { status: 'blocked', error: route.refusal } });
       else {
         routed.push({
@@ -3772,17 +3774,17 @@ export class DomainExpertService {
     return current.record;
   }
 
-  // Whether a GCS object whose key does not say .pdf is a PDF: its first five bytes are the
-  // PDF header. A missing object is not one (the import then reports it as before).
+  // Whether a GCS object whose key does not say .pdf is a PDF: its first bytes carry the
+  // PDF header (hasPdfHeader). A missing object is not one (the import then reports it as before).
   private async gcsObjectIsPdf(gcsUri: string): Promise<boolean> {
     const { bucket, prefix } = parseGcsPrefix(gcsUri);
     let head: Uint8Array | null;
     try {
-      head = await this.google.readGcsObjectHead(bucket, prefix.replace(/\/$/, ''), PDF_HEADER.length);
+      head = await this.google.readGcsObjectHead(bucket, prefix.replace(/\/$/, ''), PDF_SNIFF_BYTES);
     } catch {
       throw new DomainExpertWorkerError(502, 'gcs_object_unreadable', `${gcsUri} could not be read to tell whether it is a PDF. Nothing was imported.`);
     }
-    return head !== null && new TextDecoder('latin1').decode(head.subarray(0, PDF_HEADER.length)) === PDF_HEADER;
+    return head !== null && hasPdfHeader(head);
   }
 
   // Submission is not ingestion, for any import. On 2026-10-07 every web and
@@ -9757,8 +9759,11 @@ interface SourceImportContext {
 // ingestSplitPdf with one of these.
 // A batch whose every file was a routed PDF: imported (or present, or still
 // importing) when any was, refused when every one was.
-function routedPdfStatus(pdfSources: Array<Record<string, unknown>>): string {
-  return pdfSources.every((pdf) => pdf.status === 'blocked' || pdf.status === 'skipped_duplicate' || pdf.route === 'in_progress') ? 'pdf_sources_refused' : 'pdf_sources_routed';
+// A batch that staged nothing but PDFs reports the most actionable state: one still in
+// progress (here or under another operation's lock), else all refused or duplicates.
+export function routedPdfStatus(pdfSources: Array<Record<string, unknown>>): string {
+  if (pdfSources.some((pdf) => pdf.route === 'in_progress' || pdf.status === 'import_in_progress')) return 'pdf_sources_in_progress';
+  return pdfSources.every((pdf) => pdf.status === 'blocked' || pdf.status === 'skipped_duplicate') ? 'pdf_sources_refused' : 'pdf_sources_routed';
 }
 
 // A staged PDF the shared pipeline took out of its batch: reported present or
@@ -10269,7 +10274,21 @@ const RAG_IMPORT_OUTCOME_FIELDS = new Set([
 
 // One imported object is recorded flat, the shape the hand-corrected records
 // use; a batch of several keeps a rag_files list.
-const PDF_HEADER = '%PDF-';
+// How many of a file's first bytes tell whether it is a PDF (hasPdfHeader): a file is a
+// PDF by its bytes, whatever its name, for GCS imports, staged files and web imports alike.
+const PDF_SNIFF_BYTES = ANNAS_PDF_HEADER_WINDOW_BYTES;
+
+// A file's first bytes, enough to tell a PDF.
+async function readFileHead(path: string, length: number): Promise<Uint8Array> {
+  const handle = await open(path, 'r');
+  try {
+    const buffer = new Uint8Array(length);
+    const { bytesRead } = await handle.read(buffer, 0, length, 0);
+    return buffer.subarray(0, bytesRead);
+  } finally {
+    await handle.close();
+  }
+}
 const PDF_CONTENT_TYPE = 'application/pdf';
 
 function isPdfUri(uri: string): boolean {
@@ -12113,6 +12132,8 @@ function directFileExtension(url: string, headers: Headers, bytes: Uint8Array): 
   return contentType ? byContentType[contentType] : undefined;
 }
 
+// Whether the bytes open with a PDF header (%PDF-1.x or %PDF-2.x), after nothing but
+// whitespace, within the first PDF_SNIFF_BYTES. The one test of "is this a PDF" by content.
 function hasPdfHeader(bytes: Uint8Array): boolean {
   const window = bytes.subarray(0, Math.min(bytes.byteLength, 1024));
   for (let at = 0; at <= window.byteLength - 8; at += 1) {
