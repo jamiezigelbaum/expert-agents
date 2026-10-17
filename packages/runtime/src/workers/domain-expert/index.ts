@@ -5640,7 +5640,9 @@ export class DomainExpertService {
     sourcePath: string,
   ): Promise<{ ragIngest: Record<string, unknown>; registry: Record<string, unknown> }> {
     const context: SourceImportContext = { sha256 };
-    const work = this.tryAnnasRagIngest(manifest, params, locator, format, bytes, scale, sourcePath, context);
+    // An unexpected throw still ends the run with a record, like any other outcome.
+    const work = this.tryAnnasRagIngest(manifest, params, locator, format, bytes, scale, sourcePath, context)
+      .catch((error: unknown): Record<string, unknown> => ({ status: 'blocked', error: ingestErrorRecord(error) }));
     const settled = await this.raceResponseBudget(work);
     if (settled) {
       return { ragIngest: settled, registry: await this.registerAnnasIngest(manifest, params, locator, format, context, settled) };
@@ -5743,7 +5745,8 @@ export class DomainExpertService {
     const current = () => (mode.inProgress && context.snapshot ? context.snapshot : ragIngest);
     const splitParts = splitPartRecords(ragIngest);
     const running = mode.inProgress || mode.progress;
-    if (ragIngest.status !== 'imported' && !running && !mode.recordOutcome && !splitParts.some((part) => part.status === 'imported')) {
+    // A run that wrote a running record always writes its end, whatever the outcome.
+    if (ragIngest.status !== 'imported' && !running && !mode.recordOutcome && !context.running && !splitParts.some((part) => part.status === 'imported')) {
       return { status: 'skipped', reason: `rag_ingest.status is ${String(ragIngest.status)}; only an imported source is registered.` };
     }
     const ingestStatus = running ? 'import_requested' : String(ragIngest.status);
@@ -5757,11 +5760,18 @@ export class DomainExpertService {
       const registryRelativePath = `${manifest.workspace_relative_path}/references/source-registry.jsonl`;
       const registryPath = resolveInside(rootPath, registryRelativePath);
       const registry = await readDomainSourceRegistry(registryPath);
-      const history = registry.records.filter((record) => (context.sourceId
-        ? record.sourceId === context.sourceId
-        : input.sameSource?.(record.record) ?? record.sourceId === input.catalogue.source_id));
+      // Identity is the sha256: the route's match finds a source only when that
+      // source carries no sha256 or this one, and a different file gets a source of its own.
+      const groups = groupDomainSourceRecords(registry.records);
+      const sameSource = (entries: DomainSourceRegistryRecord[]) => (input.sameSource
+        ? entries.some((entry) => input.sameSource!(entry.record))
+        : entries[0]!.sourceId === input.catalogue.source_id);
+      const history = context.sourceId
+        ? groups.get(context.sourceId) ?? []
+        : [...groups.values()].find((entries) => sameSource(entries) && sameIdentityHistory(entries, context.sha256)) ?? [];
       const previous = history.length ? latestDomainSourceRecord(history) : undefined;
-      const sourceId = previous?.sourceId ?? input.catalogue.source_id;
+      const baseId = input.catalogue.source_id;
+      const sourceId = previous?.sourceId ?? (groups.has(baseId) ? `${baseId}-${context.sha256.slice(0, 12)}` : baseId);
       // Found present again under the identity it is already registered with: nothing to revise.
       if (asOptionalRecord(ragIngest.import_outcome)?.already_present === true && ragIngest.status === 'imported' && previous && !previous.removed
         && previous.record.source_sha256 === context.sha256 && previous.record.ingest_status === 'imported') {
@@ -5798,6 +5808,7 @@ export class DomainExpertService {
       if (heldUnverified(history, registryRecordGcsUris(record))) record.sha256_verified = false;
       await this.appendRegistryJsonLine(registryPath, record);
       context.sourceId = sourceId;
+      if (running) context.running = true;
       if (!mode.progress) {
         const logPath = resolveInside(rootPath, `${manifest.workspace_relative_path}/references/ingest-log.md`);
         await appendFile(logPath, `- ${registeredAt} ${previous ? 'updated' : 'registered'} ${sourceId} (${input.logLabel})\n`, 'utf8');
@@ -9270,6 +9281,8 @@ interface SourceImportContext {
   sha256: string;
   sourceId?: string;
   snapshot?: Record<string, unknown>;
+  // This run has written a running record (progress or in progress), so it must also write its end.
+  running?: boolean;
 }
 
 // One source on its way into a corpus, whatever route brought it: the original
@@ -9371,7 +9384,9 @@ function sourceForIdentity(
   if (!candidates.length) return undefined;
   const history = candidates.map((entries) => ({ entries, current: latestDomainSourceRecord(entries) }))
     .reduce((latest, candidate) => (compareDomainSourceRecords(latest.current, candidate.current) <= 0 ? candidate : latest));
-  const holdings = history.entries.filter((entry) => registryRecordGcsUris(entry.record).length > 0);
+  // Only records of this identity hold it (an older record without a sha256 counts).
+  const holdings = history.entries.filter((entry) => registryRecordGcsUris(entry.record).length > 0
+    && (registryRecordSha256s(entry.record).length === 0 || registryRecordSha256s(entry.record).includes(sha256)));
   const holding = holdings.length ? latestDomainSourceRecord(holdings).record : undefined;
   return {
     sourceId: history.current.sourceId,
@@ -9381,6 +9396,12 @@ function sourceForIdentity(
     viaBatchEntry: holding !== undefined && holding.source_sha256 !== sha256 && Array.isArray(holding.rag_files)
       && holding.rag_files.length > 1 && typeof holding.split_parts !== 'number',
   };
+}
+
+// A source history a file with this sha256 may join: one that carries no sha256, or this one.
+function sameIdentityHistory(history: DomainSourceRegistryRecord[], sha256: string): boolean {
+  const hashes = new Set(history.flatMap((entry) => registryRecordSha256s(entry.record)));
+  return hashes.size === 0 || (hashes.size === 1 && hashes.has(sha256));
 }
 
 function registryRecordSha256s(record: Record<string, unknown>): string[] {
