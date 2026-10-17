@@ -2673,8 +2673,9 @@ export class DomainExpertService {
         rerun: `Re-run rag_corpus ${action} for ${file.workspaceRelativePath}`,
         partNames: async () => ({
           bucket: stage.destination.bucket,
-          // Beside the batch directory, never in it, so the batch's directory import never takes a part.
-          directory: `${stage.destination.objectPrefix.replace(/\/$/, '')}--parts/`,
+          // Beside the batch's objects, addressed by the PDF's bytes like a whole file, so two
+          // PDFs of one name, or two versions of one file, never share a part name.
+          directory: `${stage.destination.objectPrefix.replace(/\/$/, '')}--parts/${digest.slice(0, STAGED_OBJECT_DIGEST_HEX)}/`,
           stem: safeObjectName(name),
           priorStems: [],
         }),
@@ -4928,11 +4929,18 @@ export class DomainExpertService {
     }
     if (this.google.ragParserModel() === undefined) return { whole: true };
     if (pages === undefined || !qpdf) {
-      // Without qpdf's count only pages both byte-scan signals report may refuse.
-      if (measuredPages !== undefined && measuredPages > limit) {
-        return { refusal: pdfPageLimitRefusal(measuredPages, limit, qpdf ? String(unreadable) : `${this.annasQpdfBin} (qpdf) is not installed on the worker host`, source.kept) };
-      }
-      return { whole: true };
+      const why = qpdf ? String(unreadable) : `${this.annasQpdfBin} (qpdf) is not installed on the worker host`;
+      // Without qpdf's count only pages both byte-scan signals report may decide.
+      if (measuredPages !== undefined && measuredPages > limit) return { refusal: pdfPageLimitRefusal(measuredPages, limit, why, source.kept) };
+      if (measuredPages !== undefined) return { whole: true };
+      // A count nothing can establish fails closed: the LLM parser fails a PDF over its limit.
+      return {
+        refusal: {
+          code: 'pdf_page_count_unavailable',
+          message: `The PDF's pages could not be counted (${why}), and imports with the LLM parser take at most ${limit} pages per PDF on this deployment. Nothing was uploaded or imported; ${source.kept}.`,
+          suggestion: 'Install qpdf on the worker host so the PDF is counted and split if long, or acquire an EPUB edition of the same work; a deployment set to the default parser (EXPERT_AGENTS_DOMAIN_EXPERT_RAG_PARSER_MODEL=default) imports PDFs whole without a page limit.',
+        },
+      };
     }
     if (pages <= limit) return { whole: true };
     if (this.annasPdfSplitDisabled) return { refusal: pdfPageLimitRefusal(pages, limit, disabled, source.kept) };

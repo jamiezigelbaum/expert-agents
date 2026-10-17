@@ -45,7 +45,11 @@ What the worker does with it, while imports use the LLM parser:
   imported and coverage-checked on its own (`pdftotext` reads each part's
   text layer);
 - a longer PDF the worker cannot split (no `qpdf`, or a file `qpdf` cannot
-  read) is refused before upload with `pdf_exceeds_parser_page_limit`.
+  read) is refused before upload with `pdf_exceeds_parser_page_limit`;
+- a PDF whose pages nothing can count (no `qpdf` or a file it cannot read, and
+  no corroborated count from the byte scan) is refused before upload with
+  `pdf_page_count_unavailable`. Under Google's default parser, which has no
+  page limit, such a PDF is imported whole.
 
 The worker applies this to acquisitions, to `rag_corpus import` of one GCS PDF
 object, and to the PDFs of `stage_import` and `web_import` batches. A

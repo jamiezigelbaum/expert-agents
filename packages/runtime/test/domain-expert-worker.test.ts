@@ -667,7 +667,8 @@ describe('ported retrieval regressions', () => {
 });
 
 // The smallest object a PDF import can read: a header and nothing qpdf can count.
-const FIXTURE_PDF_TEXT = '%PDF-1.7\n% fixture object\n';
+// A one-page PDF qpdf can count: a PDF whose pages cannot be counted is refused under the LLM parser.
+const FIXTURE_PDF_TEXT = new TextDecoder('latin1').decode(textPdfBytes(1));
 
 describe('RAG ingestion configuration', () => {
   const corpusResource = 'projects/fixture-project/locations/us-central1/ragCorpora/1001';
@@ -1019,7 +1020,9 @@ describe('ported staging regressions', () => {
       mkdirSync(sourceDir, { recursive: true });
       writeFileSync(join(sourceDir, 'good.md'), 'good');
       writeFileSync(join(sourceDir, 'bad.bin'), 'bad');
-      writeFileSync(join(sourceDir, 'large.pdf'), new Uint8Array((10 * 1024 * 1024) + 1));
+      // A real PDF past the text cap: a PDF's own limit applies (padded with a comment).
+      const largePdf = new TextEncoder().encode(new TextDecoder('latin1').decode(textPdfBytes(1)).replace('trailer\n', `%${'x'.repeat(10 * 1024 * 1024)}\ntrailer\n`));
+      writeFileSync(join(sourceDir, 'large.pdf'), largePdf);
       writeFileSync(join(sourceDir, 'large.md'), new Uint8Array((10 * 1024 * 1024) + 1).fill(65));
       const worker = createDomainExpertWorker({
         roots: [rootPolicy(fixture.workspaceRoot)],
@@ -1037,7 +1040,7 @@ describe('ported staging regressions', () => {
       expect(result).toMatchObject({
         eligible_file_count: 2,
         skipped_file_count: 2,
-        total_eligible_bytes: (10 * 1024 * 1024) + 5,
+        total_eligible_bytes: largePdf.byteLength + 4,
         file_policy: {
           max_file_bytes: 100_000_000,
           text_default_max_file_bytes: 10_000_000,
@@ -1847,7 +1850,7 @@ describe('book-scale sanity gate on acquisition ingest', () => {
     dry_run: false,
   };
 
-  function scaleGateFixture(bytes: Uint8Array, annas: { minPdfPages?: number } = {}) {
+  function scaleGateFixture(bytes: Uint8Array, annas: { minPdfPages?: number; qpdfBin?: string } = {}, google: { ragParserModel?: string } = {}) {
     const fixture = workspaceFixture();
     const booksRoot = join(fixture.base, 'books');
     mkdirSync(booksRoot);
@@ -1862,7 +1865,7 @@ describe('book-scale sanity gate on acquisition ingest', () => {
         importGcsPrefix: 'gs://fixture-shared-library/v1/book-imports/',
         ...annas,
       },
-      google: { accessToken: 'fixture-google-token', fetchImpl: fakeIngestGoogleFetch(googleCalls) },
+      google: { accessToken: 'fixture-google-token', fetchImpl: fakeIngestGoogleFetch(googleCalls), ...google },
       fetchImpl: fakeAnnasArtifactFetch(annasCalls, bytes, 'application/pdf'),
     });
     return { worker, booksRoot, annasCalls, googleCalls, cleanup: fixture.cleanup };
@@ -1990,8 +1993,10 @@ describe('book-scale sanity gate on acquisition ingest', () => {
     }
   });
 
-  test('an artifact whose scale cannot be measured ingests, recorded as unmeasured', async () => {
-    const gate = scaleGateFixture(new TextEncoder().encode('this is not a PDF at all'));
+  // The scale gate does not refuse what it cannot measure; under the default parser (no page
+  // limit) such an artifact ingests. The LLM parser's page limit refuses it (next tests).
+  test('an artifact whose scale cannot be measured ingests under the default parser, recorded as unmeasured', async () => {
+    const gate = scaleGateFixture(new TextEncoder().encode('this is not a PDF at all'), {}, { ragParserModel: 'default' });
     try {
       const response = await postDomain(gate.worker, 'annas_archive_import', {
         ...PDF_IMPORT_PARAMS,
@@ -2011,9 +2016,9 @@ describe('book-scale sanity gate on acquisition ingest', () => {
     }
   });
 
-  test('a truncated PDF is unmeasured rather than refused, and a zero floor disables the gate', async () => {
+  test('a truncated PDF is unmeasured rather than refused by the scale gate, and a zero floor disables the gate', async () => {
     const truncated = syntheticPdfBytes(36).slice(0, 12);
-    const unmeasurable = scaleGateFixture(truncated);
+    const unmeasurable = scaleGateFixture(truncated, {}, { ragParserModel: 'default' });
     try {
       const response = await postDomain(unmeasurable.worker, 'annas_archive_import', {
         ...PDF_IMPORT_PARAMS,
@@ -2042,6 +2047,26 @@ describe('book-scale sanity gate on acquisition ingest', () => {
     } finally {
       disabled.cleanup();
     }
+  });
+
+  test('a PDF whose pages nothing can count is refused under the LLM parser and imported under the default parser', async () => {
+    const uncountable = syntheticPdfBytes(36).slice(0, 12);
+    for (const [ragParserModel, qpdfBin] of [[undefined, undefined], [undefined, 'qpdf-missing-fixture']] as const) {
+      const gate = scaleGateFixture(uncountable, qpdfBin ? { qpdfBin } : {}, ragParserModel ? { ragParserModel } : {});
+      try {
+        const response = await postDomain(gate.worker, 'annas_archive_import', { ...PDF_IMPORT_PARAMS, ingest: true, corpus_id: FIXTURE_CORPUS });
+        expect(response.rag_ingest).toMatchObject({ status: 'blocked', error: { code: 'pdf_page_count_unavailable' } });
+        expect(response.rag_ingest.error.suggestion).toContain('qpdf');
+        expect(response.rag_ingest.error.suggestion).toContain('EPUB');
+        expect(response.rag_ingest.error.suggestion).toContain('default parser');
+        expect(gate.googleCalls.some((call) => call.url.includes('/upload/storage/') || call.url.includes('ragFiles:import'))).toBe(false);
+      } finally { gate.cleanup(); }
+    }
+    const defaultParser = scaleGateFixture(uncountable, { qpdfBin: 'qpdf-missing-fixture' }, { ragParserModel: 'default' });
+    try {
+      const response = await postDomain(defaultParser.worker, 'annas_archive_import', { ...PDF_IMPORT_PARAMS, ingest: true, corpus_id: FIXTURE_CORPUS });
+      expect(response.rag_ingest).toMatchObject({ status: 'imported' });
+    } finally { defaultParser.cleanup(); }
   });
 
   test('page objects hidden in a compressed object stream still measure as pages', async () => {
@@ -6417,6 +6442,11 @@ function sleepFor(ms: number): Promise<void> {
   return new Promise((resolveSleep) => setTimeout(resolveSleep, ms));
 }
 
+// Where a batch stages a split PDF's part: beside the batch, in a directory named by the PDF's bytes.
+function stagedPart(batch: string, bytes: Uint8Array, stem: string, index: number, of: number): string {
+  return `gs://fixture-shared-library/v1/staged/research/${batch}--parts/${createHash('sha256').update(bytes).digest('hex').slice(0, 32)}/${stem}--part${index}of${of}.pdf`;
+}
+
 // Where a batch stages a file: under the batch, in a directory named by the file's bytes.
 function stagedObject(batchPrefix: string, name: string, bytes: string | Uint8Array): string {
   return `${batchPrefix}${createHash('sha256').update(bytes).digest('hex').slice(0, 32)}/${name}`;
@@ -7413,7 +7443,7 @@ describe('splitting long PDFs for LLM-parser imports', () => {
 
     // One source, one holding: the same bytes twice in a batch are imported once.
     test('two identical long PDFs in one batch: the first is split and imported, the second is its duplicate', async () => {
-      const parts = [1, 2, 3].map((index) => `gs://fixture-shared-library/v1/staged/research/twin-batch--parts/volume-a--part${index}of3.pdf`);
+      const parts = [1, 2, 3].map((index) => stagedPart('twin-batch', LONG, 'volume-a', index, 3));
       const fixture = workspaceFixture();
       const calls: CapturedCall[] = [];
       try {
@@ -7663,6 +7693,24 @@ describe('splitting long PDFs for LLM-parser imports', () => {
     });
 
     // The parser applies per request: a PDF batched with Markdown keeps the LLM parser.
+    // Parts are addressed by their PDF's bytes, like whole files: same names never collide.
+    test('three different long PDFs of one name in one batch are each split under their own parts', async () => {
+      const f = splitFixture(LONG, importsAll);
+      try {
+        const volumes = [textPdfBytes(450), textPdfBytes(451), textPdfBytes(452)];
+        for (const [index, dir] of ['a', 'b', 'c'].entries()) {
+          const directory = join(f.base, 'workspace', 'experts', 'research', 'sources', 'batch', dir);
+          mkdirSync(directory, { recursive: true });
+          writeFileSync(join(directory, 'volume.pdf'), volumes[index]!);
+        }
+        const result = await stageBatch(f.worker, 'same-names');
+        expect(result.pdf_sources.map((pdf: Record<string, any>) => [pdf.route, pdf.status])).toEqual([['split', 'imported'], ['split', 'imported'], ['split', 'imported']]);
+        const parts = f.importedUris().filter((uri) => uri.includes('--parts/'));
+        expect(parts).toEqual(volumes.flatMap((bytes) => [1, 2, 3].map((index) => stagedPart('same-names', bytes, 'volume', index, 3))));
+        expect(new Set(parts).size).toBe(9);
+      } finally { f.cleanup(); }
+    });
+
     test('a mixed batch imports its PDF in a request of its own, with the LLM parser', async () => {
       const short = textPdfBytes(120);
       const f = splitFixture(LONG, importsAll);
@@ -7738,7 +7786,7 @@ describe('splitting long PDFs for LLM-parser imports', () => {
         const second = await stageBatch(f.worker, 'retry-batch');
         expect(stagedUris(second)).toEqual([note]);
         expect(second.pdf_sources).toMatchObject([{ route: 'split', status: 'imported' }]);
-        const parts = [1, 2, 3].map((index) => `gs://fixture-shared-library/v1/staged/research/retry-batch--parts/volume--part${index}of3.pdf`);
+        const parts = [1, 2, 3].map((index) => stagedPart('retry-batch', LONG, 'volume', index, 3));
         // The earlier whole copy is never named again; the note keeps its URI and is skipped.
         // The first run imported the note and the short PDF in requests of their own parsers.
         expect(f.importRequests().slice(0, 2)).toEqual([[note], [shortCopy]]);
@@ -7925,7 +7973,7 @@ describe('splitting long PDFs for LLM-parser imports', () => {
         const response = await stage('long-batch');
         expect(response.status).toBe('staged_and_import_requested');
         expect(response.staged_files.map((file: Record<string, any>) => file.workspace_relative_path)).toEqual(['experts/research/sources/batch/note.md']);
-        const parts = [1, 2, 3].map((index) => `gs://fixture-shared-library/v1/staged/research/long-batch--parts/long-volume--part${index}of3.pdf`);
+        const parts = [1, 2, 3].map((index) => stagedPart('long-batch', LONG, 'long-volume', index, 3));
         expect(response.pdf_sources).toMatchObject([{
           workspace_relative_path: 'experts/research/sources/batch/long-volume.pdf', source_sha256: sha256Hex(LONG), status: 'imported',
           gcs_uris: parts, split: { pages: 450, parts: 3, imported_parts: 3 }, source_registry: { status: 'updated' },

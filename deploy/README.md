@@ -218,7 +218,11 @@ with `qpdf` into `<name>--partNofM.pdf` parts that are imported one at a time
 and coverage-checked (ACTIVE ragFile; text layer read with `pdftotext`); the
 host needs `qpdf` and `pdftotext` (poppler-utils) on PATH, and without `qpdf`,
 or for a file `qpdf` cannot read, such a PDF is refused before upload with
-`pdf_exceeds_parser_page_limit`. Worker health reports `pdf_import` as
+`pdf_exceeds_parser_page_limit`. A PDF whose pages nothing can count (no
+`qpdf`, or a file `qpdf` cannot read, and no page count the byte scan can
+corroborate) is refused before upload with `pdf_page_count_unavailable` while
+imports use the LLM parser; under the default parser, which has no page limit,
+it is imported whole. Worker health reports `pdf_import` as
 `degraded` while either tool is missing.
 
 These worker routes take the same PDF pipeline: `annas_archive_import`;
@@ -277,7 +281,11 @@ with one terminal record; a receipt of several requests carries
 `submission_receipts`, `operations` and `import_outcome.requests`. A request
 still running when its budget ends stops the batch with the rest unsubmitted
 (`request_still_running`); re-running the batch finishes it, skipping what is
-already in. Parts go to `staged/<domain>/<batch>--parts/` after the batch import, and a staged PDF that
+already in. Parts go to `staged/<domain>/<batch>--parts/<first 32 hex of the
+PDF's sha256>/<name>--partNofM.pdf`, addressed by the PDF's bytes like a whole
+file so two PDFs of one name or two versions of one file never share a part
+name (parts recorded under the earlier `<batch>--parts/<name>--partNofM.pdf`
+names still resume from their recorded URIs), after the batch import, and a staged PDF that
 is the batch's only file is registered under the `source_id` the import names.
 A PDF imported by URI without `source_id` is registered under its sha256 as
 `<domain>-pdf-<sha prefix>` and answers within the response budget. A

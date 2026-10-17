@@ -73,7 +73,10 @@ disk. A book already in the corpus whole is not split; when that cannot be
 checked the import stops with `annas_pdf_whole_copy_unverified` — re-run it
 later rather than splitting by hand. On a host that cannot split (no qpdf, or
 a PDF qpdf cannot read) a PDF longer than 200 pages is refused before upload
-with `pdf_exceeds_parser_page_limit`; the file stays on disk.
+with `pdf_exceeds_parser_page_limit`, and one whose pages cannot be counted at
+all with `pdf_page_count_unavailable`; the file stays on disk. For the latter,
+install qpdf, look for an EPUB edition, or tell the owner the deployment would
+need the default parser.
 
 Every source has one identity, the sha256 of the original file. Before
 uploading anything the runtime looks that identity up in the domain's source

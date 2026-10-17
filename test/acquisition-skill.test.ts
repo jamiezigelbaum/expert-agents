@@ -8,6 +8,7 @@ describe("acquisition skill", () => {
     const named = [...new Set(skill.match(/`([a-z]+(?:_[a-z]+)+)`/g)?.map((code) => code.slice(1, -1)) ?? [])]
       .filter((name) => /^(annas|unsupported|rag|import|pdf|source)_/.test(name) && !/^(import_(failed|empty|requested|in_progress|outcome))$/.test(name));
     expect(named).toContain("pdf_exceeds_parser_page_limit");
+    expect(named).toContain("pdf_page_count_unavailable");
     expect(named).toContain("source_holding_unverified");
     for (const code of named) expect(worker).toContain(`'${code}'`);
   });
