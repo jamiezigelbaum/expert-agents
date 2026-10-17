@@ -1353,6 +1353,8 @@ export class DomainExpertService {
       const holding = holdings.get(uri);
       const span = chunkPageSpan(context);
       const fields: Record<string, unknown> = holding ? { sourceId: holding.source_id, ...(holding.part ? { sourcePart: holding.part } : {}) } : {};
+      // A part recorded without its range (#37): its offset in the original is unknown.
+      if (holding?.part && holding.first_page === undefined) return fields;
       if (holding?.first_page !== undefined) {
         const offset = holding.first_page - 1;
         const pages = span && offset + span.last <= holding.last_page!
@@ -1384,9 +1386,14 @@ export class DomainExpertService {
       if (latestDomainSourceRecord(history).removed) continue;
       const withObjects = history.filter((entry) => registryRecordGcsUris(entry.record).length > 0);
       if (!withObjects.length) continue;
-      const holding = recordedSourceHolding(latestDomainSourceRecord(withObjects).record);
+      const record = latestDomainSourceRecord(withObjects).record;
+      const holding = recordedSourceHolding(record);
       if (holding?.whole) holdings.set(holding.whole.gcs_uri, { source_id: sourceId });
-      for (const part of holding?.parts ?? []) {
+      // Parts recorded without ranges get them back when the original's page count is recorded.
+      const parts = holding?.parts && typeof record.pages === 'number'
+        ? recordedPartsWithRanges(holding.parts, record.pages, this.annasPdfSplitPages) ?? holding.parts
+        : holding?.parts ?? [];
+      for (const part of parts) {
         holdings.set(part.gcs_uri, {
           source_id: sourceId, part: part.name,
           ...(part.first_page !== undefined && part.last_page !== undefined ? { first_page: part.first_page, last_page: part.last_page } : {}),
@@ -2292,8 +2299,8 @@ export class DomainExpertService {
         llmParserEligible: llmParserEligibleUris(params.gcsUri ? [params.gcsUri] : []),
       });
     });
-    const verified = sourceRootPath && registeredSource
-      ? await this.verifyAndRegisterRagImport({
+    const verifying = sourceRootPath && registeredSource
+      ? this.verifyAndRegisterRagImport({
         manifest,
         rootPath: sourceRootPath,
         resolved: usedResolved,
@@ -2303,7 +2310,18 @@ export class DomainExpertService {
         action: 'import',
         source: registeredSource,
       })
-      : {};
+      : undefined;
+    // A source the caller named is verified before answering, as before. A PDF the
+    // pipeline identified answers within the response budget and records its
+    // outcome when the import settles.
+    let verified: Record<string, unknown> = {};
+    if (verifying && namedSource) verified = await verifying;
+    else if (verifying) {
+      verified = await this.raceResponseBudget(verifying) ?? {
+        source_registry: { status: 'recording', source_ids: [String(registeredSource!.source_id)], hint: 'The import outcome is recorded in the source registry when Vertex finishes.' },
+      };
+      void verifying.catch(() => undefined);
+    }
     return {
       kind: 'rag_corpus_result',
       status: 'import_requested',
@@ -2434,21 +2452,29 @@ export class DomainExpertService {
   private async routeStagedPdfs(
     stage: { manifest: ReturnType<typeof domainManifest>; destination: ReturnType<typeof stageDestination>; eligible: StageImportEligibleFile[]; resolved: ResolvedRagCorpus },
     action: 'stage_import' | 'web_import',
+    // The source the import names: it is the PDF's source when the PDF is the batch's only file.
+    namedSource?: Record<string, unknown>,
+    // A dry run's files are not written yet; their bytes come from here.
+    bytesOf?: (file: StageImportEligibleFile) => Uint8Array | undefined,
   ): Promise<{ eligible: StageImportEligibleFile[]; routed: RoutedStagedPdf[] }> {
     const { manifest } = stage;
     const corpusId = stage.resolved.requested;
     const eligible: StageImportEligibleFile[] = [];
     const routed: RoutedStagedPdf[] = [];
+    const named = namedSource && stage.eligible.length === 1 ? namedSource : undefined;
     for (const file of stage.eligible) {
       if (!isPdfUri(file.workspaceRelativePath)) {
         eligible.push(file);
         continue;
       }
-      const bytes = new Uint8Array(await readFile(file.absolutePath));
+      const bytes = bytesOf?.(file) ?? new Uint8Array(await readFile(file.absolutePath));
       const digest = sha256(bytes);
-      const context: SourceImportContext = { sha256: digest };
+      const context: SourceImportContext = { sha256: digest, ...(named ? { sourceId: String(named.source_id) } : {}) };
       const name = basename(file.uploadRelativePath).replace(/\.pdf$/i, '');
-      const catalogue = {
+      const catalogue = named ? {
+        ...Object.fromEntries(Object.entries(named).filter(([key]) => !RAG_IMPORT_OUTCOME_FIELDS.has(key))),
+        source_id: String(named.source_id),
+      } : {
         source_id: `${manifest.domain_id}-pdf-${digest.slice(0, 16)}`,
         domain_id: manifest.domain_id,
         kind: 'pdf',
@@ -2476,46 +2502,68 @@ export class DomainExpertService {
       const entry = { workspace_relative_path: file.workspaceRelativePath, source_sha256: digest };
       const holding = await this.sourceHolding(source);
       if (holding.kind === 'present') {
-        routed.push({ entry, register, outcome: { status: 'imported', target_corpus_id: corpusId, ...holding.result } });
+        routed.push({ entry, route: 'present', register, outcome: { status: 'imported', target_corpus_id: corpusId, ...holding.result } });
         continue;
       }
       if (holding.kind === 'unknown' || holding.kind === 'conflict') {
-        routed.push({ entry, outcome: { status: 'blocked', error: holding.kind === 'unknown' ? sourceHoldingUnverified(source, holding) : sourceIdentityConflict(source, holding) } });
+        routed.push({ entry, route: 'refused', outcome: { status: 'blocked', error: holding.kind === 'unknown' ? sourceHoldingUnverified(source, holding) : sourceIdentityConflict(source, holding) } });
         continue;
       }
       const route = await this.routePdf(source, bytes, measurePdfArtifactScale(bytes).corroborated_pages, holding);
       if ('whole' in route) eligible.push(file);
-      else if ('refusal' in route) routed.push({ entry, outcome: { status: 'blocked', error: route.refusal } });
-      else routed.push({ entry, register, split: () => this.ingestSplitPdf(source, { ...route, bytes }) });
+      else if ('refusal' in route) routed.push({ entry, route: 'refused', outcome: { status: 'blocked', error: route.refusal } });
+      else routed.push({ entry, route: 'split', pages: route.pages, parts: route.plan.length, register, split: () => this.ingestSplitPdf(source, { ...route, bytes }) });
     }
     return { eligible, routed };
   }
 
-  // Imports the split PDFs a batch left out, one at a time after the batch
-  // import, and registers each one's outcome. Past the response budget the
-  // imports finish on the worker and record their outcomes there.
-  private async importRoutedStagedPdfs(routed: RoutedStagedPdf[]): Promise<Record<string, unknown> | Array<Record<string, unknown>>> {
-    if (!routed.length) return [];
-    const work = (async () => {
-      const results: Array<Record<string, unknown>> = [];
-      for (const pdf of routed) {
-        const outcome = pdf.split ? await pdf.split() : pdf.outcome!;
-        const registry = pdf.register ? await pdf.register(outcome, {}) : undefined;
-        results.push({ ...pdf.entry, ...outcome, ...(registry ? { source_registry: registry } : {}) });
+  // The outcome of every PDF a batch left out, in batch order. A PDF found present
+  // or refused is reported and registered at once; the split PDFs import one at a
+  // time after the batch import, and past the response budget they finish on the
+  // worker and record their outcomes there.
+  private async importRoutedStagedPdfs(routed: RoutedStagedPdf[]): Promise<Array<Record<string, unknown>>> {
+    const results: Array<Record<string, unknown> | undefined> = [];
+    for (const pdf of routed) {
+      if (pdf.split) {
+        results.push(undefined);
+        continue;
       }
-      return results;
+      const registry = pdf.register ? await pdf.register(pdf.outcome!, {}) : undefined;
+      results.push({ ...pdf.entry, route: pdf.route, ...pdf.outcome, ...(registry ? { source_registry: registry } : {}) });
+    }
+    const splits = routed.flatMap((pdf, index) => (pdf.split ? [{ pdf, index }] : []));
+    const work = (async () => {
+      for (const { pdf, index } of splits) {
+        const outcome = await pdf.split!();
+        const registry = await pdf.register!(outcome, {});
+        results[index] = { ...pdf.entry, route: pdf.route, ...outcome, source_registry: registry };
+      }
+      return true;
     })();
-    const settled = await this.raceResponseBudget(work);
-    if (settled) return settled;
-    void work.catch((error: unknown) => {
-      console.error(JSON.stringify({ kind: 'domain_expert_pdf_split_background_error', code: error instanceof DomainExpertWorkerError ? error.code : 'error' }));
-    });
-    return {
-      status: 'import_in_progress',
-      files: routed.map((pdf) => pdf.entry),
-      response_budget_ms: this.annasResponseBudgetMs,
-      hint: 'The split PDFs are still importing on the worker and record their outcomes in the source registry. Check domain_source status before acting; do not import them again.',
-    };
+    if (splits.length && await this.raceResponseBudget(work) === undefined) {
+      void work.catch((error: unknown) => {
+        console.error(JSON.stringify({ kind: 'domain_expert_pdf_split_background_error', code: error instanceof DomainExpertWorkerError ? error.code : 'error' }));
+      });
+      return routed.map((pdf, index) => results[index] ?? {
+        ...pdf.entry,
+        route: pdf.route,
+        status: 'import_in_progress',
+        response_budget_ms: this.annasResponseBudgetMs,
+        hint: 'The split PDF is still importing on the worker and records its outcome in the source registry. Check domain_source status before acting; do not import it again.',
+      });
+    }
+    return results.map((result) => result!);
+  }
+
+  // How a batch's PDFs were routed, for the plan and the receipt: the batch keeps
+  // the rest; a routed PDF never reaches the batch directory.
+  private stagedPdfRouting(routed: RoutedStagedPdf[]): Array<Record<string, unknown>> {
+    return routed.map((pdf) => ({
+      ...pdf.entry,
+      route: pdf.route,
+      ...(pdf.route === 'split' ? { pages: pdf.pages, parts: pdf.parts } : {}),
+      ...(pdf.route === 'refused' ? { error: pdf.outcome!.error } : {}),
+    }));
   }
 
   private async stageRagImport(params: RagCorpusParams, dryRun: boolean): Promise<unknown> {
@@ -2533,15 +2581,20 @@ export class DomainExpertService {
       corpusId,
       includeMedia: params.includeMedia ?? false,
     });
-    const { eligible, skipped, totalBytes, destination, resolvedCorpus } = stage;
+    const { skipped, destination, resolvedCorpus } = stage;
     const resolutionWarnings = ragCorpusWarnings(stage.resolved);
-    if (eligible.length === 0) {
+    if (stage.eligible.length === 0) {
       throw new DomainExpertWorkerError(
         400,
         'no_stage_import_files',
         'stage_import found no eligible files after applying extension and size limits.',
       );
     }
+    const registeredSource = dryRun ? undefined : await this.registeredImportSource(manifest, rootPath, params.sourceId);
+    // The PDFs take the shared pipeline first; the batch is what stays.
+    const pdfs = await this.routeStagedPdfs(stage, 'stage_import', registeredSource);
+    const eligible = pdfs.eligible;
+    const totalBytes = eligible.reduce((total, file) => total + file.bytes, 0);
     const base = {
       action: 'stage_import',
       domain_id: manifest.domain_id,
@@ -2578,20 +2631,20 @@ export class DomainExpertService {
       eligible_file_count: eligible.length,
       skipped_file_count: skipped.length,
       total_eligible_bytes: totalBytes,
+      ...(pdfs.routed.length ? { pdf_routing: this.stagedPdfRouting(pdfs.routed) } : {}),
       ...(resolutionWarnings.length ? { warnings: resolutionWarnings } : {}),
       policy: domainPolicy(),
     };
     if (dryRun) {
       return {
         kind: 'rag_corpus_stage_import_plan',
-        status: 'dry_run_stage_import_ready',
+        status: eligible.length || pdfs.routed.some((pdf) => pdf.route === 'split') ? 'dry_run_stage_import_ready' : 'dry_run_stage_import_nothing_to_import',
         ...base,
       };
     }
-    const registeredSource = await this.registeredImportSource(manifest, rootPath, params.sourceId);
-    const pdfs = await this.routeStagedPdfs(stage, 'stage_import');
-    if (!pdfs.eligible.length) {
-      return { kind: 'rag_corpus_stage_import_result', status: 'pdf_sources_routed', ...base, pdf_sources: await this.importRoutedStagedPdfs(pdfs.routed) };
+    if (!eligible.length) {
+      const pdfSources = await this.importRoutedStagedPdfs(pdfs.routed);
+      return { kind: 'rag_corpus_stage_import_result', status: routedPdfStatus(pdfSources), ...base, pdf_sources: pdfSources };
     }
     const { stagedFiles, operation, warnings, resolved, importResultSink, submissionReceipt } = await this.executeStageImport({ ...stage, eligible: pdfs.eligible });
     const importResolvedCorpus = resolvedCorpusRecord(resolved);
@@ -2725,9 +2778,14 @@ export class DomainExpertService {
         }
         throw error;
       });
-    const eligible = stage?.eligible ?? [];
+    // The PDFs take the shared pipeline first; the batch is what stays. A dry run reads them from memory.
+    const derivedBytes = new Map(writePreflight.files.map((file) => [file.fileName, file.bytes]));
+    const pdfs = stage
+      ? await this.routeStagedPdfs(stage, 'web_import', registeredSource, dryRun ? (file) => derivedBytes.get(file.uploadRelativePath) : undefined)
+      : { eligible: [], routed: [] as RoutedStagedPdf[] };
+    const eligible = pdfs.eligible;
     const skipped = [...writePreflight.skipped, ...(stage?.skipped ?? [])];
-    const totalBytes = stage?.totalBytes ?? 0;
+    const totalBytes = eligible.reduce((total, file) => total + file.bytes, 0);
     const destination = stage?.destination ?? mediaDestination;
     const resolved = stage?.resolved ?? await this.resolveRagCorpus(manifest, corpusId);
     const resolvedCorpus = stage?.resolvedCorpus ?? resolvedCorpusRecord(resolved);
@@ -2797,26 +2855,27 @@ export class DomainExpertService {
       eligible_file_count: eligible.length,
       skipped_file_count: skipped.length,
       total_eligible_bytes: totalBytes,
+      ...(pdfs.routed.length ? { pdf_routing: this.stagedPdfRouting(pdfs.routed) } : {}),
       ...(resolutionWarnings.length ? { warnings: resolutionWarnings } : {}),
       policy: domainPolicy(),
     };
     if (dryRun) {
       return {
         kind: 'rag_corpus_web_import_plan',
-        status: eligible.length > 0 ? 'dry_run_web_import_ready' : 'dry_run_web_import_no_importable_files',
+        status: eligible.length > 0 || pdfs.routed.some((pdf) => pdf.route === 'split') ? 'dry_run_web_import_ready' : 'dry_run_web_import_no_importable_files',
         ...base,
       };
     }
-    if (!stage || eligible.length === 0) {
+    if (!stage || (eligible.length === 0 && pdfs.routed.length === 0)) {
       return {
         kind: 'rag_corpus_web_import_result',
         status: 'web_import_no_importable_files',
         ...base,
       };
     }
-    const pdfs = await this.routeStagedPdfs(stage, 'web_import');
-    if (!pdfs.eligible.length) {
-      return { kind: 'rag_corpus_web_import_result', status: 'pdf_sources_routed', ...base, pdf_sources: await this.importRoutedStagedPdfs(pdfs.routed) };
+    if (!eligible.length) {
+      const pdfSources = await this.importRoutedStagedPdfs(pdfs.routed);
+      return { kind: 'rag_corpus_web_import_result', status: routedPdfStatus(pdfSources), ...base, pdf_sources: pdfSources };
     }
     const { stagedFiles, operation, warnings, resolved: importResolved, importResultSink, submissionReceipt } = await this.executeStageImport({ ...stage, eligible: pdfs.eligible });
     const importResolvedCorpus = resolvedCorpusRecord(importResolved);
@@ -9213,10 +9272,19 @@ interface SourceImportContext {
 // file's identity, where a split's parts go, and how its progress is recorded.
 // Every PDF import goes through sourceHolding, routePdf and, for a long PDF,
 // ingestSplitPdf with one of these.
+// A batch whose every file was a routed PDF: imported (or present, or still
+// importing) when any was, refused when every one was.
+function routedPdfStatus(pdfSources: Array<Record<string, unknown>>): string {
+  return pdfSources.every((pdf) => pdf.status === 'blocked') ? 'pdf_sources_refused' : 'pdf_sources_routed';
+}
+
 // A staged PDF the shared pipeline took out of its batch: reported present or
 // refused, or split and imported after the batch.
 interface RoutedStagedPdf {
   entry: { workspace_relative_path: string; source_sha256: string };
+  route: 'present' | 'split' | 'refused';
+  pages?: number;
+  parts?: number;
   outcome?: Record<string, unknown>;
   split?: () => Promise<Record<string, unknown>>;
   register?: (ragIngest: Record<string, unknown>, mode: { inProgress?: boolean; recordOutcome?: boolean; progress?: boolean }) => Promise<Record<string, unknown>>;

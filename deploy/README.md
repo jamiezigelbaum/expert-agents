@@ -221,18 +221,32 @@ or for a file `qpdf` cannot read, such a PDF is refused before upload with
 `pdf_exceeds_parser_page_limit`. Worker health reports `pdf_import` as
 `degraded` while either tool is missing.
 
-Every worker route takes the same PDF pipeline: `annas_archive_import`,
-`rag_corpus import` of a GCS PDF (the worker reads the object to identify it
-and count its pages; parts go beside it as `<name>--partNofM.pdf`), and
-`stage_import` and `web_import` (a PDF already in the corpus, one to split or
-one refused leaves the batch and is reported under `pdf_sources`; parts go to
-`staged/<domain>/<batch>--parts/` after the batch import). A PDF imported by
-URI without `source_id` is registered under its sha256 as
-`<domain>-pdf-<sha prefix>`. The library materializer imports each object
-whole and does not split: under the LLM parser its CLI counts each PDF's pages
-with `qpdf` and rejects one over the limit with `pdf_exceeds_parser_page_limit`
-in the receipt's `rejectedImports` (without `qpdf` it warns and does not
-check); import such a PDF through the worker instead.
+These worker routes take the same PDF pipeline: `annas_archive_import`;
+`rag_corpus import` of one GCS PDF object, which the worker reads to identify
+it and count its pages (the worker's service account needs
+`storage.objects.get` on it; an unreadable object answers 502
+`gcs_object_unreadable`, one over 100,000,000 bytes 413
+`file_size_limit_exceeded`), with parts beside it as `<name>--partNofM.pdf`;
+and `stage_import` and `web_import`, where a PDF already in the corpus, one to
+split or one refused leaves the batch. The plan's `pdf_routing` and the
+receipt's `pdf_sources` list each such PDF with its route (`present`, `split`,
+`refused`); `eligible_files` lists only what the batch stages, and a batch of
+refused PDFs answers `pdf_sources_refused`. Parts go to
+`staged/<domain>/<batch>--parts/` after the batch import, and a staged PDF that
+is the batch's only file is registered under the `source_id` the import names.
+A PDF imported by URI without `source_id` is registered under its sha256 as
+`<domain>-pdf-<sha prefix>` and answers within the response budget. A
+`rag_corpus import` of a GCS directory (`gs://…/prefix/`) or a Drive file does
+not take the pipeline: it is imported as before, so a long PDF in it is not
+split. The library materializer imports each object whole and does not split:
+under the LLM parser its CLI counts each PDF's pages with `qpdf`, in a plan as
+in an execution, and rejects one over the limit (`pdf_exceeds_parser_page_limit`)
+or one it cannot count, including every PDF on a host without `qpdf`
+(`pdf_page_count_unavailable`), in the receipt's `rejectedImports`; import such
+a PDF through the worker instead. Registry rows written before this release
+name the split codes `annas_pdf_split_import_incomplete` and
+`annas_pdf_split_failed`; they are now `pdf_split_import_incomplete` and
+`pdf_split_failed`.
 
 Citations name the original source: a passage or citation from a registered
 object carries `source_id`, `source_part` for a split's part, and

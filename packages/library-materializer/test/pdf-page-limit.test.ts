@@ -13,7 +13,7 @@ describe("PDF page limit", () => {
   const pages = new Map([[contentIdFromBytes(longPdf), LLM_PARSER_MAX_PDF_PAGES + 1], [contentIdFromBytes(shortPdf), LLM_PARSER_MAX_PDF_PAGES]]);
   const pdf = (path: string, value: Uint8Array) => ({ path, bytes: async () => value, metadata: { ...candidateMetadata(path), mediaType: "application/pdf" } });
 
-  async function run(pdfPageLimit?: Parameters<typeof materializeScope>[0]["pdfPageLimit"]) {
+  async function run(pdfPageLimit?: Parameters<typeof materializeScope>[0]["pdfPageLimit"], execute = true) {
     const vertex = new InMemoryVertexAdapter();
     const receipt = await materializeScope({
       config: { bucket: "neutral-library-bucket", prefix: "shared/library" },
@@ -22,7 +22,7 @@ describe("PDF page limit", () => {
       candidates: [pdf("long.pdf", longPdf), pdf("short.pdf", shortPdf)],
       gcs: new InMemoryGcsAdapter(),
       vertex,
-      execute: true,
+      execute,
       ...(pdfPageLimit ? { pdfPageLimit } : {}),
     });
     return { receipt, vertex };
@@ -47,5 +47,19 @@ describe("PDF page limit", () => {
     const { receipt } = await run();
     expect(receipt.materialization.importedObjectIds).toHaveLength(2);
     expect(receipt.materialization.rejectedImports).toEqual([]);
+  });
+
+  test("a PDF whose pages cannot be counted is rejected, not imported whole", async () => {
+    const { receipt, vertex } = await run({ maxPages: LLM_PARSER_MAX_PDF_PAGES, countPages: async () => undefined });
+    expect(receipt.materialization.importedObjectIds).toEqual([]);
+    expect(receipt.materialization.rejectedImports.map((entry) => entry.reason.split(":")[0])).toEqual(["pdf_page_count_unavailable", "pdf_page_count_unavailable"]);
+    expect(vertex.importCalls).toEqual([]);
+  });
+
+  test("a plan rejects the same PDFs", async () => {
+    const { receipt, vertex } = await run({ maxPages: LLM_PARSER_MAX_PDF_PAGES, countPages: async (bytes) => pages.get(contentIdFromBytes(bytes)) }, false);
+    expect(receipt.materialization.plannedImportObjectIds).toEqual([contentIdFromBytes(shortPdf)]);
+    expect(receipt.materialization.rejectedImports.map((entry) => entry.objectId)).toEqual([contentIdFromBytes(longPdf)]);
+    expect(vertex.importCalls).toEqual([]);
   });
 });

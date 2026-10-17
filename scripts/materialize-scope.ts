@@ -90,7 +90,7 @@ export async function runMaterializeScopeCli(
     vertex,
     execute: args.execute,
     readScopeManifest: async (path) => read(path, "utf8"),
-    ...(args.execute ? pdfPageLimitFromEnv(env, dependencies.qpdfBin) : {}),
+    ...pdfPageLimitFromEnv(env, dependencies.qpdfBin),
   });
   const receiptBytes = new TextEncoder().encode(serializeMaterializationReceipt(receipt));
   assertMaterializationReceiptContainsNoSecrets(
@@ -104,22 +104,19 @@ export async function runMaterializeScopeCli(
 }
 
 // While imports use the LLM parser, PDFs longer than it takes per file are rejected before
-// import (docs/vertex-rag-limits.md); qpdf counts the pages. Without qpdf the count is skipped,
-// and the CLI says so.
+// import (docs/vertex-rag-limits.md); qpdf counts the pages. Without qpdf no PDF can be
+// counted, so every PDF import is rejected, and the CLI says so.
 function pdfPageLimitFromEnv(
   env: Record<string, string | undefined>,
   qpdfBin: string | undefined,
 ): Pick<MaterializeScopeOptions, "pdfPageLimit"> {
   if (resolveRagParserModel(env.EXPERT_AGENTS_DOMAIN_EXPERT_RAG_PARSER_MODEL) === undefined) return {};
   const qpdf = qpdfBin ?? Bun.which(env.EXPERT_AGENTS_DOMAIN_EXPERT_ANNAS_QPDF_BIN?.trim() || "qpdf") ?? undefined;
-  if (qpdf === undefined) {
-    console.warn("qpdf is not on PATH: PDF page counts are not checked, and a PDF over the LLM parser's page limit will fail inside Vertex.");
-    return {};
-  }
+  if (qpdf === undefined) console.warn("qpdf is not on PATH: PDF pages cannot be counted, so PDF imports are rejected under the LLM parser.");
   return {
     pdfPageLimit: {
       maxPages: LLM_PARSER_MAX_PDF_PAGES,
-      countPages: (bytes) => qpdfPageCount(qpdf, bytes).catch(() => undefined),
+      countPages: async (bytes) => (qpdf === undefined ? undefined : qpdfPageCount(qpdf, bytes).catch(() => undefined)),
     },
   };
 }

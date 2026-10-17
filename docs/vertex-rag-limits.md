@@ -47,9 +47,11 @@ What the worker does with it, while imports use the LLM parser:
 - a longer PDF the worker cannot split (no `qpdf`, or a file `qpdf` cannot
   read) is refused before upload with `pdf_exceeds_parser_page_limit`.
 
-Every worker import route (acquisition, `rag_corpus import` of a GCS PDF,
-`stage_import`, `web_import`) applies this. The library materializer does not
-split; it rejects a longer PDF before import with the same code.
+The worker applies this to acquisitions, to `rag_corpus import` of one GCS PDF
+object, and to the PDFs of `stage_import` and `web_import` batches. A
+`rag_corpus import` of a GCS directory or a Drive file is imported as before,
+without the check. The library materializer does not split; it rejects a
+longer PDF, or one it cannot count, before import.
 
 Worker health reports `pdf_import.status: degraded` while the LLM parser is
 configured and `qpdf` or `pdftotext` is missing.

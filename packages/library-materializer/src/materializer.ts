@@ -50,8 +50,8 @@ export interface MaterializeScopeOptions {
   readScopeManifest?: (path: string) => Promise<string>;
   // While imports use the LLM parser, the most pages one PDF may hold and how to count them
   // (docs/vertex-rag-limits.md). The materializer imports each object whole and does not
-  // split, so a longer PDF is rejected before import; one whose pages cannot be counted is
-  // imported as before.
+  // split, so a longer PDF, or one whose pages cannot be counted, is rejected before import,
+  // in a plan as in an execution.
   pdfPageLimit?: { maxPages: number; countPages: (bytes: Uint8Array) => Promise<number | undefined> };
 }
 
@@ -182,12 +182,9 @@ export async function materializeScope(options: MaterializeScopeOptions): Promis
       const recoveredRagFileId = vertexFileByUri.get(gcsUri);
       let ragFileId: string;
       if (recoveredRagFileId === undefined) {
-        const tooLong = await pdfPagesOverLimit(options, manifest, candidateById, plannedImport);
-        if (tooLong !== undefined) {
-          rejectedImports.push({
-            objectId: plannedImport.objectId,
-            reason: `pdf_exceeds_parser_page_limit: measured ${tooLong} pages; imports with the LLM parser take at most ${options.pdfPageLimit!.maxPages} pages per PDF, and the materializer does not split PDFs. Import it through the worker (rag_corpus import), which splits it into parts.`,
-          });
+        const refused = await pdfImportRefusal(options, manifest, candidateById, plannedImport);
+        if (refused !== undefined) {
+          rejectedImports.push({ objectId: plannedImport.objectId, reason: refused });
           continue;
         }
         try {
@@ -228,10 +225,16 @@ export async function materializeScope(options: MaterializeScopeOptions): Promis
     }
   }
 
+  if (!options.execute) {
+    for (const plannedImport of plan.imports) {
+      const refused = await pdfImportRefusal(options, manifest, candidateById, plannedImport);
+      if (refused !== undefined) rejectedImports.push({ objectId: plannedImport.objectId, reason: refused });
+    }
+  }
   const dedupedObjectIds = sortedUnique([...duplicateCandidateIds, ...initiallyDeduped]);
   const plannedImportObjectIds = options.execute
     ? sortedUnique([...importedObjectIds, ...recoveredObjectIds])
-    : plan.imports.map((entry) => entry.objectId);
+    : plan.imports.map((entry) => entry.objectId).filter((id) => !rejectedImports.some((rejected) => rejected.objectId === id));
   const alreadyMaterializedObjectIds = plan.alreadyMaterialized.map((entry) => entry.objectId);
   const retractions = plan.retractions.map(({ objectId }) => ({ objectId, dry_run_only: true as const }));
   const noOp = options.execute
@@ -286,21 +289,25 @@ export async function materializeScope(options: MaterializeScopeOptions): Promis
   });
 }
 
-// The page count of a planned PDF import above the limit, or undefined when it is within the
-// limit, not a PDF, not checked, or not countable.
-async function pdfPagesOverLimit(
+// Why a planned PDF import is rejected before import, or undefined when it is not
+// a PDF, no limit applies, or it is within the limit.
+async function pdfImportRefusal(
   options: MaterializeScopeOptions,
   manifest: MasterManifest,
   candidateById: Map<Sha256Id, PreparedCandidate>,
   plannedImport: { objectId: Sha256Id; relativePath: string },
-): Promise<number | undefined> {
+): Promise<string | undefined> {
   if (options.pdfPageLimit === undefined) return undefined;
   const object = manifest.objects.find((entry) => entry.id === plannedImport.objectId);
   if (object?.mediaType !== "application/pdf") return undefined;
+  const { maxPages } = options.pdfPageLimit;
   const bytes = candidateById.get(plannedImport.objectId)?.bytes ?? (await options.gcs.read(plannedImport.relativePath))?.bytes;
-  if (bytes === undefined) return undefined;
-  const pages = await options.pdfPageLimit.countPages(bytes);
-  return pages !== undefined && pages > options.pdfPageLimit.maxPages ? pages : undefined;
+  const pages = bytes === undefined ? undefined : await options.pdfPageLimit.countPages(bytes).catch(() => undefined);
+  if (pages === undefined) {
+    return `pdf_page_count_unavailable: the PDF's pages could not be counted (qpdf missing, or the file unreadable), and imports with the LLM parser take at most ${maxPages} pages per PDF. Install qpdf, or import it through the worker (rag_corpus import).`;
+  }
+  if (pages <= maxPages) return undefined;
+  return `pdf_exceeds_parser_page_limit: measured ${pages} pages; imports with the LLM parser take at most ${maxPages} pages per PDF, and the materializer does not split PDFs. Import it through the worker (rag_corpus import), which splits it into parts.`;
 }
 
 async function prepareCandidates(candidates: readonly MaterializerCandidate[]): Promise<PreparedCandidate[]> {
