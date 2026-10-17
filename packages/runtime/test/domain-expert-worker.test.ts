@@ -7758,6 +7758,19 @@ describe('splitting long PDFs for LLM-parser imports', () => {
       } finally { f.cleanup(); }
     });
 
+    // Vertex's count is not per file: a batch whose ragFiles cannot be listed is not recorded imported.
+    test('a multi-file batch whose ragFile listing fails stays requested, not imported', async () => {
+      // The listing fails only once the request is in.
+      let submitted = false;
+      const f = splitFixture(LONG, () => { submitted = true; return { importedRagFilesCount: '2' }; }, { listingStatus: () => (submitted ? 503 : undefined) });
+      try {
+        writeBatch(f.base, { 'a.md': '# A', 'b.md': '# B' });
+        const result = await stageBatch(f.worker, 'unlisted-batch');
+        expect(result.import_outcome).toMatchObject({ status: 'import_requested', hint: expect.stringContaining('could not be listed') });
+        expect(f.readRegistry().filter((record) => record.source_id === 'research-stage-import-unlisted-batch').at(-1)).toMatchObject({ ingest_status: 'import_requested' });
+      } finally { f.cleanup(); }
+    });
+
     // The listing lags imports: a copy recorded imported before it was ever listed may be there.
     test('a PDF recorded imported but never listed is held as unknown; one listed before and gone now is imported again', async () => {
       const short = textPdfBytes(120);

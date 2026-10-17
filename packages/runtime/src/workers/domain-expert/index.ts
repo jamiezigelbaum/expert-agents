@@ -3986,7 +3986,12 @@ export class DomainExpertService {
       // A request of several objects is decided file by file, by each ragFile's own state:
       // imported only when every one is ACTIVE.
       const listed = await lookUpRagFiles();
-      if (listed) {
+      if (!listed) {
+        // Vertex's count is not per file, and a counted file can still end in ERROR: with no
+        // listing the outcome stays requested, so a later check reads each file's ragFile.
+        status = 'import_requested';
+        detail = { ...detail, hint: 'Vertex counted the request, but its ragFiles could not be listed to confirm each file; check the source again once the corpus answers.' };
+      } else {
         files = listed;
         const byFile = requestOutcomeByFile(files);
         const alreadyPresent = status === 'import_empty' && byFile.status === 'imported';
