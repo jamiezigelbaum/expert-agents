@@ -188,7 +188,7 @@ describe("Google Vertex adapter request shaping", () => {
 
     expect(bodies[0]!.ragFileParsingConfig).toEqual({
       llmParser: {
-        modelName: "projects/neutral-project/locations/europe-west1/publishers/google/models/gemini-2.5-flash",
+        modelName: "projects/neutral-project/locations/global/publishers/google/models/gemini-3.5-flash-lite",
       },
     });
     expect(bodies[1]).not.toHaveProperty("ragFileParsingConfig");
@@ -203,10 +203,10 @@ describe("Google Vertex adapter request shaping", () => {
     const corpus = "projects/neutral-project/locations/europe-west1/ragCorpora/123";
     const uris = ["gs://neutral-library-bucket/shared/library/objects/book.pdf"];
 
-    const overridden = await importedConfigs(corpus, uris, "gemini-2.5-pro");
+    const overridden = await importedConfigs(corpus, uris, "gemini-3.1-flash-lite");
     expect(overridden[0]!.ragFileParsingConfig).toEqual({
       llmParser: {
-        modelName: "projects/neutral-project/locations/europe-west1/publishers/google/models/gemini-2.5-pro",
+        modelName: "projects/neutral-project/locations/global/publishers/google/models/gemini-3.1-flash-lite",
       },
     });
 
