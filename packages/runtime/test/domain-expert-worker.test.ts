@@ -6897,7 +6897,8 @@ describe('splitting long PDFs for LLM-parser imports', () => {
         ]);
         // Registering it again writes nothing.
         const again = await postDomain(f.worker, 'domain_source', REGISTER);
-        expect(again).toMatchObject({ status: 'already_registered', source_id: registered.source_id });
+        // Parts cannot prove the original's sha256, and the answer says so.
+        expect(again).toMatchObject({ status: 'already_registered', source_id: registered.source_id, identity_verified: false });
         expect(f.readRegistry()).toHaveLength(1);
 
         // The acquisition of the same file is present: nothing is uploaded or imported, even
@@ -7665,8 +7666,9 @@ describe('citations from split parts', () => {
       const result = await postDomain(worker, 'domain_ask', { domain_id: 'history', question: 'Where is it said?', output: 'passages' });
       const byUri = new Map<string, Record<string, any>>(result.passages.map((passage: Record<string, any>) => [passage.source_uri, passage]));
       // Part 2 holds original pages 195-388, so its pages 3-4 are pages 197-198 of the book.
-      expect(byUri.get(PART_URIS[1])).toMatchObject({ source_id: registered.source_id, source_part: 'part2of3', original_pages: { first_page: 197, last_page: 198, basis: 'chunk' } });
-      expect(byUri.get(PART_URIS[1])!.header).toEndWith(', pages 197-198');
+      // Hand-registered parts cannot prove the original's sha256, so the source is marked unverified.
+      expect(byUri.get(PART_URIS[1])).toMatchObject({ source_id: registered.source_id, source_part: 'part2of3', identity_verified: false, original_pages: { first_page: 197, last_page: 198, basis: 'chunk' } });
+      expect(byUri.get(PART_URIS[1])!.header).toEndWith(', pages 197-198 (source identity unverified)');
       expect(byUri.get(PART_URIS[2])).toMatchObject({ source_id: registered.source_id, original_pages: { first_page: 389, last_page: 582, basis: 'part_range' } });
       expect(byUri.get(WHOLE_URI)).toMatchObject({ original_pages: { first_page: 7, last_page: 7, basis: 'chunk' } });
       expect(byUri.get(WHOLE_URI)!.header).toEndWith(', page 7');
@@ -7747,6 +7749,54 @@ describe('citations from split parts', () => {
         ['batch-one', ['history-stage-import-batch', 2]],
         ['batch-two', ['history-stage-import-batch', 2]],
       ]));
+    } finally { fixture.cleanup(); }
+  });
+
+  // Identity is claimed only for bytes the registry proved: an object any record holds without
+  // that proof is still cited, with its source marked unverified.
+  test('an object recorded with its identity unverified is cited with the source marked unverified', async () => {
+    const fixture = workspaceFixture();
+    const object = (name: string) => `gs://fixture-shared-library/v1/library/${name}.pdf`;
+    try {
+      const registryPath = join(fixture.workspaceRoot, domainManifest('history').workspace_relative_path, 'references/source-registry.jsonl');
+      mkdirSync(dirname(registryPath), { recursive: true });
+      const sha = 'a'.repeat(64);
+      writeFileSync(registryPath, [
+        { source_id: 'history-steady', domain_id: 'history', ingest_status: 'imported', gcs_uri: object('steady-paper'), source_sha256: 'b'.repeat(64), registered_at: '2026-10-17T12:00:00.000Z' },
+        // The shape an import writes when the object's generation changed while Vertex read it.
+        { source_id: 'history-changed', domain_id: 'history', ingest_status: 'import_requested', gcs_uri: object('changing-paper'), source_sha256: sha, registered_at: '2026-10-17T12:00:00.000Z' },
+        { source_id: 'history-changed', domain_id: 'history', ingest_status: 'imported', gcs_uri: object('changing-paper'), source_sha256: sha, sha256_verified: false,
+          source_check: 'the object changed during the import (generation 1 inspected, 2 now)', registered_at: '2026-10-17T12:01:00.000Z' },
+        // A later record of the same object without the flag does not prove it.
+        { source_id: 'history-changed', domain_id: 'history', ingest_status: 'imported', gcs_uri: object('changing-paper'), source_sha256: sha, registered_at: '2026-10-17T12:02:00.000Z' },
+        { source_id: 'history-hand-split', domain_id: 'history', ingest_status: 'imported', split_parts: 2, pages: 300, sha256_verified: false, rag_files: [
+          { gcs_uri: object('hand-book--part1of2'), part: 'part1of2', first_page: 1, last_page: 150, status: 'imported' },
+          { gcs_uri: object('hand-book--part2of2'), part: 'part2of2', first_page: 151, last_page: 300, status: 'imported' },
+        ], registered_at: '2026-10-17T12:00:00.000Z' },
+      ].map((record) => JSON.stringify(record)).join('\n') + '\n');
+      const worker = createDomainExpertWorker({
+        roots: [rootPolicy(fixture.workspaceRoot)],
+        dataDir: join(fixture.base, 'data'),
+        google: {
+          accessToken: 'fixture-google-token',
+          fetchImpl: fakeGoogleFetch([], {
+            ragCorpora: [{ name: corpusResource, displayName: 'history-library' }],
+            contexts: () => ['steady-paper', 'changing-paper', 'hand-book--part2of2'].map((name) => ({
+              sourceUri: object(name), sourceDisplayName: name, text: `${name} passage.`, score: 0.1, chunk: { text: 'x', pageSpan: { firstPage: 2, lastPage: 2 } },
+            })),
+          }),
+        },
+      });
+      const result = await postDomain(worker, 'domain_ask', { domain_id: 'history', question: 'Where is it said?', output: 'passages' });
+      const byName = new Map<string, Record<string, any>>(result.passages.map((passage: Record<string, any>) => [passage.source_display_name, passage]));
+      expect(byName.get('steady-paper')).toMatchObject({ source_id: 'history-steady' });
+      expect(byName.get('steady-paper')!.identity_verified).toBeUndefined();
+      expect(byName.get('steady-paper')!.header).not.toContain('unverified');
+      for (const [name, sourceId] of [['changing-paper', 'history-changed'], ['hand-book--part2of2', 'history-hand-split']] as const) {
+        expect(byName.get(name)).toMatchObject({ source_id: sourceId, identity_verified: false });
+        expect(byName.get(name)!.header).toContain('(source identity unverified)');
+      }
+      expect(byName.get('hand-book--part2of2')!.original_pages).toMatchObject({ first_page: 152 });
     } finally { fixture.cleanup(); }
   });
 

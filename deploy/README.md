@@ -231,7 +231,12 @@ it and count its pages (the worker's service account needs
 reads the URI after the worker inspected it, so once the import settles the
 worker reads the object's generation again: if it changed, the record keeps the
 inspected sha256 but says `sha256_verified: false` with `source_check`, and the
-result reports `source_changed_during_import`;
+result reports `source_changed_during_import`. Identity is claimed only for
+bytes the registry proved: an object any of its source's records holds with
+`sha256_verified: false` (a hand split's parts, an object that changed during
+its import) is matched with `identity_verified: false` and cited with its
+`source_id` and `identity_verified: false`, its citation header ending
+`(source identity unverified)`;
 and `stage_import` and `web_import`, where a PDF already in the corpus, one to
 split or one refused leaves the batch. The plan's `pdf_routing` and the
 receipt's `pdf_sources` list each such PDF with its route (`present`, `split`,
@@ -319,7 +324,7 @@ original page range, and writes one `imported` record
 sha256; a split's parts cannot prove it, so their record says
 `sha256_verified: false` and an import that matches it reports
 `identity_verified: false`. The same call again answers `already_registered`
-and writes nothing; a different holding for the same sha256, or the same one in
+(with `identity_verified: false` for such a split) and writes nothing; a different holding for the same sha256, or the same one in
 another corpus, is refused with `source_identity_conflict`. A record written
 before sources carried a sha256 that holds the same objects is updated rather
 than duplicated. A book already imported whole before sources carried their

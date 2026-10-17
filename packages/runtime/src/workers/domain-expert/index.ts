@@ -1361,7 +1361,11 @@ export class DomainExpertService {
       const uri = uris[index];
       if (!uri) return {};
       const holding = holdings.get(uri);
-      const fields: Record<string, unknown> = holding ? { sourceId: holding.source_id, ...(holding.part ? { sourcePart: holding.part } : {}) } : {};
+      const fields: Record<string, unknown> = holding ? {
+        sourceId: holding.source_id,
+        ...(holding.part ? { sourcePart: holding.part } : {}),
+        ...(holding.unverified ? { sourceIdentityVerified: false } : {}),
+      } : {};
       if (!isPdfUri(uri)) return fields;
       const span = chunkPageSpan(context);
       // A part recorded without its range (#37): its offset in the original is unknown.
@@ -1383,8 +1387,8 @@ export class DomainExpertService {
   // split's part, its range in the original file. An unreadable registry maps nothing.
   private async registeredHoldingsByUri(
     manifest: ReturnType<typeof domainManifest>,
-  ): Promise<Map<string, { source_id: string; part?: string; first_page?: number; last_page?: number }>> {
-    const holdings = new Map<string, { source_id: string; part?: string; first_page?: number; last_page?: number }>();
+  ): Promise<Map<string, CitedHolding>> {
+    const holdings = new Map<string, CitedHolding>();
     const root = this.roots.get(manifest.workspace_root_id);
     if (!root) return holdings;
     let records: DomainSourceRegistryRecord[];
@@ -1400,12 +1404,15 @@ export class DomainExpertService {
       if (!withObjects.length) continue;
       const record = latestDomainSourceRecord(withObjects).record;
       const holding = recordedSourceHolding(record);
-      if (holding?.whole) holdings.set(holding.whole.gcs_uri, { source_id: sourceId });
+      // An object any record registered without proof of its sha256 (a hand split, an object
+      // that changed during its import) is cited with its source marked unverified.
+      const cited = (uri: string) => ({ source_id: sourceId, ...(heldUnverified(history, [uri]) ? { unverified: true } : {}) });
+      if (holding?.whole) holdings.set(holding.whole.gcs_uri, cited(holding.whole.gcs_uri));
       // A batch record lists several whole objects; each is cited under the record's source
       // unless a source of its own (registered by its sha256) names it too.
       if (!holding?.parts) {
         for (const uri of registryRecordGcsUris(record)) if (!holdings.has(uri) || batchCited.has(uri)) {
-          holdings.set(uri, { source_id: sourceId });
+          holdings.set(uri, cited(uri));
           if (registryRecordGcsUris(record).length > 1) batchCited.add(uri);
           else batchCited.delete(uri);
         }
@@ -1416,7 +1423,7 @@ export class DomainExpertService {
         : holding?.parts ?? [];
       for (const part of parts) {
         holdings.set(part.gcs_uri, {
-          source_id: sourceId, part: part.name,
+          ...cited(part.gcs_uri), part: part.name,
           ...(part.first_page !== undefined && part.last_page !== undefined ? { first_page: part.first_page, last_page: part.last_page } : {}),
         });
       }
@@ -1953,6 +1960,7 @@ export class DomainExpertService {
         action: 'add',
         domain_id: manifest.domain_id,
         source_id: existing.sourceId,
+        ...(existing.unverified ? { identity_verified: false } : {}),
         source_record: existing.current,
         registry_relative_path: registryRelativePath,
         policy: domainPolicy(),
@@ -4517,8 +4525,9 @@ export class DomainExpertService {
     const verification = listed ? 'corpus' : 'registry';
     const unverified = {
       ...(listingError ? { corpus_check_error: listingError } : {}),
-      // Registered from a split's parts: the sha256 is the operator's, not measured.
-      ...(found.holding?.sha256_verified === false ? { identity_verified: false } : {}),
+      // Any record of these objects without proof of the sha256 (a hand split, an object
+      // that changed during its import) leaves the identity unverified.
+      ...(found.unverified ? { identity_verified: false } : {}),
     };
     // A source keeps one holding: one recorded in another corpus is not imported again here.
     const recordedCorpus = stringRecordField(found.holding ?? {}, 'target_corpus_id');
@@ -9660,7 +9669,7 @@ function sourceForIdentity(
   records: DomainSourceRegistryRecord[],
   sha256: string,
   legacyLocator: string | undefined,
-): { sourceId: string; current: Record<string, unknown>; holding: Record<string, unknown> | undefined; viaBatchEntry: boolean } | undefined {
+): { sourceId: string; current: Record<string, unknown>; holding: Record<string, unknown> | undefined; viaBatchEntry: boolean; unverified: boolean } | undefined {
   const bySha: Array<DomainSourceRegistryRecord[]> = [];
   const byLocator: Array<DomainSourceRegistryRecord[]> = [];
   for (const history of groupDomainSourceRecords(records).values()) {
@@ -9684,6 +9693,7 @@ function sourceForIdentity(
     // The file is one entry of a record that lists several, such as a staged batch.
     viaBatchEntry: holding !== undefined && holding.source_sha256 !== sha256 && Array.isArray(holding.rag_files)
       && holding.rag_files.length > 1 && typeof holding.split_parts !== 'number',
+    unverified: holding !== undefined && heldUnverified(history.entries, registryRecordGcsUris(holding)),
   };
 }
 
@@ -9764,7 +9774,7 @@ function sourceHoldingObjects(records: DomainSourceRegistryRecord[], uris: strin
     const holding = latestDomainSourceRecord(holdings).record;
     const recorded = recordedSourceHolding(holding);
     const held = recorded?.whole ? [recorded.whole.gcs_uri] : recorded?.parts.map((part) => part.gcs_uri) ?? [];
-    if (held.join('\n') === uris.join('\n')) return { sourceId: current.sourceId, current: current.record, holding, viaBatchEntry: false };
+    if (held.join('\n') === uris.join('\n')) return { sourceId: current.sourceId, current: current.record, holding, viaBatchEntry: false, unverified: heldUnverified(history, held) };
   }
   return undefined;
 }
@@ -9819,6 +9829,10 @@ function heldUnverified(history: DomainSourceRegistryRecord[], uris: string[]): 
   const unverified = new Set(history.filter((entry) => entry.record.sha256_verified === false).flatMap((entry) => registryRecordGcsUris(entry.record)));
   return uris.some((uri) => unverified.has(uri));
 }
+
+// A corpus object as citations attribute it: its source, a split's part and range, and
+// whether the registry ever recorded it without proof of the source's sha256.
+interface CitedHolding { source_id: string; part?: string; first_page?: number; last_page?: number; unverified?: boolean }
 
 // The objects a registry record holds: its gcs_uri, or each entry of its rag_files list.
 function registryRecordGcsUris(record: Record<string, unknown>): string[] {
@@ -10602,7 +10616,9 @@ function citationHeader(context: Record<string, unknown>): string {
     : String(context.sourceDisplayName ?? context.sourceUri ?? 'source');
   const pages = asOptionalRecord(context.originalPages);
   const range = pages ? (pages.first === pages.last ? `, page ${String(pages.first)}` : `, pages ${String(pages.first)}-${String(pages.last)}`) : '';
-  return `[${String(context.citation_id)}] ${display}${range}`;
+  // The object is cited, but the registry cannot prove it holds that source's bytes.
+  const unverified = context.sourceIdentityVerified === false ? ' (source identity unverified)' : '';
+  return `[${String(context.citation_id)}] ${display}${range}${unverified}`;
 }
 
 // The original source and pages a citation resolves to (see originalSourcePages).
@@ -10611,6 +10627,8 @@ function citationOriginalFields(context: Record<string, unknown>): Record<string
   return {
     ...(typeof context.sourceId === 'string' ? { source_id: context.sourceId } : {}),
     ...(typeof context.sourcePart === 'string' ? { source_part: context.sourcePart } : {}),
+    // The object is cited, but the registry cannot prove it holds that source's bytes.
+    ...(context.sourceIdentityVerified === false ? { identity_verified: false } : {}),
     ...(pages ? { original_pages: { first_page: pages.first, last_page: pages.last, basis: pages.basis } } : {}),
   };
 }
