@@ -84,8 +84,8 @@ export const researchToolSchemas: Record<DomainExpertTool, ToolParameterSchema> 
     limit: count('Per-call limit: read characters (default 12000, max 24000, min 2); open/catalog items (default 100, max 200); find matches (default 20, max 100).', 1, 24000),
   }, ['action']),
 
-  domain_source: schema('Manage source registry metadata. add does not ingest bytes or make a source searchable; follow with a supported rag_corpus import operation.', {
-    action: choice(DOMAIN_SOURCE_ACTIONS, 'add requires url or relative_path; status/remove require source_id; list reads the registry.'),
+  domain_source: schema('Manage source registry metadata. add does not ingest bytes or make a source searchable; follow with a supported rag_corpus import operation. add with sha256 and gcs_uris instead registers objects already in the corpus (for example a book split by hand and imported outside the worker), so imports find the source present.', {
+    action: choice(DOMAIN_SOURCE_ACTIONS, 'add requires url, relative_path or gcs_uris; status/remove require source_id; list reads the registry.'),
     domain_id: domainId,
     source_id: text('Stable source identifier; required for status and remove.'),
     kind: choice(DOMAIN_SOURCE_KINDS, 'Source media/category.'),
@@ -96,6 +96,8 @@ export const researchToolSchemas: Record<DomainExpertTool, ToolParameterSchema> 
     corpus_id: corpusId,
     trust_posture: text('Explicit source trust classification.'),
     copyright_posture: text('Explicit source rights/use classification.'),
+    sha256: text('SHA-256 of the original source file (64 lowercase hex characters), the source\'s identity across import routes; required with gcs_uris.'),
+    gcs_uris: strings('add only: gs:// objects already in the corpus that hold this source, one whole file or a split\'s PDF parts in page order. Each must have an ACTIVE ragFile; PDF pages are counted to record each part\'s original page range.'),
     include_history: flag('Include prior registry records.'),
     include_removed: flag('Include removed sources.'),
     dry_run: dryRun,
