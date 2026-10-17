@@ -77,13 +77,7 @@ export class DomainExpertClient {
   }
 
   async run(tool: DomainExpertTool, params: Record<string, unknown>): Promise<unknown> {
-    if (!this.config.domainExpert.enabled) {
-      throw new OperationError(
-        'domain_expert_not_configured',
-        'Domain expert worker is disabled.',
-        'Configure the bounded domain expert worker before live Google/Gemini/Docs/Anna actions.',
-      );
-    }
+    this.requireEnabled();
     // Live model traffic sometimes omits domain_id. This runtime is
     // tenant-neutral, so its own default domain is unrouted and the omission
     // fails closed with an error naming the wrong remedy. Which expert a
@@ -105,6 +99,24 @@ export class DomainExpertClient {
     });
     assertDomainExpertPolicy(response);
     return response;
+  }
+
+  /** The worker's authenticated health report, including its Google configuration status. */
+  async health(): Promise<unknown> {
+    this.requireEnabled();
+    const response = await this.transport.requestJson(`${this.config.domainExpert.baseUrl}/health`, { method: 'GET' });
+    assertDomainExpertPolicy(response);
+    return response;
+  }
+
+  private requireEnabled(): void {
+    if (!this.config.domainExpert.enabled) {
+      throw new OperationError(
+        'domain_expert_not_configured',
+        'Domain expert worker is disabled.',
+        'Configure the bounded domain expert worker before live Google/Gemini/Docs/Anna actions.',
+      );
+    }
   }
 }
 
