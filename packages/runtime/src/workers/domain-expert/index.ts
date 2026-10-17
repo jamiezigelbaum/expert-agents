@@ -2369,6 +2369,10 @@ export class DomainExpertService {
     const namedSource = params.sourceId
       ? await this.registeredImportSource(manifest, await checkedRootPath(this.rootFor(manifest.workspace_root_id)), params.sourceId)
       : undefined;
+    // A named source that records another file's sha256 is another source.
+    if (typeof namedSource?.source_sha256 === 'string' && namedSource.source_sha256 !== digest) {
+      throw new DomainExpertWorkerError(409, 'source_identity_conflict', `Source ${String(namedSource.source_id)} records a different file (sha256 ${namedSource.source_sha256.slice(0, 12)}) than ${gcsUri} (sha256 ${digest.slice(0, 12)}). Nothing was imported.`, 'Import it without source_id, or under the source that is this file.');
+    }
     const context: SourceImportContext = { sha256: digest, ...(namedSource ? { sourceId: String(namedSource.source_id) } : {}) };
     const named = parseObjectNameUri(gcsUri);
     const catalogue = namedSource
@@ -2411,7 +2415,9 @@ export class DomainExpertService {
       const result = await this.ragCorpus(params, { wholeObject: true, sourceSha256: digest, identitySource: { ...catalogue, source_id: context.sourceId ?? catalogue.source_id } });
       return { ...asOptionalRecord(result), source_sha256: digest };
     }
-    const work = this.ingestSplitPdf(source, { ...route, bytes });
+    // An unexpected throw still ends the run with a record.
+    const work = this.ingestSplitPdf(source, { ...route, bytes })
+      .catch((error: unknown): Record<string, unknown> => ({ status: 'blocked', ...corpusTarget, error: ingestErrorRecord(error) }));
     const settled = await this.raceResponseBudget(work);
     if (settled) return { ...base, ...settled, source_registry: await register(settled, {}), policy: domainPolicy() };
     const registry = await register(context.snapshot ?? { status: 'import_in_progress', ...corpusTarget }, { inProgress: true });
@@ -2500,6 +2506,14 @@ export class DomainExpertService {
         recordProgress: (snapshot) => register(snapshot, { progress: true }),
       };
       const entry = { workspace_relative_path: file.workspaceRelativePath, source_sha256: digest };
+      if (named && typeof named.source_sha256 === 'string' && named.source_sha256 !== digest) {
+        routed.push({ entry, route: 'refused', outcome: { status: 'blocked', error: {
+          code: 'source_identity_conflict',
+          message: `Source ${String(named.source_id)} records a different file (sha256 ${named.source_sha256.slice(0, 12)}) than ${file.workspaceRelativePath}. Nothing was imported.`,
+          suggestion: 'Stage it without source_id, or under the source that is this file.',
+        } } });
+        continue;
+      }
       const holding = await this.sourceHolding(source);
       if (holding.kind === 'present') {
         routed.push({ entry, route: 'present', register, outcome: { status: 'imported', target_corpus_id: corpusId, ...holding.result } });
@@ -2534,7 +2548,8 @@ export class DomainExpertService {
     const splits = routed.flatMap((pdf, index) => (pdf.split ? [{ pdf, index }] : []));
     const work = (async () => {
       for (const { pdf, index } of splits) {
-        const outcome = await pdf.split!();
+        // An unexpected throw still ends that PDF's run with a record.
+        const outcome = await pdf.split!().catch((error: unknown): Record<string, unknown> => ({ status: 'blocked', error: ingestErrorRecord(error) }));
         const registry = await pdf.register!(outcome, {});
         results[index] = { ...pdf.entry, route: pdf.route, ...outcome, source_registry: registry };
       }

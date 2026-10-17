@@ -7095,6 +7095,33 @@ describe('splitting long PDFs for LLM-parser imports', () => {
       } finally { f.cleanup(); }
     });
 
+    test('rag_corpus import of a long GCS PDF whose parts all fail records its end', async () => {
+      const f = splitFixture(LONG, () => ({ error: { code: 13, message: 'An internal error occurred processing the file.' } }), { importPollTimeoutMs: 30, seed: { objects: [[OBJECT, LONG]] } });
+      try {
+        const response = await postDomain(f.worker, 'rag_corpus', { action: 'import', domain_id: 'research', corpus_id: CORPUS, gcs_uri: `gs://fixture-shared-library/${OBJECT}`, dry_run: false });
+        expect(response).toMatchObject({ status: 'import_failed', source_registry: { status: 'updated' } });
+        expect(f.readRegistry().at(-1)).toMatchObject({ ingest_status: 'import_failed', ingest_reason: 'pdf_split_import_incomplete' });
+      } finally { f.cleanup(); }
+    });
+
+    test('a named source that records another file is not given this one', async () => {
+      const f = splitFixture(LONG, importsAll, { seed: { objects: [[OBJECT, LONG]] } });
+      try {
+        await postDomain(f.worker, 'domain_source', { action: 'add', domain_id: 'research', source_id: 'other-file', kind: 'pdf', url: 'https://example.com/other', sha256: 'c'.repeat(64), dry_run: false });
+        const refused = await postDomainResponse(f.worker, 'rag_corpus', { action: 'import', domain_id: 'research', corpus_id: CORPUS, gcs_uri: `gs://fixture-shared-library/${OBJECT}`, source_id: 'other-file', dry_run: false });
+        expect(refused.status).toBe(409);
+        expect(((await refused.json()) as Record<string, any>).error.code).toBe('source_identity_conflict');
+        const batchDir = join(f.base, 'workspace', 'experts', 'research', 'sources', 'batch');
+        mkdirSync(batchDir, { recursive: true });
+        writeFileSync(join(batchDir, 'long-volume.pdf'), LONG);
+        const staged = await postDomain(f.worker, 'rag_corpus', {
+          action: 'stage_import', domain_id: 'research', corpus_id: CORPUS, workspace_relative_path: 'experts/research/sources/batch', batch_id: 'named-other', source_id: 'other-file', dry_run: false,
+        });
+        expect(staged).toMatchObject({ status: 'pdf_sources_refused', pdf_sources: [{ route: 'refused', error: { code: 'source_identity_conflict' } }] });
+        expect(f.importedUris()).toEqual([]);
+      } finally { f.cleanup(); }
+    });
+
     test('rag_corpus import of a long GCS PDF the worker cannot split is refused before import', async () => {
       const f = splitFixture(LONG, importsAll, { qpdfBin: 'qpdf-missing-fixture', seed: { objects: [[OBJECT, LONG]] } });
       try {
