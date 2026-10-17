@@ -7243,6 +7243,29 @@ describe('splitting long PDFs for LLM-parser imports', () => {
       } finally { f.cleanup(); }
     }, 60_000);
 
+    // A dry run writes nothing, so a planned PDF carries its own bytes; a long name the staging
+    // path shortens must not lose them.
+    test('a web_import dry run routes a fetched long PDF whose name staging shortens', async () => {
+      const fixture = workspaceFixture();
+      const name = `${'a-very-long-fixture-volume-title-'.repeat(4)}final.pdf`;
+      try {
+        const worker = createDomainExpertWorker({
+          roots: [rootPolicy(fixture.workspaceRoot)],
+          dataDir: join(fixture.base, 'data'),
+          google: { accessToken: 'fixture-google-token', fetchImpl: splitGoogleFetch([], importsAll) },
+          resolveHostImpl: async () => ['93.184.216.34'],
+          webImportFetchImpl: async () => new Response(new Blob([LONG as Uint8Array<ArrayBuffer>]), { status: 200, headers: { 'content-type': 'application/pdf' } }),
+        });
+        const plan = await postDomain(worker, 'rag_corpus', {
+          action: 'web_import', domain_id: 'research', corpus_id: CORPUS, urls: [`https://files.example/${name}`], batch_id: 'long-name', dry_run: true,
+        });
+        expect(plan.status).toBe('dry_run_web_import_ready');
+        expect(plan.pdf_routing).toMatchObject([{ route: 'split', pages: 450, parts: 3, source_sha256: sha256Hex(LONG) }]);
+        expect(plan.eligible_files).toEqual([]);
+        expect(existsSync(join(fixture.workspaceRoot, 'experts', 'research', 'sources', 'web-imports'))).toBe(false);
+      } finally { fixture.cleanup(); }
+    });
+
     test('a batch of refused PDFs reports them refused', async () => {
       const f = splitFixture(LONG, importsAll, { qpdfBin: 'qpdf-missing-fixture' });
       writeBatch(f.base, { 'long-volume.pdf': LONG });

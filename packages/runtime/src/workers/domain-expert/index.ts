@@ -390,6 +390,8 @@ interface StageImportEligibleFile {
   uploadRelativePath: string;
   absolutePath: string;
   bytes: number;
+  // The file's bytes, for a planned file not yet written (a dry-run web import's derivatives).
+  content?: Uint8Array;
   objectName: string;
   gcsUri: string;
 }
@@ -2477,8 +2479,6 @@ export class DomainExpertService {
     action: 'stage_import' | 'web_import',
     // The source the import names: it is the PDF's source when the PDF is the batch's only file.
     namedSource?: Record<string, unknown>,
-    // A dry run's files are not written yet; their bytes come from here.
-    bytesOf?: (file: StageImportEligibleFile) => Uint8Array | undefined,
   ): Promise<{ eligible: StageImportEligibleFile[]; routed: RoutedStagedPdf[] }> {
     const { manifest } = stage;
     const corpusId = stage.resolved.requested;
@@ -2490,7 +2490,8 @@ export class DomainExpertService {
         eligible.push(file);
         continue;
       }
-      const bytes = bytesOf?.(file) ?? new Uint8Array(await readFile(file.absolutePath));
+      // A dry run's derived files are not written; they carry their bytes.
+      const bytes = file.content ?? new Uint8Array(await readFile(file.absolutePath));
       const digest = sha256(bytes);
       const context: SourceImportContext = { sha256: digest, ...(named ? { sourceId: String(named.source_id) } : {}) };
       const name = basename(file.uploadRelativePath).replace(/\.pdf$/i, '');
@@ -2824,10 +2825,9 @@ export class DomainExpertService {
         }
         throw error;
       });
-    // The PDFs take the shared pipeline first; the batch is what stays. A dry run reads them from memory.
-    const derivedBytes = new Map(writePreflight.files.map((file) => [file.fileName, file.bytes]));
+    // The PDFs take the shared pipeline first; the batch is what stays.
     const pdfs = stage
-      ? await this.routeStagedPdfs(stage, 'web_import', registeredSource, dryRun ? (file) => derivedBytes.get(file.uploadRelativePath) : undefined)
+      ? await this.routeStagedPdfs(stage, 'web_import', registeredSource)
       : { eligible: [], routed: [] as RoutedStagedPdf[] };
     // The batch cap counts only what the batch stages.
     const batch = capStagedBatch(pdfs.eligible);
@@ -2990,6 +2990,7 @@ export class DomainExpertService {
       uploadRelativePath: file.fileName,
       absolutePath: resolveInside(input.importPath, file.fileName),
       bytes: file.bytes.byteLength,
+      content: file.bytes,
     }));
     const { eligible, skipped, totalBytes } = planStageImportCandidates(
       candidates,
@@ -8103,6 +8104,7 @@ function planStageImportCandidates(
     uploadRelativePath: string;
     absolutePath: string;
     bytes: number;
+    content?: Uint8Array;
   }>,
   destinationBucket: string,
   destinationObjectPrefix: string,
@@ -8157,6 +8159,7 @@ function planStageImportCandidates(
       uploadRelativePath,
       absolutePath: file.absolutePath,
       bytes: file.bytes,
+      ...(file.content ? { content: file.content } : {}),
       objectName,
       gcsUri: `gs://${destinationBucket}/${objectName}`,
     });
