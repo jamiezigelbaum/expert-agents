@@ -959,8 +959,9 @@ describe('RAG ingestion configuration', () => {
         .toEqual(uploaded.map((name) => `gs://fixture-shared-library/${name}`));
       // The import names exactly the staged objects, and the ERROR cleanup
       // matches them, so shortening a name never moves a file out of their reach.
-      const importConfig = JSON.parse(calls.find((call) => call.url.endsWith('/ragFiles:import'))!.body).importRagFilesConfig;
-      expect([...importConfig.gcsSource.uris].sort()).toEqual(uploaded.map((name) => `gs://fixture-shared-library/${name}`).sort());
+      const imported = calls.filter((call) => call.url.endsWith('/ragFiles:import'))
+        .flatMap((call) => JSON.parse(call.body).importRagFilesConfig.gcsSource.uris as string[]);
+      expect([...imported].sort()).toEqual(uploaded.map((name) => `gs://fixture-shared-library/${name}`).sort());
       expect(calls.filter((call) => call.method === 'DELETE').map((call) => call.url))
         .toEqual([`https://us-central1-aiplatform.googleapis.com/v1/${stagedErrorFile}`]);
     } finally {
@@ -6466,14 +6467,22 @@ describe('splitting long PDFs for LLM-parser imports', () => {
           ? [...objects.keys()].filter((name) => name.startsWith(target.replace('gs://fixture-shared-library/', ''))).map((name) => `gs://fixture-shared-library/${name}`)
           : [target]));
         const fresh = files.filter((file) => !imported.has(file) && !errored.has(file));
+        // failUris: objects (by URI suffix) Vertex fails to embed while it imports the rest.
+        const failUris = Array.isArray(chosen.failUris) ? chosen.failUris as string[] : [];
+        const failing = fresh.filter((file) => failUris.some((suffix) => file.endsWith(suffix)));
         const outcome = fresh.length === 0 ? { skippedRagFilesCount: String(files.length) }
           : files.length > 1 && 'importedRagFilesCount' in chosen
-            ? { importedRagFilesCount: String(fresh.length), ...(fresh.length < files.length ? { skippedRagFilesCount: String(files.length - fresh.length) } : {}) }
+            ? {
+              importedRagFilesCount: String(fresh.length - failing.length),
+              ...(failing.length ? { failedRagFilesCount: String(failing.length) } : {}),
+              ...(fresh.length < files.length ? { skippedRagFilesCount: String(files.length - fresh.length) } : {}),
+            }
             : chosen;
         operations += 1;
         for (const [index, file] of files.entries()) {
           if (imported.has(file) || errored.has(file)) continue;
-          if ('importedRagFilesCount' in outcome) imported.set(file, `${CORPUS}/ragFiles/${9000 + operations}${index ? `-${index}` : ''}`);
+          if (failing.includes(file)) errored.set(file, `${CORPUS}/ragFiles/${7000 + operations}${index ? `-${index}` : ''}`);
+          else if ('importedRagFilesCount' in outcome) imported.set(file, `${CORPUS}/ragFiles/${9000 + operations}${index ? `-${index}` : ''}`);
           if ('error' in outcome) errored.set(file, `${CORPUS}/ragFiles/${7000 + operations}${index ? `-${index}` : ''}`);
         }
         return jsonResponse({ name: `${CORPUS}/operations/split-${operations}`, done: true, ...(('error' in outcome) ? { error: outcome.error } : { response: outcome }) });
@@ -7618,6 +7627,56 @@ describe('splitting long PDFs for LLM-parser imports', () => {
       } finally { f.cleanup(); }
     });
 
+    // A request of several objects counts as imported only when every one of them is.
+    test('a request with one ACTIVE and one ERROR file is partial, and a retry imports only the failed one', async () => {
+      const short = textPdfBytes(120);
+      const f = splitFixture(LONG, (_part, attempt) => (attempt === 1 ? { importedRagFilesCount: '1', failUris: ['/broken.md'] } : { importedRagFilesCount: '1' }));
+      try {
+        writeBatch(f.base, { 'good.md': '# Good', 'broken.md': '# Broken', 'paper.pdf': short });
+        const batch = 'gs://fixture-shared-library/v1/staged/research/partial-batch/';
+        const good = stagedObject(batch, 'good.md', '# Good');
+        const broken = stagedObject(batch, 'broken.md', '# Broken');
+        const paper = stagedObject(batch, 'paper.pdf', short);
+        const first = await stageBatch(f.worker, 'partial-batch');
+        expect(first.import_outcome).toMatchObject({ status: 'import_partial', requests: [{ status: 'import_partial', gcs_uri_count: 2 }, { status: 'imported', gcs_uri_count: 1 }] });
+        const record = f.readRegistry().filter((entry) => entry.source_id === 'research-stage-import-partial-batch').at(-1)!;
+        expect(record.ingest_status).toBe('import_partial');
+        expect(new Map(record.rag_files.map((file: Record<string, any>) => [file.gcs_uri, [file.state, file.status]]))).toEqual(new Map([
+          [good, ['ACTIVE', 'imported']], [broken, ['ERROR', 'import_failed']], [paper, ['ACTIVE', 'imported']],
+        ]));
+        // The PDF imported: another batch with it finds it present.
+        const retryDir = join(f.base, 'workspace', 'experts', 'research', 'sources', 'retry');
+        mkdirSync(retryDir, { recursive: true });
+        writeFileSync(join(retryDir, 'paper.pdf'), short);
+        const other = await postDomain(f.worker, 'rag_corpus', {
+          action: 'stage_import', domain_id: 'research', corpus_id: CORPUS, workspace_relative_path: 'experts/research/sources/retry', batch_id: 'other-batch', dry_run: false,
+        });
+        expect(other.pdf_sources).toMatchObject([{ route: 'present', status: 'imported' }]);
+        // The batch again: the ERROR file is imported anew; the ACTIVE ones keep their URIs and are skipped.
+        const again = await stageBatch(f.worker, 'partial-batch');
+        // The PDF is present now, so one request remains: the Markdown files.
+        expect(again.pdf_sources).toMatchObject([{ route: 'present' }]);
+        expect(again.import_outcome).toMatchObject({ status: 'imported', imported_rag_files_count: 1, skipped_rag_files_count: 1 });
+        expect(f.importRequests().at(-1)!.sort()).toEqual([broken, good].sort());
+        expect(f.readRegistry().filter((entry) => entry.source_id === 'research-stage-import-partial-batch').at(-1)!.ingest_status).toBe('imported');
+      } finally { f.cleanup(); }
+    });
+
+    // The parser applies per request: a PDF batched with Markdown keeps the LLM parser.
+    test('a mixed batch imports its PDF in a request of its own, with the LLM parser', async () => {
+      const short = textPdfBytes(120);
+      const f = splitFixture(LONG, importsAll);
+      try {
+        writeBatch(f.base, { 'note.md': '# A note', 'paper.pdf': short });
+        await stageBatch(f.worker, 'mixed-batch');
+        const batch = 'gs://fixture-shared-library/v1/staged/research/mixed-batch/';
+        const configs = f.googleCalls.filter((call) => call.url.endsWith('/ragFiles:import')).map((call) => JSON.parse(call.body).importRagFilesConfig);
+        expect(configs.map((config) => config.gcsSource.uris)).toEqual([[stagedObject(batch, 'note.md', '# A note')], [stagedObject(batch, 'paper.pdf', short)]]);
+        expect(configs[0].ragFileParsingConfig).toBeUndefined();
+        expect(configs[1].ragFileParsingConfig).toMatchObject({ llmParser: expect.any(Object) });
+      } finally { f.cleanup(); }
+    });
+
     test('two concurrent resumes of the same partial split import each part once', async () => {
       const f = splitFixture(LONG, (part, attempt) => (part !== 'part1of3' && attempt === 1
         ? { error: { code: 13, message: 'An internal error occurred processing the file.' } }
@@ -7681,7 +7740,9 @@ describe('splitting long PDFs for LLM-parser imports', () => {
         expect(second.pdf_sources).toMatchObject([{ route: 'split', status: 'imported' }]);
         const parts = [1, 2, 3].map((index) => `gs://fixture-shared-library/v1/staged/research/retry-batch--parts/volume--part${index}of3.pdf`);
         // The earlier whole copy is never named again; the note keeps its URI and is skipped.
-        expect(f.importRequests().slice(1)).toEqual([[note], ...parts.map((part) => [part])]);
+        // The first run imported the note and the short PDF in requests of their own parsers.
+        expect(f.importRequests().slice(0, 2)).toEqual([[note], [shortCopy]]);
+        expect(f.importRequests().slice(2)).toEqual([[note], ...parts.map((part) => [part])]);
         expect(second.import_outcome).toMatchObject({ status: 'imported', already_present: true });
         expect(storageDeletes(f.googleCalls)).toEqual([]);
       } finally { f.cleanup(); }
@@ -7735,7 +7796,9 @@ describe('splitting long PDFs for LLM-parser imports', () => {
         const latest = f.readRegistry().filter((record) => record.source_id === 'research-stage-import-retry-batch').at(-1)!;
         const recorded = latest.rag_files.find((file: Record<string, any>) => file.gcs_uri === stagedObject(BATCH, 'b.md', '# B, revised'));
         expect(recorded.rag_file_name).toBeUndefined();
-        expect(latest.verification).toContain('ragFiles 1 ACTIVE, 1 not listed');
+        // An object whose ragFile cannot be told apart is not counted as imported.
+        expect(second.import_outcome.status).toBe('import_partial');
+        expect(latest).toMatchObject({ ingest_status: 'import_partial', ingest_reason: expect.stringContaining('1 of 2 files are ACTIVE') });
       } finally { f.cleanup(); }
     });
 
@@ -7765,7 +7828,8 @@ describe('splitting long PDFs for LLM-parser imports', () => {
         expect(stagedUris(second)).toEqual([stagedObject(BATCH, 'note.md', '# A note, revised')]);
         // The second run imported first, while the first run's objects sat staged; each request named only its own run's files.
         const requests = f.importRequests().filter((uris) => !uris.some((uri) => uri.includes('--parts/')));
-        expect(requests.map((uris) => [...uris].sort())).toEqual([stagedUris(second), stagedUris(first)]);
+        expect(requests[0]).toEqual(stagedUris(second));
+        expect(requests.slice(1).flat().sort()).toEqual(stagedUris(first));
         expect(first.import_outcome).toMatchObject({ status: 'imported' });
         expect(second.import_outcome).toMatchObject({ status: 'imported' });
         expect(second.pdf_sources).toMatchObject([{ route: 'split', status: 'imported' }]);

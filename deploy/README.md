@@ -262,7 +262,12 @@ previous version stays in the corpus as its own ragFile, the earlier version
 rather than a duplicate, and the batch's registry record names the new URI. A
 medium's transcript sits beside the medium, so a re-run keeps it instead of
 transcribing the same bytes again. The import goes in requests of at most 25
-URIs: `ImportRagFiles` documents no per-request maximum, so 25 is a cautious
+URIs, files the LLM parser takes (PDFs) in requests of their own so other
+files never decide a PDF's parser. A request counts as imported only when
+every one of its files has an ACTIVE ragFile; otherwise it, and the batch, is
+`import_partial` (or `import_failed` when none is), the batch record giving
+each file's `state` and `status`, and a re-run imports only the files that are
+not in. The request size: `ImportRagFiles` documents no per-request maximum, so 25 is a cautious
 guess. Each request settles before the next is submitted (a corpus takes one
 import at a time), a busy corpus or quota refusal is waited out within the poll
 budget, and the requests share the Vertex RAG request pacing. From the first

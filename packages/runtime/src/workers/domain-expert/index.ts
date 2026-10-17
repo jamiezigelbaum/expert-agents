@@ -3570,8 +3570,12 @@ export class DomainExpertService {
     const { manifest } = input;
     const gcsUris = input.stagedFiles.map((file) => String(file.gcs_uri));
     const sha256ByUri = stagedFileSha256s(input.stagedFiles);
+    // The parser applies to a whole request, so files the LLM parser takes (PDFs) go in
+    // requests of their own: unrelated files never decide a PDF's parser.
     const chunks: string[][] = [];
-    for (let index = 0; index < gcsUris.length; index += STAGED_IMPORT_URIS_PER_REQUEST) chunks.push(gcsUris.slice(index, index + STAGED_IMPORT_URIS_PER_REQUEST));
+    for (const group of [gcsUris.filter((uri) => !llmParserEligibleUris([uri])), gcsUris.filter((uri) => llmParserEligibleUris([uri]))]) {
+      for (let index = 0; index < group.length; index += STAGED_IMPORT_URIS_PER_REQUEST) chunks.push(group.slice(index, index + STAGED_IMPORT_URIS_PER_REQUEST));
+    }
     const sinkRoot = this.agentRouting[manifest.domain_id]?.ingestion?.importResultSink === 'client'
       ? undefined : importResultSinkUri(manifest.allowed_gcs_prefixes, manifest.domain_id, input.batchId);
     let resolved = input.resolved;
@@ -3628,10 +3632,12 @@ export class DomainExpertService {
     const listed = new Map(requests.flatMap((request) => request.files).map((file) => [String(file.gcs_uri), file]));
     const files = gcsUris.map((gcsUri) => listed.get(gcsUri) ?? { gcs_uri: gcsUri });
     const statuses = requests.map((request) => request.status);
+    // Imported only when every request imported every one of its files.
     const status = statuses.includes('import_requested') ? 'import_requested'
       : statuses.every((value) => value === 'imported') && !stopped ? 'imported'
         : statuses.every((value) => value === 'import_empty') && !stopped ? 'import_empty'
-          : 'import_failed';
+          : statuses.some((value) => value === 'imported' || value === 'import_partial') ? 'import_partial'
+            : 'import_failed';
     const counts = (key: string) => requests.reduce((total, request) => total + ragImportCount(request.detail[key]), 0);
     const detail: Record<string, unknown> = requests.length === 1 && !stopped
       ? requests[0]!.detail
@@ -3950,7 +3956,23 @@ export class DomainExpertService {
         return undefined;
       }
     };
-    if (status === 'imported' && gcsUris.length > 0) {
+    if (gcsUris.length > 1 && (status === 'imported' || status === 'import_partial'
+      || (status === 'import_empty' && ragImportCount(detail.skipped_rag_files_count) >= 1))) {
+      // A request of several objects is decided file by file, by each ragFile's own state:
+      // imported only when every one is ACTIVE.
+      const listed = await lookUpRagFiles();
+      if (listed) {
+        files = listed;
+        const byFile = requestOutcomeByFile(files);
+        const alreadyPresent = status === 'import_empty' && byFile.status === 'imported';
+        status = byFile.status;
+        detail = {
+          ...Object.fromEntries(Object.entries(detail).filter(([key]) => key !== 'hint')),
+          ...(alreadyPresent ? { already_present: true } : {}),
+          ...(byFile.hint ? { hint: byFile.hint } : {}),
+        };
+      }
+    } else if ((status === 'imported' || status === 'import_partial') && gcsUris.length > 0) {
       files = (await lookUpRagFiles()) ?? files;
       // Vertex counts a file it then failed to embed; the ragFile's own state
       // is the last word on whether it is in the library.
@@ -9826,7 +9848,8 @@ interface AnnasArtifactScale {
   short_artifact_override?: boolean;
 }
 
-type AnnasImportOutcomeStatus = 'imported' | 'import_failed' | 'import_empty' | 'import_requested';
+// import_partial: a request of several objects imported some and not others.
+type AnnasImportOutcomeStatus = 'imported' | 'import_failed' | 'import_empty' | 'import_requested' | 'import_partial';
 
 // The acquisition's top-level status must not read as success when the
 // ingest did not verify: a caller that only looks at the outer status saw
@@ -10138,7 +10161,8 @@ function recordedSourceHolding(
   }
   // A batch record lists each file with its own sha256; this source is the matching entry.
   const entry = sha256 && record.source_sha256 !== sha256 ? files.find((file) => file.source_sha256 === sha256) : undefined;
-  if (entry) return typeof entry.gcs_uri === 'string' ? { whole: { gcs_uri: entry.gcs_uri, status } } : undefined;
+  // Its own outcome when the record has one per file (a batch that partly imported).
+  if (entry) return typeof entry.gcs_uri === 'string' ? { whole: { gcs_uri: entry.gcs_uri, status: typeof entry.status === 'string' ? entry.status : status } } : undefined;
   const whole = stringRecordField(record, 'gcs_uri', 'gcsUri') ?? (files.length === 1 && typeof files[0]!.gcs_uri === 'string' ? files[0]!.gcs_uri : undefined);
   return whole ? { whole: { gcs_uri: whole, status } } : undefined;
 }
@@ -10389,6 +10413,10 @@ function classifyRagImportOperation(
     failed_rag_files_count: ragImportCount(response.failedRagFilesCount),
     skipped_rag_files_count: ragImportCount(response.skippedRagFilesCount),
   };
+  // Some imported and some failed is not an import of the request's files.
+  if (counts.imported_rag_files_count >= 1 && counts.failed_rag_files_count >= 1) {
+    return { status: 'import_partial', detail: { operation_name: operationName, ...counts } };
+  }
   if (counts.imported_rag_files_count >= 1) return { status: 'imported', detail: { operation_name: operationName, ...counts } };
   if (counts.failed_rag_files_count >= 1) {
     return {
@@ -10446,13 +10474,26 @@ function isPdfUri(uri: string): boolean {
   return /\.pdf$/i.test(uri);
 }
 
+// A request of several objects, by each ragFile's state: imported when all are ACTIVE,
+// failed when all are in ERROR, and partial otherwise (some ERROR or not listed).
+function requestOutcomeByFile(files: Array<Record<string, unknown>>): { status: AnnasImportOutcomeStatus; hint?: string } {
+  const active = files.filter((file) => file.state === 'ACTIVE').length;
+  const failed = files.filter((file) => file.state === 'ERROR').length;
+  if (active === files.length) return { status: 'imported' };
+  const rerun = 'Re-run the batch: files already in the corpus keep their URIs and are skipped, and the rest are imported again.';
+  if (failed === files.length) return { status: 'import_failed', hint: `Every ragFile of the request is in ERROR. ${rerun}` };
+  return { status: 'import_partial', hint: `${active} of ${files.length} files are ACTIVE; ${failed} in ERROR, ${files.length - active - failed} not listed. ${rerun}` };
+}
+
 function ragImportFileFields(files: Array<Record<string, unknown>>, sha256ByUri?: Map<string, string>): Record<string, unknown> {
   if (files.length === 0) return {};
   const identity = (uri: unknown) => {
     const digest = typeof uri === 'string' ? sha256ByUri?.get(uri) : undefined;
     return digest ? { source_sha256: digest } : {};
   };
-  if (files.length > 1) return { rag_files: files.map(({ gcs_uri, rag_file_name }) => ({ gcs_uri, ...(rag_file_name ? { rag_file_name } : {}), ...identity(gcs_uri) })) };
+  // Each object's own outcome, where its ragFile was read: holding checks use it per file.
+  const outcome = (state: unknown) => (state === 'ACTIVE' ? { state, status: 'imported' } : state === 'ERROR' ? { state, status: 'import_failed' } : {});
+  if (files.length > 1) return { rag_files: files.map(({ gcs_uri, rag_file_name, state }) => ({ gcs_uri, ...(rag_file_name ? { rag_file_name } : {}), ...identity(gcs_uri), ...outcome(state) })) };
   const [file] = files;
   return { ...(file!.rag_file_name ? { rag_file_name: file!.rag_file_name } : {}), gcs_uri: file!.gcs_uri, ...identity(file!.gcs_uri) };
 }
