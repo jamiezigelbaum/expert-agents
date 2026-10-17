@@ -6393,7 +6393,7 @@ describe('splitting long PDFs for LLM-parser imports', () => {
       ...(options.listingDisplayNameOnly ? { displayNameOnly: true } : {}),
     }, options.seed);
     // A fresh worker over the same workspace, books and Google state: a restart or a reconfigured host.
-    const workerWith = (overrides: SplitOptions = {}) => {
+    const workerWith = (overrides: SplitOptions & { bytes?: Uint8Array } = {}) => {
       const settings = { ...options, ...overrides };
       return createDomainExpertWorker({
         gcpProject: 'fixture-project',
@@ -6413,7 +6413,7 @@ describe('splitting long PDFs for LLM-parser imports', () => {
           fetchImpl: googleFetch,
           ...(settings.ragParserModel ? { ragParserModel: settings.ragParserModel } : {}),
         },
-        fetchImpl: fakeAnnasArtifactFetch([], bytes, 'application/pdf'),
+        fetchImpl: fakeAnnasArtifactFetch([], overrides.bytes ?? bytes, 'application/pdf'),
       });
     };
     const registryPath = join(fixture.workspaceRoot, domainManifest('research').workspace_relative_path, 'references/source-registry.jsonl');
@@ -6888,6 +6888,71 @@ describe('splitting long PDFs for LLM-parser imports', () => {
         expect(registered.source_record).toMatchObject({ gcs_uri: `gs://fixture-shared-library/${WHOLE}`, sha256_verified: true, pages: 582 });
       } finally { f.cleanup(); }
     });
+  });
+
+  // Any run that wrote a running record writes its end, whatever the outcome.
+  describe('every run that records progress records its end', () => {
+    const fails: ImportBehaviour = () => ({ error: { code: 13, message: 'An internal error occurred processing the file.' } });
+    const quota: ImportBehaviour = () => jsonResponse({ error: { code: 429, status: 'RESOURCE_EXHAUSTED', message: 'Quota exceeded.' } }, 429);
+
+    test.each([
+      ['every part fails', fails, 'import_failed', ['import_failed', 'import_failed', 'import_failed']],
+      ['the first part is blocked', quota, 'blocked', ['blocked', 'not_attempted', 'not_attempted']],
+    ] as const)('when %s, the last record is terminal', async (_name, behaviour, status, parts) => {
+      const f = splitFixture(textPdfBytes(450), behaviour, { importPollTimeoutMs: 30 });
+      try {
+        const response = await postDomain(f.worker, 'annas_archive_import', PARAMS);
+        expect(response.rag_ingest.status).toBe(status);
+        expect(response.registry.status).toBe('updated');
+        const records = f.readRegistry();
+        expect(records[0]!.ingest_status).toBe('import_requested');
+        expect(records.at(-1)).toMatchObject({ ingest_status: status, ingest_reason: 'annas_pdf_split_import_incomplete' });
+        expect(partStatuses(records.at(-1)!).map(([, part]: [string, string]) => part)).toEqual(parts);
+      } finally { f.cleanup(); }
+    });
+
+    test('when the response budget lapses and every part fails, the outcome is still recorded', async () => {
+      const f = splitFixture(textPdfBytes(450), fails, { responseBudgetMs: 1, importPollTimeoutMs: 30 });
+      try {
+        expect((await postDomain(f.worker, 'annas_archive_import', PARAMS)).rag_ingest.status).toBe('import_in_progress');
+        const deadline = Date.now() + 5_000;
+        while (f.readRegistry().at(-1)!.ingest_status === 'import_requested' && Date.now() < deadline) await Bun.sleep(10);
+        expect(f.readRegistry().at(-1)).toMatchObject({ ingest_status: 'import_failed' });
+      } finally { f.cleanup(); }
+    });
+
+    test('a run that wrote nothing still writes nothing when it fails', async () => {
+      const f = splitFixture(textPdfBytes(150), fails, { importPollTimeoutMs: 30 });
+      try {
+        const response = await postDomain(f.worker, 'annas_archive_import', PARAMS);
+        expect(response.rag_ingest.status).toBe('import_failed');
+        expect(response.registry.status).toBe('skipped');
+        expect(existsSync(f.registryPath)).toBe(false);
+      } finally { f.cleanup(); }
+    });
+  });
+
+  // Identity is the sha256: one locator serving two different files gives two sources.
+  test('a locator that serves different bytes later gets a second source, and each file finds its own holding', async () => {
+    const first = textPdfBytes(450);
+    const second = textPdfBytes(460);
+    const f = splitFixture(first, importsAll);
+    try {
+      const a = await postDomain(f.worker, 'annas_archive_import', PARAMS);
+      expect(a.rag_ingest.status).toBe('imported');
+      // The file is gone from disk, and the same locator now serves other bytes.
+      rmSync(a.download.path);
+      const b = await postDomain(f.workerWith({ bytes: second }), 'annas_archive_import', PARAMS);
+      expect(b).toMatchObject({ status: 'downloaded', download: { sha256: sha256Hex(second) }, rag_ingest: { status: 'imported' } });
+      expect(b.registry.source_id).not.toBe(a.registry.source_id);
+      const bySource = new Map<string, Set<string>>();
+      for (const record of f.readRegistry()) bySource.set(record.source_id, new Set([...(bySource.get(record.source_id) ?? []), record.source_sha256]));
+      expect([...bySource.values()].map((hashes) => [...hashes])).toEqual([[sha256Hex(first)], [sha256Hex(second)]]);
+      // Re-acquiring the first file is present at the first file's parts, not the second's.
+      rmSync(b.download.path);
+      const again = await postDomain(f.worker, 'annas_archive_import', PARAMS);
+      expect(again.rag_ingest).toMatchObject({ status: 'imported', gcs_uris: a.rag_ingest.gcs_uris, import_outcome: { already_present: true, source_id: a.registry.source_id } });
+    } finally { f.cleanup(); }
   });
 
   // A source keeps one holding: a book held in one corpus is not imported into another.
