@@ -70,11 +70,15 @@ importing it, so a failed import (a failed split part included) can be
 retried, and it reports a skipped import as present only when the URI's
 ragFile is ACTIVE.
 
-A staged batch relies on this dedupe across retries: each run stages into
-`staged/<domain>/<batch>/<run-id>/`, a directory named by its files' paths and
-sha256s, so a retry of the same bytes imports the same URIs and is skipped,
-while a run that stages anything else imports only its own directory. A
-superseded run's directory is left in place and never imported again.
+A staged batch relies on this dedupe across re-runs: each file is staged at
+`staged/<domain>/<batch>/<first 32 hex of its sha256>/<file name>` and the
+batch imports exactly those URIs, so an unchanged file is skipped and a changed
+one is imported under a new URI. The changed file's previous version stays in
+the corpus; an object no run names is never imported again.
+
+`ImportRagFiles` takes several URIs per request (`GcsSource.uris` is a repeated
+string) and documents no maximum; the worker sends at most 25 per request, a
+cautious guess rather than a known limit.
 
 ## Sources
 

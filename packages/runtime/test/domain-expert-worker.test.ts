@@ -36,7 +36,6 @@ import {
 import {
   bookObjectStem,
   assertAllowedGcsDestination,
-  stagedRunId,
   createDomainExpertWorker as createRawDomainExpertWorker,
   domainExpertAnnasConfigFromEnv,
   reciprocalRankFuse,
@@ -852,12 +851,12 @@ describe('RAG ingestion configuration', () => {
     expect(calls.filter((call) => call.method === 'DELETE')).toHaveLength(0);
   });
 
-  test('a staged re-import clears ERROR records anywhere under its run directory', async () => {
+  test('a staged re-import clears the ERROR record of each object it imports', async () => {
     const fixture = workspaceFixture();
     const calls: CapturedCall[] = [];
     const stagedErrorFile = 'projects/fixture-project/locations/us-central1/ragCorpora/1234567890123456789/ragFiles/staged-error';
-    // The same bytes again stage into the same run directory, so its earlier ERROR record is in the way.
-    const runDirectory = stagedRunDirectory('gs://fixture-shared-library/v1/staged/research/retry-fixture/', { 'note.md': 'retry' });
+    // The same bytes again stage to the same URI, so its earlier ERROR record is in the way.
+    const noteUri = stagedObject('gs://fixture-shared-library/v1/staged/research/retry-fixture/', 'note.md', 'retry');
     try {
       const sourceDir = join(fixture.workspaceRoot, 'experts', 'research', 'sources', 'retry');
       mkdirSync(sourceDir, { recursive: true });
@@ -870,13 +869,13 @@ describe('RAG ingestion configuration', () => {
             ragFiles: [
               {
                 name: stagedErrorFile,
-                gcsSource: { uris: [`${runDirectory}note.md`] },
+                gcsSource: { uris: [noteUri] },
                 fileStatus: { state: 'ERROR', errorStatus: 'failed to insert chunks' },
               },
               {
-                // Another run of the batch, which staged other bytes: its directory is never imported here.
-                name: 'projects/fixture-project/locations/us-central1/ragCorpora/1234567890123456789/ragFiles/other-run',
-                gcsSource: { uris: ['gs://fixture-shared-library/v1/staged/research/retry-fixture/run-0000000000000000/note.md'] },
+                // An earlier version of the file, at its own URI: never imported here.
+                name: 'projects/fixture-project/locations/us-central1/ragCorpora/1234567890123456789/ragFiles/other-version',
+                gcsSource: { uris: [stagedObject('gs://fixture-shared-library/v1/staged/research/retry-fixture/', 'note.md', 'earlier')] },
                 fileStatus: { state: 'ERROR' },
               },
               {
@@ -909,12 +908,13 @@ describe('RAG ingestion configuration', () => {
     const fixture = workspaceFixture();
     const calls: CapturedCall[] = [];
     const longStem = `${'games-and-puzzles-as-computational-systems-'.repeat(2)}essay-writings`;
-    // The run's directory, named by the shortened names and their bytes.
-    const stagedPrefix = stagedRunDirectory('v1/staged/research/long-names/', {
-      [`${longStem.slice(0, 77)}.md`]: '# essay',
-      [`${longStem.slice(0, 76)}.pdf`]: syntheticPdfBytes(1),
-      'short.md': 'short',
-    });
+    const stagedPrefix = 'v1/staged/research/long-names/';
+    // Each object sits in a directory named by its bytes, under its shortened name.
+    const expected = [
+      stagedObject(stagedPrefix, `${longStem.slice(0, 77)}.md`, '# essay'),
+      stagedObject(stagedPrefix, `${longStem.slice(0, 76)}.pdf`, syntheticPdfBytes(1)),
+      stagedObject(stagedPrefix, 'short.md', 'short'),
+    ];
     const stagedErrorFile = 'projects/fixture-project/locations/us-central1/ragCorpora/1234567890123456789/ragFiles/long-error';
     try {
       const sourceDir = join(fixture.workspaceRoot, 'experts', 'research', 'sources', 'long');
@@ -928,10 +928,10 @@ describe('RAG ingestion configuration', () => {
           accessToken: 'fixture-google-token',
           fetchImpl: fakeGoogleFetch(calls, {
             ragFiles: [{
-              // A failed record in this run's directory under the old mangled
-              // name: cleanup still matches it by prefix.
+              // A failed record that surfaces only its display name, the
+              // shortened file name: cleanup still matches it.
               name: stagedErrorFile,
-              gcsSource: { uris: [`gs://fixture-shared-library/${stagedPrefix}${longStem.slice(0, 79)}.m`] },
+              displayName: `${longStem.slice(0, 77)}.md`,
               fileStatus: { state: 'ERROR' },
             }],
           }),
@@ -951,18 +951,14 @@ describe('RAG ingestion configuration', () => {
       // The old 80-character cut left `...writings.m` and `...writings.p`,
       // which Vertex skipped without an error.
       const uploaded = uploadedObjectNames(calls);
-      expect(uploaded.sort()).toEqual([
-        `${stagedPrefix}${longStem.slice(0, 77)}.md`,
-        `${stagedPrefix}${longStem.slice(0, 76)}.pdf`,
-        `${stagedPrefix}short.md`,
-      ].sort());
-      for (const name of uploaded) expect(name.slice(stagedPrefix.length).length).toBeLessThanOrEqual(80);
+      expect(uploaded.sort()).toEqual([...expected].sort());
+      for (const name of uploaded) expect(name.split('/').pop()!.length).toBeLessThanOrEqual(80);
       expect((result.staged_files as Array<{ gcs_uri: string }>).map((file) => file.gcs_uri).sort())
         .toEqual(uploaded.map((name) => `gs://fixture-shared-library/${name}`));
-      // The import and the ERROR cleanup both work on the run directory, so
-      // shortening a file name never moves a file out of their reach.
+      // The import names exactly the staged objects, and the ERROR cleanup
+      // matches them, so shortening a name never moves a file out of their reach.
       const importConfig = JSON.parse(calls.find((call) => call.url.endsWith('/ragFiles:import'))!.body).importRagFilesConfig;
-      expect(importConfig.gcsSource.uris).toEqual([`gs://fixture-shared-library/${stagedPrefix}`]);
+      expect([...importConfig.gcsSource.uris].sort()).toEqual(uploaded.map((name) => `gs://fixture-shared-library/${name}`).sort());
       expect(calls.filter((call) => call.method === 'DELETE').map((call) => call.url))
         .toEqual([`https://us-central1-aiplatform.googleapis.com/v1/${stagedErrorFile}`]);
     } finally {
@@ -1045,16 +1041,14 @@ describe('ported staging regressions', () => {
           pdf_max_file_bytes: 100_000_000,
         },
       });
-      // A plan names the run directory a live run of the same files stages into.
-      const runDirectory = stagedRunDirectory('gs://fixture-shared-library/v1/staged/research/caps-fixture/', {
-        'good.md': 'good', 'large.pdf': new Uint8Array((10 * 1024 * 1024) + 1),
-      });
       expect(result.destination).toMatchObject({
-        gcs_uri_prefix: runDirectory,
-        batch_gcs_uri_prefix: 'gs://fixture-shared-library/v1/staged/research/caps-fixture/',
-        run_id: runDirectory.split('/').at(-2),
+        gcs_uri_prefix: 'gs://fixture-shared-library/v1/staged/research/caps-fixture/',
         allowed_gcs_prefixes: ['gs://fixture-shared-library/v1'],
       });
+      // A plan names the URI a live run of the same bytes stages each file to.
+      expect(result.eligible_files.map((file: Record<string, unknown>) => file.gcs_uri)).toContain(
+        stagedObject('gs://fixture-shared-library/v1/staged/research/caps-fixture/', 'good.md', 'good'),
+      );
       expect(result.skipped_files).toEqual([
         { workspace_relative_path: 'experts/research/sources/mixed/bad.bin', reason: 'extension_not_allowed:.bin', bytes: 3 },
         { workspace_relative_path: 'experts/research/sources/mixed/large.md', reason: 'file_size_limit_exceeded', bytes: (10 * 1024 * 1024) + 1 },
@@ -4831,6 +4825,7 @@ function fakeGcsObjectResponse(url: string, method: string, init: RequestInit | 
   if (method === 'GET' && parsed.searchParams.get('alt') === 'media') {
     const bytes = objects.get(decodeURIComponent(parsed.pathname.split('/o/')[1] ?? ''));
     if (bytes) return Promise.resolve(new Response(new Blob([bytes as Uint8Array<ArrayBuffer>]), { status: 200 }));
+    return Promise.resolve(jsonResponse({ error: { code: 404, message: 'No such object' } }, 404));
   }
   if (method === 'GET' && parsed.searchParams.get('fields')?.includes('md5Hash')) {
     const name = decodeURIComponent(parsed.pathname.split('/o/')[1] ?? '');
@@ -5540,8 +5535,8 @@ describe('acquisition ingest registers the imported source', () => {
 describe('rag_corpus imports record their verified outcome in the source registry', () => {
   const CORPUS = 'projects/fixture-project/locations/us-central1/ragCorpora/1234567890123456789';
   const OPERATION = `${CORPUS}/operations/import-1`;
-  // A one-file batch's staged URI: its run directory is named by the file's path and bytes.
-  const stagedUri = (batch: string, file: string, bytes: string = 'staged') => `${stagedRunDirectory(`gs://fixture-shared-library/v1/staged/research/${batch}/`, { [file]: bytes })}${file}`;
+  // A staged file's URI, in the directory its bytes name.
+  const stagedUri = (batch: string, file: string, bytes: string = 'staged') => stagedObject(`gs://fixture-shared-library/v1/staged/research/${batch}/`, file, bytes);
 
   function importFixture(google: Parameters<typeof fakeGoogleFetch>[1] = {}, overrides: Partial<DomainExpertWorkerOptions> = {}) {
     const fixture = workspaceFixture();
@@ -5951,8 +5946,7 @@ describe('rag_corpus imports record their verified outcome in the source registr
         dry_run: false,
       });
       expect(result.import_outcome).toMatchObject({ status: 'imported' });
-      expect(pageUri()).toStartWith(`${result.destination.gcs_uri_prefix}`);
-      expect(result.destination.gcs_uri_prefix).toMatch(/\/v1\/staged\/research\/web-batch\/run-[0-9a-f]{16}\/$/);
+      expect(pageUri()).toMatch(/\/v1\/staged\/research\/web-batch\/[0-9a-f]{32}\/fixture-page\.md$/);
       const records = f.readRegistry();
       expect(records.map((record) => [record.source_id, record.ingest_status])).toEqual([
         ['research-web-import-web-batch', 'import_requested'],
@@ -6416,11 +6410,9 @@ function sha256Hex(bytes: Uint8Array): string {
   return createHash('sha256').update(bytes).digest('hex');
 }
 
-// The directory a run of a batch stages into, named by each staged file's path and bytes.
-function stagedRunDirectory(batchPrefix: string, files: Record<string, string | Uint8Array>): string {
-  return `${batchPrefix}${stagedRunId(Object.entries(files).map(([uploadRelativePath, bytes]) => ({
-    uploadRelativePath, sha256: createHash('sha256').update(bytes).digest('hex'),
-  })))}/`;
+// Where a batch stages a file: under the batch, in a directory named by the file's bytes.
+function stagedObject(batchPrefix: string, name: string, bytes: string | Uint8Array): string {
+  return `${batchPrefix}${createHash('sha256').update(bytes).digest('hex').slice(0, 32)}/${name}`;
 }
 
 // #33: the LLM parser fails PDFs of about 300 pages and more (docs/vertex-rag-limits.md). A
@@ -6455,18 +6447,23 @@ describe('splitting long PDFs for LLM-parser imports', () => {
       const gcs = fakeGcsObjectResponse(url, method, init, objects);
       if (gcs) return gcs;
       if (url.endsWith('/ragFiles:import')) {
-        const uri = JSON.parse(String(init?.body)).importRagFilesConfig.gcsSource.uris[0] as string;
-        const part = /--(part\d+of\d+)\.pdf$/.exec(uri)?.[1] ?? 'whole';
+        const requested = JSON.parse(String(init?.body)).importRagFilesConfig.gcsSource.uris as string[];
+        const uri = requested[0]!;
+        const part = requested.length === 1 ? /--(part\d+of\d+)\.pdf$/.exec(uri)?.[1] ?? 'whole' : 'whole';
         const attempt = (attempts.get(part) ?? 0) + 1;
         attempts.set(part, attempt);
         // A refusal (quota, busy corpus) comes before Vertex looks at the file; a held URI is skipped.
         const chosen = behaviour(part, attempt, objects);
         if (chosen instanceof Response) return chosen;
         // A directory import makes one ragFile per object under it, as Vertex does.
-        const prefix = uri.endsWith('/') ? uri.replace('gs://fixture-shared-library/', '') : undefined;
-        const files = prefix ? [...objects.keys()].filter((name) => name.startsWith(prefix)).map((name) => `gs://fixture-shared-library/${name}`) : [uri];
-        const held = files.length > 0 && files.every((file) => imported.has(file) || errored.has(file));
-        const outcome = held ? { skippedRagFilesCount: String(files.length) } : chosen;
+        const files = requested.flatMap((target) => (target.endsWith('/')
+          ? [...objects.keys()].filter((name) => name.startsWith(target.replace('gs://fixture-shared-library/', ''))).map((name) => `gs://fixture-shared-library/${name}`)
+          : [target]));
+        const fresh = files.filter((file) => !imported.has(file) && !errored.has(file));
+        const outcome = fresh.length === 0 ? { skippedRagFilesCount: String(files.length) }
+          : files.length > 1 && 'importedRagFilesCount' in chosen
+            ? { importedRagFilesCount: String(fresh.length), ...(fresh.length < files.length ? { skippedRagFilesCount: String(files.length - fresh.length) } : {}) }
+            : chosen;
         operations += 1;
         for (const [index, file] of files.entries()) {
           if (imported.has(file) || errored.has(file)) continue;
@@ -6541,8 +6538,11 @@ describe('splitting long PDFs for LLM-parser imports', () => {
     const registryPath = join(fixture.workspaceRoot, domainManifest('research').workspace_relative_path, 'references/source-registry.jsonl');
     const readRegistry = () => readFileSync(registryPath, 'utf8').split('\n').filter(Boolean).map((line) => JSON.parse(line) as Record<string, any>);
     const importedUris = () => googleCalls.filter((call) => call.url.endsWith('/ragFiles:import'))
-      .map((call) => JSON.parse(call.body).importRagFilesConfig.gcsSource.uris[0] as string);
-    return { worker: workerWith(), workerWith, googleCalls, booksRoot, base: fixture.base, registryPath, readRegistry, importedUris, fetchImpl: googleFetch, cleanup: fixture.cleanup };
+      .flatMap((call) => JSON.parse(call.body).importRagFilesConfig.gcsSource.uris as string[]);
+    // What each import request named.
+    const importRequests = () => googleCalls.filter((call) => call.url.endsWith('/ragFiles:import'))
+      .map((call) => JSON.parse(call.body).importRagFilesConfig.gcsSource.uris as string[]);
+    return { worker: workerWith(), workerWith, googleCalls, booksRoot, base: fixture.base, registryPath, readRegistry, importedUris, importRequests, fetchImpl: googleFetch, cleanup: fixture.cleanup };
   }
 
   const importsAll: ImportBehaviour = () => ({ importedRagFilesCount: '1' });
@@ -7413,102 +7413,150 @@ describe('splitting long PDFs for LLM-parser imports', () => {
         const response = await stageBatch(f.worker, 'second-batch');
         expect(response.pdf_sources).toMatchObject([{ route: 'split', status: 'blocked', gcs_uris: other, error: { code: 'source_import_in_progress' } }]);
         // Only the batch directory was imported; no second split.
-        expect(f.importedUris()).toEqual([stagedRunDirectory('gs://fixture-shared-library/v1/staged/research/second-batch/', { 'note.md': '# A note' })]);
+        expect(f.importedUris()).toEqual([stagedObject('gs://fixture-shared-library/v1/staged/research/second-batch/', 'note.md', '# A note')]);
         // The other import's record is left as the source's latest.
         expect(f.readRegistry().filter((record) => record.source_sha256 === sha256Hex(LONG)).at(-1)!.rag_files.map((file: Record<string, any>) => file.gcs_uri)).toEqual(other);
       } finally { f.cleanup(); }
     });
 
-    // A batch imports its whole run directory, so what Vertex sees there is what it imports.
-    const directoryImports = () => {
-      const seen: Array<{ uri: string; objects: string[] }> = [];
-      let calls: CapturedCall[] = [];
-      const behaviour: ImportBehaviour = (part, _attempt, objects) => {
-        const uri = JSON.parse(calls.filter((call) => call.url.endsWith('/ragFiles:import')).at(-1)!.body).importRagFilesConfig.gcsSource.uris[0] as string;
-        if (part === 'whole' && uri.endsWith('/')) {
-          const prefix = uri.replace('gs://fixture-shared-library/', '');
-          seen.push({ uri, objects: [...objects.keys()].filter((name) => name.startsWith(prefix)).map((name) => `gs://fixture-shared-library/${name}`).sort() });
-        }
-        return { importedRagFilesCount: '1' };
-      };
-      return { seen, behaviour, watch: (googleCalls: CapturedCall[]) => { calls = googleCalls; } };
-    };
+    // A batch names exactly its own objects; each request's URIs are what Vertex imports.
     const stagedUris = (result: Record<string, any>) => result.staged_files.map((file: Record<string, any>) => file.gcs_uri as string).sort();
     const BATCH = 'gs://fixture-shared-library/v1/staged/research/retry-batch/';
+    const storageDeletes = (calls: CapturedCall[]) => calls.filter((call) => call.method === 'DELETE' && call.url.includes('storage.googleapis.com'));
 
     // A retry of the same batch_id must not let an earlier attempt's object ride along.
     test('a retried batch whose PDF became long splits it and never imports the earlier whole copy', async () => {
-      const imports = directoryImports();
-      const f = splitFixture(LONG, imports.behaviour);
-      imports.watch(f.googleCalls);
+      const f = splitFixture(LONG, importsAll);
       const short = textPdfBytes(120);
       try {
         writeBatch(f.base, { 'note.md': '# A note', 'volume.pdf': short });
         const first = await stageBatch(f.worker, 'retry-batch');
-        const firstRun = stagedRunDirectory(BATCH, { 'note.md': '# A note', 'volume.pdf': short });
-        expect(first.destination).toMatchObject({ gcs_uri_prefix: firstRun, batch_gcs_uri_prefix: BATCH });
-        expect(stagedUris(first)).toEqual([`${firstRun}note.md`, `${firstRun}volume.pdf`]);
+        const note = stagedObject(BATCH, 'note.md', '# A note');
+        const shortCopy = stagedObject(BATCH, 'volume.pdf', short);
+        expect(stagedUris(first)).toEqual([note, shortCopy].sort());
         // The same batch again, now with the PDF replaced by a long one the pipeline splits.
         writeBatch(f.base, { 'volume.pdf': LONG });
         const second = await stageBatch(f.worker, 'retry-batch');
-        const secondRun = stagedRunDirectory(BATCH, { 'note.md': '# A note' });
-        expect(secondRun).not.toBe(firstRun);
-        expect(stagedUris(second)).toEqual([`${secondRun}note.md`]);
+        expect(stagedUris(second)).toEqual([note]);
         expect(second.pdf_sources).toMatchObject([{ route: 'split', status: 'imported' }]);
-        // Each run imported its own directory, which held exactly what that run staged.
-        expect(imports.seen).toEqual([
-          { uri: firstRun, objects: stagedUris(first) },
-          { uri: secondRun, objects: stagedUris(second) },
-        ]);
-        expect(f.importedUris().filter((uri) => uri.endsWith('.pdf'))).toEqual([1, 2, 3].map((index) => `gs://fixture-shared-library/v1/staged/research/retry-batch--parts/volume--part${index}of3.pdf`));
-        // Nothing is deleted: the earlier run's directory stays in place, never imported again.
-        expect(f.googleCalls.filter((call) => call.method === 'DELETE' && call.url.includes('storage.googleapis.com'))).toEqual([]);
-        expect(f.readRegistry().filter((record) => record.source_id === 'research-stage-import-retry-batch').at(-1)).toMatchObject({ gcs_uri: `${secondRun}note.md`, ingest_status: 'imported' });
-        // A retry that stages the same bytes again lands on the same URIs, so Vertex skips what it holds.
+        const parts = [1, 2, 3].map((index) => `gs://fixture-shared-library/v1/staged/research/retry-batch--parts/volume--part${index}of3.pdf`);
+        // The earlier whole copy is never named again; the note keeps its URI and is skipped.
+        expect(f.importRequests().slice(1)).toEqual([[note], ...parts.map((part) => [part])]);
+        expect(second.import_outcome).toMatchObject({ status: 'imported', already_present: true });
+        expect(storageDeletes(f.googleCalls)).toEqual([]);
+      } finally { f.cleanup(); }
+    });
+
+    test('a batch re-run with one changed file imports only that file anew, and an identical re-run nothing', async () => {
+      const f = splitFixture(LONG, importsAll);
+      try {
+        writeBatch(f.base, { 'a.md': '# A', 'b.md': '# B', 'c.md': '# C' });
+        const first = await stageBatch(f.worker, 'retry-batch');
+        expect(first.import_outcome).toMatchObject({ status: 'imported', imported_rag_files_count: 3 });
+        const ragFileOf = (result: Record<string, any>) => new Map(result.import_outcome.rag_files.map((file: Record<string, any>) => [file.gcs_uri, file.rag_file_name]));
+        const before = ragFileOf(first);
+        writeBatch(f.base, { 'b.md': '# B, revised' });
+        const second = await stageBatch(f.worker, 'retry-batch');
+        const changed = stagedObject(BATCH, 'b.md', '# B, revised');
+        expect(stagedUris(second)).toEqual([stagedObject(BATCH, 'a.md', '# A'), changed, stagedObject(BATCH, 'c.md', '# C')].sort());
+        // Vertex imports one new ragFile, for the changed file's new URI; the others keep theirs.
+        expect(second.import_outcome).toMatchObject({ status: 'imported', imported_rag_files_count: 1, skipped_rag_files_count: 2 });
+        const after = ragFileOf(second);
+        expect([...after].filter(([uri, name]) => before.get(uri) !== name).map(([uri]) => uri)).toEqual([changed]);
+        // The batch record names the changed file's new URI.
+        const latest = f.readRegistry().filter((record) => record.source_id === 'research-stage-import-retry-batch').at(-1)!;
+        expect(latest.rag_files.map((file: Record<string, any>) => file.gcs_uri).sort()).toEqual(stagedUris(second));
+        // The same bytes again: the same URIs, and Vertex imports nothing new.
         const third = await stageBatch(f.worker, 'retry-batch');
         expect(stagedUris(third)).toEqual(stagedUris(second));
-        expect(third.import_outcome).toMatchObject({ status: 'imported', already_present: true });
-        expect(f.importedUris().filter((uri) => uri.endsWith('/'))).toEqual([firstRun, secondRun, secondRun]);
+        expect(third.import_outcome).toMatchObject({ status: 'imported', already_present: true, skipped_rag_files_count: 3 });
+        expect(ragFileOf(third)).toEqual(after);
+        expect(storageDeletes(f.googleCalls)).toEqual([]);
       } finally { f.cleanup(); }
     });
 
     test('two overlapping runs of one batch_id each import exactly their own objects', async () => {
-      const imports = directoryImports();
       const short = textPdfBytes(120);
       let overlapping: Promise<Record<string, any>> | undefined;
       let worker: { fetch(request: Request): Promise<Response> } | undefined;
       let base = '';
-      const f = splitFixture(LONG, imports.behaviour, {
+      const f = splitFixture(LONG, importsAll, {
         // The first run has staged and is about to import when the second run of the batch starts and finishes.
         wrapGoogleFetch: (next) => (async (input: string | URL | Request, init?: RequestInit) => {
           if (!overlapping && String(input).endsWith('/ragFiles:import')) {
-            writeBatch(base, { 'volume.pdf': LONG });
+            writeBatch(base, { 'note.md': '# A note, revised', 'volume.pdf': LONG });
             overlapping = stageBatch(worker!, 'retry-batch');
             await overlapping;
           }
           return next(input, init);
         }) as typeof fetch,
       });
-      imports.watch(f.googleCalls);
       worker = f.worker;
       base = f.base;
       try {
         writeBatch(f.base, { 'note.md': '# A note', 'volume.pdf': short });
         const first = await stageBatch(f.worker, 'retry-batch');
         const second = await overlapping!;
-        const firstRun = stagedRunDirectory(BATCH, { 'note.md': '# A note', 'volume.pdf': short });
-        const secondRun = stagedRunDirectory(BATCH, { 'note.md': '# A note' });
-        expect(stagedUris(first)).toEqual([`${firstRun}note.md`, `${firstRun}volume.pdf`]);
-        expect(stagedUris(second)).toEqual([`${secondRun}note.md`]);
-        // The second run imported first, while the first run's objects sat staged; neither saw the other's.
-        expect(imports.seen).toEqual([
-          { uri: secondRun, objects: stagedUris(second) },
-          { uri: firstRun, objects: stagedUris(first) },
-        ]);
+        expect(stagedUris(first)).toEqual([stagedObject(BATCH, 'note.md', '# A note'), stagedObject(BATCH, 'volume.pdf', short)].sort());
+        expect(stagedUris(second)).toEqual([stagedObject(BATCH, 'note.md', '# A note, revised')]);
+        // The second run imported first, while the first run's objects sat staged; each request named only its own run's files.
+        const requests = f.importRequests().filter((uris) => !uris.some((uri) => uri.includes('--parts/')));
+        expect(requests.map((uris) => [...uris].sort())).toEqual([stagedUris(second), stagedUris(first)]);
         expect(first.import_outcome).toMatchObject({ status: 'imported' });
         expect(second.import_outcome).toMatchObject({ status: 'imported' });
         expect(second.pdf_sources).toMatchObject([{ route: 'split', status: 'imported' }]);
-        expect(f.googleCalls.filter((call) => call.method === 'DELETE' && call.url.includes('storage.googleapis.com'))).toEqual([]);
+        expect(storageDeletes(f.googleCalls)).toEqual([]);
+      } finally { f.cleanup(); }
+    });
+
+    test('a re-run keeps the transcript staged beside an unchanged medium instead of transcribing it again', async () => {
+      let transcriptions = 0;
+      const f = splitFixture(LONG, importsAll, {
+        wrapGoogleFetch: (next) => (async (input: string | URL | Request, init?: RequestInit) => {
+          if (String(input).includes(':generateContent')) {
+            transcriptions += 1;
+            return jsonResponse({ candidates: [{ content: { parts: [{ text: `Transcript, take ${transcriptions}.` }] } }] });
+          }
+          return next(input, init);
+        }) as typeof fetch,
+      });
+      try {
+        const audio = new Uint8Array([73, 68, 51, 4, 0, 0, 0, 0, 0, 0]);
+        writeBatch(f.base, { 'episode.mp3': audio });
+        const first = await stageBatch(f.worker, 'media-batch', { include_media: true });
+        const medium = stagedObject('gs://fixture-shared-library/v1/staged/research/media-batch/', 'episode.mp3', audio);
+        const transcript = medium.replace(/episode\.mp3$/, 'episode.mp3.transcript.md');
+        expect(stagedUris(first)).toEqual([medium, transcript]);
+        expect(transcriptions).toBe(1);
+        const again = await stageBatch(f.worker, 'media-batch', { include_media: true });
+        // The same medium names the same transcript, already staged: no second transcription, nothing new imported.
+        expect(transcriptions).toBe(1);
+        expect(stagedUris(again)).toEqual([medium, transcript]);
+        expect(again.staged_files.find((file: Record<string, any>) => file.kind === 'media_transcript').sha256)
+          .toBe(first.staged_files.find((file: Record<string, any>) => file.kind === 'media_transcript').sha256);
+        expect(again.import_outcome).toMatchObject({ status: 'imported', already_present: true });
+      } finally { f.cleanup(); }
+    });
+
+    test('a batch of more files than one request takes imports them in several requests, all recorded', async () => {
+      const f = splitFixture(LONG, importsAll);
+      try {
+        const files = Object.fromEntries(Array.from({ length: 30 }, (_, index) => [`note-${String(index).padStart(2, '0')}.md`, `# Note ${index}`]));
+        writeBatch(f.base, files);
+        const result = await stageBatch(f.worker, 'chunked-batch');
+        const requests = f.importRequests();
+        expect(requests.map((uris) => uris.length)).toEqual([25, 5]);
+        expect(requests.flat().sort()).toEqual(stagedUris(result));
+        expect(result.submission_receipts).toHaveLength(2);
+        expect(result.import_outcome).toMatchObject({ status: 'imported', imported_rag_files_count: 30, requests: [{ status: 'imported', gcs_uri_count: 25 }, { status: 'imported', gcs_uri_count: 5 }] });
+        const names = result.import_outcome.requests.map((request: Record<string, any>) => request.operation_name);
+        const records = f.readRegistry().filter((record) => record.source_id === 'research-stage-import-chunked-batch');
+        // Each accepted request is recorded as it is accepted, naming every file of the batch, then one terminal record.
+        expect(records.map((record) => record.ingest_status)).toEqual(['import_requested', 'import_requested', 'imported']);
+        expect(records[0]).toMatchObject({ rag_operation_name: names[0] });
+        expect(records[1]).toMatchObject({ rag_operation_names: names });
+        expect(records[2]).toMatchObject({ rag_operation_names: names });
+        for (const record of records) expect(record.rag_files).toHaveLength(30);
       } finally { f.cleanup(); }
     });
 
@@ -7555,13 +7603,13 @@ describe('splitting long PDFs for LLM-parser imports', () => {
           gcs_uris: parts, split: { pages: 450, parts: 3, imported_parts: 3 }, source_registry: { status: 'updated' },
         }]);
         // The batch directory first, then each part on its own.
-        expect(f.importedUris()).toEqual([stagedRunDirectory('gs://fixture-shared-library/v1/staged/research/long-batch/', { 'note.md': '# A note' }), ...parts]);
+        expect(f.importedUris()).toEqual([stagedObject('gs://fixture-shared-library/v1/staged/research/long-batch/', 'note.md', '# A note'), ...parts]);
         const record = f.readRegistry().find((entry) => entry.source_id === `research-pdf-${sha256Hex(LONG).slice(0, 16)}` && entry.ingest_status === 'imported')!;
         expect(record).toMatchObject({ acquisition: 'stage_import', workspace_relative_path: 'experts/research/sources/batch/long-volume.pdf', pages: 450 });
         // Staged again, the PDF is present and only the note is staged.
         const again = await stage('long-batch-2');
         expect(again.pdf_sources).toMatchObject([{ status: 'imported', import_outcome: { already_present: true } }]);
-        expect(f.importedUris().slice(4)).toEqual([stagedRunDirectory('gs://fixture-shared-library/v1/staged/research/long-batch-2/', { 'note.md': '# A note' })]);
+        expect(f.importedUris().slice(4)).toEqual([stagedObject('gs://fixture-shared-library/v1/staged/research/long-batch-2/', 'note.md', '# A note')]);
       } finally { f.cleanup(); }
     });
   });

@@ -240,20 +240,31 @@ one in the batch, reported `duplicate_in_batch` with `duplicate_of` and not
 imported; a split also checks the corpus again right before it runs); `eligible_files` lists only what the batch stages, and a batch of
 refused PDFs answers `pdf_sources_refused`. The 100 MiB batch cap counts only
 the files the batch stages; a routed PDF is bounded by the per-file limit alone
-(web_import's 100 MiB fetch budget still covers everything it fetches). Each run stages
-into its own directory, `staged/<domain>/<batch>/<run-id>/`, and the batch
-import takes that directory, so it imports exactly what the run staged. The run
-id (`run-` and 16 hex digits, in the receipt's `destination.run_id`) is named by
-each staged file's path and sha256: a retry that stages the same bytes reuses
-the same URIs, which Vertex skips as already held, and a run that stages
-anything else, overlapping or not, gets its own directory. Nothing is deleted:
-a superseded run's directory, a PDF since routed out of the batch included, is
-left in place and never imported again; whatever it already imported stays in
-the corpus. A batch whose files changed therefore imports every file it stages
-again under the new directory, beside the earlier run's ragFiles; the batch's
-registry record names the latest run's URIs. A plan names the directory a live
-run of the same files stages into. Parts go to `staged/<domain>/<batch>--parts/`, shared by every run
-of the batch, after the batch import, and a staged PDF that
+(web_import's 100 MiB fetch budget still covers everything it fetches). Each staged file is
+addressed by its bytes, `staged/<domain>/<batch>/<first 32 hex of its
+sha256>/<file name>` (the receipt's `destination.object_naming`), and the batch
+imports exactly its own objects, named one by one, never a directory. An
+unchanged file keeps its URI, so a re-run of the batch is skipped by Vertex for
+it; a changed file gets a new URI and is imported; an object no run names any
+more is never imported again; and two runs of one `batch_id`, overlapping or
+not, cannot reach each other's objects. Nothing is deleted. A batch staged
+before this release, at `staged/<domain>/<batch>/<file name>`, imports each
+file once more under its new name on its first re-run. A changed file's
+previous version stays in the corpus as its own ragFile, the earlier version
+rather than a duplicate, and the batch's registry record names the new URI. A
+medium's transcript sits beside the medium, so a re-run keeps it instead of
+transcribing the same bytes again. The import goes in requests of at most 25
+URIs: `ImportRagFiles` documents no per-request maximum, so 25 is a cautious
+guess. Each request settles before the next is submitted (a corpus takes one
+import at a time), a busy corpus or quota refusal is waited out within the poll
+budget, and the requests share the Vertex RAG request pacing. From the first
+accepted request the batch record names every file with each request's
+operation (`rag_operation_names` once there are several), and the run ends
+with one terminal record; a receipt of several requests carries
+`submission_receipts`, `operations` and `import_outcome.requests`. A request
+still running when its budget ends stops the batch with the rest unsubmitted
+(`request_still_running`); re-running the batch finishes it, skipping what is
+already in. Parts go to `staged/<domain>/<batch>--parts/` after the batch import, and a staged PDF that
 is the batch's only file is registered under the `source_id` the import names.
 A PDF imported by URI without `source_id` is registered under its sha256 as
 `<domain>-pdf-<sha prefix>` and answers within the response budget. A

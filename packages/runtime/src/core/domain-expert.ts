@@ -572,7 +572,7 @@ export function planRagCorpus(
         max_batch_bytes: 100 * 1024 * 1024,
         media_max_file_bytes: 200 * 1024 * 1024,
         media_bytes_count_against_text_batch_cap: false,
-        ...(destinationRoot ? { destination_prefix: `${destinationRoot}/staged/${manifest.domain_id}/${params.batchId ?? '<generated-batch-id>'}/<run-id>/` } : {}),
+        ...(destinationRoot ? { destination_prefix: `${destinationRoot}/staged/${manifest.domain_id}/${params.batchId ?? '<generated-batch-id>'}/` } : {}),
       }
     : undefined;
   const webImport = params.action === 'web_import'
@@ -590,7 +590,7 @@ export function planRagCorpus(
         youtube_media_transcripts: `${EXTRACTION_METHOD} handles YouTube and media URLs with its own tooling; the worker selects neither captions nor ASR`,
         media_max_file_bytes: 200 * 1024 * 1024,
         media_bytes_count_against_text_batch_cap: false,
-        ...(destinationRoot ? { destination_prefix: `${destinationRoot}/staged/${manifest.domain_id}/${params.batchId ?? '<generated-batch-id>'}/<run-id>/` } : {}),
+        ...(destinationRoot ? { destination_prefix: `${destinationRoot}/staged/${manifest.domain_id}/${params.batchId ?? '<generated-batch-id>'}/` } : {}),
     }
     : undefined;
   const notionImport = params.action === 'notion_import'
@@ -607,7 +607,7 @@ export function planRagCorpus(
           object_cap_default: 200,
           recursive_block_depth_default: 6,
         },
-        ...(destinationRoot ? { destination_prefix: `${destinationRoot}/staged/${manifest.domain_id}/${params.batchId ?? '<generated-batch-id>'}/<run-id>/` } : {}),
+        ...(destinationRoot ? { destination_prefix: `${destinationRoot}/staged/${manifest.domain_id}/${params.batchId ?? '<generated-batch-id>'}/` } : {}),
       }
     : undefined;
   return {
