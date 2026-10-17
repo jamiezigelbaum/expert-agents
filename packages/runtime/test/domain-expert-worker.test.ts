@@ -7519,6 +7519,56 @@ describe('splitting long PDFs for LLM-parser imports', () => {
       } finally { f.cleanup(); }
     });
 
+    // Content-addressed URIs carry the batch id, so a retry under another batch would not be
+    // skipped by Vertex: a recorded import still running is asked about, not imported again.
+    test('a retry under a new batch id waits for a recorded import still running, then retries once it failed', async () => {
+      const PENDING = `${CORPUS}/operations/pending-1`;
+      let operation: Record<string, unknown> = { name: PENDING, done: false };
+      const short = textPdfBytes(120);
+      const f = splitFixture(LONG, (part, attempt) => (part === 'whole' && attempt === 1 ? jsonResponse({ name: PENDING, done: false }) : { importedRagFilesCount: '1' }), {
+        importPollTimeoutMs: 60,
+        wrapGoogleFetch: (next) => (async (input: string | URL | Request, init?: RequestInit) => (String(input).includes('/operations/pending-1')
+          ? jsonResponse(operation)
+          : next(input, init))) as typeof fetch,
+      });
+      try {
+        writeBatch(f.base, { 'volume.pdf': short });
+        const first = await stageBatch(f.worker, 'batch-a');
+        expect(first.import_outcome).toMatchObject({ status: 'import_requested' });
+        const firstUri = stagedObject('gs://fixture-shared-library/v1/staged/research/batch-a/', 'volume.pdf', short);
+        // Still running: the retry imports nothing and says so.
+        const retry = await stageBatch(f.worker, 'batch-b');
+        expect(retry).toMatchObject({ status: 'pdf_sources_in_progress', pdf_sources: [{ route: 'in_progress', status: 'import_in_progress', error: { code: 'source_import_in_progress' } }] });
+        expect(f.importedUris()).toEqual([firstUri]);
+        // Finished and failed: the failure is recorded, and the next retry imports the file.
+        operation = { name: PENDING, done: true, error: { code: 13, message: 'An internal error occurred processing the file.' } };
+        const again = await stageBatch(f.worker, 'batch-c');
+        expect(f.readRegistry().find((record) => record.source_id === 'research-stage-import-batch-a' && record.ingest_status === 'import_failed'))
+          .toMatchObject({ ingest_reason: expect.stringContaining('Reconciled') });
+        expect(again.import_outcome).toMatchObject({ status: 'imported' });
+        expect(f.importedUris()).toEqual([firstUri, stagedObject('gs://fixture-shared-library/v1/staged/research/batch-c/', 'volume.pdf', short)]);
+      } finally { f.cleanup(); }
+    });
+
+    // Two imports naming one new source with different files take different sha256 locks, so
+    // the source's id is locked too: the second sees the first's file and is refused.
+    test('two concurrent imports naming one new source_id with different PDFs: one is imported, the other refused', async () => {
+      const ONE = 'v1/library/first-paper.pdf';
+      const TWO = 'v1/library/second-paper.pdf';
+      const f = splitFixture(LONG, importsAll, { seed: { objects: [[ONE, textPdfBytes(110)], [TWO, textPdfBytes(111)]] } });
+      try {
+        await postDomain(f.worker, 'domain_source', { action: 'add', domain_id: 'research', source_id: 'shared-paper', kind: 'pdf', url: 'https://example.com/paper', dry_run: false });
+        const request = (object: string) => postDomainResponse(f.worker, 'rag_corpus', { action: 'import', domain_id: 'research', corpus_id: CORPUS, gcs_uri: `gs://fixture-shared-library/${object}`, source_id: 'shared-paper', dry_run: false });
+        const responses = await Promise.all([request(ONE), request(TWO)]);
+        const outcomes = await Promise.all(responses.map(async (response) => ({ status: response.status, body: (await response.json()) as Record<string, any> })));
+        expect(outcomes.map((outcome) => outcome.status).sort()).toEqual([200, 409]);
+        expect(outcomes.find((outcome) => outcome.status === 409)!.body.error.code).toBe('source_identity_conflict');
+        expect(f.importedUris()).toHaveLength(1);
+        const hashes = new Set(f.readRegistry().filter((record) => record.source_id === 'shared-paper').map((record) => record.source_sha256).filter(Boolean));
+        expect(hashes.size).toBe(1);
+      } finally { f.cleanup(); }
+    });
+
     test('two concurrent resumes of the same partial split import each part once', async () => {
       const f = splitFixture(LONG, (part, attempt) => (part !== 'part1of3' && attempt === 1
         ? { error: { code: 13, message: 'An internal error occurred processing the file.' } }

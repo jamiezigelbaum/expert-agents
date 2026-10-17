@@ -1771,18 +1771,22 @@ export class DomainExpertService {
     if (dryRun) return plan;
     const sourceRecord = (plan as { source_record: Record<string, unknown> }).source_record;
     // A source given its identity is registered under that identity's lock, like any import of it.
-    const lock = typeof params.sha256 === 'string' && params.sha256.trim()
-      ? await this.sourceLocks.acquire(sourceLockKey(manifest, params.sha256.trim()), 'domain_source add', this.sourceLockDeadline())
-      : undefined;
-    if (lock && 'heldBy' in lock) {
-      const busy = await this.sourceImportBusy(manifest, params.sha256!.trim(), lock.heldBy);
-      const error = busy.error as { code: string; message: string; suggestion: string };
-      throw new DomainExpertWorkerError(409, error.code, error.message.replace('Nothing was imported here.', 'Nothing was registered.'), error.suggestion);
+    // So is the source it names.
+    const sha256 = typeof params.sha256 === 'string' && params.sha256.trim() ? params.sha256.trim() : undefined;
+    const lock = await this.sourceLocks.acquireAll(
+      [...(sha256 ? [sourceLockKey(manifest, sha256)] : []), sourceIdLockKey(manifest, String(sourceRecord.source_id))],
+      'domain_source add', this.sourceLockDeadline(),
+    );
+    if ('heldBy' in lock) {
+      const busy = sha256 ? await this.sourceImportBusy(manifest, sha256, lock.heldBy) : undefined;
+      throw new DomainExpertWorkerError(409, 'source_import_in_progress',
+        `Another operation on this source (${lock.heldBy}) is still running${busy?.source_id ? ` and records it as ${String(busy.source_id)}` : ''}. Nothing was registered.`,
+        'Check domain_source status for this source once that operation settles.');
     }
     try {
       return await this.addDomainSource(params, manifest, sourceRecord, rootPath, registryPath, registryRelativePath);
     } finally {
-      lock?.release();
+      lock.release();
     }
   }
 
@@ -2447,13 +2451,28 @@ export class DomainExpertService {
       throw new DomainExpertWorkerError(409, 'gcs_object_changed', `${gcsUri} changed while it was being read. Nothing was imported.`, 'Re-run the import once the object is stable.');
     }
     const digest = sha256(bytes);
-    const namedSource = params.sourceId
-      ? await this.registeredImportSource(manifest, await checkedRootPath(this.rootFor(manifest.workspace_root_id)), params.sourceId)
-      : undefined;
-    // A named source that records another file's sha256 is another source.
-    const otherIdentity = namedSource ? otherRecordedIdentity(namedSource, digest) : undefined;
-    if (otherIdentity) {
-      throw new DomainExpertWorkerError(409, 'source_identity_conflict', `Source ${String(namedSource!.source_id)} records a different file (sha256 ${otherIdentity.slice(0, 12)}) than ${gcsUri} (sha256 ${digest.slice(0, 12)}). Nothing was imported.`, 'Import it without source_id, or under the source that is this file.');
+    const base = { kind: 'rag_corpus_result', domain_id: manifest.domain_id, resolved_corpus: resolvedCorpusRecord(resolved), requested_gcs_uri: gcsUri, source_sha256: digest };
+    // From reading the named source and the holding until this import's outcome (or
+    // in-progress record) is written, no other import of this file, or of the source it
+    // names, runs: it waits, then sees what this one recorded.
+    const lock = await this.sourceLocks.acquireAll(
+      [sourceLockKey(manifest, digest), ...(params.sourceId ? [sourceIdLockKey(manifest, params.sourceId)] : [])],
+      `rag_corpus import of ${gcsUri}`, this.sourceLockDeadline(),
+    );
+    if ('heldBy' in lock) return { ...base, ...(await this.sourceImportBusy(manifest, digest, lock.heldBy)), policy: domainPolicy() };
+    let namedSource: Record<string, unknown> | undefined;
+    try {
+      namedSource = params.sourceId
+        ? await this.registeredImportSource(manifest, await checkedRootPath(this.rootFor(manifest.workspace_root_id)), params.sourceId)
+        : undefined;
+      // A named source that records another file's sha256 is another source.
+      const otherIdentity = namedSource ? otherRecordedIdentity(namedSource, digest) : undefined;
+      if (otherIdentity) {
+        throw new DomainExpertWorkerError(409, 'source_identity_conflict', `Source ${String(namedSource!.source_id)} records a different file (sha256 ${otherIdentity.slice(0, 12)}) than ${gcsUri} (sha256 ${digest.slice(0, 12)}). Nothing was imported.`, 'Import it without source_id, or under the source that is this file.');
+      }
+    } catch (error) {
+      lock.release();
+      throw error;
     }
     const context: SourceImportContext = { sha256: digest, ...(namedSource ? { sourceId: String(namedSource.source_id) } : {}) };
     const named = parseObjectNameUri(gcsUri);
@@ -2483,17 +2502,15 @@ export class DomainExpertService {
       partNames: async () => ({ bucket, directory, stem: objectName.slice(directory.length).replace(/\.pdf$/i, ''), priorStems: [] }),
       recordProgress: (snapshot) => register(snapshot, { progress: true }),
     };
-    const base = { kind: 'rag_corpus_result', domain_id: manifest.domain_id, resolved_corpus: resolvedCorpusRecord(resolved), requested_gcs_uri: gcsUri, source_sha256: digest };
-    // From the holding check until this import's outcome (or in-progress record) is
-    // written, no other import of this file runs: it waits, then sees what this one recorded.
-    const lock = await this.sourceLocks.acquire(sourceLockKey(manifest, digest), `rag_corpus import of ${gcsUri}`, this.sourceLockDeadline());
-    if ('heldBy' in lock) return { ...base, ...(await this.sourceImportBusy(manifest, digest, lock.heldBy)), policy: domainPolicy() };
     let handedOff = false;
     try {
       const holding = await this.sourceHolding(source);
       if (holding.kind === 'present') {
         const present = { status: 'imported', ...corpusTarget, ...holding.result };
         return { ...base, ...holding.result, status: 'already_present', source_registry: await register(present, {}), policy: domainPolicy() };
+      }
+      if (holding.kind === 'in_progress') {
+        return { ...base, status: 'import_in_progress', source_id: holding.source_id, error: sourceImportPending(source, holding), policy: domainPolicy() };
       }
       if (holding.kind === 'unknown' || holding.kind === 'conflict') {
         const refusal = holding.kind === 'unknown' ? sourceHoldingUnverified(source, holding) : sourceIdentityConflict(source, holding);
@@ -2567,12 +2584,11 @@ export class DomainExpertService {
     namedSource?: Record<string, unknown>,
     // A live run's source locks (a dry run takes none): each PDF is routed under its sha256's lock.
     held?: HeldSources,
-  ): Promise<{ eligible: StageImportEligibleFile[]; routed: RoutedStagedPdf[] }> {
+  ): Promise<{ eligible: StageImportEligibleFile[]; routed: RoutedStagedPdf[]; namedSource?: Record<string, unknown> }> {
     const { manifest } = stage;
     const corpusId = stage.resolved.requested;
     const eligible: StageImportEligibleFile[] = [];
     const routed: RoutedStagedPdf[] = [];
-    const named = namedSource && stage.eligible.length === 1 ? namedSource : undefined;
     // A dry run's derived files are not written; they carry their bytes.
     const pdfBytes = new Map<StageImportEligibleFile, { bytes: Uint8Array; digest: string }>();
     for (const file of stage.eligible) {
@@ -2581,16 +2597,30 @@ export class DomainExpertService {
       const bytes = file.content ?? new Uint8Array(await readFile(file.absolutePath));
       pdfBytes.set(file, { bytes, digest: sha256(bytes) });
     }
-    // Locks are taken in sha256 order, so two batches sharing PDFs never wait on each other in a cycle.
+    // Locks are taken in one sorted order (each PDF's sha256 and the named source's id), so
+    // no two operations wait on each other in a cycle.
     const busy = new Map<string, Record<string, unknown>>();
     if (held) {
       const deadline = this.sourceLockDeadline();
-      for (const digest of [...new Set([...pdfBytes.values()].map((pdf) => pdf.digest))].sort()) {
-        const lock = await this.sourceLocks.acquire(sourceLockKey(manifest, digest), `rag_corpus ${action} batch`, deadline);
-        if ('heldBy' in lock) busy.set(digest, await this.sourceImportBusy(manifest, digest, lock.heldBy));
-        else held.add(digest, lock.release);
+      const keys = new Map<string, string>([...pdfBytes.values()].map((pdf) => [sourceLockKey(manifest, pdf.digest), pdf.digest]));
+      if (namedSource) keys.set(sourceIdLockKey(manifest, String(namedSource.source_id)), NAMED_SOURCE_LOCK);
+      for (const key of [...keys.keys()].sort()) {
+        const entry = keys.get(key)!;
+        const lock = await this.sourceLocks.acquire(key, `rag_corpus ${action} batch`, deadline);
+        if ('heldBy' in lock && entry === NAMED_SOURCE_LOCK) {
+          throw new DomainExpertWorkerError(409, 'source_import_in_progress',
+            `Another operation on source ${String(namedSource!.source_id)} (${lock.heldBy}) is still running. Nothing was staged or imported.`,
+            'Check domain_source status for that source once it settles, then re-run the import.');
+        }
+        if ('heldBy' in lock) busy.set(entry, await this.sourceImportBusy(manifest, entry, lock.heldBy));
+        else held.add(entry, lock.release);
+      }
+      // Read again under its lock: another import may have recorded it meanwhile.
+      if (namedSource) {
+        namedSource = await this.registeredImportSource(manifest, await checkedRootPath(this.rootFor(manifest.workspace_root_id)), String(namedSource.source_id));
       }
     }
+    const named = namedSource && stage.eligible.length === 1 ? namedSource : undefined;
     const firstOfDigest = new Map<string, string>();
     for (const file of stage.eligible) {
       const pdf = pdfBytes.get(file);
@@ -2657,9 +2687,13 @@ export class DomainExpertService {
         } } });
         continue;
       }
-      const holding = await this.sourceHolding(source);
+      const holding = await this.sourceHolding(source, { reconcile: held !== undefined });
       if (holding.kind === 'present') {
         routed.push({ entry, corpusId, route: 'present', register, outcome: { status: 'imported', target_corpus_id: corpusId, ...holding.result } });
+        continue;
+      }
+      if (holding.kind === 'in_progress') {
+        routed.push({ entry, corpusId, route: 'in_progress', outcome: { status: 'import_in_progress', source_id: holding.source_id, error: sourceImportPending(source, holding) } });
         continue;
       }
       if (holding.kind === 'unknown' || holding.kind === 'conflict') {
@@ -2678,7 +2712,7 @@ export class DomainExpertService {
         });
       }
     }
-    return { eligible, routed };
+    return { eligible, routed, ...(namedSource ? { namedSource } : {}) };
   }
 
   // The outcome of every PDF a batch left out, in batch order. A PDF found present
@@ -2703,8 +2737,10 @@ export class DomainExpertService {
     }
     // Each PDF's registry writes run in order, so an in-progress record never lands after its outcome.
     const splits = routed.flatMap((pdf, index) => (pdf.split ? [{ pdf, index, ended: false, writes: Promise.resolve() as Promise<unknown> }] : []));
-    // The splits may outlive the request: they keep their locks and release each once its outcome is recorded.
+    // The splits may outlive the request: they keep their locks and release each once its
+    // outcome is recorded, and the named source's lock once the last one is.
     for (const split of splits) held?.handOff(split.pdf.entry.source_sha256);
+    if (splits.length) held?.handOff(NAMED_SOURCE_LOCK);
     const work = (async () => {
       for (const split of splits) {
         try {
@@ -2721,6 +2757,7 @@ export class DomainExpertService {
     })().finally(() => {
       // A throw that ended the loop early must not leave a later split's lock held.
       for (const split of splits) held?.release(split.pdf.entry.source_sha256);
+      if (splits.length) held?.release(NAMED_SOURCE_LOCK);
     });
     if (splits.length && await this.raceResponseBudget(work) === undefined) {
       void work.catch((error: unknown) => {
@@ -2863,7 +2900,8 @@ export class DomainExpertService {
         target_corpus_id: corpus.requested,
         trust_posture: manifest.trust_posture,
       }),
-      ...(registeredSource ? { source: registeredSource } : {}),
+      // As read under its lock.
+      ...((pdfs.namedSource ?? registeredSource) ? { source: (pdfs.namedSource ?? registeredSource)! } : {}),
     });
     // The batch record now holds each whole PDF's outcome.
     for (const file of eligible) if (file.sha256) held.release(file.sha256);
@@ -3102,7 +3140,8 @@ export class DomainExpertService {
         target_corpus_id: corpus.requested,
         trust_posture: manifest.trust_posture,
       }),
-      ...(registeredSource ? { source: registeredSource } : {}),
+      // As read under its lock.
+      ...((pdfs.namedSource ?? registeredSource) ? { source: (pdfs.namedSource ?? registeredSource)! } : {}),
     });
     // The batch record now holds each whole PDF's outcome.
     for (const file of eligible) if (file.sha256) held.release(file.sha256);
@@ -4538,6 +4577,7 @@ export class DomainExpertService {
     if (holding.kind === 'present') return { status: 'imported', ...corpusTarget, source_sha256: context.sha256, ...holding.result };
     if (holding.kind === 'conflict') return { status: 'blocked', ...corpusTarget, error: sourceIdentityConflict(source, holding) };
     if (holding.kind === 'unknown') return { status: 'blocked', ...corpusTarget, error: sourceHoldingUnverified(source, holding) };
+    if (holding.kind === 'in_progress') return { status: 'blocked', ...corpusTarget, error: sourceImportPending(source, holding) };
     // The single choke point for every ingest, so the scale gate sits here, after
     // the identity check (a source already in the corpus is present whatever its
     // scale): a positively measured sub-book-scale artifact stops before anything
@@ -4616,7 +4656,9 @@ export class DomainExpertService {
   // (a transient read never downgrades a known import). Partial: a recorded
   // split with parts still to import. Unknown: a recorded copy whose corpus
   // state cannot be read and that the registry does not know as imported.
-  private async sourceHolding(source: SourceImport): Promise<SourceHolding> {
+  // reconcile: write the outcome of a finished import the registry still records as
+  // requested (a dry run reads it without writing).
+  private async sourceHolding(source: SourceImport, options: { reconcile?: boolean } = {}): Promise<SourceHolding> {
     const { manifest, corpusId, context } = source;
     const found = await this.registeredSourceForIdentity(manifest, context.sha256, source.legacyLocator);
     if (!found) return { kind: 'none' };
@@ -4656,8 +4698,11 @@ export class DomainExpertService {
         };
       }
       if (!listed) return { kind: 'unknown', source_id: found.sourceId, reason: listingError ?? 'rag_file_listing_failed' };
-      // The recorded copy is not in the corpus: the source is imported as usual.
-      return { kind: 'none' };
+      // An import recorded as requested may still be running. A retry under another batch
+      // stages another URI, so Vertex would not skip it: the operation decides.
+      const pending = await this.pendingImportHolding(manifest, corpusId, found, file, options.reconcile !== false);
+      // Otherwise the recorded copy is not in the corpus: the source is imported as usual.
+      return pending ?? { kind: 'none' };
     }
     const parts = holding.parts.map((part, position) => {
       const file = listed?.[position];
@@ -4690,6 +4735,54 @@ export class DomainExpertService {
   // How long an operation waits for a source's lock: its response budget, or as long as it takes without one.
   private sourceLockDeadline(): number | undefined {
     return this.annasResponseBudgetMs > 0 ? Date.now() + this.annasResponseBudgetMs : undefined;
+  }
+
+  // A whole holding whose latest record says import_requested, with no ACTIVE ragFile yet:
+  // each recorded operation is read once. One still running makes the holding in progress;
+  // when all are done and the file did not import, the failure is recorded now and the
+  // source can be imported again (undefined); an operation that cannot be read, or one that
+  // imported a file not yet listed, leaves it unknown.
+  private async pendingImportHolding(
+    manifest: ReturnType<typeof domainManifest>,
+    corpusId: string,
+    found: NonNullable<ReturnType<typeof sourceForIdentity>>,
+    file: Record<string, unknown> | undefined,
+    reconcile: boolean,
+  ): Promise<SourceHolding | undefined> {
+    const record = found.holding;
+    if (!record || record.ingest_status !== 'import_requested') return undefined;
+    const names = [...new Set([...(Array.isArray(record.rag_operation_names) ? record.rag_operation_names : []), record.rag_operation_name]
+      .filter((name): name is string => typeof name === 'string'))];
+    if (!names.length) return undefined;
+    const outcomes: Array<ReturnType<typeof classifyRagImportOperation>> = [];
+    try {
+      const resolved = await this.resolveRagCorpus(manifest, corpusId);
+      const scope = { project: manifest.gcp_project, location: manifest.rag_location, corpusName: resolved.resourceName };
+      for (const name of names) outcomes.push(classifyRagImportOperation(await this.google.getRagImportOperation(scope, name), name, 'pdf'));
+    } catch (error) {
+      return { kind: 'unknown', source_id: found.sourceId, reason: `import operation unreadable (${ingestErrorRecord(error).code})` };
+    }
+    if (outcomes.some((outcome) => outcome === undefined)) return { kind: 'in_progress', source_id: found.sourceId, operations: names };
+    const failed = file?.state === 'ERROR' || outcomes.every((outcome) => outcome!.status !== 'imported');
+    if (!failed) return { kind: 'unknown', source_id: found.sourceId, reason: 'its import finished but its ragFile is not listed yet' };
+    if (reconcile) {
+      const reason = outcomes.map((outcome) => ragImportReason(outcome!.detail)).join('; ');
+      try {
+        const root = this.roots.get(manifest.workspace_root_id);
+        if (root) {
+          const registryPath = resolveInside(await checkedRootPath(root), `${manifest.workspace_relative_path}/references/source-registry.jsonl`);
+          await this.appendRegistryJsonLine(registryPath, {
+            ...Object.fromEntries(Object.entries(record).filter(([key]) => key !== 'verification' && key !== 'ingest_reason' && key !== 'registered_at')),
+            ingest_status: 'import_failed',
+            ingest_reason: `Reconciled from the recorded operation: ${reason}`,
+            registered_at: new Date().toISOString(),
+          });
+        }
+      } catch {
+        // The outcome is still known; the next check records it.
+      }
+    }
+    return undefined;
   }
 
   // The answer when another operation holds this file's lock past the response budget:
@@ -9806,6 +9899,14 @@ function sourceIdentityConflict(source: SourceImport, holding: { source_id: stri
   };
 }
 
+function sourceImportPending(source: SourceImport, holding: { source_id: string; operations: string[] }): { code: string; message: string; suggestion: string } {
+  return {
+    code: 'source_import_in_progress',
+    message: `The source registry records this file (sha256 ${source.context.sha256.slice(0, 12)}) as ${holding.source_id}, and its import (${holding.operations.join(', ')}) is still running in Vertex. Nothing was uploaded or imported; ${source.kept}.`,
+    suggestion: `Check domain_source status for ${holding.source_id}; ${source.rerun} only if that import fails.`,
+  };
+}
+
 function sourceHoldingUnverified(source: SourceImport, holding: { source_id: string; reason: string }): { code: string; message: string; suggestion: string } {
   return {
     code: 'source_holding_unverified',
@@ -9840,6 +9941,20 @@ interface RecordedPart {
 // registry would need a distributed lock.
 class SourceIdentityLocks {
   readonly #held = new Map<string, { holder: string; wake: Array<() => void> }>();
+
+  // Several keys, taken in sorted order; all or none.
+  async acquireAll(keys: string[], holder: string, deadline: number | undefined): Promise<{ release: () => void } | { heldBy: string }> {
+    const releases: Array<() => void> = [];
+    for (const key of [...new Set(keys)].sort()) {
+      const lock = await this.acquire(key, holder, deadline);
+      if ('heldBy' in lock) {
+        for (const release of releases) release();
+        return lock;
+      }
+      releases.push(lock.release);
+    }
+    return { release: () => { for (const release of releases) release(); } };
+  }
 
   // deadline: when to stop waiting (ms since epoch); undefined waits as long as it takes.
   async acquire(key: string, holder: string, deadline: number | undefined): Promise<{ release: () => void } | { heldBy: string }> {
@@ -9894,11 +10009,20 @@ function sourceLockKey(manifest: ReturnType<typeof domainManifest>, sha256: stri
   return `${manifest.domain_id}:${sha256.toLowerCase()}`;
 }
 
+// A source named by its id is locked too: two imports naming one new source_id with
+// different files take different sha256 locks but the same id lock. Every caller takes
+// its keys in one sorted order (sha256 and id keys together), so none waits in a cycle.
+function sourceIdLockKey(manifest: ReturnType<typeof domainManifest>, sourceId: string): string {
+  return `${manifest.domain_id}:source:${sourceId.trim()}`;
+}
+
 type SourceHolding =
   | { kind: 'none' }
   | { kind: 'present'; result: Record<string, unknown> }
   | { kind: 'partial'; source_id: string; parts: RecordedPart[]; listing_error?: string }
   | { kind: 'unknown'; source_id: string; reason: string }
+  // A recorded import whose operation Vertex reports still running.
+  | { kind: 'in_progress'; source_id: string; operations: string[] }
   | { kind: 'conflict'; source_id: string; corpus: string };
 
 // The registry source for an identity. A source matches by the sha256 any of
@@ -10277,6 +10401,9 @@ const RAG_IMPORT_OUTCOME_FIELDS = new Set([
 // How many of a file's first bytes tell whether it is a PDF (hasPdfHeader): a file is a
 // PDF by its bytes, whatever its name, for GCS imports, staged files and web imports alike.
 const PDF_SNIFF_BYTES = ANNAS_PDF_HEADER_WINDOW_BYTES;
+
+// HeldSources' entry for the lock on the source a staged import names.
+const NAMED_SOURCE_LOCK = 'named-source';
 
 // A file's first bytes, enough to tell a PDF.
 async function readFileHead(path: string, length: number): Promise<Uint8Array> {

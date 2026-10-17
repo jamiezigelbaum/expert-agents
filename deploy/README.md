@@ -291,7 +291,15 @@ in-progress record, and a split that outlives its request keeps the lock until
 its outcome is recorded. Another operation on the same file waits for it, then
 sees what it recorded; past the response budget it answers
 `import_in_progress` (`source_import_in_progress`, naming the holder and the
-source) instead. The lock lives in the worker process: running several worker
+source) instead. An import that names a `source_id` also locks that id, with
+all keys taken in one sorted order, so two imports naming one new source with
+different files cannot both claim it. A whole holding whose latest record is
+still `import_requested` (an import whose poll budget ran out) is checked
+against its recorded operations: one still running answers
+`source_import_in_progress`, since a retry under another batch id stages
+another URI that Vertex would not skip; once they finished without the file in
+the corpus, the failure is recorded and the file is imported again; an
+operation that cannot be read answers `source_holding_unverified`. The lock lives in the worker process: running several worker
 processes against one registry would need a distributed lock. A `rag_corpus import` of a GCS directory
 (`gs://…/prefix/`) or a Drive file does not take the pipeline: it is imported as before, so a long PDF in it is not
 split. The library materializer imports each object whole and does not split:
