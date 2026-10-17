@@ -1,7 +1,7 @@
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import type { ExpertAgentsConfig } from '../packages/runtime/src/core/config.ts';
-import { FACTORY_NETWORK_ENV, type FactoryConfig, type FactoryGatewaySelection, type FactoryGitHubSelection, type FactoryRequest } from '../packages/provisioning/src/factory-types.ts';
+import { factoryNetworkEnv, type FactoryConfig, type FactoryGatewaySelection, type FactoryGitHubSelection, type FactoryRequest } from '../packages/provisioning/src/factory-types.ts';
 
 export interface FactoryPluginConfig extends FactoryConfig { bunBin: string }
 export interface FactoryToolContext {
@@ -43,12 +43,15 @@ export async function invokeFactory(
   signal?.throwIfAborted();
   const entry = fileURLToPath(new URL('./factory.js', import.meta.url));
   // No GitHub credential or GH_CONFIG_DIR here: the System GitHub selection travels on private
-  // stdin, and the factory applies it only to its own GitHub Git commands. Proxy and CA settings
-  // pass through so a host behind a proxy reaches GitHub, the worker and Telegram.
-  const env: Record<string, string> = {};
-  for (const name of ['PATH', 'HOME', 'USER', 'TMPDIR', 'XDG_CONFIG_HOME', 'XDG_STATE_HOME', 'OPENCLAW_CONFIG_PATH', 'OPENCLAW_STATE_DIR', 'OPENCLAW_PROFILE', ...FACTORY_NETWORK_ENV]) {
+  // stdin, and the factory applies it only to its own GitHub Git commands. Credential-free proxy
+  // and CA settings pass through so a host behind a proxy reaches GitHub, the worker and Telegram;
+  // a proxy URL with a credential is withheld and named, never echoed, in the response.
+  const network = factoryNetworkEnv(process.env);
+  const env: Record<string, string> = { ...network.env };
+  for (const name of ['PATH', 'HOME', 'USER', 'TMPDIR', 'XDG_CONFIG_HOME', 'XDG_STATE_HOME', 'OPENCLAW_CONFIG_PATH', 'OPENCLAW_STATE_DIR', 'OPENCLAW_PROFILE']) {
     if (process.env[name]) env[name] = process.env[name]!;
   }
+  const withheld = network.withheld.length > 0 ? { environment_withheld: network.withheld } : {};
   return new Promise((resolve) => {
     const grouped = process.platform !== 'win32';
     const child = spawn(factory.bunBin!, [entry], { env, stdio: ['pipe', 'pipe', 'pipe'], detached: grouped });
@@ -60,7 +63,8 @@ export async function invokeFactory(
       settled = true;
       clearTimeout(timeout);
       signal?.removeEventListener('abort', abort);
-      resolve(value);
+      resolve(value.result && typeof value.result === 'object' ? { result: { ...value.result, ...withheld } }
+        : value.error ? { error: { ...value.error, ...withheld } } : value);
     };
     const stop = () => { try { if (grouped && child.pid) process.kill(-child.pid, 'SIGTERM'); else child.kill(); } catch { /* already exited */ } };
     const abort = () => { stop(); finish(failure('factory_interrupted', 'Factory invocation interrupted. Inspect saved progress before resuming.')); };

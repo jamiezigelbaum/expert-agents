@@ -3,7 +3,7 @@ import { lstat, mkdtemp, open, rm } from 'node:fs/promises';
 import { devNull, tmpdir } from 'node:os';
 import { dirname, isAbsolute, join } from 'node:path';
 import { cleanupOnExit, runFactory, FactoryError, type FactoryCommand, type FactoryFailureCategory } from '../packages/provisioning/src/factory.ts';
-import { FACTORY_NETWORK_ENV, type FactoryConfig, type FactoryGatewaySelection, type FactoryGitHubSelection, type FactoryRequest } from '../packages/provisioning/src/factory-types.ts';
+import { factoryNetworkEnv, type FactoryConfig, type FactoryGatewaySelection, type FactoryGitHubSelection, type FactoryRequest } from '../packages/provisioning/src/factory-types.ts';
 import { DomainExpertClient } from '../packages/runtime/src/core/domain-expert-client.ts';
 import type { ExpertAgentsConfig } from '../packages/runtime/src/core/config.ts';
 import { OperationError } from '../packages/runtime/src/core/operation-error.ts';
@@ -51,9 +51,9 @@ const MANAGED_PROFILE_ID = /^ghp_[a-f0-9]{32}$/;
 const GITHUB_GIT_CONFIG = ['-c', 'credential.helper=', '-c', 'credential.helper=!gh auth git-credential', '-c', 'core.askPass=', '-c', `core.hooksPath=${devNull}`];
 // Like OpenClaw's authenticated worker Git, inherited Git, GitHub CLI and askpass settings never
 // reach the push: they could supply another credential, reroute the remote or trace headers. The
-// host's proxy and CA trust variables are kept, so a host behind a proxy can still reach GitHub.
-const INHERITED_GIT_SETTINGS = /^(GIT_|GH_|GITHUB_|SSH_ASKPASS$|NETRC$|XDG_CONFIG_HOME$)/i;
-const KEPT_NETWORK_SETTINGS: readonly string[] = FACTORY_NETWORK_ENV;
+// host's credential-free proxy and CA trust variables are kept, so a host behind a proxy can still
+// reach GitHub.
+const INHERITED_GIT_SETTINGS = /^(GIT_|GH_|GITHUB_|HTTPS?_PROXY$|ALL_PROXY$|NO_PROXY$|SSL_CERT_(FILE|DIR)$|NODE_EXTRA_CA_CERTS$|SSH_ASKPASS$|NETRC$|XDG_CONFIG_HOME$)/i;
 // Repository settings that could still redirect, proxy or authenticate the push: URL rewrites,
 // HTTP settings, includes, and per-remote push URLs, proxies or remote helpers.
 // GitHub CLI's check of the profile's active credential, the only gh command given the identity.
@@ -75,10 +75,8 @@ export function factoryCommand(github?: FactoryGitHubSelection): FactoryCommand 
     const stopCleanup = cleanupOnExit(() => rmSync(home, { recursive: true, force: true }));
     try {
       const env: Record<string, string> = {};
-      for (const [name, value] of Object.entries(process.env)) {
-        if (value !== undefined && (!INHERITED_GIT_SETTINGS.test(name) || KEPT_NETWORK_SETTINGS.includes(name))) env[name] = value;
-      }
-      Object.assign(env, { HOME: home, GH_CONFIG_DIR: profileDir, GIT_CONFIG_GLOBAL: devNull, GIT_CONFIG_NOSYSTEM: '1', GIT_TERMINAL_PROMPT: '0' });
+      for (const [name, value] of Object.entries(process.env)) if (value !== undefined && !INHERITED_GIT_SETTINGS.test(name)) env[name] = value;
+      Object.assign(env, factoryNetworkEnv(process.env).env, { HOME: home, GH_CONFIG_DIR: profileDir, GIT_CONFIG_GLOBAL: devNull, GIT_CONFIG_NOSYSTEM: '1', GIT_TERMINAL_PROMPT: '0' });
       // Git's credential helper is gh. A missing gh would surface only as a failed credential
       // prompt, so both programs must resolve on PATH before Git starts.
       for (const program of ['git', 'gh']) {

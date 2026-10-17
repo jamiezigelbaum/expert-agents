@@ -36,12 +36,15 @@ only for a missing product decision or an actual deployment prerequisite.
      is running.
    - With `apply: true`, the factory runs its own preflight before it creates
      anything. A refusal with phase `preflight` (`factory_gateway_reload_off`,
-     `factory_google_not_ready`, `factory_remote_missing`,
+     `factory_google_not_ready`, `factory_workspace_root_missing`,
+     `factory_workspace_root_overwrites`, `factory_remote_missing`,
      `factory_remote_has_history`, or `factory_command_failed` such as System
      GitHub refused or a missing `gh` or deployment program) means nothing was
      created. Tell the owner the named cause, have it fixed, then repeat the
      same create. `factory_remote_has_history` means a repository with that
      name already exists: pick another `agent_id`; never ask to overwrite it.
+     A result's `environment_withheld` names a proxy variable that carried a
+     credential and was not used; tell the owner.
 2. Translate the request into `action: "create"`, a new lowercase `agent_id`,
    `display_name`, `purpose`, and a suggested `telegram_username` ending in
    `bot`. Suggest one plausible name and move on: availability cannot be

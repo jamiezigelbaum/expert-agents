@@ -169,8 +169,10 @@ describe('packaged factory preflight', () => {
   }, 30_000);
 });
 
-describe('deployment lock under termination', () => {
-  test('a factory ended with SIGTERM, as the plugin ends a timed-out one, releases its lock', async () => {
+describe('deployment lock across factory processes', () => {
+  // Packaged factory processes sharing one root, and a worker that holds the preflight health
+  // request, so a factory that got the lock stays mid-invocation holding it.
+  async function packaged() {
     const root = await realpath(await mkdtemp(join(tmpdir(), 'expert-command-test-'))); roots.push(root);
     const factoryRoot = join(root, 'factory'); const tokens = join(root, 'tokens');
     await mkdir(factoryRoot, { mode: 0o700 }); await mkdir(tokens, { mode: 0o700 });
@@ -178,27 +180,58 @@ describe('deployment lock under termination', () => {
     await writeFile(manager, 'synthetic-manager-placeholder', { mode: 0o600 });
     const cli = join(root, 'openclaw');
     await writeFile(cli, `#!${process.execPath}\nconst args = process.argv.slice(2).join(' ');\nif (args === 'agents list --json' || args === 'agents bindings --json') process.stdout.write('[]');\nelse if (args === 'config get channels.telegram --json') process.stdout.write('{}');\nelse if (args === 'config validate') process.stdout.write('ok');\nelse process.exit(64);\n`, { mode: 0o700 });
-    // A worker that holds the preflight health request, so the factory is mid-invocation with its lock.
+    const held: string[] = [];
     let arrived!: () => void;
     const reached = new Promise<void>((resolve) => { arrived = resolve; });
-    const worker = Bun.serve({ port: 0, hostname: '127.0.0.1', fetch: () => { arrived(); return new Promise<Response>(() => {}); } });
-    try {
-      const child = Bun.spawn([process.execPath, 'scripts/expert-factory.ts'], {
-        env: { PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: root, TMPDIR: tmpdir() }, stdout: 'pipe', stderr: 'pipe',
-        stdin: new Blob([JSON.stringify({
-          factory: { enabled: true, rootDir: factoryRoot, tokenDirectory: tokens, managerTokenFile: manager, ownerTelegramUserId: 1234,
-            libraryBucket: 'fixture-library', libraryPrefix: 'experts', openclawBin: cli },
-          worker: { domainExpert: { enabled: true, baseUrl: `http://127.0.0.1:${worker.port}/v1`, requestTimeoutSeconds: 60, authToken: 'synthetic-placeholder' } },
-          request: { action: 'create', agent_id: 'example', display_name: 'Example', purpose: 'A neutral purpose', telegram_username: 'ExampleFactoryBot', apply: true },
-          gateway: { reloadMode: 'hybrid' },
-        })]),
-      });
-      await reached;
-      const lock = JSON.parse(await readFile(join(factoryRoot, 'factory.lock'), 'utf8')) as { pid: number };
-      expect(lock.pid).toBe(child.pid);
-      child.kill('SIGTERM');
-      expect(await child.exited).toBe(143);
-      expect(await readdir(factoryRoot)).toEqual(['operations']);
-    } finally { worker.stop(true); }
+    const worker = Bun.serve({ port: 0, hostname: '127.0.0.1', async fetch(request) {
+      const url = new URL(request.url);
+      // The registration check answers; the health check is held.
+      if (url.pathname === '/v1/domain') return Response.json({ status: 'dry_run_registration_ready', manifest: { workspace_root_id: 'expert_agents_workspace' },
+        policy: { expert_agents_control_plane_only: true, raw_runtime_secrets_exposed: false } });
+      held.push(url.pathname); arrived();
+      return new Promise<Response>(() => {});
+    } });
+    servers.push(worker);
+    const start = (agentId: string) => Bun.spawn([process.execPath, 'scripts/expert-factory.ts'], {
+      env: { PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: root, TMPDIR: tmpdir() }, stdout: 'pipe', stderr: 'pipe',
+      stdin: new Blob([JSON.stringify({
+        factory: { enabled: true, rootDir: factoryRoot, tokenDirectory: tokens, managerTokenFile: manager, ownerTelegramUserId: 1234,
+          libraryBucket: 'fixture-library', libraryPrefix: 'experts', openclawBin: cli },
+        worker: { domainExpert: { enabled: true, baseUrl: `http://127.0.0.1:${worker.port}/v1`, requestTimeoutSeconds: 60, authToken: 'synthetic-placeholder' } },
+        request: { action: 'create', agent_id: agentId, display_name: 'Example', purpose: 'A neutral purpose', telegram_username: `${agentId.replace('-', '')}Bot`, apply: true },
+        gateway: { reloadMode: 'hybrid' },
+      })]),
+    });
+    return { factoryRoot, held, reached, start };
+  }
+  const servers: { stop(force?: boolean): unknown }[] = [];
+  afterEach(() => { for (const server of servers.splice(0)) server.stop(true); });
+
+  test('a factory ended with SIGTERM, as the plugin ends a timed-out one, releases its lock', async () => {
+    const f = await packaged();
+    const child = f.start('example');
+    await f.reached;
+    const lock = JSON.parse(await readFile(join(f.factoryRoot, 'factory.lock'), 'utf8')) as { pid: number };
+    expect(lock.pid).toBe(child.pid);
+    child.kill('SIGTERM');
+    expect(await child.exited).toBe(143);
+    expect(await readdir(f.factoryRoot)).toEqual(['operations']);
+  }, 30_000);
+
+  test('two factory processes finding the same abandoned lock: exactly one takes it over', async () => {
+    const f = await packaged();
+    const exited = Bun.spawn(['true']); await exited.exited;
+    await writeFile(join(f.factoryRoot, 'factory.lock'), JSON.stringify({ pid: exited.pid, nonce: '00000000-0000-4000-8000-000000000001' }) + '\n', { mode: 0o600 });
+    const children = [f.start('example'), f.start('other-agent')];
+    // The loser returns factory_busy; the winner holds the lock at the worker's health check.
+    const loser = await Promise.race(children.map((child) => child.exited.then(() => child)));
+    const winner = children.find((child) => child !== loser)!;
+    expect(JSON.parse(await new Response(loser.stdout).text())).toMatchObject({ error: { code: 'factory_busy' } });
+    await f.reached;
+    expect(f.held).toEqual(['/v1/health']);
+    expect((JSON.parse(await readFile(join(f.factoryRoot, 'factory.lock'), 'utf8')) as { pid: number }).pid).toBe(winner.pid);
+    winner.kill('SIGTERM');
+    expect(await winner.exited).toBe(143);
+    expect((await readdir(f.factoryRoot)).sort()).toEqual(['operations']);
   }, 30_000);
 });

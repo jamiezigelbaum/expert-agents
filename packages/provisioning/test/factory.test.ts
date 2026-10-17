@@ -1,5 +1,6 @@
-import { afterEach, describe, expect, test } from 'bun:test';
+import { afterEach, describe, expect, spyOn, test } from 'bun:test';
 import { chmod, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, symlink, writeFile } from 'node:fs/promises';
+import * as fsPromises from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { FACTORY_PHASES, FactoryError, runFactory, type FactoryCommandOptions, type FactoryDependencies } from '../src/factory.ts';
@@ -46,6 +47,7 @@ async function fixture() {
     probeInputs: [] as Record<string, unknown>[],
     // The worker's domain workspace: seeded by bootstrap, reported by status.
     seeded: false, bootstrapCount: 0, googleStatus: 'ready' as unknown,
+    roots: [{ root_id: 'expert_agents_workspace', max_write_bytes: 1_000_000, allow_overwrite: false }] as Record<string, unknown>[],
   };
   const dependencies: FactoryDependencies = {
     command: async (argv, cwd, options) => {
@@ -123,9 +125,11 @@ async function fixture() {
           workspace: { exists: state.seeded, missing_requirements: state.seeded ? [] : [{ relative_path: 'example/PROPOSAL.md', kind: 'proposal' }] } };
       }
       if (params.action === 'bootstrap') { state.bootstrapCount++; state.seeded = true; return { status: 'workspace_bootstrapped' }; }
-      return { status: params.dry_run ? 'dry_run_registration_ready' : state.registrationStatus };
+      return params.dry_run ? { status: 'dry_run_registration_ready', manifest: { domain_id: params.domain_id, workspace_root_id: 'expert_agents_workspace' } }
+        : { status: state.registrationStatus };
     },
-    workerHealth: async () => ({ kind: 'domain_expert_health', configuration_status: { google: state.googleStatus } }),
+    workerHealth: async () => ({ kind: 'domain_expert_health', configured: { workspace_roots: state.roots.length },
+      configuration_status: { google: state.googleStatus }, roots: state.roots }),
     beginTelegram: async ({ username }) => {
       state.beginCount++;
       return { managerUsername: 'FactoryManagerBot', requestedUsername: username, deepLink: 'https://t.me/FactoryManagerBot?start=fixture' };
@@ -713,6 +717,39 @@ describe('conversational expert factory', () => {
       expect(await readdir(join(f.config.rootDir, 'operations', 'example'))).toEqual([]);
     }, 60_000);
 
+    test('a factory root whose filesystem has no hard links refuses with a coded error', async () => {
+      const f = await fixture();
+      const link = spyOn(fsPromises, 'link').mockImplementation(async () => { throw Object.assign(new Error('Operation not permitted'), { code: 'EPERM' }); });
+      try {
+        const error = await f.run().catch((caught: unknown) => caught);
+        expect(error).toMatchObject({ code: 'factory_lock_unsupported' });
+        expect(String(error)).toContain('hard links');
+      } finally { link.mockRestore(); }
+      expect((await readdir(f.config.rootDir)).sort()).toEqual(['operations']);
+      expect(f.state.beginCount).toBe(0);
+    }, 60_000);
+
+    test('a takeover claim left by an exited invocation does not block the lock', async () => {
+      const f = await fixture();
+      const stale = '00000000-0000-4000-8000-000000000001';
+      await writeFile(lockPath(f), owner(await exitedPid()), { mode: 0o600 });
+      // The claim on that lock, by an invocation that exited while holding it.
+      await writeFile(`${lockPath(f)}.${stale}`, JSON.stringify({ pid: await exitedPid(), nonce: '00000000-0000-4000-8000-000000000002' }) + '\n', { mode: 0o600 });
+      expect((await f.run()).status).toBe('waiting_for_telegram');
+      expect((await readdir(f.config.rootDir)).sort()).toEqual(['agents', 'operations']);
+    }, 60_000);
+
+    test('a takeover claim held by a live invocation is respected', async () => {
+      const f = await fixture();
+      await writeFile(lockPath(f), owner(await exitedPid()), { mode: 0o600 });
+      const claim = `${lockPath(f)}.00000000-0000-4000-8000-000000000001`;
+      const live = JSON.stringify({ pid: process.pid, start: await ownStart(), nonce: '00000000-0000-4000-8000-000000000002' }) + '\n';
+      await writeFile(claim, live, { mode: 0o600 });
+      await expect(f.run()).rejects.toMatchObject({ code: 'factory_busy' });
+      expect(await readFile(claim, 'utf8')).toBe(live);
+      expect(f.state.beginCount).toBe(0);
+    }, 60_000);
+
     test('two invocations finding the same abandoned lock: exactly one takes it over', async () => {
       const f = await fixture();
       await writeFile(lockPath(f), owner(await exitedPid()), { mode: 0o600 });
@@ -1082,6 +1119,35 @@ describe('conversational expert factory', () => {
       expect(f.state.provisionCount).toBe(0);
       f.state.googleStatus = 'ready';
       expect((await f.resume()).status).toBe('ready_empty_library');
+    }, 60_000);
+
+    test.each([
+      ['no workspace roots', []],
+      ['only another root', [{ root_id: 'other_root', allow_overwrite: false }]],
+    ])('refuses before anything is created when the worker has %s for the domain workspace', async (_name, roots) => {
+      const f = await fixture(); f.state.roots = roots;
+      const error = await f.run().catch((caught: unknown) => caught);
+      expect(error).toMatchObject({ code: 'factory_workspace_root_missing', details: { phase: 'preflight', step: 'worker health' } });
+      expect(String(error)).toContain('EXPERT_AGENTS_DOMAIN_EXPERT_ROOTS_JSON');
+      await nothingCreated(f);
+    }, 60_000);
+
+    test.each([true, undefined])('refuses a workspace root whose allow_overwrite is %p, so bootstrap can never rewrite owner files', async (allowOverwrite) => {
+      const f = await fixture(); f.state.roots = [{ root_id: 'expert_agents_workspace', ...(allowOverwrite === undefined ? {} : { allow_overwrite: allowOverwrite }) }];
+      await expect(f.run()).rejects.toMatchObject({ code: 'factory_workspace_root_overwrites', details: { phase: 'preflight', step: 'worker health' } });
+      await nothingCreated(f);
+    }, 60_000);
+
+    test('an owner who deleted a seed file on an overwriting root gets a refusal, not a rewritten workspace', async () => {
+      const f = await fixture(); await f.run(); f.state.confirmed = true;
+      expect((await f.resume()).status).toBe('ready_empty_library');
+      f.state.seeded = false;
+      f.state.roots = [{ root_id: 'expert_agents_workspace', allow_overwrite: true }];
+      await expect(f.resume()).rejects.toMatchObject({ code: 'factory_workspace_root_overwrites', details: { phase: 'preflight' } });
+      expect(f.state.bootstrapCount).toBe(1);
+      f.state.roots = [{ root_id: 'expert_agents_workspace', allow_overwrite: false }];
+      expect((await f.resume()).status).toBe('ready_empty_library');
+      expect(f.state.bootstrapCount).toBe(2);
     }, 60_000);
 
     test('a resume refuses with reload off until the Gateway is configured, then readiness still checks', async () => {

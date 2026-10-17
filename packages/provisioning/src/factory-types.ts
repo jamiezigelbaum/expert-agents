@@ -29,10 +29,24 @@ export interface FactoryGitHubSelection {
 
 /**
  * Proxy and CA trust variables the factory needs to reach GitHub, the worker and Telegram from a
- * host behind a proxy. The plugin passes them to the factory process and the GitHub commands keep
- * them; none carries a credential, and their values are never logged.
+ * host behind a proxy. A proxy URL can carry a credential (`user:pass@host`); such a variable is
+ * withheld, so every command the factory runs inherits only credential-free values.
  */
 export const FACTORY_NETWORK_ENV = ['HTTPS_PROXY', 'https_proxy', 'NO_PROXY', 'no_proxy', 'SSL_CERT_FILE', 'SSL_CERT_DIR', 'GIT_SSL_CAINFO', 'NODE_EXTRA_CA_CERTS'] as const;
+const PROXY_URLS: readonly string[] = ['HTTPS_PROXY', 'https_proxy'];
+
+/** The credential-free network variables of an environment, and the names (never values) withheld. */
+export function factoryNetworkEnv(source: Record<string, string | undefined>): { env: Record<string, string>; withheld: string[] } {
+  const env: Record<string, string> = {};
+  const withheld: string[] = [];
+  for (const name of FACTORY_NETWORK_ENV) {
+    const value = source[name];
+    if (!value) continue;
+    if (PROXY_URLS.includes(name) && value.includes('@')) withheld.push(name);
+    else env[name] = value;
+  }
+  return { env, withheld };
+}
 
 /** The running Gateway's `gateway.reload.mode`, read by the plugin from its live runtime config. */
 export interface FactoryGatewaySelection {

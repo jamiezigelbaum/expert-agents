@@ -114,13 +114,25 @@ export async function runFactory(config: FactoryConfig, request: FactoryRequest,
       for (const [step, program] of programs) {
         if (program && !await executable(program)) throw locate(new FactoryError('factory_command_failed', 'missing', { category: 'missing_command' }), 'preflight', step);
       }
+      // The worker's registration boundary, before local or remote resources exist. Its manifest
+      // names the workspace root the domain's seed files live in.
+      const registration = record(await during('worker registration check', () => io.worker('domain_agent', registrationParams(state!, config, true))));
+      if (registration.status !== 'dry_run_registration_ready') throw new FactoryError('factory_registration_preflight_failed', 'The worker did not confirm that the domain registration is safe to apply.');
+      const health = record(await during('worker health', io.workerHealth));
       // Every invocation ensures or re-proves the Vertex corpus, which needs the worker's Google
       // credentials and project. Its authenticated health names that configuration.
-      const google = record(record(await during('worker health', io.workerHealth)).configuration_status).google;
+      const google = record(health.configuration_status).google;
       if (google !== 'ready') {
         const reported = GOOGLE_NOT_READY.includes(google) ? google : 'not ready';
         throw new FactoryError('factory_google_not_ready', `preflight: worker health: the Expert Agents worker reports its Google configuration as ${reported}, so it could not create or check the Vertex corpus. Configure the worker's Google credentials and project, then repeat this request.`, { phase: 'preflight', step: 'worker health' });
       }
+      // Every invocation also seeds or re-proves the domain workspace in that root. A root that
+      // allows overwrite would make the worker's bootstrap rewrite existing seed files, including
+      // the source registry, so the factory never seeds there.
+      const rootId = record(registration.manifest).workspace_root_id;
+      const root = Array.isArray(health.roots) ? health.roots.map(record).find((entry) => entry.root_id === rootId) : undefined;
+      if (typeof rootId !== 'string' || !root) throw new FactoryError('factory_workspace_root_missing', 'preflight: worker health: the Expert Agents worker has no workspace root configured for the domain workspace (EXPERT_AGENTS_DOMAIN_EXPERT_ROOTS_JSON), so it could not seed it. Configure that root, then repeat this request.', { phase: 'preflight', step: 'worker health' });
+      if (root.allow_overwrite !== false) throw new FactoryError('factory_workspace_root_overwrites', 'preflight: worker health: the worker\'s workspace root allows overwrite, so seeding the domain workspace could rewrite its existing files, including the source registry. Ask the deployment owner to set allow_overwrite to false for that root, then repeat this request.', { phase: 'preflight', step: 'worker health' });
       if (remoteUrl && !state!.remotePushed && isGitHubHttps(remoteUrl)) {
         // The same isolated identity, helper and environment as the push. The remote first: it
         // separates an unreachable service from a refused credential, and GitHub asks for the
@@ -156,9 +168,6 @@ export async function runFactory(config: FactoryConfig, request: FactoryRequest,
       await checkGatewayCollisions(cli, spec.agentId, workspace, tokenPath, false);
       await cli(['config', 'validate']);
       await preflight();
-      // Validate the server's registration boundary before creating local or remote resources.
-      const registration = record(await during('worker registration check', () => io.worker('domain_agent', registrationParams(state!, config, true))));
-      if (registration.status !== 'dry_run_registration_ready') throw new FactoryError('factory_registration_preflight_failed', 'The worker did not confirm that domain registration is safe to apply.');
       const existing = await during('Telegram manager check', () => (io.probeTelegram ?? probeManagedBotProvision)({ username: spec.telegramUsername, ownerUserId: config.ownerTelegramUserId }, telegramDeps));
       if (existing.status === 'confirmed') throw new FactoryError('factory_telegram_username_taken', 'This Telegram username already has a managed bot confirmation. Choose a new username; existing bots cannot be adopted by a new operation.');
       const began = await during('Telegram confirmation link', () => (io.beginTelegram ?? beginManagedBotProvision)({ username: spec.telegramUsername, displayName: spec.displayName }, telegramDeps));
@@ -171,10 +180,6 @@ export async function runFactory(config: FactoryConfig, request: FactoryRequest,
       // A previous success is a receipt, not current routing proof.
       const observed = await checkGatewayCollisions(cli, spec.agentId, workspace, tokenPath, true);
       if (state.gatewayConfigured) requireGatewayConfiguration(observed, expectedAccount(config, tokenPath));
-      if (state.domainRegistered) {
-        const registration = record(await during('worker registration check', () => io.worker('domain_agent', registrationParams(state!, config, true))));
-        if (registration.status !== 'dry_run_registration_ready') throw new FactoryError('factory_registration_preflight_failed', 'The worker did not confirm the recorded domain registration.');
-      }
       await preflight();
       stage = undefined;
     }
@@ -229,8 +234,9 @@ export async function runFactory(config: FactoryConfig, request: FactoryRequest,
     }
     if (!state.workspaceSeeded) {
       await enter();
-      // Read-only status first, so a seeded workspace is never rewritten. The worker's bootstrap
-      // creates the missing seed files, the recovery its own status recommends.
+      // Read-only status first, so a seeded workspace is not touched. The worker's bootstrap, the
+      // recovery its own status recommends, then creates only the missing seed files: preflight
+      // refused a root that allows overwrite.
       const seeded = async () => {
         const status = record(await during('worker workspace status', () => io.worker('domain_agent', { action: 'status', domain_id: spec.agentId })));
         const workspace = record(status.workspace);
@@ -652,10 +658,11 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
  * Takes the deployment-wide lock, which names its owner process. A lock whose owner has exited (the
  * plugin ends a timed-out factory with SIGTERM) is taken over; a lock whose owner is alive, or that
  * names no verifiable owner, never is. Returns the release, which also runs if this process exits.
+ * Liveness is exact for invocations on one Linux host in one pid namespace, as the plugin runs them.
  */
 async function acquireLock(path: string): Promise<() => void> {
   const owner: LockOwner = { pid: process.pid, ...await processStart(process.pid).then((start) => start ? { start } : {}), nonce: randomUUID() };
-  for (let attempt = 0; attempt < 3; attempt++) {
+  for (let attempt = 0; attempt < 5; attempt++) {
     if (await createExclusive(path, owner)) {
       const release = () => {
         stopCleanup();
@@ -664,19 +671,27 @@ async function acquireLock(path: string): Promise<() => void> {
       const stopCleanup = cleanupOnExit(release);
       return release;
     }
-    let holder: LockOwner | undefined;
-    try { holder = lockOwner(await readFile(path, 'utf8')); }
-    catch (error) { if (missing(error)) continue; throw error; }
-    if (!holder) throw new FactoryError('factory_busy', 'The deployment lock names no owner process the factory can verify. Ask the deployment owner to confirm that no factory process is running and remove factory.lock under the factory root, then retry.');
-    if (await ownerAlive(holder)) throw new FactoryError('factory_busy', 'Another factory invocation is running. Retry after it finishes.');
-    // Only the invocation that claims this stale lock may remove it. Its owner is gone, so the lock
-    // cannot change while it is claimed, and the removal can never hit a newer lock.
-    const claim = `${path}.${holder.nonce}`;
-    if (!await createExclusive(claim, owner)) throw new FactoryError('factory_busy', 'Another invocation is taking over an abandoned deployment lock. Retry shortly; if this persists, ask the deployment owner to inspect factory.lock files under the factory root.');
-    try { if (lockOwner(await readFile(path, 'utf8').catch(() => ''))?.nonce === holder.nonce) await unlink(path); }
-    finally { await unlink(claim); }
+    await removeIfAbandoned(path, owner);
   }
   throw new FactoryError('factory_busy', 'Another factory invocation is running. Retry after it finishes.');
+}
+
+/**
+ * Removes the owner file at `path` if its owner has exited. Only the invocation that claims this
+ * file generation (`<path>.<its nonce>`) may remove it: its owner is gone, so it cannot change while
+ * claimed, and the removal never hits a newer file. A claim left by an invocation that exited while
+ * holding it is itself abandoned and removed the same way, so no exited process can block the lock.
+ */
+async function removeIfAbandoned(path: string, owner: LockOwner): Promise<void> {
+  let holder: LockOwner | undefined;
+  try { holder = lockOwner(await readFile(path, 'utf8')); }
+  catch (error) { if (missing(error)) return; throw error; }
+  if (!holder) throw new FactoryError('factory_busy', 'The deployment lock names no owner process the factory can verify. Ask the deployment owner to confirm that no factory process is running and remove factory.lock files under the factory root, then retry.');
+  if (await ownerAlive(holder)) throw new FactoryError('factory_busy', 'Another factory invocation is running. Retry after it finishes.');
+  const claim = `${path}.${holder.nonce}`;
+  if (!await createExclusive(claim, owner)) return removeIfAbandoned(claim, owner);
+  try { if (lockOwner(await readFile(path, 'utf8').catch(() => ''))?.nonce === holder.nonce) await unlink(path); }
+  finally { await unlink(claim); }
 }
 
 /** Creates a file holding the owner record only if none exists, atomically and never partially written. */
@@ -684,8 +699,10 @@ async function createExclusive(path: string, owner: LockOwner): Promise<boolean>
   const temporary = `${path}.${randomUUID()}.tmp`;
   await writeFile(temporary, JSON.stringify(owner) + '\n', { mode: 0o600, flag: 'wx' });
   try { await link(temporary, path); return true; }
-  catch (error) { if (record(error).code === 'EEXIST') return false; throw error; }
-  finally { await unlink(temporary); }
+  catch (error) {
+    if (record(error).code === 'EEXIST') return false;
+    throw new FactoryError('factory_lock_unsupported', 'The factory root could not hold the deployment lock: its filesystem must support hard links. Place rootDir on a local POSIX filesystem.');
+  } finally { await unlink(temporary); }
 }
 
 function lockOwner(text: string): LockOwner | undefined {

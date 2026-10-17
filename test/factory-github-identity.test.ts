@@ -341,6 +341,19 @@ describe('factory pushes as the System GitHub identity', () => {
     }
   }, 30_000);
 
+  test('never passes a proxy URL that carries a credential, even when invoked outside the plugin', async () => {
+    const f = await fixture();
+    const secret = 'synthetic-proxy-password';
+    const result = await f.run({ identity: true, env: { ...f.gatewayEnv, HTTPS_PROXY: `http://proxy-user:${secret}@proxy.example.invalid:3128`,
+      https_proxy: 'http://proxy.example.invalid:3129', ALL_PROXY: `http://proxy-user:${secret}@proxy.example.invalid:1080`, NO_PROXY: '127.0.0.1' } });
+    expect(result).toMatchObject({ ok: true });
+    for (const spawned of result.spawned) {
+      expect(JSON.stringify(spawned.env)).not.toContain(secret);
+      expect(spawned.env).toMatchObject({ https_proxy: 'http://proxy.example.invalid:3129', NO_PROXY: '127.0.0.1' });
+    }
+    expect(result.transcript).not.toContain(secret);
+  }, 30_000);
+
   test.each(['git', 'gh'])('with only %s on PATH, the other is a missing program before Git starts, never a refused credential', async (present) => {
     const f = await fixture();
     const only = join(f.base, `only-${present}`);

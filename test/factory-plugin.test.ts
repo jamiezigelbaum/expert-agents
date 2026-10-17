@@ -76,6 +76,7 @@ describe('packaged expert factory', () => {
         expect(Object.keys(env).filter((name) => /^(GH_|GITHUB_)/.test(name))).toEqual([]);
         expect(env).toMatchObject(network);
         expect(env.EXAMPLE_UNLISTED_SETTING).toBeUndefined();
+        expect(output.content[0]!.text).not.toContain('environment_withheld');
       }
     } finally {
       for (const [name, value] of Object.entries(ambient)) if (value === undefined) delete process.env[name]; else process.env[name] = value;
@@ -87,6 +88,39 @@ describe('packaged expert factory', () => {
         tools: { github: { profileId, kind: 'oauth' } },
         plugins: { entries: { 'expert-agents': { config: { domainExpert: { enabled: true }, factory: { enabled: true, bunBin: fakeBun } } } } },
       };
+    }
+  });
+
+  test('withholds a proxy URL that carries a credential from every factory command, naming it but never its value', async () => {
+    const root = await realpath(await mkdtemp(join(tmpdir(), 'expert-plugin-proxy-')));
+    roots.push(root);
+    const fakeBun = join(root, 'bun');
+    await writeFile(fakeBun, `#!/bin/sh\ncat > "${root}/stdin.json"\nenv > "${root}/env.txt"\nprintf '%s' '{"result":{"kind":"expert_factory","agent_id":"example","status":"planned","next_action":"fixture"}}'\n`, { mode: 0o700 });
+    const runtime = { plugins: { entries: { 'expert-agents': { config: { domainExpert: { enabled: true }, factory: { enabled: true, bunBin: fakeBun } } } } } };
+    let found: NativeTool | undefined;
+    plugin.register({
+      pluginConfig: {}, runtime: { state: { resolveStateDir: () => join(root, 'state') } },
+      registerTool: (registration) => {
+        const tool = typeof registration === 'function' ? registration({ senderIsOwner: true, getRuntimeConfig: () => runtime }) : registration;
+        if (tool.name === 'expert_factory') found = tool;
+      },
+    });
+    const secret = 'synthetic-proxy-password';
+    const injected = { HTTPS_PROXY: `http://proxy-user:${secret}@proxy.example.invalid:3128`, https_proxy: 'http://proxy.example.invalid:3129', NO_PROXY: '127.0.0.1' };
+    const ambient = Object.fromEntries(Object.keys(injected).map((name) => [name, process.env[name]]));
+    Object.assign(process.env, injected);
+    try {
+      const output = await found!.execute('fixture', { action: 'status', agent_id: 'example' });
+      const env = await readFile(join(root, 'env.txt'), 'utf8');
+      expect(env).not.toContain(secret);
+      expect(env).not.toMatch(/^HTTPS_PROXY=/m);
+      expect(env).toContain('https_proxy=http://proxy.example.invalid:3129');
+      expect(env).toContain('NO_PROXY=127.0.0.1');
+      expect(JSON.parse(output.content[0]!.text)).toMatchObject({ environment_withheld: ['HTTPS_PROXY'] });
+      expect(output.content[0]!.text).not.toContain(secret);
+      expect(await readFile(join(root, 'stdin.json'), 'utf8')).not.toContain(secret);
+    } finally {
+      for (const [name, value] of Object.entries(ambient)) if (value === undefined) delete process.env[name]; else process.env[name] = value;
     }
   });
 
