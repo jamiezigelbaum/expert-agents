@@ -8665,7 +8665,10 @@ async function planStageImportCandidates(
       });
       continue;
     }
-    if (!allowedExtensions.has(extension)) {
+    // A PDF is known by its bytes before its name or any limit is judged: one named .bin, .txt
+    // or nothing is still staged as a PDF and takes the PDF limit.
+    const pdf = extension === '.pdf' || hasPdfHeader(file.content ?? await readFileHead(file.absolutePath, PDF_SNIFF_BYTES));
+    if (!pdf && !allowedExtensions.has(extension)) {
       skipped.push({
         workspace_relative_path: file.workspaceRelativePath,
         reason: `extension_not_allowed:${extension || '<none>'}`,
@@ -8673,8 +8676,6 @@ async function planStageImportCandidates(
       });
       continue;
     }
-    // A PDF is known by its bytes before any limit applies, so one named .txt takes the PDF limit.
-    const pdf = extension === '.pdf' || hasPdfHeader(file.content ?? await readFileHead(file.absolutePath, PDF_SNIFF_BYTES));
     const maxFileBytes = pdf ? PDF_PROCESSING_MAX_BYTES : maxStageFileBytes(file.workspaceRelativePath);
     if (file.bytes > maxFileBytes) {
       skipped.push({

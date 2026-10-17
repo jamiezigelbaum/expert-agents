@@ -296,7 +296,8 @@ file is a PDF when its name ends in `.pdf` or, under any other name, when its
 first bytes carry the PDF header (`%PDF-1.x` or `%PDF-2.x` after nothing but
 whitespace, within the first 1024 bytes): a single GCS object is checked with a
 ranged read (an unreadable object answers 502 `gcs_object_unreadable`), a
-staged file from its first bytes when it is planned, before any size limit, so
+staged file from its first bytes when it is planned, before its extension or
+any size limit is judged, so one named `.bin` or with no extension is staged, and
 it takes the PDF limit (100,000,000 bytes) rather than the text one. A staged PDF so found that stays whole is staged
 under its name plus `.pdf`. Its record then says `content_type:
 application/pdf`, so it takes the LLM parser and its citations carry pages

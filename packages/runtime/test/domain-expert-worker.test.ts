@@ -7545,15 +7545,20 @@ describe('splitting long PDFs for LLM-parser imports', () => {
     });
 
     // A PDF is known by its bytes, whatever its staged name.
-    test('a staged PDF named .txt is routed like any PDF: split when long, staged as .pdf when whole', async () => {
+    test('a staged PDF named .txt, .bin or nothing is routed like any PDF: split when long, staged as .pdf when whole', async () => {
       const f = splitFixture(LONG, importsAll);
       const short = textPdfBytes(120);
+      const scan = textPdfBytes(121);
+      const bare = textPdfBytes(122);
       try {
-        writeBatch(f.base, { 'book.txt': LONG, 'paper.txt': short, 'notes.txt': 'Plain notes.' });
+        writeBatch(f.base, { 'book.txt': LONG, 'paper.txt': short, 'scan.bin': scan, 'bare': bare, 'blob.bin': 'not a pdf', 'notes.txt': 'Plain notes.' });
         const result = await stageBatch(f.worker, 'named-txt');
         expect(result.pdf_sources).toMatchObject([{ workspace_relative_path: 'experts/research/sources/batch/book.txt', route: 'split', status: 'imported', split: { parts: 3 } }]);
         const prefix = 'gs://fixture-shared-library/v1/staged/research/named-txt/';
-        expect(stagedUris(result)).toEqual([stagedObject(prefix, 'notes.txt', 'Plain notes.'), stagedObject(prefix, 'paper.txt.pdf', short)].sort());
+        expect(stagedUris(result)).toEqual([stagedObject(prefix, 'notes.txt', 'Plain notes.'), stagedObject(prefix, 'paper.txt.pdf', short),
+          stagedObject(prefix, 'scan.bin.pdf', scan), stagedObject(prefix, 'bare.pdf', bare)].sort());
+        // A file that is not a PDF is still judged by its extension.
+        expect(JSON.stringify(result)).toContain('extension_not_allowed:.bin');
         expect(f.importedUris().filter((uri) => uri.includes('--parts/'))).toHaveLength(3);
       } finally { f.cleanup(); }
     });
