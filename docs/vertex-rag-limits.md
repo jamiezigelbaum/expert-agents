@@ -76,6 +76,13 @@ batch imports exactly those URIs, so an unchanged file is skipped and a changed
 one is imported under a new URI. The changed file's previous version stays in
 the corpus; an object no run names is never imported again.
 
+The worker matches a ragFile to an object by its exact source URI. When Vertex
+lists a ragFile without one, it falls back to the display name (the object's
+file name) only when no ragFile names the URI and exactly one ragFile in the
+corpus carries that name. A changed file and its previous version share a file
+name, so such an object is left unmatched (its state unknown) rather than taken
+for the other version.
+
 `ImportRagFiles` takes several URIs per request (`GcsSource.uris` is a repeated
 string) and documents no maximum; the worker sends at most 25 per request, a
 cautious guess rather than a known limit.

@@ -3615,22 +3615,8 @@ export class DomainExpertService {
     resolved: ResolvedRagCorpus,
     targetUris: string[],
   ): Promise<void> {
-    const errorRecords: string[] = [];
-    let pageToken: string | undefined;
-    do {
-      const page = await this.google.listRagFiles({
-        project: manifest.gcp_project,
-        location: manifest.rag_location,
-        corpusName: resolved.resourceName,
-        ...(pageToken ? { pageToken } : {}),
-      });
-      for (const file of page.files) {
-        if (file.state === 'ERROR' && ragFileMatchesTargets(file, targetUris)) {
-          errorRecords.push(String(file.name));
-        }
-      }
-      pageToken = page.nextPageToken;
-    } while (pageToken);
+    const matched = ragFilesByTarget(await this.listCorpusRagFiles(manifest, resolved), targetUris);
+    const errorRecords = [...new Set([...matched.values()].flat().filter((file) => file.state === 'ERROR').map((file) => String(file.name)))];
     for (const ragFileName of errorRecords) {
       try {
         await this.google.deleteRagFile({
@@ -3874,16 +3860,8 @@ export class DomainExpertService {
 
   // One entry per imported object: the ragFile Vertex made from it and that
   // file's state. An object with no listed ragFile keeps only its URI.
-  private async ragFilesForImportedUris(
-    manifest: ReturnType<typeof domainManifest>,
-    resolved: ResolvedRagCorpus,
-    gcsUris: string[],
-    options: { exact?: boolean } = {},
-  ): Promise<Array<Record<string, unknown>>> {
-    const matches = (file: Record<string, unknown>, targets: string[]) => (options.exact
-      ? typeof file.sourceUri === 'string' && targets.includes(file.sourceUri)
-      : ragFileMatchesTargets(file, targets));
-    const listed: Array<Record<string, unknown>> = [];
+  private async listCorpusRagFiles(manifest: ReturnType<typeof domainManifest>, resolved: ResolvedRagCorpus): Promise<Array<Record<string, unknown>>> {
+    const files: Array<Record<string, unknown>> = [];
     let pageToken: string | undefined;
     do {
       const page = await this.google.listRagFiles({
@@ -3892,11 +3870,21 @@ export class DomainExpertService {
         corpusName: resolved.resourceName,
         ...(pageToken ? { pageToken } : {}),
       });
-      listed.push(...page.files.filter((file) => matches(file, gcsUris)));
+      files.push(...page.files);
       pageToken = page.nextPageToken;
     } while (pageToken);
+    return files;
+  }
+
+  private async ragFilesForImportedUris(
+    manifest: ReturnType<typeof domainManifest>,
+    resolved: ResolvedRagCorpus,
+    gcsUris: string[],
+    options: { exact?: boolean } = {},
+  ): Promise<Array<Record<string, unknown>>> {
+    const matched = ragFilesByTarget(await this.listCorpusRagFiles(manifest, resolved), gcsUris, options);
     return gcsUris.map((gcsUri) => {
-      const found = listed.filter((file) => matches(file, [gcsUri]));
+      const found = matched.get(gcsUri) ?? [];
       const file = found.find((candidate) => candidate.state === 'ACTIVE') ?? found[0];
       if (!file) return { gcs_uri: gcsUri };
       return {
@@ -10447,17 +10435,36 @@ function importResultSinkUri(allowedPrefixes: string[], domainId: string, batchI
   return directoryUri;
 }
 
-function ragFileMatchesTargets(file: Record<string, unknown>, targetUris: string[]): boolean {
-  const sourceUri = typeof file.sourceUri === 'string' ? file.sourceUri : undefined;
-  if (sourceUri) {
-    // A directory target (trailing slash) covers every record staged under it.
-    return targetUris.some((target) => (target.endsWith('/') ? sourceUri.startsWith(target) : sourceUri === target));
+// Each target's ragFiles in a corpus listing. A ragFile whose sourceUri is the target
+// (or, for a directory target with a trailing slash, under it) is its; only a target
+// that no ragFile names exactly falls back to display name, which Vertex derives from
+// the object's file name, and only when exactly one ragFile in the corpus carries that
+// name. Content-addressed objects of one batch share file names across versions, so a
+// name two ragFiles carry matches nothing: the object is then unmatched, never guessed.
+// exact: sourceUri only, no display-name fallback.
+function ragFilesByTarget(
+  files: Array<Record<string, unknown>>,
+  targets: string[],
+  options: { exact?: boolean } = {},
+): Map<string, Array<Record<string, unknown>>> {
+  const byName = new Map<string, Array<Record<string, unknown>>>();
+  for (const file of files) {
+    if (typeof file.displayName !== 'string') continue;
+    byName.set(file.displayName, [...(byName.get(file.displayName) ?? []), file]);
   }
-  // A record that surfaces no URI can still be matched by display name, which
-  // Vertex derives from the imported object's file name.
-  const displayName = typeof file.displayName === 'string' ? file.displayName : undefined;
-  if (!displayName) return false;
-  return targetUris.some((target) => !target.endsWith('/') && target.split('/').pop() === displayName);
+  const matched = new Map<string, Array<Record<string, unknown>>>();
+  for (const target of targets) {
+    const directory = target.endsWith('/');
+    const exact = files.filter((file) => typeof file.sourceUri === 'string'
+      && (directory ? file.sourceUri.startsWith(target) : file.sourceUri === target));
+    if (exact.length || directory || options.exact) {
+      matched.set(target, exact);
+      continue;
+    }
+    const named = byName.get(target.split('/').pop() ?? '') ?? [];
+    matched.set(target, named.length === 1 && typeof named[0]!.sourceUri !== 'string' ? named : []);
+  }
+  return matched;
 }
 
 function gcsPrefixesCover(prefixes: string[], uri: string): boolean {

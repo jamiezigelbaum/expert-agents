@@ -7476,6 +7476,30 @@ describe('splitting long PDFs for LLM-parser imports', () => {
       } finally { f.cleanup(); }
     });
 
+    // Vertex can list ragFiles by display name alone. A changed file and its previous version
+    // share that name, so neither may be taken for the other.
+    test('a changed file whose versions share a display name is left unmatched, never taken for the older one', async () => {
+      const f = splitFixture(LONG, importsAll, { listingDisplayNameOnly: true });
+      try {
+        writeBatch(f.base, { 'a.md': '# A', 'b.md': '# B' });
+        const first = await stageBatch(f.worker, 'retry-batch');
+        const older = first.import_outcome.rag_files.find((file: Record<string, any>) => file.gcs_uri === stagedObject(BATCH, 'b.md', '# B'));
+        // One ragFile per name: the display name identifies it.
+        expect(older).toMatchObject({ state: 'ACTIVE', rag_file_name: expect.any(String) });
+        writeBatch(f.base, { 'b.md': '# B, revised' });
+        const second = await stageBatch(f.worker, 'retry-batch');
+        const byUri = new Map(second.import_outcome.rag_files.map((file: Record<string, any>) => [file.gcs_uri, file]));
+        // Two ragFiles are now named b.md: the new version's state is unknown, not the older one's ACTIVE.
+        expect(byUri.get(stagedObject(BATCH, 'b.md', '# B, revised'))).toEqual({ gcs_uri: stagedObject(BATCH, 'b.md', '# B, revised') });
+        // a.md is still the one ragFile with its name.
+        expect(byUri.get(stagedObject(BATCH, 'a.md', '# A'))).toMatchObject({ state: 'ACTIVE' });
+        const latest = f.readRegistry().filter((record) => record.source_id === 'research-stage-import-retry-batch').at(-1)!;
+        const recorded = latest.rag_files.find((file: Record<string, any>) => file.gcs_uri === stagedObject(BATCH, 'b.md', '# B, revised'));
+        expect(recorded.rag_file_name).toBeUndefined();
+        expect(latest.verification).toContain('ragFiles 1 ACTIVE, 1 not listed');
+      } finally { f.cleanup(); }
+    });
+
     test('two overlapping runs of one batch_id each import exactly their own objects', async () => {
       const short = textPdfBytes(120);
       let overlapping: Promise<Record<string, any>> | undefined;
