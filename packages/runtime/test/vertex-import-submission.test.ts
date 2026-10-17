@@ -49,6 +49,8 @@ describe('runtime import submission custody', () => {
         if (url.endsWith('/ragCorpora')) return Response.json({ ragCorpora: registered ? [{ name: corpus, displayName: 'neutral-library' }] : [] });
         if (url.endsWith('/ragFiles')) return Response.json({ ragFiles: [] });
         if (url.includes('/upload/storage/')) return Response.json({});
+        // A single-object import reads the object's first bytes to tell whether it is a PDF.
+        if (url.includes('/storage/v1/b/') && url.includes('alt=media')) return new Response('# Source\n');
         if (url.endsWith('/ragFiles:import')) {
           const pending = pendingReceipt();
           expect(pending.status).toBe('submission_pending');

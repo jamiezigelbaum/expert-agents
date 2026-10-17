@@ -273,8 +273,10 @@ already in. Parts go to `staged/<domain>/<batch>--parts/` after the batch import
 is the batch's only file is registered under the `source_id` the import names.
 A PDF imported by URI without `source_id` is registered under its sha256 as
 `<domain>-pdf-<sha prefix>` and answers within the response budget. A
-`rag_corpus import` of a GCS directory (`gs://…/prefix/`) or a Drive file does
-not take the pipeline: it is imported as before, so a long PDF in it is not
+single object is a PDF when its key ends in `.pdf` or, under any other key, when
+its first five bytes are `%PDF-` (a ranged read; an unreadable object answers
+502 `gcs_object_unreadable`). A `rag_corpus import` of a GCS directory
+(`gs://…/prefix/`) or a Drive file does not take the pipeline: it is imported as before, so a long PDF in it is not
 split. The library materializer imports each object whole and does not split:
 under the LLM parser its CLI counts each PDF's pages with `qpdf`, in a plan as
 in an execution, and rejects one over the limit (`pdf_exceeds_parser_page_limit`)

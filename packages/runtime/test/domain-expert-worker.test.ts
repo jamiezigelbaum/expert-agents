@@ -7194,6 +7194,45 @@ describe('splitting long PDFs for LLM-parser imports', () => {
       } finally { f.cleanup(); }
     });
 
+    // A batch record keeps each file's sha256 in rag_files; any of them that is not this file's makes the source another.
+    test('a named batch source whose rag_files record another file is not given this one', async () => {
+      const f = splitFixture(LONG, importsAll, { seed: { objects: [[OBJECT, LONG]] } });
+      try {
+        mkdirSync(dirname(f.registryPath), { recursive: true });
+        writeFileSync(f.registryPath, `${JSON.stringify({
+          source_id: 'research-stage-import-mixed', domain_id: 'research', kind: 'stage_import', batch_id: 'mixed', ingest_status: 'imported', target_corpus_id: CORPUS,
+          rag_files: [
+            { gcs_uri: 'gs://fixture-shared-library/v1/staged/research/mixed/a/long.pdf', source_sha256: sha256Hex(LONG) },
+            { gcs_uri: 'gs://fixture-shared-library/v1/staged/research/mixed/b/other.pdf', source_sha256: 'c'.repeat(64) },
+          ],
+          registered_at: '2026-10-17T12:00:00.000Z',
+        })}\n`);
+        const refused = await postDomainResponse(f.worker, 'rag_corpus', { action: 'import', domain_id: 'research', corpus_id: CORPUS, gcs_uri: `gs://fixture-shared-library/${OBJECT}`, source_id: 'research-stage-import-mixed', dry_run: false });
+        expect(refused.status).toBe(409);
+        expect(((await refused.json()) as Record<string, any>).error.code).toBe('source_identity_conflict');
+        writeBatch(f.base, { 'long-volume.pdf': LONG });
+        const staged = await stageBatch(f.worker, 'named-mixed', { source_id: 'research-stage-import-mixed' });
+        expect(staged).toMatchObject({ status: 'pdf_sources_refused', pdf_sources: [{ route: 'refused', error: { code: 'source_identity_conflict' } }] });
+        expect(f.importedUris()).toEqual([]);
+        expect(uploadedObjectNames(f.googleCalls)).toEqual([]);
+      } finally { f.cleanup(); }
+    });
+
+    // A PDF is known by its bytes as well as its key: one stored without a .pdf suffix still takes the pipeline.
+    test('a GCS PDF under a key without .pdf is split like any other; a non-PDF there is imported as before', async () => {
+      const KEYLESS = 'v1/library/scanned-volume';
+      const NOTE = 'v1/library/field-notes';
+      const f = splitFixture(LONG, importsAll, { seed: { objects: [[KEYLESS, LONG], [NOTE, new TextEncoder().encode('# Field notes\n')]] } });
+      try {
+        const response = await postDomain(f.worker, 'rag_corpus', { action: 'import', domain_id: 'research', corpus_id: CORPUS, gcs_uri: `gs://fixture-shared-library/${KEYLESS}`, dry_run: false });
+        expect(response).toMatchObject({ status: 'imported', source_sha256: sha256Hex(LONG), split: { pages: 450, parts: 3, imported_parts: 3 } });
+        expect(f.importedUris()).toEqual([1, 2, 3].map((index) => `gs://fixture-shared-library/${KEYLESS}--part${index}of3.pdf`));
+        const plain = await postDomain(f.worker, 'rag_corpus', { action: 'import', domain_id: 'research', corpus_id: CORPUS, gcs_uri: `gs://fixture-shared-library/${NOTE}`, dry_run: false });
+        expect(plain.source_sha256).toBeUndefined();
+        expect(f.importRequests().at(-1)).toEqual([`gs://fixture-shared-library/${NOTE}`]);
+      } finally { f.cleanup(); }
+    });
+
     // Vertex reads the URI after the worker inspected it: an overwrite in between must not be claimed as the inspected file.
     test('a GCS PDF overwritten during its import is recorded with its identity unverified', async () => {
       const SHORT_NAME = 'v1/library/example-author---a-changing-paper-1992.pdf';

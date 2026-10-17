@@ -2305,8 +2305,13 @@ export class DomainExpertService {
         operation,
       };
     }
-    // Every PDF object goes through the shared pipeline: identity, page limit, split.
-    if (params.gcsUri && isPdfUri(params.gcsUri) && !options.wholeObject) return this.importGcsPdf(params, manifest, corpusId, resolved);
+    // Every PDF object goes through the shared pipeline: identity, page limit, split. A PDF is
+    // known by its key's .pdf suffix or, under any other key, by its first bytes (%PDF-); a
+    // directory import is imported as before.
+    if (params.gcsUri && !options.wholeObject && !params.gcsUri.endsWith('/')
+      && (isPdfUri(params.gcsUri) || await this.gcsObjectIsPdf(params.gcsUri))) {
+      return this.importGcsPdf(params, manifest, corpusId, resolved);
+    }
     // A plain import is registered when it names the source it ingests, or
     // when the shared PDF pipeline identified the file; a split's parts and
     // annas_archive_import's objects are registered by their callers.
@@ -2413,8 +2418,9 @@ export class DomainExpertService {
       ? await this.registeredImportSource(manifest, await checkedRootPath(this.rootFor(manifest.workspace_root_id)), params.sourceId)
       : undefined;
     // A named source that records another file's sha256 is another source.
-    if (typeof namedSource?.source_sha256 === 'string' && namedSource.source_sha256 !== digest) {
-      throw new DomainExpertWorkerError(409, 'source_identity_conflict', `Source ${String(namedSource.source_id)} records a different file (sha256 ${namedSource.source_sha256.slice(0, 12)}) than ${gcsUri} (sha256 ${digest.slice(0, 12)}). Nothing was imported.`, 'Import it without source_id, or under the source that is this file.');
+    const otherIdentity = namedSource ? otherRecordedIdentity(namedSource, digest) : undefined;
+    if (otherIdentity) {
+      throw new DomainExpertWorkerError(409, 'source_identity_conflict', `Source ${String(namedSource!.source_id)} records a different file (sha256 ${otherIdentity.slice(0, 12)}) than ${gcsUri} (sha256 ${digest.slice(0, 12)}). Nothing was imported.`, 'Import it without source_id, or under the source that is this file.');
     }
     const context: SourceImportContext = { sha256: digest, ...(namedSource ? { sourceId: String(namedSource.source_id) } : {}) };
     const named = parseObjectNameUri(gcsUri);
@@ -2562,10 +2568,11 @@ export class DomainExpertService {
         recordProgress: (snapshot) => register(snapshot, { progress: true }),
       };
       const entry = { workspace_relative_path: file.workspaceRelativePath, source_sha256: digest };
-      if (named && typeof named.source_sha256 === 'string' && named.source_sha256 !== digest) {
+      const otherIdentity = named ? otherRecordedIdentity(named, digest) : undefined;
+      if (otherIdentity) {
         routed.push({ entry, corpusId, route: 'refused', outcome: { status: 'blocked', error: {
           code: 'source_identity_conflict',
-          message: `Source ${String(named.source_id)} records a different file (sha256 ${named.source_sha256.slice(0, 12)}) than ${file.workspaceRelativePath}. Nothing was imported.`,
+          message: `Source ${String(named!.source_id)} records a different file (sha256 ${otherIdentity.slice(0, 12)}) than ${file.workspaceRelativePath}. Nothing was imported.`,
           suggestion: 'Stage it without source_id, or under the source that is this file.',
         } } });
         continue;
@@ -3663,6 +3670,19 @@ export class DomainExpertService {
       );
     }
     return current.record;
+  }
+
+  // Whether a GCS object whose key does not say .pdf is a PDF: its first five bytes are the
+  // PDF header. A missing object is not one (the import then reports it as before).
+  private async gcsObjectIsPdf(gcsUri: string): Promise<boolean> {
+    const { bucket, prefix } = parseGcsPrefix(gcsUri);
+    let head: Uint8Array | null;
+    try {
+      head = await this.google.readGcsObjectHead(bucket, prefix.replace(/\/$/, ''), PDF_HEADER.length);
+    } catch {
+      throw new DomainExpertWorkerError(502, 'gcs_object_unreadable', `${gcsUri} could not be read to tell whether it is a PDF. Nothing was imported.`);
+    }
+    return head !== null && new TextDecoder('latin1').decode(head.subarray(0, PDF_HEADER.length)) === PDF_HEADER;
   }
 
   // Submission is not ingestion, for any import. On 2026-10-07 every web and
@@ -6947,6 +6967,17 @@ class GoogleRuntimeClient {
     });
   }
 
+  // The object's first bytes, by a ranged read; null when it does not exist.
+  async readGcsObjectHead(bucket: string, objectName: string, length: number): Promise<Uint8Array | null> {
+    const response = await this.authedFetch(
+      `https://storage.googleapis.com/storage/v1/b/${encodeURIComponent(bucket)}/o/${encodeURIComponent(objectName)}?alt=media`,
+      { headers: { Range: `bytes=0-${length - 1}` } },
+    );
+    if (response.status === 404) { await response.body?.cancel(); return null; }
+    if (!response.ok) throw googleError(response, await responseTextOrJson(response));
+    return new Uint8Array(await response.arrayBuffer()).subarray(0, length);
+  }
+
   async getGcsObjectMetadata(bucket: string, objectName: string): Promise<GcsObjectMetadata | null> {
     const response = await this.authedFetch(
       `https://storage.googleapis.com/storage/v1/b/${encodeURIComponent(bucket)}/o/${encodeURIComponent(objectName)}?fields=generation,size,md5Hash,crc32c`,
@@ -9691,6 +9722,13 @@ function sameIdentityHistory(history: DomainSourceRegistryRecord[], sha256: stri
   return hashes.size === 0 || (hashes.size === 1 && hashes.has(sha256));
 }
 
+// A sha256 the record holds other than this file's, at the top level or in any rag_files
+// entry (a batch record keeps each file's there): a source that records another file is
+// another source.
+function otherRecordedIdentity(record: Record<string, unknown>, sha256: string): string | undefined {
+  return registryRecordSha256s(record).find((hash) => hash !== sha256);
+}
+
 function registryRecordSha256s(record: Record<string, unknown>): string[] {
   const hashes = typeof record.source_sha256 === 'string' ? [record.source_sha256] : [];
   if (Array.isArray(record.rag_files)) {
@@ -10016,6 +10054,8 @@ const RAG_IMPORT_OUTCOME_FIELDS = new Set([
 
 // One imported object is recorded flat, the shape the hand-corrected records
 // use; a batch of several keeps a rag_files list.
+const PDF_HEADER = '%PDF-';
+
 function isPdfUri(uri: string): boolean {
   return /\.pdf$/i.test(uri);
 }
