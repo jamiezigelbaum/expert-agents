@@ -5462,6 +5462,10 @@ export class DomainExpertService {
           : {}),
         registered_at: registeredAt,
       };
+      // Objects registered without proof of the sha256 (a hand split) stay unproven
+      // while the source still holds any of them; only parts cut here from the
+      // original's bytes are proven.
+      if (heldUnverified(history, registryRecordGcsUris(record))) record.sha256_verified = false;
       await this.appendRegistryJsonLine(registryPath, record);
       context.sourceId = sourceId;
       if (!mode.progress) {
@@ -9104,6 +9108,12 @@ function pdfPageLimitRefusal(pages: number, limit: number, why: string, sourcePa
     message: `Measured ${pages} pages in the PDF. Imports with the LLM parser take at most ${limit} pages per PDF on this deployment, and the worker cannot split this one into parts: ${why}. Nothing was uploaded or imported; the download is still on disk at ${sourcePath}.`,
     suggestion: 'Install qpdf on the worker host so long PDFs are split into parts, or acquire an EPUB edition of the same work; annas_archive_search with ingest_intent: true ranks EPUB first.',
   };
+}
+
+// Whether a source's history registered any of these objects with sha256_verified: false.
+function heldUnverified(history: DomainSourceRegistryRecord[], uris: string[]): boolean {
+  const unverified = new Set(history.filter((entry) => entry.record.sha256_verified === false).flatMap((entry) => registryRecordGcsUris(entry.record)));
+  return uris.some((uri) => unverified.has(uri));
 }
 
 // The objects a registry record holds: its gcs_uri, or each entry of its rag_files list.
