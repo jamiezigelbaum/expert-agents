@@ -6856,8 +6856,10 @@ describe('splitting long PDFs for LLM-parser imports', () => {
         const refused = await postDomainResponse(f.worker, 'domain_source', { ...REGISTER, gcs_uris: [`gs://fixture-shared-library/${WHOLE}`] });
         expect(await refusal(refused)).toEqual({ status: 409, code: 'source_identity_conflict' });
         // The same holding in another corpus is a second holding too.
-        const elsewhere = await postDomainResponse(f.worker, 'domain_source', { ...REGISTER, corpus_id: 'research-library' });
+        const elsewhere = await postDomainResponse(f.worker, 'domain_source', { ...REGISTER, corpus_id: 'another-library' });
         expect(await refusal(elsewhere)).toEqual({ status: 409, code: 'source_identity_conflict' });
+        // The same corpus named by its display name is the same holding.
+        expect(await postDomain(f.worker, 'domain_source', { ...REGISTER, corpus_id: 'research-library' })).toMatchObject({ status: 'already_registered' });
         expect(f.readRegistry()).toHaveLength(1);
       } finally { f.cleanup(); }
     });
@@ -6871,6 +6873,8 @@ describe('splitting long PDFs for LLM-parser imports', () => {
           HAND_URIS.slice(0, 2),
           [HAND_URIS[0], HAND_URIS[0]!.replace('part1of3', 'part1of2'), HAND_URIS[2]],
           [HAND_URIS[0], 'gs://fixture-shared-library/v1/book-imports/research/unnamed.pdf', HAND_URIS[2]],
+          // Parts of two different splits.
+          ['gs://fixture-shared-library/v1/book-imports/research/volume-a--part1of2.pdf', 'gs://fixture-shared-library/v1/book-imports/research/volume-b--part2of2.pdf'],
         ]) {
           expect(await refusal(await postDomainResponse(f.worker, 'domain_source', { ...REGISTER, gcs_uris: gcsUris }))).toEqual({ status: 400, code: 'invalid_params' });
         }
@@ -6908,6 +6912,24 @@ describe('splitting long PDFs for LLM-parser imports', () => {
         expect(registered.source_record).toMatchObject({ gcs_uri: `gs://fixture-shared-library/${WHOLE}`, sha256_verified: true, pages: 582 });
       } finally { f.cleanup(); }
     });
+  });
+
+  // A source keeps one holding: a book held in one corpus is not imported into another.
+  test('an import into another corpus than the one holding the source is refused', async () => {
+    const f = splitFixture(textPdfBytes(450), importsAll);
+    try {
+      expect((await postDomain(f.worker, 'annas_archive_import', PARAMS)).rag_ingest.status).toBe('imported');
+      const records = f.readRegistry().length;
+      const importsBefore = f.importedUris().length;
+      const elsewhere = await postDomain(f.worker, 'annas_archive_import', { ...PARAMS, corpus_id: 'another-library' });
+      expect(elsewhere.rag_ingest).toMatchObject({ status: 'blocked', error: { code: 'source_identity_conflict' } });
+      expect(elsewhere.rag_ingest.error.message).toContain(`held in corpus ${CORPUS}`);
+      expect(f.importedUris()).toHaveLength(importsBefore);
+      expect(f.readRegistry()).toHaveLength(records);
+      // The same corpus by its display name is the same holding: present.
+      const same = await postDomain(f.worker, 'annas_archive_import', { ...PARAMS, corpus_id: 'research-library' });
+      expect(same.rag_ingest).toMatchObject({ status: 'imported', import_outcome: { already_present: true } });
+    } finally { f.cleanup(); }
   });
 
   // A split recorded by #37 carries part names but no page ranges or sha256. Found through its
