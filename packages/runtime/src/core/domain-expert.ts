@@ -166,6 +166,11 @@ export interface DomainSourceParams {
   corpusId?: string;
   trustPosture?: string;
   copyrightPosture?: string;
+  // The original file's sha256, the source's one identity across every import route.
+  sha256?: string;
+  // add: corpus objects that already hold this source (one whole file, or a split's
+  // parts in page order), registered without importing anything.
+  gcsUris?: string[];
   includeHistory?: boolean;
   includeRemoved?: boolean;
   dryRun?: boolean;
@@ -520,10 +525,15 @@ export function planDomainSource(
       ...(params.corpusId ? { target_corpus_id: params.corpusId } : {}),
       trust_posture: params.trustPosture ?? manifest.trust_posture,
       ...(params.copyrightPosture ? { copyright_posture: params.copyrightPosture } : {}),
-      ingest_status: params.action === 'add' ? 'not_ingested' : 'lookup_planned',
+      ...(params.sha256 ? { source_sha256: params.sha256 } : {}),
+      ...(params.gcsUris?.length ? { gcs_uris: params.gcsUris } : {}),
+      ingest_status: params.action === 'add' ? (params.gcsUris?.length ? 'imported' : 'not_ingested') : 'lookup_planned',
     },
     registration_effects: [
       'append source-registry.jsonl and ingest-log.md',
+      ...(params.gcsUris?.length
+        ? ['first verify that every gcs_uris object has an ACTIVE ragFile in the corpus and count each PDF part\'s pages with qpdf, recording each part\'s original page range']
+        : []),
     ],
     ingestion: {
       performed_by_domain_source_add: false,
@@ -899,8 +909,18 @@ export function domainWorkspaceSeedFiles(manifest: DomainManifest): Array<Record
 }
 
 function validateDomainSourceRequest(params: DomainSourceParams): void {
-  if (params.action === 'add' && !firstNonEmpty(params.url, params.relativePath)) {
-    throw new OperationError('invalid_params', 'domain_source add requires url or relative_path.');
+  if (params.action === 'add' && !firstNonEmpty(params.url, params.relativePath) && !params.gcsUris?.length) {
+    throw new OperationError('invalid_params', 'domain_source add requires url, relative_path or gcs_uris.');
+  }
+  if (params.sha256 !== undefined && !/^[0-9a-f]{64}$/.test(params.sha256)) {
+    throw new OperationError('invalid_params', 'sha256 must be the original file\'s SHA-256 as 64 lowercase hex characters.');
+  }
+  if (params.gcsUris?.length) {
+    if (params.action !== 'add') throw new OperationError('invalid_params', 'gcs_uris is accepted only by domain_source add.');
+    if (!params.sha256) throw new OperationError('invalid_params', 'domain_source add with gcs_uris requires sha256, the original file\'s identity.');
+    if (new Set(params.gcsUris).size !== params.gcsUris.length || params.gcsUris.some((uri) => !uri.startsWith('gs://'))) {
+      throw new OperationError('invalid_params', 'gcs_uris must be distinct gs:// URIs.');
+    }
   }
   if ((params.action === 'status' || params.action === 'remove') && !params.sourceId?.trim()) {
     throw new OperationError('invalid_params', `domain_source ${params.action} requires source_id.`);
@@ -987,7 +1007,8 @@ function validateGcsUri(manifest: DomainManifest, gcsUri: string | undefined): v
 
 function plannedSourceId(domainId: string, params: DomainSourceParams): string {
   const basis = firstNonEmpty(params.url, params.relativePath, params.title, params.author) ?? 'source';
-  return `${domainId}-${slugify(basis).slice(0, 48)}-${stableShortHash(basis)}`;
+  // A source identified by its file hash is told apart from another of the same title.
+  return `${domainId}-${slugify(basis).slice(0, 48)}-${stableShortHash(params.sha256 ? `${basis}:${params.sha256}` : basis)}`;
 }
 
 // The domain's routing target — the corpus a configured deployment's library

@@ -3,6 +3,7 @@
 Current reference:
 
 - [Direct library reading](direct-library-reading.md): complete source and section reads.
+- [Vertex RAG limits](vertex-rag-limits.md): measured parser limits the import code depends on.
 
 - [Factory](FACTORY.md) — creating an expert from a conversation.
 - [Agent repository contract](AGENT_REPO_CONTRACT.md) — what an expert's own repository must contain.

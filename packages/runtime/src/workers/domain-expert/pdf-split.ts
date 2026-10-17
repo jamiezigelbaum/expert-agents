@@ -1,11 +1,9 @@
 // Splits a long PDF into page-range parts for Vertex RAG import (#33).
 //
-// The Gemini LLM parser fails long PDFs inside Vertex with an internal error.
-// On 2026-10-08 born-digital PDFs of 254 and 251 pages imported while ones of
-// about 330, 350, 400 and 500 pages failed, so the limit is page count (about
-// 300), not size. Splitting with qpdf into parts of at most 200 pages then
-// imported 9 of 9 parts from 4 books, including a 508-page OCR scan. This
-// module holds the host-tool mechanics; the worker decides when to split.
+// The Gemini LLM parser fails PDFs of about 300 pages and more inside Vertex
+// with an internal error; the measurements and the 200-page split size are in
+// docs/vertex-rag-limits.md. This module holds the host-tool mechanics; the
+// worker decides when to split.
 import { execFile } from 'node:child_process';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';

@@ -211,19 +211,62 @@ an overwrite); a DJVU is converted through `djvutxt` when
 `EXPERT_AGENTS_DOMAIN_EXPERT_ANNAS_DJVUTXT_BIN` (default `djvutxt`, from
 djvulibre) resolves on PATH; MOBI/AZW3 are refused with
 `unsupported_ingest_format` and the download stays on disk. While imports use
-the LLM parser, a PDF longer than
-`EXPERT_AGENTS_DOMAIN_EXPERT_ANNAS_PDF_SPLIT_PAGES` (default 200) is split with
-`qpdf` into `<name>--partNofM.pdf` parts that are imported one at a time and
-coverage-checked (ACTIVE ragFile; text layer read with `pdftotext`); the host
-needs `qpdf` and `pdftotext` (poppler-utils) on PATH, and without `qpdf` such a
-PDF above `EXPERT_AGENTS_DOMAIN_EXPERT_ANNAS_MAX_PDF_PAGES` (default 500) is
-refused instead. Only this acquisition path splits: a long PDF reaching the
-corpus through `stage_import`, `rag_corpus import` of a GCS object or the
-library materializer is still imported whole. A re-run reuses parts only when
-the split reproduces the same bytes (`qpdf --deterministic-id`): changing the
-split size or the installed qpdf version makes new parts, which import beside
-the earlier ones, so remove the earlier parts first. A book already imported
-whole is left whole. After submission
+the LLM parser a PDF holds at most
+`EXPERT_AGENTS_DOMAIN_EXPERT_ANNAS_PDF_SPLIT_PAGES` (default 200) pages per
+import ([measured limit](../docs/vertex-rag-limits.md)). A longer PDF is split
+with `qpdf` into `<name>--partNofM.pdf` parts that are imported one at a time
+and coverage-checked (ACTIVE ragFile; text layer read with `pdftotext`); the
+host needs `qpdf` and `pdftotext` (poppler-utils) on PATH, and without `qpdf`,
+or for a file `qpdf` cannot read, such a PDF is refused before upload with
+`pdf_exceeds_parser_page_limit`. Worker health reports `pdf_import` as
+`degraded` while either tool is missing. Only this acquisition path splits: a
+long PDF reaching the corpus through `stage_import`, `rag_corpus import` of a
+GCS object or the library materializer is still imported whole.
+
+Every acquired source has one identity, the sha256 of the original file.
+Before anything is uploaded the worker looks it up in the domain's
+`references/source-registry.jsonl`: a source the registry records in the
+corpus, whole or as parts of any split, is reported present (when the ragFile
+listing fails, a part the registry already knows as imported stays imported),
+and nothing is uploaded or imported again, whatever the split size, parser or
+installed tools are now. A split records its progress in the registry after
+its uploads, at each part's submission and at each part's outcome; every part
+record carries the original sha256 and its page range in the original. A
+re-run, including one after a worker restart, imports only the parts not yet
+in the corpus, deleting a failed part's ERROR ragFile first so Vertex does not
+skip it. A holding made outside the worker (for example a book split by hand
+and imported straight into Vertex) is registered without importing anything:
+
+```json
+{"tool": "domain_source", "params": {"action": "add", "domain_id": "<domain>", "kind": "book",
+  "title": "<title>", "author": "<author>", "corpus_id": "<corpus>",
+  "sha256": "<sha256sum of the original file>",
+  "gcs_uris": ["gs://<bucket>/<dir>/<name>--part1of2.pdf", "gs://<bucket>/<dir>/<name>--part2of2.pdf"],
+  "dry_run": false}}
+```
+
+Each entry names an object, not a directory or bucket. The parts of a split are
+named `<name>--partNofM.pdf` for one M, N from 1 to M once each, and are ordered
+by N. The worker requires every object to have an ACTIVE ragFile matched by its
+exact source URI, counts each PDF's pages with `qpdf` to record each part's
+original page range, and writes one `imported` record
+(`acquisition: registered_holding`). A whole object must hash to the given
+sha256; a split's parts cannot prove it, so their record says
+`sha256_verified: false` and an import that matches it reports
+`identity_verified: false`. The same call again answers `already_registered`
+and writes nothing; a different holding for the same sha256, or the same one in
+another corpus, is refused with `source_identity_conflict`. A record written
+before sources carried a sha256 that holds the same objects is updated rather
+than duplicated. A book already imported whole before sources carried their
+sha256 is left whole, and a split recorded before parts carried page ranges
+gets its ranges back from the part names and the original's page count, so a
+re-run imports only the unfinished parts. Two imports of the same book at once
+are not locked against each other: Vertex skips the URI the other import holds
+and registry writes are serialized.
+
+Upgrading from a release with `EXPERT_AGENTS_DOMAIN_EXPERT_ANNAS_PDF_SPLIT_PAGES=0`:
+0 still disables splitting, and a PDF over 200 pages is then refused before
+upload; health reports `pdf_split_disabled`. After submission
 the worker polls the Vertex operation, starting at
 `EXPERT_AGENTS_DOMAIN_EXPERT_ANNAS_IMPORT_POLL_INTERVAL_MS` (default 5000) and
 growing ×1.5 per read up to 30 s while the import runs (each read counts

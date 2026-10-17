@@ -1,6 +1,6 @@
 ---
 name: expert-annas-archive-acquisition
-version: 0.5.0
+version: 0.6.0
 description: Search for candidate books, download owner-named titles immediately, present candidates for selection questions, save approved files through the configured sink, and route them to the domain's target corpus.
 tools:
   - annas_archive_search
@@ -56,22 +56,43 @@ download stays on disk and the refusal names the path.
 **Always acquire the EPUB; take a PDF only when no EPUB of the work is
 offered** (owner ruling). PDF imports with the LLM parser fail at about 300
 pages, so while this deployment imports with the LLM parser (its usual
-setting) the runtime splits a longer PDF into parts of at most 200 pages,
-uploads them as `<name>--partNofM.pdf` and imports them one at a time.
-`rag_ingest.split` gives the page count and how many parts imported;
-`rag_ingest.parts` lists each part's page range, status and coverage
-(`covered`, `text_layer_absent` for a scan the parser read from images —
-probe it with `domain_ask` — `not_covered` or `unverified`). When a part fails
-or is blocked the error is `annas_pdf_split_import_incomplete`, naming each
-part and its pages; re-run the same import once the cause is cleared and only
-the missing parts are imported again. If splitting fails the code is
-`annas_pdf_split_failed` and the file stays on disk. A book already in the
-corpus whole is not split; when that cannot be checked the import stops with
-`annas_pdf_whole_copy_unverified` — re-run it later rather than splitting by
-hand. On a host that cannot
-split (no qpdf, or splitting disabled) the runtime instead refuses a PDF
-measured above its configured ceiling (default 500) before upload, with
-`annas_pdf_exceeds_parser_page_limit`; the file stays on disk.
+setting) a PDF holds at most 200 pages per import: the runtime splits a longer
+PDF into parts of at most 200 pages, uploads them as `<name>--partNofM.pdf`
+and imports them one at a time. `rag_ingest.split` gives the page count and
+how many parts imported; `rag_ingest.parts` lists each part's page range in
+the original, status and coverage (`covered`, `text_layer_absent` for a scan
+the parser read from images — probe it with `domain_ask` — `not_covered` or
+`unverified`). When a part fails or is blocked the error is
+`annas_pdf_split_import_incomplete`, naming each part and its pages; re-run
+the same import once the cause is cleared: parts already in the corpus are
+kept, a failed part's leftover ragFile is removed, and only the parts not yet
+imported are imported again. The registry records each part as it goes, so a
+re-run after a worker restart also resumes where the split stopped. If
+splitting fails the code is `annas_pdf_split_failed` and the file stays on
+disk. A book already in the corpus whole is not split; when that cannot be
+checked the import stops with `annas_pdf_whole_copy_unverified` — re-run it
+later rather than splitting by hand. On a host that cannot split (no qpdf, or
+a PDF qpdf cannot read) a PDF longer than 200 pages is refused before upload
+with `pdf_exceeds_parser_page_limit`; the file stays on disk.
+
+Every source has one identity, the sha256 of the original file. Before
+uploading anything the runtime looks that identity up in the domain's source
+registry: a book already in the corpus, whole or as parts of any split, is
+reported `imported` with `import_outcome.already_present: true` and nothing
+is uploaded or imported again, whatever this host could do now. When that
+copy's corpus state cannot be read and the registry does not already know it
+as imported, the import stops with `source_holding_unverified`; re-run it
+later. A partly imported split is resumed on its recorded page ranges; when
+the remaining parts cannot be cut the code is
+`source_parts_resume_unavailable`. A book that reached the corpus outside the
+worker (split by hand and imported straight into Vertex) is registered with
+`domain_source add` giving `sha256` (of the original file) and `gcs_uris`
+(its objects; parts named `<name>--partNofM.pdf`); the runtime checks each
+object has an ACTIVE ragFile and records each part's page range, and
+registering it again changes nothing. A match with such a split reports
+`identity_verified: false`, since parts cannot prove the original's sha256:
+say so when you report the book as present.
+
 Report a refusal or failure with the measured page count (`scale.pages`) and,
 for a split, the failing parts; do not substitute another copy without telling
 the owner. When the owner intends to ingest, search with
@@ -85,9 +106,10 @@ reports `rag_ingest.status` as what actually happened:
 - `imported` — Vertex counted the file; the book is in the library.
 - `import_failed` — the operation errored or Vertex reported the file failed;
   the Vertex message is in `import_outcome`.
-- `imported` with `import_outcome.already_present: true` — Vertex skipped a
-  re-import because the same object is already in the corpus and ACTIVE. The
-  book is in the library; do not retry it.
+- `imported` with `import_outcome.already_present: true` — the source was
+  already in the corpus and ACTIVE (found by its sha256 in the registry, or
+  Vertex skipped a re-import of the same object). The book is in the library;
+  do not retry it.
 - `import_empty` — the operation finished having imported nothing (the
   format was not parsed, or a skipped object has no ACTIVE ragFile).
 - `import_requested` — only when the poll ran out of budget;
@@ -106,7 +128,9 @@ never describe `import_requested`, `import_in_progress`, `import_empty`,
 `import_failed` or `blocked` as success.
 
 An `imported` acquisition is also recorded automatically in the domain's
-source registry, keyed by its md5 (`annas:<md5>`) with title, author and
-year, and the result's `registry` reports `registered`, `updated` (a
-re-ingest revised the existing record) or `unavailable` (no workspace root is
-configured; register the source manually with `domain_source add`).
+source registry with the original file's sha256, its Anna locator
+(`annas:<md5>`), title, author and year, and for a split each part's page
+range; the result's `registry` reports `registered`, `updated` (a re-ingest
+revised the existing record), `unchanged` (the source was already registered
+as present) or `unavailable` (no workspace root is configured; register the
+source manually with `domain_source add`).
