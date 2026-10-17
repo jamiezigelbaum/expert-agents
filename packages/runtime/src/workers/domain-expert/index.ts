@@ -1406,32 +1406,36 @@ export class DomainExpertService {
       if (latestDomainSourceRecord(history).removed) continue;
       const withObjects = history.filter((entry) => registryRecordGcsUris(entry.record).length > 0);
       if (!withObjects.length) continue;
-      const record = latestDomainSourceRecord(withObjects).record;
-      const holding = recordedSourceHolding(record);
-      // An object any record registered without proof of its sha256 (a hand split, an object
-      // that changed during its import) is cited with its source marked unverified.
-      // A record of a PDF the pipeline imported says so, whatever the object's key.
-      const pdf = record.content_type === PDF_CONTENT_TYPE;
-      const cited = (uri: string) => ({ source_id: sourceId, ...(heldUnverified(history, [uri]) ? { unverified: true } : {}), ...(pdf ? { pdf: true } : {}) });
-      if (holding?.whole) holdings.set(holding.whole.gcs_uri, cited(holding.whole.gcs_uri));
-      // A batch record lists several whole objects; each is cited under the record's source
-      // unless a source of its own (registered by its sha256) names it too.
-      if (!holding?.parts) {
-        for (const uri of registryRecordGcsUris(record)) if (!holdings.has(uri) || batchCited.has(uri)) {
-          holdings.set(uri, cited(uri));
-          if (registryRecordGcsUris(record).length > 1) batchCited.add(uri);
-          else batchCited.delete(uri);
+      // Every record that names objects, oldest first: a batch rerun after a file changed
+      // stages its new version beside the old, which stays in the corpus and is still cited
+      // under this source. A newer record wins where two name one object.
+      for (const { record } of withObjects) {
+        const holding = recordedSourceHolding(record);
+        // An object any record registered without proof of its sha256 (a hand split, an object
+        // that changed during its import) is cited with its source marked unverified.
+        // A record of a PDF the pipeline imported says so, whatever the object's key.
+        const pdf = record.content_type === PDF_CONTENT_TYPE;
+        const cited = (uri: string) => ({ source_id: sourceId, ...(heldUnverified(history, [uri]) ? { unverified: true } : {}), ...(pdf ? { pdf: true } : {}) });
+        if (holding?.whole) holdings.set(holding.whole.gcs_uri, cited(holding.whole.gcs_uri));
+        // A batch record lists several whole objects; each is cited under the record's source
+        // unless a source of its own (registered by its sha256) names it too.
+        if (!holding?.parts) {
+          for (const uri of registryRecordGcsUris(record)) if (!holdings.has(uri) || batchCited.has(uri)) {
+            holdings.set(uri, cited(uri));
+            if (registryRecordGcsUris(record).length > 1) batchCited.add(uri);
+            else batchCited.delete(uri);
+          }
         }
-      }
-      // Parts recorded without ranges get them back when the original's page count is recorded.
-      const parts = holding?.parts && typeof record.pages === 'number'
-        ? recordedPartsWithRanges(holding.parts, record.pages, this.annasPdfSplitPages) ?? holding.parts
-        : holding?.parts ?? [];
-      for (const part of parts) {
-        holdings.set(part.gcs_uri, {
-          ...cited(part.gcs_uri), part: part.name,
-          ...(part.first_page !== undefined && part.last_page !== undefined ? { first_page: part.first_page, last_page: part.last_page } : {}),
-        });
+        // Parts recorded without ranges get them back when the original's page count is recorded.
+        const parts = holding?.parts && typeof record.pages === 'number'
+          ? recordedPartsWithRanges(holding.parts, record.pages, this.annasPdfSplitPages) ?? holding.parts
+          : holding?.parts ?? [];
+        for (const part of parts) {
+          holdings.set(part.gcs_uri, {
+            ...cited(part.gcs_uri), part: part.name,
+            ...(part.first_page !== undefined && part.last_page !== undefined ? { first_page: part.first_page, last_page: part.last_page } : {}),
+          });
+        }
       }
     }
     return holdings;

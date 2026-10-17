@@ -8243,6 +8243,43 @@ describe('citations from split parts', () => {
     } finally { fixture.cleanup(); }
   });
 
+  // A batch rerun after a file changed stages the new version beside the old, which stays in the corpus.
+  test('an earlier version of a staged file is still cited under its batch source, with its pages', async () => {
+    const fixture = workspaceFixture();
+    const staged = (sha: string, name: string) => `gs://fixture-shared-library/v1/staged/history/batch/${sha.repeat(32)}/${name}`;
+    try {
+      const registryPath = join(fixture.workspaceRoot, domainManifest('history').workspace_relative_path, 'references/source-registry.jsonl');
+      mkdirSync(dirname(registryPath), { recursive: true });
+      writeFileSync(registryPath, [
+        { source_id: 'history-stage-import-batch', domain_id: 'history', ingest_status: 'imported', rag_files: [
+          { gcs_uri: staged('a', 'paper.pdf'), content_type: 'application/pdf', status: 'imported' }, { gcs_uri: staged('c', 'notes.md'), status: 'imported' },
+        ], registered_at: '2026-10-17T12:00:00.000Z' },
+        { source_id: 'history-stage-import-batch', domain_id: 'history', ingest_status: 'imported', rag_files: [
+          { gcs_uri: staged('b', 'paper.pdf'), content_type: 'application/pdf', status: 'imported' }, { gcs_uri: staged('c', 'notes.md'), status: 'imported' },
+        ], registered_at: '2026-10-17T13:00:00.000Z' },
+      ].map((record) => JSON.stringify(record)).join('\n') + '\n');
+      const worker = createDomainExpertWorker({
+        roots: [rootPolicy(fixture.workspaceRoot)],
+        dataDir: join(fixture.base, 'data'),
+        google: {
+          accessToken: 'fixture-google-token',
+          fetchImpl: fakeGoogleFetch([], {
+            ragCorpora: [{ name: corpusResource, displayName: 'history-library' }],
+            contexts: () => [staged('a', 'paper.pdf'), staged('b', 'paper.pdf'), staged('c', 'notes.md')].map((uri, index) => ({
+              sourceUri: uri, sourceDisplayName: `context-${index}`, text: 'Passage.', score: 0.1, chunk: { text: 'x', pageSpan: { firstPage: 3, lastPage: 3 } },
+            })),
+          }),
+        },
+      });
+      const result = await postDomain(worker, 'domain_ask', { domain_id: 'history', question: 'Where is it said?', output: 'passages' });
+      const byUri = new Map<string, Record<string, any>>(result.passages.map((passage: Record<string, any>) => [passage.source_uri, passage]));
+      for (const sha of ['a', 'b']) {
+        expect(byUri.get(staged(sha, 'paper.pdf'))).toMatchObject({ source_id: 'history-stage-import-batch', original_pages: { first_page: 3, last_page: 3 } });
+      }
+      expect(byUri.get(staged('c', 'notes.md'))).toMatchObject({ source_id: 'history-stage-import-batch' });
+    } finally { fixture.cleanup(); }
+  });
+
   // A context's citation fields depend only on that context and the registry, never on the rest of the result set.
   test('a registered non-PDF source is cited by source alone, whether or not a PDF is retrieved with it', async () => {
     const note = 'gs://fixture-shared-library/v1/library/field-notes.md';
