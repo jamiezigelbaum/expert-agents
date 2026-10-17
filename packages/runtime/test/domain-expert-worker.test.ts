@@ -7585,6 +7585,45 @@ describe('splitting long PDFs for LLM-parser imports', () => {
       } finally { f.cleanup(); }
     });
 
+    // Two reads of one object overwritten between them hash differently: the URI serializes them.
+    test('two imports of one GCS object overwritten between their reads run one at a time; the second is refused', async () => {
+      const NAME = 'v1/library/example-author---a-racing-paper-1992.pdf';
+      const uri = `gs://fixture-shared-library/${NAME}`;
+      const PENDING = `${CORPUS}/operations/pending-1`;
+      const revised = textPdfBytes(121);
+      let release = false;
+      let submitted!: () => void;
+      const firstSubmitted = new Promise<void>((resolve) => { submitted = resolve; });
+      const f = splitFixture(LONG, (part, attempt, objects) => {
+        if (part !== 'whole' || attempt !== 1) return { importedRagFilesCount: '1' };
+        writeFakeGcsObject(objects, NAME, revised);
+        submitted();
+        return jsonResponse({ name: PENDING, done: false });
+      }, {
+        importPollTimeoutMs: 5_000,
+        seed: { objects: [[NAME, textPdfBytes(120)]] },
+        wrapGoogleFetch: (next) => (async (input: string | URL | Request, init?: RequestInit) => (String(input).includes('/operations/pending-1')
+          ? jsonResponse(release ? { name: PENDING, done: true, response: { importedRagFilesCount: '1' } } : { name: PENDING, done: false })
+          : next(input, init))) as typeof fetch,
+      });
+      try {
+        const request = () => postDomainResponse(f.worker, 'rag_corpus', { action: 'import', domain_id: 'research', corpus_id: CORPUS, gcs_uri: uri, dry_run: false });
+        const first = request();
+        await firstSubmitted;
+        let secondSettled = false;
+        const second = request().then((response) => { secondSettled = true; return response; });
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        // The second read the revised bytes, but waits on the object the first is importing.
+        expect(secondSettled).toBe(false);
+        release = true;
+        await first;
+        const refused = await second;
+        expect(refused.status).toBe(409);
+        expect(((await refused.json()) as Record<string, any>).error.code).toBe('gcs_object_replaced');
+        expect(f.importRequests()).toEqual([[uri]]);
+      } finally { f.cleanup(); }
+    });
+
     // A source re-added without a sha256 is still the file its history recorded.
     test('a named source whose older record holds another file refuses a different PDF after a re-add without sha256', async () => {
       const NAME = 'v1/library/example-author---another-paper-1993.pdf';

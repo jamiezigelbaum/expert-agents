@@ -2462,7 +2462,8 @@ export class DomainExpertService {
     // in-progress record) is written, no other import of this file, or of the source it
     // names, runs: it waits, then sees what this one recorded.
     const lock = await this.sourceLocks.acquireAll(
-      [sourceLockKey(manifest, digest), ...(params.sourceId ? [sourceIdLockKey(manifest, params.sourceId)] : [])],
+      // The object too: an overwrite between two reads gives two digests, but one URI.
+      [sourceLockKey(manifest, digest), objectLockKey(manifest, gcsUri), ...(params.sourceId ? [sourceIdLockKey(manifest, params.sourceId)] : [])],
       `rag_corpus import of ${gcsUri}`, this.sourceLockDeadline(),
     );
     if ('heldBy' in lock) return { ...base, ...(await this.sourceImportBusy(manifest, digest, lock.heldBy)), policy: domainPolicy() };
@@ -10096,6 +10097,12 @@ function sourceIdLockKey(manifest: ReturnType<typeof domainManifest>, sourceId: 
   return `${manifest.domain_id}:source:${sourceId.trim()}`;
 }
 
+// A GCS object imported by URI: two reads of one object overwritten between them hash
+// differently, so its URI is locked as well, and the second sees what the first recorded.
+function objectLockKey(manifest: ReturnType<typeof domainManifest>, gcsUri: string): string {
+  return `${manifest.domain_id}:object:${gcsUri}`;
+}
+
 type SourceHolding =
   | { kind: 'none' }
   | { kind: 'present'; result: Record<string, unknown> }
@@ -10155,7 +10162,8 @@ function otherHistoryIdentity(records: DomainSourceRegistryRecord[], sourceId: s
 
 // The sha256 a live source recorded for this exact object, when it is not this file's: the
 // object was overwritten in place. A batch entry's own hash decides; a record's top-level
-// hash only for the object it names alone.
+// hash only for the object it names alone. A record whose import of it failed leaves
+// nothing in the corpus for Vertex to skip.
 function replacedObjectIdentity(records: DomainSourceRegistryRecord[], gcsUri: string, sha256: string): string | undefined {
   for (const history of groupDomainSourceRecords(records).values()) {
     if (latestDomainSourceRecord(history).removed) continue;
@@ -10163,6 +10171,8 @@ function replacedObjectIdentity(records: DomainSourceRegistryRecord[], gcsUri: s
       const uris = registryRecordGcsUris(record);
       if (!uris.includes(gcsUri)) continue;
       const entry = Array.isArray(record.rag_files) ? record.rag_files.map(asOptionalRecord).find((file) => file?.gcs_uri === gcsUri) : undefined;
+      const status = typeof entry?.status === 'string' ? entry.status : new Set(uris).size === 1 ? record.ingest_status : undefined;
+      if (status === 'import_failed' || status === 'import_empty') continue;
       const hash = typeof entry?.source_sha256 === 'string' ? entry.source_sha256
         : new Set(uris).size === 1 && typeof record.source_sha256 === 'string' ? record.source_sha256 : undefined;
       if (hash && hash !== sha256) return hash;
