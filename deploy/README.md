@@ -238,7 +238,13 @@ inspected sha256 but says `sha256_verified: false` with `source_check`, and the
 result reports `source_changed_during_import`. An import still running when
 the worker stops waiting is recorded the same way (`sha256_verified: false`,
 and `identity_verified: false` in the result), since Vertex may read the
-object after any check the worker could make. Identity is claimed only for
+object after any check the worker could make, and so is one Vertex skipped as
+already in the corpus with no record of its bytes. An object a live source
+recorded as a different file (overwritten in place) is refused before import
+with 409 `gcs_object_replaced`, since Vertex would skip its URI and keep the old
+file: upload the new file under a new object name. A named `source_id` whose
+history records another file's sha256 is refused with
+`source_identity_conflict`, even after a re-add without a sha256. Identity is claimed only for
 bytes the registry proved: an object any of its source's records holds with
 `sha256_verified: false` (a hand split's parts, an object that changed during
 its import or whose import had not settled) is matched with `identity_verified: false` and cited with its

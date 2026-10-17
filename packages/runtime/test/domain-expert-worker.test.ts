@@ -7564,6 +7564,44 @@ describe('splitting long PDFs for LLM-parser imports', () => {
       } finally { f.cleanup(); }
     });
 
+    // Vertex skips a URI already in the corpus: an object overwritten in place must not take the old file's place.
+    test('a GCS PDF overwritten in place after its import is refused; one in the corpus with no record is not verified', async () => {
+      const NAME = 'v1/library/example-author---a-revised-paper-1992.pdf';
+      const uri = `gs://fixture-shared-library/${NAME}`;
+      const revised = textPdfBytes(121);
+      const f = splitFixture(revised, importsAll, { seed: { objects: [[NAME, revised]], imported: [uri] } });
+      try {
+        mkdirSync(dirname(f.registryPath), { recursive: true });
+        writeFileSync(f.registryPath, `${JSON.stringify({ source_id: 'research-pdf-old', domain_id: 'research', kind: 'pdf', ingest_status: 'imported', gcs_uri: uri, source_sha256: 'a'.repeat(64), registered_at: '2026-10-17T12:00:00.000Z' })}\n`);
+        const refused = await postDomainResponse(f.worker, 'rag_corpus', { action: 'import', domain_id: 'research', corpus_id: CORPUS, gcs_uri: uri, dry_run: false });
+        expect(refused.status).toBe(409);
+        expect(((await refused.json()) as Record<string, any>).error.code).toBe('gcs_object_replaced');
+        expect(f.importRequests()).toEqual([]);
+        // Already in the corpus with no record of its bytes: Vertex skips it, so its identity is not claimed.
+        writeFileSync(f.registryPath, '');
+        const skipped = await postDomain(f.worker, 'rag_corpus', { action: 'import', domain_id: 'research', corpus_id: CORPUS, gcs_uri: uri, dry_run: false });
+        expect(skipped.import_outcome).toMatchObject({ already_present: true, identity_verified: false });
+        expect(f.readRegistry().at(-1)).toMatchObject({ source_sha256: sha256Hex(revised), sha256_verified: false, source_check: expect.stringContaining('skipped') });
+      } finally { f.cleanup(); }
+    });
+
+    // A source re-added without a sha256 is still the file its history recorded.
+    test('a named source whose older record holds another file refuses a different PDF after a re-add without sha256', async () => {
+      const NAME = 'v1/library/example-author---another-paper-1993.pdf';
+      const f = splitFixture(LONG, importsAll, { seed: { objects: [[NAME, textPdfBytes(130)]] } });
+      try {
+        mkdirSync(dirname(f.registryPath), { recursive: true });
+        writeFileSync(f.registryPath, [
+          { source_id: 'shared-paper', domain_id: 'research', kind: 'pdf', ingest_status: 'imported', gcs_uri: 'gs://fixture-shared-library/v1/library/first.pdf', source_sha256: 'a'.repeat(64), registered_at: '2026-10-17T12:00:00.000Z' },
+          { source_id: 'shared-paper', domain_id: 'research', kind: 'pdf', url: 'https://example.com/paper', registered_at: '2026-10-17T13:00:00.000Z' },
+        ].map((record) => JSON.stringify(record)).join('\n') + '\n');
+        const refused = await postDomainResponse(f.worker, 'rag_corpus', { action: 'import', domain_id: 'research', corpus_id: CORPUS, gcs_uri: `gs://fixture-shared-library/${NAME}`, source_id: 'shared-paper', dry_run: false });
+        expect(refused.status).toBe(409);
+        expect(((await refused.json()) as Record<string, any>).error.code).toBe('source_identity_conflict');
+        expect(f.importRequests()).toEqual([]);
+      } finally { f.cleanup(); }
+    });
+
     // Vertex may read the object after the worker stops waiting: no check then can prove the bytes it imports.
     test('a GCS PDF whose import is still running when the worker stops waiting is recorded with its identity unverified', async () => {
       const PENDING = `${CORPUS}/operations/pending-1`;

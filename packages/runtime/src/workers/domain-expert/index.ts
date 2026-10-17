@@ -2471,10 +2471,17 @@ export class DomainExpertService {
       namedSource = params.sourceId
         ? await this.registeredImportSource(manifest, await checkedRootPath(this.rootFor(manifest.workspace_root_id)), params.sourceId)
         : undefined;
-      // A named source that records another file's sha256 is another source.
-      const otherIdentity = namedSource ? otherRecordedIdentity(namedSource, digest) : undefined;
+      const records = await this.domainRegistryRecords(manifest);
+      // A named source that records another file's sha256 anywhere in its history is another source.
+      const otherIdentity = namedSource ? otherHistoryIdentity(records, String(namedSource.source_id), digest) : undefined;
       if (otherIdentity) {
         throw new DomainExpertWorkerError(409, 'source_identity_conflict', `Source ${String(namedSource!.source_id)} records a different file (sha256 ${otherIdentity.slice(0, 12)}) than ${gcsUri} (sha256 ${digest.slice(0, 12)}). Nothing was imported.`, 'Import it without source_id, or under the source that is this file.');
+      }
+      // Vertex skips a URI already in the corpus, so an object overwritten in place would keep
+      // the old file's passages under the new file's identity, and the new file would never be indexed.
+      const replaced = replacedObjectIdentity(records, gcsUri, digest);
+      if (replaced) {
+        throw new DomainExpertWorkerError(409, 'gcs_object_replaced', `${gcsUri} was imported as a different file (sha256 ${replaced.slice(0, 12)}) than it now holds (sha256 ${digest.slice(0, 12)}). Vertex would skip the URI and keep the old file. Nothing was imported.`, 'Upload the new file under a new object name and import that.');
       }
     } catch (error) {
       lock.release();
@@ -2627,6 +2634,7 @@ export class DomainExpertService {
       }
     }
     const named = namedSource && stage.eligible.length === 1 ? namedSource : undefined;
+    const namedRecords = named ? await this.domainRegistryRecords(manifest) : [];
     const firstOfDigest = new Map<string, string>();
     for (const file of stage.eligible) {
       const pdf = pdfBytes.get(file);
@@ -2685,7 +2693,7 @@ export class DomainExpertService {
         }),
         recordProgress: (snapshot) => register(snapshot, { progress: true }),
       };
-      const otherIdentity = named ? otherRecordedIdentity(named, digest) : undefined;
+      const otherIdentity = named ? otherHistoryIdentity(namedRecords, String(named.source_id), digest) : undefined;
       if (otherIdentity) {
         routed.push({ entry, corpusId, route: 'refused', outcome: { status: 'blocked', error: {
           code: 'source_identity_conflict',
@@ -3902,6 +3910,11 @@ export class DomainExpertService {
       // Vertex may still read the object after this run ends, so no later check ties what it imports to the bytes inspected.
       unsettled = 'the import had not settled when the worker stopped waiting, so the bytes Vertex reads cannot be tied to the ones inspected';
       detail = { ...detail, identity_verified: false, source_check: unsettled };
+    } else if (input.pinned && detail.already_present === true) {
+      // Vertex skipped the URI as already in the corpus: what it holds was read before this
+      // inspection, and no record proved it the same file.
+      unsettled = 'Vertex skipped the object as already in the corpus, so the bytes it holds cannot be tied to the ones inspected';
+      detail = { ...detail, identity_verified: false, source_check: unsettled };
     } else if (input.pinned) {
       const after = await this.google.getGcsObjectMetadata(input.pinned.bucket, input.pinned.objectName).catch(() => undefined);
       if (after === undefined) changed = 'the object could not be read back after the import';
@@ -4875,16 +4888,18 @@ export class DomainExpertService {
     sha256: string,
     legacyLocator: string | undefined,
   ): Promise<ReturnType<typeof sourceForIdentity>> {
+    return sourceForIdentity(await this.domainRegistryRecords(manifest), sha256, legacyLocator);
+  }
+
+  // The domain's registry records; a missing or unreadable registry has none.
+  private async domainRegistryRecords(manifest: ReturnType<typeof domainManifest>): Promise<DomainSourceRegistryRecord[]> {
     const root = this.roots.get(manifest.workspace_root_id);
-    if (!root) return undefined;
-    let records: DomainSourceRegistryRecord[];
+    if (!root) return [];
     try {
-      const registryPath = resolveInside(await checkedRootPath(root), `${manifest.workspace_relative_path}/references/source-registry.jsonl`);
-      ({ records } = await readDomainSourceRegistry(registryPath));
+      return (await readDomainSourceRegistry(resolveInside(await checkedRootPath(root), `${manifest.workspace_relative_path}/references/source-registry.jsonl`))).records;
     } catch {
-      return undefined;
+      return [];
     }
-    return sourceForIdentity(records, sha256, legacyLocator);
   }
 
   // How a PDF enters the corpus while imports use the LLM parser, which takes
@@ -10131,11 +10146,29 @@ function sameIdentityHistory(history: DomainSourceRegistryRecord[], sha256: stri
   return hashes.size === 0 || (hashes.size === 1 && hashes.has(sha256));
 }
 
-// A sha256 the record holds other than this file's, at the top level or in any rag_files
-// entry (a batch record keeps each file's there): a source that records another file is
-// another source.
-function otherRecordedIdentity(record: Record<string, unknown>, sha256: string): string | undefined {
-  return registryRecordSha256s(record).find((hash) => hash !== sha256);
+// A sha256 any record of the source holds other than this file's, at the top level or in any
+// rag_files entry (a batch record keeps each file's there): a source that records another file
+// is another source, even after a later record without a sha256 (a re-add) became current.
+function otherHistoryIdentity(records: DomainSourceRegistryRecord[], sourceId: string, sha256: string): string | undefined {
+  return records.filter((entry) => entry.sourceId === sourceId).flatMap((entry) => registryRecordSha256s(entry.record)).find((hash) => hash !== sha256);
+}
+
+// The sha256 a live source recorded for this exact object, when it is not this file's: the
+// object was overwritten in place. A batch entry's own hash decides; a record's top-level
+// hash only for the object it names alone.
+function replacedObjectIdentity(records: DomainSourceRegistryRecord[], gcsUri: string, sha256: string): string | undefined {
+  for (const history of groupDomainSourceRecords(records).values()) {
+    if (latestDomainSourceRecord(history).removed) continue;
+    for (const { record } of history) {
+      const uris = registryRecordGcsUris(record);
+      if (!uris.includes(gcsUri)) continue;
+      const entry = Array.isArray(record.rag_files) ? record.rag_files.map(asOptionalRecord).find((file) => file?.gcs_uri === gcsUri) : undefined;
+      const hash = typeof entry?.source_sha256 === 'string' ? entry.source_sha256
+        : new Set(uris).size === 1 && typeof record.source_sha256 === 'string' ? record.source_sha256 : undefined;
+      if (hash && hash !== sha256) return hash;
+    }
+  }
+  return undefined;
 }
 
 function registryRecordSha256s(record: Record<string, unknown>): string[] {
