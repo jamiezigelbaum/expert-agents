@@ -218,12 +218,136 @@ with `qpdf` into `<name>--partNofM.pdf` parts that are imported one at a time
 and coverage-checked (ACTIVE ragFile; text layer read with `pdftotext`); the
 host needs `qpdf` and `pdftotext` (poppler-utils) on PATH, and without `qpdf`,
 or for a file `qpdf` cannot read, such a PDF is refused before upload with
-`pdf_exceeds_parser_page_limit`. Worker health reports `pdf_import` as
-`degraded` while either tool is missing. Only this acquisition path splits: a
-long PDF reaching the corpus through `stage_import`, `rag_corpus import` of a
-GCS object or the library materializer is still imported whole.
+`pdf_exceeds_parser_page_limit`. A PDF whose pages nothing can count (no
+`qpdf`, or a file `qpdf` cannot read, and neither a page count both byte-scan
+signals report nor a single signal within the limit) is refused before upload
+with `pdf_page_count_unavailable` while
+imports use the LLM parser; under the default parser, which has no page limit,
+it is imported whole. Worker health reports `pdf_import` as
+`degraded` while either tool is missing.
 
-Every acquired source has one identity, the sha256 of the original file.
+These worker routes take the same PDF pipeline: `annas_archive_import`;
+`rag_corpus import` of one GCS PDF object, which the worker reads to identify
+it and count its pages (the worker's service account needs
+`storage.objects.get` on it; an unreadable object answers 502
+`gcs_object_unreadable`, one over 100,000,000 bytes 413
+`file_size_limit_exceeded`; one that changes while it is read 409
+`gcs_object_changed`), with parts beside it as `<name>--partNofM.pdf`. Vertex
+reads the URI after the worker inspected it, so once the import settles the
+worker reads the object's generation again: if it changed, the record keeps the
+inspected sha256 but says `sha256_verified: false` with `source_check`, and the
+result reports `source_changed_during_import`. An import still running when
+the worker stops waiting is recorded the same way (`sha256_verified: false`,
+and `identity_verified: false` in the result), since Vertex may read the
+object after any check the worker could make, and so is one Vertex skipped as
+already in the corpus with no record of its bytes. An object a live source
+recorded as a different file (overwritten in place) is refused before import
+with 409 `gcs_object_replaced`, since Vertex would skip its URI and keep the old
+file: upload the new file under a new object name. A named `source_id` whose
+history records another file's sha256 is refused with
+`source_identity_conflict`, even after a re-add without a sha256. Identity is claimed only for
+bytes the registry proved: an object any of its source's records holds with
+`sha256_verified: false` (a hand split's parts, an object that changed during
+its import or whose import had not settled) is matched with `identity_verified: false` and cited with its
+`source_id` and `identity_verified: false`, its citation header ending
+`(source identity unverified)`;
+and `stage_import` and `web_import`, where a PDF already in the corpus, one to
+split or one refused leaves the batch. The plan's `pdf_routing` and the
+receipt's `pdf_sources` list each such PDF with its route (`present`, `split`,
+`refused`, or `duplicate` for a later file with the same bytes as an earlier
+one in the batch, reported `duplicate_in_batch` with `duplicate_of` and not
+imported; or `in_progress` when another operation on the same file still holds
+it past the response budget); `eligible_files` lists only what the batch stages, and a batch of
+refused PDFs answers `pdf_sources_refused`; one with any PDF still in progress
+(its split, or another operation holding the file) answers
+`pdf_sources_in_progress`. The 100 MiB batch cap counts only
+the files the batch stages; a routed PDF is bounded by the per-file limit alone
+(web_import's 100 MiB fetch budget still covers everything it fetches). Each staged file is
+addressed by its bytes, `staged/<domain>/<batch>/<first 32 hex of its
+sha256>/<file name>` (the receipt's `destination.object_naming`), and the batch
+imports exactly its own objects, named one by one, never a directory. An
+unchanged file keeps its URI, so a re-run of the batch is skipped by Vertex for
+it; a changed file gets a new URI and is imported; an object no run names any
+more is never imported again; and two runs of one `batch_id`, overlapping or
+not, cannot reach each other's objects. Nothing is deleted. A batch staged
+before this release, at `staged/<domain>/<batch>/<file name>`, imports each
+file once more under its new name on its first re-run. A changed file's
+previous version stays in the corpus as its own ragFile, the earlier version
+rather than a duplicate, and the batch's registry record names the new URI. A
+medium's transcript sits beside the medium, so a re-run keeps it instead of
+transcribing the same bytes again. The import goes in requests of at most 25
+URIs, files the LLM parser takes (PDFs) in requests of their own so other
+files never decide a PDF's parser. A request counts as imported only when
+every one of its files has an ACTIVE ragFile; otherwise it, and the batch, is
+`import_partial` (or `import_failed` when none is), the batch record giving
+each file's `state` and `status`, and a re-run imports only the files that are
+not in. The request size: `ImportRagFiles` documents no per-request maximum, so 25 is a cautious
+guess. Each request settles before the next is submitted (a corpus takes one
+import at a time), a busy corpus or quota refusal is waited out within the poll
+budget, and the requests share the Vertex RAG request pacing. From the first
+accepted request the batch record names every file with each request's
+operation (`rag_operation_names` once there are several), and the run ends
+with one terminal record; a receipt of several requests carries
+`submission_receipts`, `operations` and `import_outcome.requests`. A request
+still running when its budget ends stops the batch with the rest unsubmitted
+(`request_still_running`); re-running the batch finishes it, skipping what is
+already in. Parts go to `staged/<domain>/<batch>--parts/<first 32 hex of the
+PDF's sha256>/<name>--partNofM.pdf`, addressed by the PDF's bytes like a whole
+file so two PDFs of one name or two versions of one file never share a part
+name (parts recorded under the earlier `<batch>--parts/<name>--partNofM.pdf`
+names still resume from their recorded URIs), after the batch import, and a staged PDF that
+is the batch's only file is registered under the `source_id` the import names.
+A PDF imported by URI without `source_id` is registered under its sha256 as
+`<domain>-pdf-<sha prefix>` and answers within the response budget. A
+file is a PDF when its name ends in `.pdf` or, under any other name, when its
+first bytes carry the PDF header (`%PDF-1.x` or `%PDF-2.x` after nothing but
+whitespace, within the first 1024 bytes): a single GCS object is checked with a
+ranged read (an unreadable object answers 502 `gcs_object_unreadable`), a
+staged file from its first bytes when it is planned, before its extension or
+any size limit is judged, so one named `.bin` or with no extension is staged, and
+it takes the PDF limit (100,000,000 bytes) rather than the text one. A staged PDF so found that stays whole is staged
+under its name plus `.pdf`. Its record then says `content_type:
+application/pdf`, so it takes the LLM parser and its citations carry pages
+whatever its key. One operation at a time works on a file: every route that
+checks or imports a source (acquisition, `rag_corpus import`, staged routing
+and its deferred splits, `domain_source add` with a sha256) holds a lock on its
+sha256 from checking the holding until it has written the outcome or an
+in-progress record, and a split that outlives its request keeps the lock until
+its outcome is recorded. Another operation on the same file waits for it, then
+sees what it recorded; past the response budget it answers
+`import_in_progress` (`source_import_in_progress`, naming the holder and the
+source) instead. An import that names a `source_id` also locks that id, with
+all keys taken in one sorted order, so two imports naming one new source with
+different files cannot both claim it. A whole holding whose latest record is
+still `import_requested` (an import whose poll budget ran out) is checked
+against the recorded operations whose requests named it (the batch record
+lists each operation with its URIs as `rag_operations`; an object no submitted
+request named is imported normally): one still running answers
+`source_import_in_progress`, since a retry under another batch id stages
+another URI that Vertex would not skip; once they finished without the file in
+the corpus, the failure is recorded and the file is imported again; an
+operation that cannot be read answers `source_holding_unverified`. The lock lives in the worker process: running several worker
+processes against one registry would need a distributed lock. A `rag_corpus import` of a GCS directory
+(`gs://…/prefix/`) or a Drive file does not take the pipeline: it is imported as before, so a long PDF in it is not
+split. The library materializer imports each object whole and does not split:
+under the LLM parser its CLI counts each PDF's pages with `qpdf`, in a plan as
+in an execution, and rejects one over the limit (`pdf_exceeds_parser_page_limit`)
+or one it cannot count, including every PDF on a host without `qpdf`
+(`pdf_page_count_unavailable`), in the receipt's `rejectedImports`; import such
+a PDF through the worker instead. Registry rows written before this release
+name the split codes `annas_pdf_split_import_incomplete` and
+`annas_pdf_split_failed`; they are now `pdf_split_import_incomplete` and
+`pdf_split_failed`.
+
+Citations name the original source: a passage or citation from a registered
+object carries `source_id`, `source_part` for a split's part, and
+`original_pages` (`first_page`, `last_page`, `basis`). For a part the original
+pages are the part's first original page plus the chunk's page span within
+the part (`basis: chunk`), or the part's whole range when Vertex returns no
+span (`basis: part_range`); a whole PDF's span is already original. The
+passage header ends with the pages. An unregistered part claims no pages.
+
+Every source has one identity, the sha256 of the original file.
 Before anything is uploaded the worker looks it up in the domain's
 `references/source-registry.jsonl`: a source the registry records in the
 corpus, whole or as parts of any split, is reported present (when the ragFile
@@ -251,10 +375,11 @@ by N. The worker requires every object to have an ACTIVE ragFile matched by its
 exact source URI, counts each PDF's pages with `qpdf` to record each part's
 original page range, and writes one `imported` record
 (`acquisition: registered_holding`). A whole object must hash to the given
-sha256; a split's parts cannot prove it, so their record says
-`sha256_verified: false` and an import that matches it reports
-`identity_verified: false`. The same call again answers `already_registered`
-and writes nothing; a different holding for the same sha256, or the same one in
+sha256, but the worker did not import it and Vertex may hold an earlier
+version, and a split's parts cannot prove the sha256 at all, so every
+registered holding says `sha256_verified: false` and an import that matches it
+reports `identity_verified: false`. The same call again answers `already_registered`
+(with `identity_verified: false`) and writes nothing; a different holding for the same sha256, or the same one in
 another corpus, is refused with `source_identity_conflict`. A record written
 before sources carried a sha256 that holds the same objects is updated rather
 than duplicated. A book already imported whole before sources carried their

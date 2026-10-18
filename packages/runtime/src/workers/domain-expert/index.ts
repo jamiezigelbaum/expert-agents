@@ -1,7 +1,7 @@
 import { execFile } from 'node:child_process';
 import { createHash, createSign, randomUUID } from 'node:crypto';
 import { lookup } from 'node:dns/promises';
-import { lstatSync, mkdirSync, statSync } from 'node:fs';
+import { createReadStream, lstatSync, mkdirSync, statSync } from 'node:fs';
 import { appendFile, chmod, lstat, mkdir, mkdtemp, open, readFile, readdir, realpath, rename, rm, stat, writeFile } from 'node:fs/promises';
 import type { IncomingMessage } from 'node:http';
 import { request as httpsRequest } from 'node:https';
@@ -88,7 +88,7 @@ import {
   type Sha256Id,
   type LibraryLocationConfig,
 } from '@expert-agents/library';
-import { pdfPartStem, pdfTextLayer, planPdfParts, qpdfPageCount, splitPdf, stripPdfPartSuffix, type PdfPart, type PdfPartPlan, type PdfTextLayer } from './pdf-split.ts';
+import { DEFAULT_QPDF_BIN, LLM_PARSER_MAX_PDF_PAGES, pdfPageLimitSetting, pdfPartStem, pdfTextLayer, planPdfParts, qpdfPageCount, splitPdf, stripPdfPartSuffix, type PdfPart, type PdfPartPlan, type PdfTextLayer } from '@expert-agents/library';
 import {
   agentRoutingConfigFromEnv,
   type AgentRoutingConfig,
@@ -416,6 +416,12 @@ interface StageImportEligibleFile {
   uploadRelativePath: string;
   absolutePath: string;
   bytes: number;
+  // The file's bytes, for a planned file not yet written (a dry-run web import's derivatives).
+  content?: Uint8Array;
+  // The bytes' sha256, once the object is named by it; staging checks the file still has it.
+  sha256?: string;
+  // A PDF by its bytes (hasPdfHeader) or its .pdf name, decided when the file was planned.
+  pdf?: boolean;
   objectName: string;
   gcsUri: string;
 }
@@ -545,6 +551,11 @@ const ANNAS_ARCHIVE_DOWNLOAD_TIMEOUT_MS = 15_000;
 const ANNAS_ARCHIVE_REQUEST_TIMEOUT_MS = 15_000;
 const ANNAS_ARCHIVE_MAX_REDIRECTS = 5;
 const GOOGLE_API_REQUEST_TIMEOUT_MS = 30_000;
+// ImportRagFiles documents no maximum number of URIs per request (GcsSource.uris is a
+// repeated string, aiplatform/v1/io.proto). 25 is a conservative guess, not a known limit:
+// small enough to stay inside any undocumented cap and to keep one failed request cheap,
+// and a batch's requests still go through the VertexRagDataService pacing below.
+const STAGED_IMPORT_URIS_PER_REQUEST = 25;
 // Under the 60/min VertexRagDataService default, leaving headroom for operator
 // tools that call the API directly. Raise with the quota.
 const DEFAULT_VERTEX_RAG_REQUESTS_PER_MINUTE = 45;
@@ -566,10 +577,9 @@ const DEFAULT_ANNAS_BOOKS_ROOT = join(homedir(), 'ExpertAgents', 'Books');
 // books. A configured 0 disables the gate.
 const DEFAULT_ANNAS_MIN_PDF_PAGES = 60;
 // The most pages one PDF may hold in an LLM-parser import; longer PDFs are split
-// into parts of at most this many pages. The measured limit and why 200 was
-// chosen are in docs/vertex-rag-limits.md.
-const DEFAULT_ANNAS_PDF_SPLIT_PAGES = 200;
-const DEFAULT_ANNAS_QPDF_BIN = 'qpdf';
+// into parts of at most this many pages (docs/vertex-rag-limits.md).
+const DEFAULT_ANNAS_PDF_SPLIT_PAGES = LLM_PARSER_MAX_PDF_PAGES;
+const DEFAULT_ANNAS_QPDF_BIN = DEFAULT_QPDF_BIN;
 const DEFAULT_ANNAS_PDFTOTEXT_BIN = 'pdftotext';
 const DEFAULT_ANNAS_DJVUTXT_BIN = 'djvutxt';
 const ANNAS_DJVUTXT_TIMEOUT_MS = 120_000;
@@ -769,6 +779,7 @@ export class DomainExpertService {
   private annasImportPollIntervalMs: number;
   private annasImportPollTimeoutMs: number;
   private annasResponseBudgetMs: number;
+  private readonly sourceLocks = new SourceIdentityLocks();
   private notion: NotionRuntimeClient;
   private dataDir: string;
   private fetchImpl: typeof fetch;
@@ -1361,6 +1372,102 @@ export class DomainExpertService {
     };
   }
 
+  // Citations name the original source and its page numbers. A context from a
+  // part of a split resolves, through the part's registry record, to its
+  // source and to original pages: the part's first original page plus the
+  // chunk's page span within the part, or the part's whole range when Vertex
+  // gives no span. A whole PDF's span is already in original pages. Without a
+  // registry, only an object that is not a part reports its span.
+  private async originalSourcePages(
+    manifest: ReturnType<typeof domainManifest>,
+    contexts: Array<Record<string, unknown>>,
+  ): Promise<Array<Record<string, unknown>>> {
+    const uris = contexts.map((context) => (typeof context.sourceUri === 'string' ? context.sourceUri : undefined));
+    // Every context with a source URI gets its source; only a PDF's context gets pages.
+    if (!uris.some(Boolean)) return contexts.map(() => ({}));
+    const holdings = await this.registeredHoldingsByUri(manifest);
+    return contexts.map((context, index) => {
+      const uri = uris[index];
+      if (!uri) return {};
+      const holding = holdings.get(uri);
+      const fields: Record<string, unknown> = holding ? {
+        sourceId: holding.source_id,
+        ...(holding.part ? { sourcePart: holding.part } : {}),
+        ...(holding.unverified ? { sourceIdentityVerified: false } : {}),
+      } : {};
+      // A PDF is known by its recorded type, else by its key's suffix.
+      if (!holding?.pdf && !isPdfUri(uri)) return fields;
+      const span = chunkPageSpan(context);
+      // A part recorded without its range (#37): its offset in the original is unknown.
+      if (holding?.part && holding.first_page === undefined) return fields;
+      if (holding?.first_page !== undefined) {
+        const offset = holding.first_page - 1;
+        const pages = span && offset + span.last <= holding.last_page!
+          ? { first: offset + span.first, last: offset + span.last, basis: 'chunk' }
+          : { first: holding.first_page, last: holding.last_page!, basis: 'part_range' };
+        return { ...fields, originalPages: pages };
+      }
+      // An unregistered part's offset is unknown, so its span would name the wrong pages.
+      if (span && (holding || !/--part\d+of\d+\.pdf$/i.test(uri))) return { ...fields, originalPages: { ...span, basis: 'chunk' } };
+      return fields;
+    });
+  }
+
+  // Each corpus object the domain's registry records, with its source and, for a
+  // split's part, its range in the original file. An unreadable registry maps nothing.
+  private async registeredHoldingsByUri(
+    manifest: ReturnType<typeof domainManifest>,
+  ): Promise<Map<string, CitedHolding>> {
+    const holdings = new Map<string, CitedHolding>();
+    const root = this.roots.get(manifest.workspace_root_id);
+    if (!root) return holdings;
+    let records: DomainSourceRegistryRecord[];
+    try {
+      records = (await readDomainSourceRegistry(resolveInside(await checkedRootPath(root), `${manifest.workspace_relative_path}/references/source-registry.jsonl`))).records;
+    } catch {
+      return holdings;
+    }
+    const batchCited = new Set<string>();
+    for (const [sourceId, history] of groupDomainSourceRecords(records)) {
+      if (latestDomainSourceRecord(history).removed) continue;
+      const withObjects = history.filter((entry) => registryRecordGcsUris(entry.record).length > 0);
+      if (!withObjects.length) continue;
+      // Every record that names objects, oldest first: a batch rerun after a file changed
+      // stages its new version beside the old, which stays in the corpus and is still cited
+      // under this source. A newer record wins where two name one object.
+      for (const { record } of withObjects) {
+        const holding = recordedSourceHolding(record);
+        // An object any record registered without proof of its sha256 (a hand split, an object
+        // that changed during its import) is cited with its source marked unverified.
+        // A record of a PDF says so, whatever the object's key: the pipeline records its
+        // content type, a hand registration (domain_source add) its kind.
+        const pdf = record.content_type === PDF_CONTENT_TYPE || record.kind === 'pdf';
+        const cited = (uri: string) => ({ source_id: sourceId, ...(heldUnverified(history, [uri]) ? { unverified: true } : {}), ...(pdf ? { pdf: true } : {}) });
+        if (holding?.whole) holdings.set(holding.whole.gcs_uri, cited(holding.whole.gcs_uri));
+        // A batch record lists several whole objects; each is cited under the record's source
+        // unless a source of its own (registered by its sha256) names it too.
+        if (!holding?.parts) {
+          for (const uri of registryRecordGcsUris(record)) if (!holdings.has(uri) || batchCited.has(uri)) {
+            holdings.set(uri, cited(uri));
+            if (registryRecordGcsUris(record).length > 1) batchCited.add(uri);
+            else batchCited.delete(uri);
+          }
+        }
+        // Parts recorded without ranges get them back when the original's page count is recorded.
+        const parts = holding?.parts && typeof record.pages === 'number'
+          ? recordedPartsWithRanges(holding.parts, record.pages, this.annasPdfSplitPages) ?? holding.parts
+          : holding?.parts ?? [];
+        for (const part of parts) {
+          holdings.set(part.gcs_uri, {
+            ...cited(part.gcs_uri), part: part.name,
+            ...(part.first_page !== undefined && part.last_page !== undefined ? { first_page: part.first_page, last_page: part.last_page } : {}),
+          });
+        }
+      }
+    }
+    return holdings;
+  }
+
   private async domainAsk(params: DomainAskRequestParams): Promise<unknown> {
     // Wall-clock stage timings travel with every ask so an operator eval can
     // see where latency goes without reading the journal. Stages that do not
@@ -1603,6 +1710,7 @@ export class DomainExpertService {
     });
     endStage('complete_ms');
     const citationSources = await this.resolveCitationSources(retrieved, manifest);
+    const originals = await this.originalSourcePages(manifest, retrieved);
     endStage('cite_ms');
     const cited: typeof retrieved = retrieved.map((context, index) => {
       const source = citationSources.metadata[index];
@@ -1610,6 +1718,7 @@ export class DomainExpertService {
         ...context,
         ...(source?.title ? { sourceTitle: source.title } : {}),
         ...(source?.creator ? { sourceCreator: source.creator } : {}),
+        ...originals[index],
       };
     });
     console.info(JSON.stringify({
@@ -1639,6 +1748,7 @@ export class DomainExpertService {
         citation_id: context.citation_id,
         corpus_id: context.corpus_id,
         ...citationSourceFields(context),
+        ...citationOriginalFields(context),
         source_display_name: context.sourceDisplayName,
         source_uri: context.sourceUri,
         score: context.score,
@@ -1685,6 +1795,7 @@ export class DomainExpertService {
           corpus_id: context.corpus_id,
           header: citationHeader(context),
           ...citationSourceFields(context),
+          ...citationOriginalFields(context),
           text: typeof context.text === 'string' ? context.text : '',
           ...(context.sentence_completed === true && context.excerpt_truncated !== true ? { completed: true } : {}),
           source_display_name: context.sourceDisplayName,
@@ -1731,6 +1842,34 @@ export class DomainExpertService {
     }
     if (dryRun) return plan;
     const sourceRecord = (plan as { source_record: Record<string, unknown> }).source_record;
+    // A source given its identity is registered under that identity's lock, like any import of it.
+    // So is the source it names.
+    const sha256 = typeof params.sha256 === 'string' && params.sha256.trim() ? params.sha256.trim() : undefined;
+    const lock = await this.sourceLocks.acquireAll(
+      [...(sha256 ? [sourceLockKey(manifest, sha256)] : []), sourceIdLockKey(manifest, String(sourceRecord.source_id))],
+      'domain_source add', this.sourceLockDeadline(),
+    );
+    if ('heldBy' in lock) {
+      const busy = sha256 ? await this.sourceImportBusy(manifest, sha256, lock.heldBy) : undefined;
+      throw new DomainExpertWorkerError(409, 'source_import_in_progress',
+        `Another operation on this source (${lock.heldBy}) is still running${busy?.source_id ? ` and records it as ${String(busy.source_id)}` : ''}. Nothing was registered.`,
+        'Check domain_source status for this source once that operation settles.');
+    }
+    try {
+      return await this.addDomainSource(params, manifest, sourceRecord, rootPath, registryPath, registryRelativePath);
+    } finally {
+      lock.release();
+    }
+  }
+
+  private async addDomainSource(
+    params: DomainSourceParams,
+    manifest: ReturnType<typeof domainManifest>,
+    sourceRecord: Record<string, unknown>,
+    rootPath: string,
+    registryPath: string,
+    registryRelativePath: string,
+  ): Promise<Record<string, unknown>> {
     if (params.gcsUris?.length) return this.registerSourceHolding(params, manifest, sourceRecord, rootPath, registryPath, registryRelativePath);
     const logPath = resolveInside(rootPath, `${manifest.workspace_relative_path}/references/ingest-log.md`);
     await mkdir(dirname(registryPath), { recursive: true });
@@ -1925,6 +2064,7 @@ export class DomainExpertService {
         action: 'add',
         domain_id: manifest.domain_id,
         source_id: existing.sourceId,
+        ...(existing.unverified ? { identity_verified: false } : {}),
         source_record: existing.current,
         registry_relative_path: registryRelativePath,
         policy: domainPolicy(),
@@ -1987,8 +2127,10 @@ export class DomainExpertService {
       target_corpus_id: corpusId,
       acquisition: 'registered_holding',
       source_sha256: sha256,
-      // A split's parts cannot prove the original's sha256; the operator's word stands for it.
-      sha256_verified: !split,
+      // The worker did not import these objects: a whole object's bytes match the sha256 now,
+      // but Vertex may have read an earlier version, and a split's parts cannot prove it at all.
+      // The operator's word stands for the identity.
+      sha256_verified: false,
       ingest_status: 'imported',
       ...(split
         ? { pages: firstPage - 1, split_parts: ragFiles.length, rag_files: ragFiles }
@@ -2119,7 +2261,16 @@ export class DomainExpertService {
     if (status === 'creation_failed') throw new DomainExpertWorkerError(502, 'rag_corpus_creation_failed', 'The corpus creation operation failed and requires operator reconciliation.');
   }
 
-  private async ragCorpus(params: RagCorpusParams): Promise<unknown> {
+  // options.wholeObject: import exactly this object, as a split's part or a
+  // PDF the shared pipeline already routed whole; sourceSha256 is its identity.
+  // pinned: the generation of the object whose bytes were inspected, rechecked once the import settles.
+  private async ragCorpus(params: RagCorpusParams, options: {
+    wholeObject?: boolean; sourceSha256?: string; identitySource?: Record<string, unknown>;
+    pinned?: { bucket: string; objectName: string; generation: string | undefined };
+    // Given the import's verification while it may still run, so a caller holding the
+    // source's lock keeps it until the outcome is recorded.
+    holdUntil?: (work: Promise<unknown>) => void;
+  } = {}): Promise<unknown> {
     if (params.action === 'ensure') return this.ensureRagCorpus(params);
     const dryRun = params.dryRun ?? true;
     const manifest = this.manifest(params.domainId);
@@ -2263,10 +2414,21 @@ export class DomainExpertService {
         operation,
       };
     }
-    // A plain import is registered only when it names the source it ingests;
-    // annas_archive_import calls this without one and registers its own record.
-    const sourceRootPath = params.sourceId ? await checkedRootPath(this.rootFor(manifest.workspace_root_id)) : undefined;
-    const registeredSource = sourceRootPath ? await this.registeredImportSource(manifest, sourceRootPath, params.sourceId) : undefined;
+    // Every PDF object goes through the shared pipeline: identity, page limit, split. A PDF is
+    // known by its key's .pdf suffix or, under any other key, by its first bytes (%PDF-); a
+    // directory import is imported as before.
+    if (params.gcsUri && !options.wholeObject && !params.gcsUri.endsWith('/')
+      && (isPdfUri(params.gcsUri) || await this.gcsObjectIsPdf(params.gcsUri))) {
+      return this.importGcsPdf(params, manifest, corpusId, resolved);
+    }
+    // A plain import is registered when it names the source it ingests, or
+    // when the shared PDF pipeline identified the file; a split's parts and
+    // annas_archive_import's objects are registered by their callers.
+    const identityRoot = options.sourceSha256 ? this.roots.get(manifest.workspace_root_id) : undefined;
+    const sourceRootPath = params.sourceId || identityRoot ? await checkedRootPath(identityRoot ?? this.rootFor(manifest.workspace_root_id)) : undefined;
+    const namedSource = sourceRootPath ? await this.registeredImportSource(manifest, sourceRootPath, params.sourceId) : undefined;
+    const identified = namedSource ?? options.identitySource;
+    const registeredSource = identified && options.sourceSha256 ? { ...identified, source_sha256: options.sourceSha256 } : identified;
     const importResultSink = params.gcsUri && this.agentRouting[manifest.domain_id]?.ingestion?.importResultSink !== 'client'
       ? importResultSinkUri(manifest.allowed_gcs_prefixes, manifest.domain_id)
       : undefined;
@@ -2281,11 +2443,16 @@ export class DomainExpertService {
         ...(importResultSink ? { importResultGcsSink: importResultSink } : {}),
         chunkTokens: manifest.chunking.chunk_tokens,
         chunkOverlap: manifest.chunking.chunk_overlap,
-        llmParserEligible: llmParserEligibleUris(params.gcsUri ? [params.gcsUri] : []),
+        // A PDF the pipeline identified by its bytes takes the LLM parser whatever its key says.
+        llmParserEligible: llmParserEligibleUris(params.gcsUri ? [params.gcsUri] : []) || options.identitySource?.content_type === PDF_CONTENT_TYPE,
       });
     });
-    const verified = sourceRootPath && registeredSource
-      ? await this.verifyAndRegisterRagImport({
+    let requestRecorded: () => void = () => {};
+    const requested = new Promise<void>((resolveRequested) => { requestRecorded = resolveRequested; });
+    const verifying = sourceRootPath && registeredSource
+      ? this.verifyAndRegisterRagImport({
+        onRequestRecorded: requestRecorded,
+        ...(options.pinned ? { pinned: options.pinned } : {}),
         manifest,
         rootPath: sourceRootPath,
         resolved: usedResolved,
@@ -2295,7 +2462,21 @@ export class DomainExpertService {
         action: 'import',
         source: registeredSource,
       })
-      : {};
+      : undefined;
+    // A source the caller named is verified before answering, as before. A PDF the
+    // pipeline identified answers within the response budget and records its
+    // outcome when the import settles.
+    if (verifying) options.holdUntil?.(verifying);
+    let verified: Record<string, unknown> = {};
+    if (verifying && namedSource) verified = await verifying;
+    else if (verifying) {
+      // The import_requested record is written before the call can answer in progress.
+      await Promise.race([requested, verifying]);
+      verified = await this.raceResponseBudget(verifying) ?? {
+        source_registry: { status: 'recording', source_ids: [String(registeredSource!.source_id)], hint: 'The import outcome is recorded in the source registry when Vertex finishes.' },
+      };
+      void verifying.catch(() => undefined);
+    }
     return {
       kind: 'rag_corpus_result',
       status: 'import_requested',
@@ -2315,7 +2496,416 @@ export class DomainExpertService {
     };
   }
 
+  // A rag_corpus import of a PDF takes the shared pipeline. The object's
+  // sha256 is the source's identity: a source already in the corpus, whole or
+  // as parts, is reported present. A PDF longer than the LLM parser takes per
+  // file is split into parts beside the object (or refused before import when
+  // it cannot be split), and any other PDF is imported as the object itself.
+  private async importGcsPdf(
+    params: RagCorpusParams,
+    manifest: ReturnType<typeof domainManifest>,
+    corpusId: string,
+    resolved: ResolvedRagCorpus,
+  ): Promise<Record<string, unknown>> {
+    const gcsUri = requireString(params.gcsUri, 'gcs_uri');
+    const { bucket, prefix } = parseGcsPrefix(gcsUri);
+    const objectName = prefix.replace(/\/$/, '');
+    const inspected = await this.google.getGcsObjectMetadata(bucket, objectName);
+    let bytes: Uint8Array | null;
+    try {
+      bytes = await this.google.downloadLibraryObject(bucket, objectName, PDF_PROCESSING_MAX_BYTES, GOOGLE_LONG_GENERATION_TIMEOUT_MS);
+    } catch (error) {
+      if (error instanceof LibraryReadError && error.code === 'library_source_too_large') {
+        throw new DomainExpertWorkerError(413, 'file_size_limit_exceeded', `${gcsUri} is larger than the ${PDF_PROCESSING_MAX_BYTES}-byte PDF limit. Nothing was imported.`);
+      }
+      throw new DomainExpertWorkerError(502, 'gcs_object_unreadable', `${gcsUri} could not be read to identify it and count its pages. Nothing was imported.`);
+    }
+    if (!bytes || !inspected) throw new DomainExpertWorkerError(404, 'gcs_object_not_found', `${gcsUri} does not exist. Nothing was imported.`);
+    if (!gcsObjectHoldsBytes(inspected, bytes)) {
+      throw new DomainExpertWorkerError(409, 'gcs_object_changed', `${gcsUri} changed while it was being read. Nothing was imported.`, 'Re-run the import once the object is stable.');
+    }
+    const digest = sha256(bytes);
+    const base = { kind: 'rag_corpus_result', domain_id: manifest.domain_id, resolved_corpus: resolvedCorpusRecord(resolved), requested_gcs_uri: gcsUri, source_sha256: digest };
+    // From reading the named source and the holding until this import's outcome (or
+    // in-progress record) is written, no other import of this file, or of the source it
+    // names, runs: it waits, then sees what this one recorded.
+    const lock = await this.sourceLocks.acquireAll(
+      // The object too: an overwrite between two reads gives two digests, but one URI.
+      [sourceLockKey(manifest, digest), objectLockKey(manifest, gcsUri), ...(params.sourceId ? [sourceIdLockKey(manifest, params.sourceId)] : [])],
+      `rag_corpus import of ${gcsUri}`, this.sourceLockDeadline(),
+    );
+    if ('heldBy' in lock) return { ...base, ...(await this.sourceImportBusy(manifest, digest, lock.heldBy)), policy: domainPolicy() };
+    let namedSource: Record<string, unknown> | undefined;
+    try {
+      namedSource = params.sourceId
+        ? await this.registeredImportSource(manifest, await checkedRootPath(this.rootFor(manifest.workspace_root_id)), params.sourceId)
+        : undefined;
+      const records = await this.domainRegistryRecords(manifest);
+      // A named source that records another file's sha256 anywhere in its history is another source.
+      const otherIdentity = namedSource ? otherHistoryIdentity(records, String(namedSource.source_id), digest) : undefined;
+      if (otherIdentity) {
+        throw new DomainExpertWorkerError(409, 'source_identity_conflict', `Source ${String(namedSource!.source_id)} records a different file (sha256 ${otherIdentity.slice(0, 12)}) than ${gcsUri} (sha256 ${digest.slice(0, 12)}). Nothing was imported.`, 'Import it without source_id, or under the source that is this file.');
+      }
+      // Vertex skips a URI already in the corpus, so an object overwritten in place would keep
+      // the old file's passages under the new file's identity, and the new file would never be indexed.
+      const replaced = replacedObjectIdentity(records, gcsUri, digest);
+      if (replaced) {
+        throw new DomainExpertWorkerError(409, 'gcs_object_replaced', `${gcsUri} was imported as a different file (sha256 ${replaced.slice(0, 12)}) than it now holds (sha256 ${digest.slice(0, 12)}). Vertex would skip the URI and keep the old file. Nothing was imported.`, 'Upload the new file under a new object name and import that.');
+      }
+    } catch (error) {
+      lock.release();
+      throw error;
+    }
+    const context: SourceImportContext = { sha256: digest, ...(namedSource ? { sourceId: String(namedSource.source_id) } : {}) };
+    const named = parseObjectNameUri(gcsUri);
+    // The record says the object is a PDF, so readers need not trust its key's suffix.
+    const catalogue = namedSource
+      ? { ...Object.fromEntries(Object.entries(namedSource).filter(([key]) => !RAG_IMPORT_OUTCOME_FIELDS.has(key))), source_id: String(namedSource.source_id), content_type: PDF_CONTENT_TYPE }
+      : {
+          source_id: `${manifest.domain_id}-pdf-${digest.slice(0, 16)}`,
+          domain_id: manifest.domain_id,
+          kind: 'pdf',
+          content_type: PDF_CONTENT_TYPE,
+          ...(named?.title ? { title: named.title } : {}),
+          ...(named?.creator ? { author: named.creator } : {}),
+          locator: gcsUri,
+          acquisition: 'rag_corpus_import',
+          trust_posture: manifest.trust_posture,
+        };
+    const directory = objectName.slice(0, objectName.lastIndexOf('/') + 1);
+    const corpusTarget = { target_corpus_id: corpusId };
+    const register = (ragIngest: Record<string, unknown>, mode: { inProgress?: boolean; recordOutcome?: boolean; progress?: boolean }) => this.registerSourceImport({
+      manifest, context, ragIngest, mode, catalogue, logLabel: 'rag_corpus import',
+    });
+    const source: SourceImport = {
+      manifest, corpusId, corpusTarget, context,
+      kept: `the object ${gcsUri} is unchanged`,
+      rerun: `Re-run rag_corpus import of ${gcsUri}`,
+      partNames: async () => ({ bucket, directory, stem: objectName.slice(directory.length).replace(/\.pdf$/i, ''), priorStems: [] }),
+      recordProgress: (snapshot) => register(snapshot, { progress: true }),
+    };
+    let handedOff = false;
+    try {
+      const holding = await this.sourceHolding(source);
+      if (holding.kind === 'present') {
+        const present = { status: 'imported', ...corpusTarget, ...holding.result };
+        return { ...base, ...holding.result, status: 'already_present', source_registry: await register(present, {}), policy: domainPolicy() };
+      }
+      if (holding.kind === 'in_progress') {
+        return { ...base, status: 'import_in_progress', source_id: holding.source_id, error: sourceImportPending(source, holding), policy: domainPolicy() };
+      }
+      if (holding.kind === 'unknown' || holding.kind === 'conflict') {
+        const refusal = holding.kind === 'unknown' ? sourceHoldingUnverified(source, holding) : sourceIdentityConflict(source, holding);
+        throw new DomainExpertWorkerError(409, refusal.code, refusal.message, refusal.suggestion);
+      }
+      const route = await this.routePdf(source, bytes, measurePdfArtifactScale(bytes), holding);
+      if ('refusal' in route) throw new DomainExpertWorkerError(422, route.refusal.code, route.refusal.message, route.refusal.suggestion);
+      if ('whole' in route) {
+        let verifying: Promise<unknown> | undefined;
+        const result = await this.ragCorpus(params, {
+          wholeObject: true, sourceSha256: digest, identitySource: { ...catalogue, source_id: context.sourceId ?? catalogue.source_id },
+          pinned: { bucket, objectName, generation: inspected.generation },
+          holdUntil: (work) => { verifying = work; },
+        });
+        if (verifying) {
+          handedOff = true;
+          void verifying.catch(() => undefined).finally(lock.release);
+        }
+        return { ...asOptionalRecord(result), source_sha256: digest };
+      }
+      // An unexpected throw still ends the run with a record.
+      const work = this.ingestSplitPdf(source, { ...route, bytes })
+        .catch((error: unknown): Record<string, unknown> => ({ status: 'blocked', ...corpusTarget, error: ingestErrorRecord(error) }));
+      const settled = await this.raceResponseBudget(work);
+      if (settled) return { ...base, ...settled, source_registry: await register(settled, {}), policy: domainPolicy() };
+      const registry = await register(context.snapshot ?? { status: 'import_in_progress', ...corpusTarget }, { inProgress: true });
+      // The split keeps the lock until its outcome is recorded.
+      handedOff = true;
+      void work
+        .then((outcome) => register(outcome, { recordOutcome: true }))
+        .catch((error: unknown) => {
+          console.error(JSON.stringify({ kind: 'domain_expert_pdf_split_background_error', domain_id: manifest.domain_id, code: error instanceof DomainExpertWorkerError ? error.code : 'error' }));
+        })
+        .finally(lock.release);
+      return {
+        ...base,
+        status: 'import_in_progress',
+        response_budget_ms: this.annasResponseBudgetMs,
+        hint: 'The split is still importing on the worker and records its outcome in the source registry when Vertex finishes. Check domain_source status for this source before acting; do not import it again.',
+        source_registry: registry,
+        policy: domainPolicy(),
+      };
+    } finally {
+      if (!handedOff) lock.release();
+    }
+  }
+
+  // The work's result if it settles within the response budget, else undefined
+  // while it keeps running (2026-10-07: a client timeout cut off imports the
+  // worker was still finishing). A budget of 0 waits for the work.
+  private async raceResponseBudget<T>(work: Promise<T>): Promise<T | undefined> {
+    if (this.annasResponseBudgetMs <= 0) return work;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const lapsed = new Promise<undefined>((resolveBudget) => { timer = setTimeout(() => resolveBudget(undefined), this.annasResponseBudgetMs); });
+    try {
+      return await Promise.race([work, lapsed]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  // The PDFs of a staged batch take the shared pipeline before the batch is
+  // staged: one already in the corpus (by sha256) is left out and reported
+  // present, one longer than the LLM parser takes per file is left out and
+  // split after the batch import, and one that cannot be split or checked is
+  // left out and refused. Every other file stays in the one directory import.
+  private async routeStagedPdfs(
+    stage: { manifest: ReturnType<typeof domainManifest>; destination: StageDestination; eligible: StageImportEligibleFile[]; resolved: ResolvedRagCorpus },
+    action: 'stage_import' | 'web_import',
+    // The source the import names: it is the PDF's source when the PDF is the batch's only file.
+    namedSource?: Record<string, unknown>,
+    // A live run's source locks (a dry run takes none): each PDF is routed under its sha256's lock.
+    held?: HeldSources,
+  ): Promise<{ eligible: StageImportEligibleFile[]; routed: RoutedStagedPdf[]; namedSource?: Record<string, unknown> }> {
+    const { manifest } = stage;
+    const corpusId = stage.resolved.requested;
+    const eligible: StageImportEligibleFile[] = [];
+    const routed: RoutedStagedPdf[] = [];
+    // Each PDF's sha256, streamed: a batch of book-sized PDFs is never held in memory at once.
+    // Its bytes are read again one PDF at a time to route it, and once more to split it.
+    // A dry run's derived files are not written; they carry their bytes.
+    const pdfDigests = new Map<StageImportEligibleFile, string>();
+    for (const file of stage.eligible) {
+      // A PDF by its name or, under any other name, by its first bytes (decided when planned).
+      if (!(file.pdf ?? isPdfUri(file.workspaceRelativePath))) continue;
+      pdfDigests.set(file, file.content ? sha256(file.content) : await sha256OfFile(file.absolutePath));
+    }
+    // The file's bytes, refused when they are no longer the ones hashed.
+    const bytesOf = async (file: StageImportEligibleFile, digest: string): Promise<Uint8Array | { status: string; error: Record<string, string> }> => {
+      const bytes = file.content ?? new Uint8Array(await readFile(file.absolutePath));
+      if (sha256(bytes) === digest) return bytes;
+      return { status: 'blocked', error: {
+        code: 'workspace_file_changed',
+        message: `${file.workspaceRelativePath} changed while the batch was being staged. Nothing was imported from it.`,
+        suggestion: 'Re-run the import once the file is no longer being written.',
+      } };
+    };
+    // Locks are taken in one sorted order (each PDF's sha256 and the named source's id), so
+    // no two operations wait on each other in a cycle.
+    const busy = new Map<string, Record<string, unknown>>();
+    if (held) {
+      const deadline = this.sourceLockDeadline();
+      const keys = new Map<string, string>([...pdfDigests.values()].map((digest) => [sourceLockKey(manifest, digest), digest]));
+      if (namedSource) keys.set(sourceIdLockKey(manifest, String(namedSource.source_id)), NAMED_SOURCE_LOCK);
+      for (const key of [...keys.keys()].sort()) {
+        const entry = keys.get(key)!;
+        const lock = await this.sourceLocks.acquire(key, `rag_corpus ${action} batch`, deadline);
+        if ('heldBy' in lock && entry === NAMED_SOURCE_LOCK) {
+          throw new DomainExpertWorkerError(409, 'source_import_in_progress',
+            `Another operation on source ${String(namedSource!.source_id)} (${lock.heldBy}) is still running. Nothing was staged or imported.`,
+            'Check domain_source status for that source once it settles, then re-run the import.');
+        }
+        if ('heldBy' in lock) busy.set(entry, await this.sourceImportBusy(manifest, entry, lock.heldBy));
+        else held.add(entry, lock.release);
+      }
+      // Read again under its lock: another import may have recorded it meanwhile.
+      if (namedSource) {
+        namedSource = await this.registeredImportSource(manifest, await checkedRootPath(this.rootFor(manifest.workspace_root_id)), String(namedSource.source_id));
+      }
+    }
+    const named = namedSource && stage.eligible.length === 1 ? namedSource : undefined;
+    const namedRecords = named ? await this.domainRegistryRecords(manifest) : [];
+    const firstOfDigest = new Map<string, string>();
+    for (const file of stage.eligible) {
+      const digest = pdfDigests.get(file);
+      if (!digest) {
+        eligible.push(file);
+        continue;
+      }
+      // One source, one holding: a later file with the same bytes is this batch's duplicate.
+      const first = firstOfDigest.get(digest);
+      if (first) {
+        routed.push({
+          entry: { workspace_relative_path: file.workspaceRelativePath, source_sha256: digest }, corpusId, route: 'duplicate',
+          outcome: { status: 'skipped_duplicate', reason: 'duplicate_in_batch', duplicate_of: first },
+        });
+        continue;
+      }
+      firstOfDigest.set(digest, file.workspaceRelativePath);
+      const entry = { workspace_relative_path: file.workspaceRelativePath, source_sha256: digest };
+      // Another operation on this file held it past the response budget: it records the outcome.
+      const elsewhere = busy.get(digest);
+      if (elsewhere) {
+        routed.push({ entry, corpusId, route: 'in_progress', outcome: elsewhere });
+        continue;
+      }
+      const context: SourceImportContext = { sha256: digest, ...(named ? { sourceId: String(named.source_id) } : {}) };
+      const name = basename(file.uploadRelativePath).replace(/\.pdf$/i, '');
+      const catalogue = named ? {
+        ...Object.fromEntries(Object.entries(named).filter(([key]) => !RAG_IMPORT_OUTCOME_FIELDS.has(key))),
+        source_id: String(named.source_id),
+        content_type: PDF_CONTENT_TYPE,
+      } : {
+        source_id: `${manifest.domain_id}-pdf-${digest.slice(0, 16)}`,
+        domain_id: manifest.domain_id,
+        kind: 'pdf',
+        content_type: PDF_CONTENT_TYPE,
+        title: name,
+        workspace_relative_path: file.workspaceRelativePath,
+        acquisition: action,
+        trust_posture: manifest.trust_posture,
+      };
+      const register = (ragIngest: Record<string, unknown>, mode: { inProgress?: boolean; recordOutcome?: boolean; progress?: boolean }) => this.registerSourceImport({
+        manifest, context, ragIngest, mode, catalogue, logLabel: `rag_corpus ${action}`,
+      });
+      const source: SourceImport = {
+        manifest, corpusId, corpusTarget: { target_corpus_id: corpusId }, context,
+        kept: `${file.workspaceRelativePath} is unchanged in the workspace`,
+        rerun: `Re-run rag_corpus ${action} for ${file.workspaceRelativePath}`,
+        partNames: async () => ({
+          bucket: stage.destination.bucket,
+          // Beside the batch's objects, addressed by the PDF's bytes like a whole file, so two
+          // PDFs of one name, or two versions of one file, never share a part name.
+          directory: `${stage.destination.objectPrefix.replace(/\/$/, '')}--parts/${digest.slice(0, STAGED_OBJECT_DIGEST_HEX)}/`,
+          stem: safeObjectName(name),
+          priorStems: [],
+        }),
+        recordProgress: (snapshot) => register(snapshot, { progress: true }),
+      };
+      const otherIdentity = named ? otherHistoryIdentity(namedRecords, String(named.source_id), digest) : undefined;
+      if (otherIdentity) {
+        routed.push({ entry, corpusId, route: 'refused', outcome: { status: 'blocked', error: {
+          code: 'source_identity_conflict',
+          message: `Source ${String(named!.source_id)} records a different file (sha256 ${otherIdentity.slice(0, 12)}) than ${file.workspaceRelativePath}. Nothing was imported.`,
+          suggestion: 'Stage it without source_id, or under the source that is this file.',
+        } } });
+        continue;
+      }
+      const holding = await this.sourceHolding(source, { reconcile: held !== undefined });
+      if (holding.kind === 'present') {
+        routed.push({ entry, corpusId, route: 'present', register, outcome: { status: 'imported', target_corpus_id: corpusId, ...holding.result } });
+        continue;
+      }
+      if (holding.kind === 'in_progress') {
+        routed.push({ entry, corpusId, route: 'in_progress', outcome: { status: 'import_in_progress', source_id: holding.source_id, error: sourceImportPending(source, holding) } });
+        continue;
+      }
+      if (holding.kind === 'unknown' || holding.kind === 'conflict') {
+        routed.push({ entry, corpusId, route: 'refused', outcome: { status: 'blocked', error: holding.kind === 'unknown' ? sourceHoldingUnverified(source, holding) : sourceIdentityConflict(source, holding) } });
+        continue;
+      }
+      const bytes = await bytesOf(file, digest);
+      if (!(bytes instanceof Uint8Array)) {
+        routed.push({ entry, corpusId, route: 'refused', outcome: bytes });
+        continue;
+      }
+      const route = await this.routePdf(source, bytes, measurePdfArtifactScale(bytes), holding);
+      // Staged under a .pdf name, so Vertex parses it as the PDF it is (and the LLM parser takes it).
+      if ('whole' in route) eligible.push({ ...file, sha256: digest, ...(isPdfUri(file.uploadRelativePath) ? {} : { uploadRelativePath: safeGcsRelativePath(`${file.uploadRelativePath}.pdf`) }) });
+      else if ('refusal' in route) routed.push({ entry, corpusId, route: 'refused', outcome: { status: 'blocked', error: route.refusal } });
+      else {
+        routed.push({
+          entry, corpusId, route: 'split', pages: route.pages, parts: route.plan.length, register,
+          // The source's lock is held from routing through the split; the file is read again then,
+          // and refused if it changed, so split PDFs are not held in memory while the batch imports.
+          split: async () => {
+            const again = await bytesOf(file, digest);
+            return again instanceof Uint8Array ? this.ingestSplitPdf(source, { ...route, bytes: again }) : again;
+          },
+        });
+      }
+    }
+    return { eligible, routed, ...(namedSource ? { namedSource } : {}) };
+  }
+
+  // The outcome of every PDF a batch left out, in batch order. A PDF found present
+  // or refused is reported and registered at once; the split PDFs import one at a
+  // time after the batch import, and past the response budget they finish on the
+  // worker and record their outcomes there.
+  // Each PDF's source lock (held) is released once its outcome is recorded.
+  private async importRoutedStagedPdfs(routed: RoutedStagedPdf[], held?: HeldSources): Promise<Array<Record<string, unknown>>> {
+    const results: Array<Record<string, unknown> | undefined> = [];
+    for (const pdf of routed) {
+      if (pdf.split) {
+        results.push(undefined);
+        continue;
+      }
+      // A duplicate's lock is its first file's; one in progress elsewhere holds none here.
+      try {
+        const registry = pdf.register ? await pdf.register(pdf.outcome!, {}) : undefined;
+        results.push({ ...pdf.entry, route: pdf.route, ...pdf.outcome, ...(registry ? { source_registry: registry } : {}) });
+      } finally {
+        if (pdf.route !== 'duplicate') held?.release(pdf.entry.source_sha256);
+      }
+    }
+    // Each PDF's registry writes run in order, so an in-progress record never lands after its outcome.
+    const splits = routed.flatMap((pdf, index) => (pdf.split ? [{ pdf, index, ended: false, writes: Promise.resolve() as Promise<unknown> }] : []));
+    // The splits may outlive the request: they keep their locks and release each once its
+    // outcome is recorded, and the named source's lock once the last one is.
+    for (const split of splits) held?.handOff(split.pdf.entry.source_sha256);
+    if (splits.length) held?.handOff(NAMED_SOURCE_LOCK);
+    const work = (async () => {
+      for (const split of splits) {
+        try {
+          // An unexpected throw still ends that PDF's run with a record.
+          const outcome = await split.pdf.split!().catch((error: unknown): Record<string, unknown> => ({ status: 'blocked', error: ingestErrorRecord(error) }));
+          split.ended = true;
+          const registry = await (split.writes = split.writes.then(() => split.pdf.register!(outcome, {})));
+          results[split.index] = { ...split.pdf.entry, route: split.pdf.route, ...outcome, source_registry: registry };
+        } finally {
+          held?.release(split.pdf.entry.source_sha256);
+        }
+      }
+      return true;
+    })().finally(() => {
+      // A throw that ended the loop early must not leave a later split's lock held.
+      for (const split of splits) held?.release(split.pdf.entry.source_sha256);
+      if (splits.length) held?.release(NAMED_SOURCE_LOCK);
+    });
+    if (splits.length && await this.raceResponseBudget(work) === undefined) {
+      void work.catch((error: unknown) => {
+        console.error(JSON.stringify({ kind: 'domain_expert_pdf_split_background_error', code: error instanceof DomainExpertWorkerError ? error.code : 'error' }));
+      });
+      // Every PDF answered as in progress is in the registry as in progress first.
+      for (const split of splits) {
+        if (results[split.index]) continue;
+        split.writes = split.writes.then(() => (split.ended ? undefined : split.pdf.register!({ status: 'import_in_progress', target_corpus_id: split.pdf.corpusId }, { inProgress: true })));
+        await split.writes;
+      }
+      return routed.map((pdf, index) => results[index] ?? {
+        ...pdf.entry,
+        route: pdf.route,
+        status: 'import_in_progress',
+        response_budget_ms: this.annasResponseBudgetMs,
+        hint: 'The split PDF is still importing on the worker and records its outcome in the source registry. Check domain_source status before acting; do not import it again.',
+      });
+    }
+    return results.map((result) => result!);
+  }
+
+  // How a batch's PDFs were routed, for the plan and the receipt: the batch keeps
+  // the rest; a routed PDF never reaches the batch directory.
+  private stagedPdfRouting(routed: RoutedStagedPdf[]): Array<Record<string, unknown>> {
+    return routed.map((pdf) => ({
+      ...pdf.entry,
+      route: pdf.route,
+      ...(pdf.route === 'split' ? { pages: pdf.pages, parts: pdf.parts } : {}),
+      ...(pdf.route === 'refused' || pdf.route === 'in_progress' ? { error: pdf.outcome!.error } : {}),
+      ...(pdf.route === 'duplicate' ? { duplicate_of: pdf.outcome!.duplicate_of } : {}),
+    }));
+  }
+
   private async stageRagImport(params: RagCorpusParams, dryRun: boolean): Promise<unknown> {
+    // The batch's source locks: whatever is not handed to a background split is released when the call ends.
+    const held = new HeldSources();
+    try {
+      return await this.stageRagImportHolding(params, dryRun, held);
+    } finally {
+      held.releaseRest();
+    }
+  }
+
+  private async stageRagImportHolding(params: RagCorpusParams, dryRun: boolean, held: HeldSources): Promise<unknown> {
     const manifest = this.manifest(params.domainId);
     const corpusId = params.corpusId ?? defaultCorpusId(manifest);
     const root = this.rootFor(manifest.workspace_root_id);
@@ -2329,16 +2919,26 @@ export class DomainExpertService {
       batchId,
       corpusId,
       includeMedia: params.includeMedia ?? false,
+      deferBatchCap: true,
     });
-    const { eligible, skipped, totalBytes, destination, resolvedCorpus } = stage;
+    const { resolvedCorpus } = stage;
     const resolutionWarnings = ragCorpusWarnings(stage.resolved);
-    if (eligible.length === 0) {
+    if (stage.eligible.length === 0) {
       throw new DomainExpertWorkerError(
         400,
         'no_stage_import_files',
         'stage_import found no eligible files after applying extension and size limits.',
       );
     }
+    const registeredSource = dryRun ? undefined : await this.registeredImportSource(manifest, rootPath, params.sourceId);
+    // The PDFs take the shared pipeline first; the batch is what stays.
+    const pdfs = await this.routeStagedPdfs(stage, 'stage_import', registeredSource, dryRun ? undefined : held);
+    // The batch cap counts only what the batch stages.
+    const batch = capStagedBatch(pdfs.eligible);
+    const destination = stage.destination;
+    const eligible = await addressStagedFiles(destination, batch.eligible);
+    const skipped = [...stage.skipped, ...batch.skipped];
+    const totalBytes = batch.totalBytes;
     const base = {
       action: 'stage_import',
       domain_id: manifest.domain_id,
@@ -2347,13 +2947,7 @@ export class DomainExpertService {
         workspace_relative_path: workspaceRelativePath,
         recursive: true,
       },
-      destination: {
-        gcs_uri_prefix: destination.directoryUri,
-        bucket: destination.bucket,
-        object_prefix: destination.objectPrefix,
-        batch_id: batchId,
-        allowed_gcs_prefixes: manifest.allowed_gcs_prefixes,
-      },
+      destination: stageDestinationRecord(destination, batchId, manifest.allowed_gcs_prefixes),
       resolved_corpus: resolvedCorpus,
       file_policy: {
         recursive: true,
@@ -2375,51 +2969,58 @@ export class DomainExpertService {
       eligible_file_count: eligible.length,
       skipped_file_count: skipped.length,
       total_eligible_bytes: totalBytes,
+      ...(pdfs.routed.length ? { pdf_routing: this.stagedPdfRouting(pdfs.routed) } : {}),
       ...(resolutionWarnings.length ? { warnings: resolutionWarnings } : {}),
       policy: domainPolicy(),
     };
     if (dryRun) {
       return {
         kind: 'rag_corpus_stage_import_plan',
-        status: 'dry_run_stage_import_ready',
+        status: eligible.length || pdfs.routed.some((pdf) => pdf.route === 'split') ? 'dry_run_stage_import_ready' : 'dry_run_stage_import_nothing_to_import',
         ...base,
       };
     }
-    const registeredSource = await this.registeredImportSource(manifest, rootPath, params.sourceId);
-    const { stagedFiles, operation, warnings, resolved, importResultSink, submissionReceipt } = await this.executeStageImport(stage);
-    const importResolvedCorpus = resolvedCorpusRecord(resolved);
-    const verified = await this.verifyAndRegisterRagImport({
+    if (!eligible.length) {
+      const pdfSources = await this.importRoutedStagedPdfs(pdfs.routed, held);
+      return { kind: 'rag_corpus_stage_import_result', status: routedPdfStatus(pdfSources), ...base, pdf_sources: pdfSources };
+    }
+    const { stagedFiles, warnings: stagingWarnings } = await this.executeStageImport({ ...stage, destination, eligible });
+    const imported = await this.importStagedBatch({
       manifest,
       rootPath,
-      resolved,
-      submissionReceipt,
-      operation,
-      gcsUris: stagedFiles.map((file) => String(file.gcs_uri)),
+      resolved: stage.resolved,
+      batchId,
       action: 'stage_import',
-      batchRecord: {
+      stagedFiles,
+      batchRecord: (corpus) => ({
         source_id: `${manifest.domain_id}-stage-import-${batchId}`,
         domain_id: manifest.domain_id,
         kind: 'stage_import',
         batch_id: batchId,
-        corpus: importResolvedCorpus,
+        corpus,
         staged_file_count: stagedFiles.length,
         workspace_relative_path: workspaceRelativePath,
-        target_corpus_id: importResolvedCorpus.requested,
+        target_corpus_id: corpus.requested,
         trust_posture: manifest.trust_posture,
-      },
-      ...(registeredSource ? { source: registeredSource } : {}),
+      }),
+      // As read under its lock.
+      ...((pdfs.namedSource ?? registeredSource) ? { source: (pdfs.namedSource ?? registeredSource)! } : {}),
     });
+    // The batch record now holds each whole PDF's outcome.
+    for (const file of eligible) if (file.sha256) held.release(file.sha256);
+    const importResolvedCorpus = resolvedCorpusRecord(imported.resolved);
+    const warnings = [...stagingWarnings, ...imported.warnings];
     return {
       kind: 'rag_corpus_stage_import_result',
       status: 'staged_and_import_requested',
       ...base,
       resolved_corpus: importResolvedCorpus,
       staged_files: stagedFiles,
-      ...(importResultSink ? { import_result_sink: importResultSink } : {}),
-      submission_receipt: submissionReceipt,
       ...([...resolutionWarnings, ...warnings].length ? { warnings: [...resolutionWarnings, ...warnings] } : {}),
-      operation,
-      ...verified,
+      ...imported.receipt,
+      import_outcome: imported.import_outcome,
+      source_registry: imported.source_registry,
+      ...(pdfs.routed.length ? { pdf_sources: await this.importRoutedStagedPdfs(pdfs.routed, held) } : {}),
     };
   }
 
@@ -2444,6 +3045,16 @@ export class DomainExpertService {
   }
 
   private async webRagImport(params: RagCorpusParams, dryRun: boolean): Promise<unknown> {
+    // The batch's source locks: whatever is not handed to a background split is released when the call ends.
+    const held = new HeldSources();
+    try {
+      return await this.webRagImportHolding(params, dryRun, held);
+    } finally {
+      held.releaseRest();
+    }
+  }
+
+  private async webRagImportHolding(params: RagCorpusParams, dryRun: boolean, held: HeldSources): Promise<unknown> {
     const manifest = this.manifest(params.domainId);
     this.requireExplicitCorpus(manifest, 'web_import', params.corpusId);
     const corpusId = params.corpusId ?? defaultCorpusId(manifest);
@@ -2468,7 +3079,7 @@ export class DomainExpertService {
       budget,
       timeoutMs: this.webImportFetchTimeoutMs,
     });
-    const mediaDestination = stageDestination(manifest.allowed_gcs_prefixes, manifest.domain_id, batchId);
+    const batchDestination = stageDestination(manifest.allowed_gcs_prefixes, manifest.domain_id, batchId);
     const derivation = await deriveWebImportFiles({
       urls,
       includeMedia,
@@ -2502,6 +3113,7 @@ export class DomainExpertService {
         corpusId,
         includeMedia,
         files: writePreflight.files,
+        deferBatchCap: true,
       })
       : await this.planStageImportDirectory({
         manifest,
@@ -2510,16 +3122,23 @@ export class DomainExpertService {
         batchId,
         corpusId,
         includeMedia,
+        deferBatchCap: true,
       }).catch((error) => {
         if (writePreflight.files.length === 0 && error instanceof DomainExpertWorkerError && error.code === 'workspace_path_not_found') {
           return undefined;
         }
         throw error;
       });
-    const eligible = stage?.eligible ?? [];
-    const skipped = [...writePreflight.skipped, ...(stage?.skipped ?? [])];
-    const totalBytes = stage?.totalBytes ?? 0;
-    const destination = stage?.destination ?? mediaDestination;
+    // The PDFs take the shared pipeline first; the batch is what stays.
+    const pdfs = stage
+      ? await this.routeStagedPdfs(stage, 'web_import', registeredSource, dryRun ? undefined : held)
+      : { eligible: [], routed: [] as RoutedStagedPdf[] };
+    // The batch cap counts only what the batch stages.
+    const batch = capStagedBatch(pdfs.eligible);
+    const destination = stage?.destination ?? batchDestination;
+    const eligible = await addressStagedFiles(destination, batch.eligible);
+    const skipped = [...writePreflight.skipped, ...(stage?.skipped ?? []), ...batch.skipped];
+    const totalBytes = batch.totalBytes;
     const resolved = stage?.resolved ?? await this.resolveRagCorpus(manifest, corpusId);
     const resolvedCorpus = stage?.resolvedCorpus ?? resolvedCorpusRecord(resolved);
     const resolutionWarnings = ragCorpusWarnings(resolved);
@@ -2559,13 +3178,7 @@ export class DomainExpertService {
         // It writes nothing and uploads nothing.
         extraction_performed_in_dry_run: true,
       },
-      destination: {
-        gcs_uri_prefix: destination.directoryUri,
-        bucket: destination.bucket,
-        object_prefix: destination.objectPrefix,
-        batch_id: batchId,
-        allowed_gcs_prefixes: manifest.allowed_gcs_prefixes,
-      },
+      destination: stageDestinationRecord(destination, batchId, manifest.allowed_gcs_prefixes),
       resolved_corpus: resolvedCorpus,
       derived_files: derivation.files.map((file) => ({
         source_url: webImportProvenanceUrl(file.sourceUrl),
@@ -2588,58 +3201,66 @@ export class DomainExpertService {
       eligible_file_count: eligible.length,
       skipped_file_count: skipped.length,
       total_eligible_bytes: totalBytes,
+      ...(pdfs.routed.length ? { pdf_routing: this.stagedPdfRouting(pdfs.routed) } : {}),
       ...(resolutionWarnings.length ? { warnings: resolutionWarnings } : {}),
       policy: domainPolicy(),
     };
     if (dryRun) {
       return {
         kind: 'rag_corpus_web_import_plan',
-        status: eligible.length > 0 ? 'dry_run_web_import_ready' : 'dry_run_web_import_no_importable_files',
+        status: eligible.length > 0 || pdfs.routed.some((pdf) => pdf.route === 'split') ? 'dry_run_web_import_ready' : 'dry_run_web_import_no_importable_files',
         ...base,
       };
     }
-    if (!stage || eligible.length === 0) {
+    if (!stage || (eligible.length === 0 && pdfs.routed.length === 0)) {
       return {
         kind: 'rag_corpus_web_import_result',
         status: 'web_import_no_importable_files',
         ...base,
       };
     }
-    const { stagedFiles, operation, warnings, resolved: importResolved, importResultSink, submissionReceipt } = await this.executeStageImport(stage);
-    const importResolvedCorpus = resolvedCorpusRecord(importResolved);
-    const verified = await this.verifyAndRegisterRagImport({
+    if (!eligible.length) {
+      const pdfSources = await this.importRoutedStagedPdfs(pdfs.routed, held);
+      return { kind: 'rag_corpus_web_import_result', status: routedPdfStatus(pdfSources), ...base, pdf_sources: pdfSources };
+    }
+    const { stagedFiles, warnings: stagingWarnings } = await this.executeStageImport({ ...stage, destination, eligible });
+    const imported = await this.importStagedBatch({
       manifest,
       rootPath,
-      resolved: importResolved,
-      submissionReceipt,
-      operation,
-      gcsUris: stagedFiles.map((file) => String(file.gcs_uri)),
+      resolved: stage.resolved,
+      batchId,
       action: 'web_import',
-      batchRecord: {
+      stagedFiles,
+      batchRecord: (corpus) => ({
         source_id: `${manifest.domain_id}-web-import-${batchId}`,
         domain_id: manifest.domain_id,
         kind: 'web_import',
         urls: urls.map(webImportProvenanceUrl),
         batch_id: batchId,
-        corpus: importResolvedCorpus,
+        corpus,
         staged_file_count: stagedFiles.length,
         workspace_relative_path: importWorkspaceRelativePath,
-        target_corpus_id: importResolvedCorpus.requested,
+        target_corpus_id: corpus.requested,
         trust_posture: manifest.trust_posture,
-      },
-      ...(registeredSource ? { source: registeredSource } : {}),
+      }),
+      // As read under its lock.
+      ...((pdfs.namedSource ?? registeredSource) ? { source: (pdfs.namedSource ?? registeredSource)! } : {}),
     });
+    // The batch record now holds each whole PDF's outcome.
+    for (const file of eligible) if (file.sha256) held.release(file.sha256);
+    const importResolvedCorpus = resolvedCorpusRecord(imported.resolved);
+    const warnings = [...stagingWarnings, ...imported.warnings];
     return {
       kind: 'rag_corpus_web_import_result',
       status: 'staged_and_import_requested',
       ...base,
       resolved_corpus: importResolvedCorpus,
       staged_files: stagedFiles,
-      ...(importResultSink ? { import_result_sink: importResultSink } : {}),
-      submission_receipt: submissionReceipt,
       ...([...resolutionWarnings, ...warnings].length ? { warnings: [...resolutionWarnings, ...warnings] } : {}),
-      operation,
-      ...verified,
+      ...imported.receipt,
+      import_outcome: imported.import_outcome,
+      source_registry: imported.source_registry,
+      ...(pdfs.routed.length ? { pdf_sources: await this.importRoutedStagedPdfs(pdfs.routed, held) } : {}),
     };
   }
 
@@ -2651,8 +3272,9 @@ export class DomainExpertService {
     corpusId: string;
     includeMedia: boolean;
     files: WebImportDerivedFile[];
+    deferBatchCap?: boolean;
   }): Promise<{
-    destination: ReturnType<typeof stageDestination>;
+    destination: StageDestination;
     batchId: string;
     eligible: StageImportEligibleFile[];
     skipped: StageImportSkippedFile[];
@@ -2667,12 +3289,13 @@ export class DomainExpertService {
       uploadRelativePath: file.fileName,
       absolutePath: resolveInside(input.importPath, file.fileName),
       bytes: file.bytes.byteLength,
+      content: file.bytes,
     }));
-    const { eligible, skipped, totalBytes } = planStageImportCandidates(
+    const { eligible, skipped, totalBytes } = await planStageImportCandidates(
       candidates,
       destination.bucket,
       destination.objectPrefix,
-      { includeMedia: input.includeMedia },
+      { includeMedia: input.includeMedia, ...(input.deferBatchCap ? { deferBatchCap: true } : {}) },
     );
     const resolved = await this.resolveRagCorpus(input.manifest, input.corpusId);
     return {
@@ -2747,13 +3370,7 @@ export class DomainExpertService {
         media_downloads: false,
         retry_429: true,
       },
-      destination: {
-        gcs_uri_prefix: destination.directoryUri,
-        bucket: destination.bucket,
-        object_prefix: destination.objectPrefix,
-        batch_id: batchId,
-        allowed_gcs_prefixes: manifest.allowed_gcs_prefixes,
-      },
+      destination: stageDestinationRecord(destination, batchId, manifest.allowed_gcs_prefixes),
       corpus: {
         corpus_id: corpusId,
         backend: manifest.rag_backend,
@@ -2835,7 +3452,7 @@ export class DomainExpertService {
           includeMedia: false,
         })
       : undefined;
-    const eligible = stage?.eligible ?? [];
+    const eligible = stage ? await addressStagedFiles(stage.destination, stage.eligible) : [];
     const skipped = [...writePreflight.skipped, ...(stage?.skipped ?? [])];
     const totalBytes = stage?.totalBytes ?? 0;
     const resolved = stage?.resolved ?? await this.resolveRagCorpus(manifest, corpusId);
@@ -2874,31 +3491,31 @@ export class DomainExpertService {
         ...liveBase,
       };
     }
-    const { stagedFiles, operation, warnings, resolved: importResolved, importResultSink, submissionReceipt } = await this.executeStageImport(stage);
-    const importResolvedCorpus = resolvedCorpusRecord(importResolved);
-    const verified = await this.verifyAndRegisterRagImport({
+    const { stagedFiles, warnings: stagingWarnings } = await this.executeStageImport({ ...stage, eligible });
+    const imported = await this.importStagedBatch({
       manifest,
       rootPath,
-      resolved: importResolved,
-      submissionReceipt,
-      operation,
-      gcsUris: stagedFiles.map((file) => String(file.gcs_uri)),
+      resolved: stage.resolved,
+      batchId,
       action: 'notion_import',
-      batchRecord: {
+      stagedFiles,
+      batchRecord: (corpus) => ({
         source_id: `${manifest.domain_id}-notion-import-${batchId}`,
         domain_id: manifest.domain_id,
         kind: 'notion_import',
         notion_object_ids: sources.map((source) => source.id),
         urls: sources.map((source) => source.url).filter((url): url is string => typeof url === 'string'),
         batch_id: batchId,
-        corpus: importResolvedCorpus,
+        corpus,
         staged_file_count: stagedFiles.length,
         workspace_relative_path: importWorkspaceRelativePath,
-        target_corpus_id: importResolvedCorpus.requested,
+        target_corpus_id: corpus.requested,
         trust_posture: manifest.trust_posture,
-      },
+      }),
       ...(registeredSource ? { source: registeredSource } : {}),
     });
+    const importResolvedCorpus = resolvedCorpusRecord(imported.resolved);
+    const warnings = [...stagingWarnings, ...imported.warnings];
     return {
       kind: 'rag_corpus_notion_import_result',
       status: 'staged_and_import_requested',
@@ -2908,11 +3525,10 @@ export class DomainExpertService {
         resolved_corpus: importResolvedCorpus,
       },
       staged_files: stagedFiles,
-      ...(importResultSink ? { import_result_sink: importResultSink } : {}),
-      submission_receipt: submissionReceipt,
       ...([...resolutionWarnings, ...warnings].length ? { warnings: [...resolutionWarnings, ...warnings] } : {}),
-      operation,
-      ...verified,
+      ...imported.receipt,
+      import_outcome: imported.import_outcome,
+      source_registry: imported.source_registry,
     };
   }
 
@@ -2923,8 +3539,9 @@ export class DomainExpertService {
     batchId: string;
     corpusId: string;
     includeMedia: boolean;
+    deferBatchCap?: boolean;
   }): Promise<{
-    destination: ReturnType<typeof stageDestination>;
+    destination: StageDestination;
     batchId: string;
     eligible: StageImportEligibleFile[];
     skipped: StageImportSkippedFile[];
@@ -2940,7 +3557,7 @@ export class DomainExpertService {
       targetPath,
       destination.bucket,
       destination.objectPrefix,
-      { includeMedia: input.includeMedia },
+      { includeMedia: input.includeMedia, ...(input.deferBatchCap ? { deferBatchCap: true } : {}) },
     );
     const resolved = await this.resolveRagCorpus(input.manifest, input.corpusId);
     return {
@@ -2955,18 +3572,20 @@ export class DomainExpertService {
     };
   }
 
+  // Uploads the batch's files to their content-addressed names (and a transcript of each
+  // medium); importStagedBatch then imports exactly those objects.
   private async executeStageImport(stage: {
-    destination: ReturnType<typeof stageDestination>;
-    batchId: string;
+    destination: StageDestination;
     eligible: StageImportEligibleFile[];
-    resolved: ResolvedRagCorpus;
     manifest: ReturnType<typeof domainManifest>;
-  }): Promise<{ stagedFiles: Array<Record<string, unknown>>; operation: unknown; warnings: Array<Record<string, unknown> | RagCorpusWarning>; resolved: ResolvedRagCorpus; importResultSink: string | undefined; submissionReceipt: Record<string, unknown> }> {
+  }): Promise<{ stagedFiles: Array<Record<string, unknown>>; warnings: Array<Record<string, unknown>> }> {
     const stagedFiles: Array<Record<string, unknown>> = [];
-    const warnings: Array<Record<string, unknown> | RagCorpusWarning> = [];
+    const warnings: Array<Record<string, unknown>> = [];
     for (const file of stage.eligible) {
       const bytes = new Uint8Array(await readFile(file.absolutePath));
-      if (bytes.byteLength !== file.bytes || bytes.byteLength > maxStageFileBytes(file.workspaceRelativePath)) {
+      // The object is named by these bytes, so they must still be the ones it was named by.
+      if (bytes.byteLength !== file.bytes || bytes.byteLength > (file.pdf ? PDF_PROCESSING_MAX_BYTES : maxStageFileBytes(file.workspaceRelativePath))
+        || (file.sha256 !== undefined && sha256(bytes) !== file.sha256)) {
         throw new DomainExpertWorkerError(409, 'stage_import_file_changed', `${file.workspaceRelativePath} changed during staging.`);
       }
       await this.google.uploadGcsObject(stage.destination.bucket, file.objectName, bytes);
@@ -2980,8 +3599,13 @@ export class DomainExpertService {
       stagedFiles.push(stagedFile);
       if (isTranscribableMediaPath(file.workspaceRelativePath)) {
         const mimeType = mediaMimeType(file.workspaceRelativePath);
+        // Beside its medium, so it is addressed by the medium's bytes: a re-run keeps the
+        // transcript already staged (and imported) instead of transcribing those bytes again.
+        const transcriptObjectName = `${file.objectName.slice(0, file.objectName.length - file.uploadRelativePath.length)}${safeGcsRelativePath(`${file.uploadRelativePath}.transcript.md`)}`;
         try {
-          const transcript = await transcribeMediaFromGcs({
+          // One that cannot be read is simply made again.
+          const kept = await this.google.downloadLibraryObject(stage.destination.bucket, transcriptObjectName, STAGE_IMPORT_MAX_FILE_BYTES, GOOGLE_API_REQUEST_TIMEOUT_MS).catch(() => null);
+          const transcript = kept ? { bytes: kept } : await transcribeMediaFromGcs({
             project: stage.manifest.gcp_project,
             location: stage.manifest.rag_location,
             sourceUrl: file.workspaceRelativePath,
@@ -2998,8 +3622,7 @@ export class DomainExpertService {
               ...input,
             }),
           });
-          const transcriptObjectName = `${stage.destination.objectPrefix}${safeGcsRelativePath(`${file.uploadRelativePath}.transcript.md`)}`;
-          await this.google.uploadGcsObject(stage.destination.bucket, transcriptObjectName, transcript.bytes);
+          if (!kept) await this.google.uploadGcsObject(stage.destination.bucket, transcriptObjectName, transcript.bytes);
           stagedFiles.push({
             workspace_relative_path: `${file.workspaceRelativePath}.transcript.md`,
             upload_relative_path: `${file.uploadRelativePath}.transcript.md`,
@@ -3020,25 +3643,182 @@ export class DomainExpertService {
         }
       }
     }
-    const importResultSink = this.agentRouting[stage.manifest.domain_id]?.ingestion?.importResultSink === 'client'
-      ? undefined : importResultSinkUri(stage.manifest.allowed_gcs_prefixes, stage.manifest.domain_id, stage.batchId);
-    const retry = await this.withRagCorpusRetry(stage.manifest, stage.resolved, async (candidate) => {
-      await this.deleteErrorRagFileRecords(stage.manifest, candidate, [stage.destination.directoryUri]);
-      return this.submitRagImport({
-        project: stage.manifest.gcp_project,
-        location: stage.manifest.rag_location,
-        corpusName: candidate.resourceName,
-        gcsUri: stage.destination.directoryUri,
-        ...(importResultSink ? { importResultGcsSink: importResultSink } : {}),
-        chunkTokens: stage.manifest.chunking.chunk_tokens,
-        chunkOverlap: stage.manifest.chunking.chunk_overlap,
-        // The request imports the whole staging directory, so the parser choice
-        // is made against every file that was staged into it.
-        llmParserEligible: llmParserEligibleUris(stagedFiles.map((file) => String(file.gcs_uri))),
-      });
+    return { stagedFiles, warnings };
+  }
+
+  // A staged batch imports exactly its own objects, named one by one, in requests of at
+  // most STAGED_IMPORT_URIS_PER_REQUEST URIs. A corpus takes one import at a time, so each
+  // request settles before the next is submitted, and a busy corpus or quota refusal is
+  // waited out inside the poll budget. Once the first request is accepted the batch record
+  // names every file and each request's operation; the run then ends with one terminal
+  // record. A first request Vertex refuses fails the call before anything is recorded.
+  private async importStagedBatch(input: {
+    manifest: ReturnType<typeof domainManifest>;
+    rootPath: string;
+    resolved: ResolvedRagCorpus;
+    batchId: string;
+    action: string;
+    stagedFiles: Array<Record<string, unknown>>;
+    batchRecord: (corpus: Record<string, unknown>) => Record<string, unknown>;
+    source?: Record<string, unknown>;
+  }): Promise<{
+    resolved: ResolvedRagCorpus;
+    warnings: RagCorpusWarning[];
+    receipt: Record<string, unknown>;
+    import_outcome: Record<string, unknown>;
+    source_registry: Record<string, unknown>;
+  }> {
+    const { manifest } = input;
+    const gcsUris = input.stagedFiles.map((file) => String(file.gcs_uri));
+    const sha256ByUri = stagedFileSha256s(input.stagedFiles);
+    // The parser applies to a whole request, so files the LLM parser takes (PDFs) go in
+    // requests of their own: unrelated files never decide a PDF's parser.
+    const chunks: string[][] = [];
+    for (const group of [gcsUris.filter((uri) => !llmParserEligibleUris([uri])), gcsUris.filter((uri) => llmParserEligibleUris([uri]))]) {
+      for (let index = 0; index < group.length; index += STAGED_IMPORT_URIS_PER_REQUEST) chunks.push(group.slice(index, index + STAGED_IMPORT_URIS_PER_REQUEST));
+    }
+    const sinkRoot = this.agentRouting[manifest.domain_id]?.ingestion?.importResultSink === 'client'
+      ? undefined : importResultSinkUri(manifest.allowed_gcs_prefixes, manifest.domain_id, input.batchId);
+    let resolved = input.resolved;
+    const warnings: RagCorpusWarning[] = [];
+    const requests: Array<{ uris: string[]; submissionReceipt: Record<string, unknown>; operation: unknown; status: string; detail: Record<string, unknown>; files: Array<Record<string, unknown>> }> = [];
+    const registryErrors: string[] = [];
+    let recordInput: Parameters<DomainExpertService['appendRagImportRegistryRecords']>[0] | undefined;
+    // Every record after the run's first is its progress or outcome: a source removed since stays removed.
+    let requestRecorded = false;
+    const record = async (fields: Record<string, unknown>) => {
+      try {
+        const outcome = requestRecorded;
+        requestRecorded = true;
+        return await this.appendRagImportRegistryRecords(recordInput!, fields, { outcome });
+      } catch (error) {
+        registryErrors.push(error instanceof DomainExpertWorkerError
+          ? `${error.code}: ${error.message}`
+          : sanitizeWebImportProvenanceText(error instanceof Error ? error.message : String(error)).slice(0, 300));
+        return [];
+      }
+    };
+    // Each operation with the URIs its request named, so a later check of one object asks
+    // only the operation that carried it (pendingImportHolding).
+    const operationFields = () => {
+      const operations = requests.flatMap((request) => (typeof request.submissionReceipt.operation_name === 'string'
+        ? [{ name: request.submissionReceipt.operation_name, uris: request.uris }] : []));
+      if (!operations.length) return {};
+      const names = operations.map((operation) => operation.name);
+      return {
+        ...(names.length === 1 ? { rag_operation_name: names[0] } : { rag_operation_name: names.at(-1), rag_operation_names: names }),
+        rag_operations: operations,
+      };
+    };
+    let stopped: Record<string, unknown> | undefined;
+    for (const [index, uris] of chunks.entries()) {
+      const deadline = Date.now() + this.annasImportPollTimeoutMs;
+      const sink = sinkRoot && chunks.length > 1 ? `${sinkRoot}request-${index + 1}/` : sinkRoot;
+      let submitted: Awaited<ReturnType<DomainExpertService['submitStagedRequest']>>;
+      try {
+        submitted = await this.submitStagedRequest(manifest, resolved, uris, sink, deadline);
+      } catch (error) {
+        if (index === 0) throw error;
+        stopped = { reason: 'request_refused', error: ingestErrorRecord(error), not_submitted_uris: chunks.slice(index).flat() };
+        break;
+      }
+      resolved = submitted.resolved;
+      warnings.push(...submitted.warnings);
+      recordInput ??= { manifest, rootPath: input.rootPath, action: input.action, batchRecord: input.batchRecord(resolvedCorpusRecord(resolved)), ...(input.source ? { source: input.source } : {}) };
+      requests.push({ uris, ...submitted.value, status: 'import_requested', detail: {}, files: uris.map((gcsUri) => ({ gcs_uri: gcsUri })) });
+      await record({ ingest_status: 'import_requested', ...operationFields(), ...ragImportFileFields(gcsUris.map((gcsUri) => ({ gcs_uri: gcsUri })), sha256ByUri) });
+      Object.assign(requests.at(-1)!, await this.settleRagImport(manifest, resolved, submitted.value, uris, deadline));
+      // Still running: the corpus takes no other import until it ends.
+      if (requests.at(-1)!.status === 'import_requested') {
+        if (index < chunks.length - 1) stopped = { reason: 'request_still_running', not_submitted_uris: chunks.slice(index + 1).flat() };
+        break;
+      }
+    }
+    const listed = new Map(requests.flatMap((request) => request.files).map((file) => [String(file.gcs_uri), file]));
+    const files = gcsUris.map((gcsUri) => listed.get(gcsUri) ?? { gcs_uri: gcsUri });
+    const statuses = requests.map((request) => request.status);
+    // Imported only when every request imported every one of its files.
+    const status = statuses.includes('import_requested') ? 'import_requested'
+      : statuses.every((value) => value === 'imported') && !stopped ? 'imported'
+        : statuses.every((value) => value === 'import_empty') && !stopped ? 'import_empty'
+          : statuses.some((value) => value === 'imported' || value === 'import_partial') ? 'import_partial'
+            : 'import_failed';
+    const counts = (key: string) => requests.reduce((total, request) => total + ragImportCount(request.detail[key]), 0);
+    const detail: Record<string, unknown> = requests.length === 1 && !stopped
+      ? requests[0]!.detail
+      : {
+        imported_rag_files_count: counts('imported_rag_files_count'),
+        skipped_rag_files_count: counts('skipped_rag_files_count'),
+        failed_rag_files_count: counts('failed_rag_files_count'),
+        ...(requests.every((request) => request.detail.already_present === true) && !stopped ? { already_present: true } : {}),
+        requests: requests.map((request) => ({
+          status: request.status,
+          gcs_uri_count: request.uris.length,
+          ...(typeof request.submissionReceipt.operation_name === 'string' ? { operation_name: request.submissionReceipt.operation_name } : {}),
+          ...Object.fromEntries(Object.entries(request.detail).filter(([key]) => key !== 'operation_name')),
+        })),
+        ...(stopped ?? {}),
+        ...(status !== 'imported' ? { hint: stopped?.reason === 'request_still_running'
+          ? 'A request was still importing when the poll budget ran out, so the rest were not submitted. Re-run the batch once it settles: files already in the corpus keep their URIs and are skipped.'
+          : 'Some requests did not import. Re-run the batch: files already in the corpus keep their URIs and are skipped, and the rest are imported.' } : {}),
+      };
+    const written = await record({
+      ingest_status: status,
+      ...operationFields(),
+      ...ragImportFileFields(files, sha256ByUri),
+      ...(status === 'imported'
+        ? { verification: ragImportVerification(detail, files, new Date().toISOString()) }
+        : { ingest_reason: ragImportReason(detail) }),
     });
-    warnings.push(...retry.warnings);
-    return { stagedFiles, operation: retry.value.operation, submissionReceipt: retry.value.submissionReceipt, warnings, resolved: retry.resolved, importResultSink };
+    const registryRelativePath = `${manifest.workspace_relative_path}/references/source-registry.jsonl`;
+    const sinks = requests.map((_request, index) => (sinkRoot && chunks.length > 1 ? `${sinkRoot}request-${index + 1}/` : sinkRoot)).filter(Boolean);
+    return {
+      resolved,
+      warnings,
+      receipt: requests.length === 1
+        ? { submission_receipt: requests[0]!.submissionReceipt, operation: requests[0]!.operation, ...(sinkRoot ? { import_result_sink: sinkRoot } : {}) }
+        : {
+          submission_receipts: requests.map((request) => request.submissionReceipt),
+          operations: requests.map((request) => request.operation),
+          ...(sinks.length ? { import_result_sinks: sinks } : {}),
+        },
+      import_outcome: { status, ...detail, ...(gcsUris.length > 0 ? { rag_files: files } : {}) },
+      source_registry: registryErrors.length > 0
+        ? { status: 'failed', reason: registryErrors.join('; '), registry_relative_path: registryRelativePath }
+        : { status: 'recorded', source_ids: written, ingest_status: status, registry_relative_path: registryRelativePath },
+    };
+  }
+
+  private async submitStagedRequest(
+    manifest: ReturnType<typeof domainManifest>,
+    resolved: ResolvedRagCorpus,
+    uris: string[],
+    importResultSink: string | undefined,
+    deadline: number,
+  ): Promise<{ value: { operation: unknown; submissionReceipt: Record<string, unknown> }; resolved: ResolvedRagCorpus; warnings: RagCorpusWarning[] }> {
+    let delay = this.annasImportPollIntervalMs;
+    for (;;) {
+      try {
+        return await this.withRagCorpusRetry(manifest, resolved, async (candidate) => {
+          await this.deleteErrorRagFileRecords(manifest, candidate, uris);
+          return this.submitRagImport({
+            project: manifest.gcp_project,
+            location: manifest.rag_location,
+            corpusName: candidate.resourceName,
+            gcsUris: uris,
+            ...(importResultSink ? { importResultGcsSink: importResultSink } : {}),
+            chunkTokens: manifest.chunking.chunk_tokens,
+            chunkOverlap: manifest.chunking.chunk_overlap,
+            // The parser choice is made against every file this request imports.
+            llmParserEligible: llmParserEligibleUris(uris),
+          });
+        });
+      } catch (error) {
+        if (!importTransientReason(error) || Date.now() + delay > deadline) throw error;
+        await sleepMs(delay);
+        delay = Math.min(delay * 2, ANNAS_IMPORT_BACKOFF_MAX_MS);
+      }
+    }
   }
 
   private async submitRagImport(options: Parameters<GoogleRuntimeClient['importRagFiles']>[0]): Promise<{
@@ -3048,7 +3828,7 @@ export class DomainExpertService {
     const receipt = {
       schema_version: 1, kind: 'rag_import_submission', submission_id: submissionId,
       submitted_at: new Date().toISOString(), corpus_resource_name: options.corpusName,
-      source_reference_sha256: sha256(new TextEncoder().encode(options.gcsUri ?? options.driveFileId ?? '')),
+      source_reference_sha256: sha256(new TextEncoder().encode(options.gcsUris?.join('\n') ?? options.gcsUri ?? options.driveFileId ?? '')),
       status: 'submission_pending',
     };
     const directory = join(this.dataDir, 'import-submissions');
@@ -3103,22 +3883,8 @@ export class DomainExpertService {
     resolved: ResolvedRagCorpus,
     targetUris: string[],
   ): Promise<void> {
-    const errorRecords: string[] = [];
-    let pageToken: string | undefined;
-    do {
-      const page = await this.google.listRagFiles({
-        project: manifest.gcp_project,
-        location: manifest.rag_location,
-        corpusName: resolved.resourceName,
-        ...(pageToken ? { pageToken } : {}),
-      });
-      for (const file of page.files) {
-        if (file.state === 'ERROR' && ragFileMatchesTargets(file, targetUris)) {
-          errorRecords.push(String(file.name));
-        }
-      }
-      pageToken = page.nextPageToken;
-    } while (pageToken);
+    const matched = ragFilesByTarget(await this.listCorpusRagFiles(manifest, resolved), targetUris);
+    const errorRecords = [...new Set([...matched.values()].flat().filter((file) => file.state === 'ERROR').map((file) => String(file.name)))];
     for (const ragFileName of errorRecords) {
       try {
         await this.google.deleteRagFile({
@@ -3167,6 +3933,19 @@ export class DomainExpertService {
     return current.record;
   }
 
+  // Whether a GCS object whose key does not say .pdf is a PDF: its first bytes carry the
+  // PDF header (hasPdfHeader). A missing object is not one (the import then reports it as before).
+  private async gcsObjectIsPdf(gcsUri: string): Promise<boolean> {
+    const { bucket, prefix } = parseGcsPrefix(gcsUri);
+    let head: Uint8Array | null;
+    try {
+      head = await this.google.readGcsObjectHead(bucket, prefix.replace(/\/$/, ''), PDF_SNIFF_BYTES);
+    } catch {
+      throw new DomainExpertWorkerError(502, 'gcs_object_unreadable', `${gcsUri} could not be read to tell whether it is a PDF. Nothing was imported.`);
+    }
+    return head !== null && hasPdfHeader(head);
+  }
+
   // Submission is not ingestion, for any import. On 2026-10-07 every web and
   // staged import in a live domain registry still read import_requested or
   // not_ingested although Vertex had imported each one, because nothing wrote
@@ -3186,12 +3965,19 @@ export class DomainExpertService {
     action: string;
     batchRecord?: Record<string, unknown>;
     source?: Record<string, unknown>;
+    // The sha256 of each staged file, recorded with it as its source identity.
+    sha256ByUri?: Map<string, string>;
+    // Called once the import_requested record is written.
+    onRequestRecorded?: () => void;
+    // The inspected object's generation. Vertex reads the URI later, so a different
+    // generation once the import settles means the imported bytes were not the ones inspected.
+    pinned?: { bucket: string; objectName: string; generation: string | undefined };
   }): Promise<{ import_outcome: Record<string, unknown>; source_registry: Record<string, unknown> }> {
     const operationName = typeof input.submissionReceipt.operation_name === 'string' ? input.submissionReceipt.operation_name : undefined;
     const registryErrors: string[] = [];
-    const record = async (fields: Record<string, unknown>) => {
+    const record = async (fields: Record<string, unknown>, options: { outcome?: boolean } = {}) => {
       try {
-        return await this.appendRagImportRegistryRecords(input, fields);
+        return await this.appendRagImportRegistryRecords(input, fields, options);
       } catch (error) {
         registryErrors.push(error instanceof DomainExpertWorkerError
           ? `${error.code}: ${error.message}`
@@ -3202,64 +3988,42 @@ export class DomainExpertService {
     await record({
       ingest_status: 'import_requested',
       ...(operationName ? { rag_operation_name: operationName } : {}),
-      ...ragImportFileFields(input.gcsUris.map((gcsUri) => ({ gcs_uri: gcsUri }))),
+      ...ragImportFileFields(input.gcsUris.map((gcsUri) => ({ gcs_uri: gcsUri })), input.sha256ByUri),
     });
+    input.onRequestRecorded?.();
 
     const deadline = Date.now() + this.annasImportPollTimeoutMs;
-    const outcome = await this.awaitRagImportOutcome(input.manifest, {
-      submission_receipt: input.submissionReceipt,
-      resolved_corpus: { resource_name: input.resolved.resourceName },
-      operation: input.operation,
-    }, ragImportFormatLabel(input.gcsUris), deadline);
-    let status: string = outcome.status;
-    let detail = outcome.detail;
-    let files: Array<Record<string, unknown>> = input.gcsUris.map((gcsUri) => ({ gcs_uri: gcsUri }));
-    const lookUpRagFiles = async (): Promise<Array<Record<string, unknown>> | undefined> => {
-      try {
-        const listed = await this.ragFilesForImportedUrisSettled(input.manifest, input.resolved, input.gcsUris, deadline);
-        detail = { ...detail, rag_file_listings: listed.listings };
-        return listed.files;
-      } catch (error) {
-        detail = {
-          ...detail,
-          rag_file_lookup_error: error instanceof DomainExpertWorkerError
-            ? `${error.code}: ${error.message}`
-            : sanitizeWebImportProvenanceText(error instanceof Error ? error.message : String(error)).slice(0, 300),
-        };
-        return undefined;
-      }
-    };
-    if (status === 'imported' && input.gcsUris.length > 0) {
-      files = (await lookUpRagFiles()) ?? files;
-      // Vertex counts a file it then failed to embed; the ragFile's own state
-      // is the last word on whether it is in the library.
-      const states = files.map((file) => file.state).filter((state) => state !== undefined);
-      if (states.length > 0 && !states.includes('ACTIVE') && states.includes('ERROR')) {
-        status = 'import_failed';
-        detail = {
-          ...detail,
-          hint: `Vertex counted the import, but its ragFile is in ERROR state: ${files.map((file) => file.error_status).filter(Boolean).join('; ') || 'no reason given'}.`,
-        };
-      }
-    } else if (status === 'import_empty' && ragImportCount(detail.skipped_rag_files_count) >= 1 && input.gcsUris.length > 0) {
-      // A re-import of an object already in the corpus is skipped, not
-      // imported. When its ragFile is ACTIVE the source is in the library.
-      const listed = await lookUpRagFiles();
-      if (listed && listed.every((file) => file.state === 'ACTIVE')) {
-        files = listed;
-        status = 'imported';
-        detail = { ...Object.fromEntries(Object.entries(detail).filter(([key]) => key !== 'hint')), already_present: true };
-      }
+    const settled = await this.settleRagImport(input.manifest, input.resolved, input, input.gcsUris, deadline);
+    const { status, files } = settled;
+    let { detail } = settled;
+    let changed: string | undefined;
+    let unsettled: string | undefined;
+    if (input.pinned && status === 'import_requested' && detail.reason !== RAG_FILE_UNLISTED) {
+      // Vertex may still read the object after this run ends, so no later check ties what it imports to the bytes inspected.
+      unsettled = 'the import had not settled when the worker stopped waiting, so the bytes Vertex reads cannot be tied to the ones inspected';
+      detail = { ...detail, identity_verified: false, source_check: unsettled };
+    } else if (input.pinned && detail.already_present === true) {
+      // Vertex skipped the URI as already in the corpus: what it holds was read before this
+      // inspection, and no record proved it the same file.
+      unsettled = 'Vertex skipped the object as already in the corpus, so the bytes it holds cannot be tied to the ones inspected';
+      detail = { ...detail, identity_verified: false, source_check: unsettled };
+    } else if (input.pinned) {
+      const after = await this.google.getGcsObjectMetadata(input.pinned.bucket, input.pinned.objectName).catch(() => undefined);
+      if (after === undefined) changed = 'the object could not be read back after the import';
+      else if (after?.generation !== input.pinned.generation) changed = `the object changed during the import (generation ${String(input.pinned.generation)} inspected, ${after ? String(after.generation) : 'deleted'} now)`;
+      if (changed) detail = { ...detail, source_changed_during_import: true, source_check: changed };
     }
     const verifiedAt = new Date().toISOString();
     const written = await record({
       ingest_status: status,
       ...(operationName ? { rag_operation_name: operationName } : {}),
-      ...ragImportFileFields(files),
+      ...ragImportFileFields(files, input.sha256ByUri),
+      // Identity is claimed only for the bytes inspected.
+      ...(changed || unsettled ? { sha256_verified: false, source_check: changed ?? unsettled } : {}),
       ...(status === 'imported'
         ? { verification: ragImportVerification(detail, files, verifiedAt) }
         : { ingest_reason: ragImportReason(detail) }),
-    });
+    }, { outcome: true });
     const registryRelativePath = `${input.manifest.workspace_relative_path}/references/source-registry.jsonl`;
     return {
       import_outcome: {
@@ -3273,30 +4037,120 @@ export class DomainExpertService {
     };
   }
 
+  // What one accepted import did: the operation read back until it settles, then the
+  // ragFile of each object it imported. Vertex's count is not the last word: a counted
+  // file whose ragFile is in ERROR failed, and a skipped re-import whose ragFiles are
+  // ACTIVE is in the library.
+  private async settleRagImport(
+    manifest: ReturnType<typeof domainManifest>,
+    resolved: ResolvedRagCorpus,
+    submission: { submissionReceipt: Record<string, unknown>; operation: unknown },
+    gcsUris: string[],
+    deadline: number,
+  ): Promise<{ status: string; detail: Record<string, unknown>; files: Array<Record<string, unknown>> }> {
+    const outcome = await this.awaitRagImportOutcome(manifest, {
+      submission_receipt: submission.submissionReceipt,
+      resolved_corpus: { resource_name: resolved.resourceName },
+      operation: submission.operation,
+    }, ragImportFormatLabel(gcsUris), deadline);
+    let status: string = outcome.status;
+    let detail = outcome.detail;
+    let files: Array<Record<string, unknown>> = gcsUris.map((gcsUri) => ({ gcs_uri: gcsUri }));
+    const lookUpRagFiles = async (): Promise<Array<Record<string, unknown>> | undefined> => {
+      try {
+        const listed = await this.ragFilesForImportedUrisSettled(manifest, resolved, gcsUris, deadline);
+        detail = { ...detail, rag_file_listings: listed.listings };
+        return listed.files;
+      } catch (error) {
+        detail = {
+          ...detail,
+          rag_file_lookup_error: error instanceof DomainExpertWorkerError
+            ? `${error.code}: ${error.message}`
+            : sanitizeWebImportProvenanceText(error instanceof Error ? error.message : String(error)).slice(0, 300),
+        };
+        return undefined;
+      }
+    };
+    if (gcsUris.length > 1 && (status === 'imported' || status === 'import_partial'
+      || (status === 'import_empty' && ragImportCount(detail.skipped_rag_files_count) >= 1))) {
+      // A request of several objects is decided file by file, by each ragFile's own state:
+      // imported only when every one is ACTIVE.
+      const listed = await lookUpRagFiles();
+      if (!listed) {
+        // Vertex's count is not per file, and a counted file can still end in ERROR: with no
+        // listing the outcome stays requested, so a later check reads each file's ragFile.
+        status = 'import_requested';
+        detail = { ...detail, hint: 'Vertex counted the request, but its ragFiles could not be listed to confirm each file; check the source again once the corpus answers.' };
+      } else {
+        files = listed;
+        const byFile = requestOutcomeByFile(files);
+        const alreadyPresent = status === 'import_empty' && byFile.status === 'imported';
+        status = byFile.status;
+        detail = {
+          ...Object.fromEntries(Object.entries(detail).filter(([key]) => key !== 'hint')),
+          ...(alreadyPresent ? { already_present: true } : {}),
+          ...(byFile.hint ? { hint: byFile.hint } : {}),
+        };
+      }
+    } else if ((status === 'imported' || status === 'import_partial') && gcsUris.length > 0) {
+      files = (await lookUpRagFiles()) ?? files;
+      // Vertex counts a file it then failed to embed; the ragFile's own state
+      // is the last word on whether it is in the library.
+      const states = files.map((file) => file.state).filter((state) => state !== undefined);
+      if (states.length === 0) {
+        // No ragFile listed for it yet: the outcome stays requested, so a later check
+        // reads its operation and ragFile before it counts as present or is imported again.
+        status = 'import_requested';
+        detail = { ...detail, reason: RAG_FILE_UNLISTED, hint: 'Vertex counted the import, but its ragFile is not listed yet; check the source again once the corpus lists it.' };
+      } else if (!states.includes('ACTIVE') && states.includes('ERROR')) {
+        status = 'import_failed';
+        detail = {
+          ...detail,
+          hint: `Vertex counted the import, but its ragFile is in ERROR state: ${files.map((file) => file.error_status).filter(Boolean).join('; ') || 'no reason given'}.`,
+        };
+      }
+    } else if (status === 'import_empty' && ragImportCount(detail.skipped_rag_files_count) >= 1 && gcsUris.length > 0) {
+      // A re-import of an object already in the corpus is skipped, not
+      // imported. When its ragFile is ACTIVE the source is in the library.
+      const listed = await lookUpRagFiles();
+      if (listed && listed.every((file) => file.state === 'ACTIVE')) {
+        files = listed;
+        status = 'imported';
+        detail = { ...Object.fromEntries(Object.entries(detail).filter(([key]) => key !== 'hint')), already_present: true };
+      }
+    }
+    return { status, detail, files };
+  }
+
   private async appendRagImportRegistryRecords(
     input: { manifest: ReturnType<typeof domainManifest>; rootPath: string; action: string; batchRecord?: Record<string, unknown>; source?: Record<string, unknown> },
     fields: Record<string, unknown>,
+    // The outcome of a run that already recorded its request: a source removed since stays removed.
+    options: { outcome?: boolean } = {},
   ): Promise<string[]> {
     const registryPath = resolveInside(input.rootPath, `${input.manifest.workspace_relative_path}/references/source-registry.jsonl`);
     await mkdir(dirname(registryPath), { recursive: true });
     const registeredAt = new Date().toISOString();
     const written: string[] = [];
+    // A run's later records are not written for a source removed meanwhile (checked under the append lock).
+    const append = (record: Record<string, unknown>) => (options.outcome
+      ? this.appendRegistryJsonLineUnlessRemoved(registryPath, record)
+      : this.appendRegistryJsonLine(registryPath, record).then(() => true));
     if (input.batchRecord) {
-      await this.appendRegistryJsonLine(registryPath, { ...input.batchRecord, ...fields, registered_at: registeredAt });
-      written.push(String(input.batchRecord.source_id));
+      if (await append({ ...input.batchRecord, ...fields, registered_at: registeredAt })) written.push(String(input.batchRecord.source_id));
     }
     if (input.source) {
       // The source keeps its catalogue fields (title, author, posture); the
       // previous import's outcome fields are replaced, not carried forward.
       const carried = Object.fromEntries(Object.entries(input.source).filter(([key]) => !RAG_IMPORT_OUTCOME_FIELDS.has(key)));
-      await this.appendRegistryJsonLine(registryPath, {
+      if (await append({
         ...carried,
         ...fields,
         ...(input.batchRecord ? { import_batch_source_id: input.batchRecord.source_id } : {}),
         registered_at: registeredAt,
-      });
-      written.push(String(input.source.source_id));
+      })) written.push(String(input.source.source_id));
     }
+    if (!written.length) return written;
     const logPath = resolveInside(input.rootPath, `${input.manifest.workspace_relative_path}/references/ingest-log.md`);
     await appendFile(logPath, `- ${registeredAt} ${String(fields.ingest_status)} ${written.join(', ')} (rag_corpus ${input.action})\n`, 'utf8');
     return written;
@@ -3328,16 +4182,8 @@ export class DomainExpertService {
 
   // One entry per imported object: the ragFile Vertex made from it and that
   // file's state. An object with no listed ragFile keeps only its URI.
-  private async ragFilesForImportedUris(
-    manifest: ReturnType<typeof domainManifest>,
-    resolved: ResolvedRagCorpus,
-    gcsUris: string[],
-    options: { exact?: boolean } = {},
-  ): Promise<Array<Record<string, unknown>>> {
-    const matches = (file: Record<string, unknown>, targets: string[]) => (options.exact
-      ? typeof file.sourceUri === 'string' && targets.includes(file.sourceUri)
-      : ragFileMatchesTargets(file, targets));
-    const listed: Array<Record<string, unknown>> = [];
+  private async listCorpusRagFiles(manifest: ReturnType<typeof domainManifest>, resolved: ResolvedRagCorpus): Promise<Array<Record<string, unknown>>> {
+    const files: Array<Record<string, unknown>> = [];
     let pageToken: string | undefined;
     do {
       const page = await this.google.listRagFiles({
@@ -3346,11 +4192,21 @@ export class DomainExpertService {
         corpusName: resolved.resourceName,
         ...(pageToken ? { pageToken } : {}),
       });
-      listed.push(...page.files.filter((file) => matches(file, gcsUris)));
+      files.push(...page.files);
       pageToken = page.nextPageToken;
     } while (pageToken);
+    return files;
+  }
+
+  private async ragFilesForImportedUris(
+    manifest: ReturnType<typeof domainManifest>,
+    resolved: ResolvedRagCorpus,
+    gcsUris: string[],
+    options: { exact?: boolean } = {},
+  ): Promise<Array<Record<string, unknown>>> {
+    const matched = ragFilesByTarget(await this.listCorpusRagFiles(manifest, resolved), gcsUris, options);
     return gcsUris.map((gcsUri) => {
-      const found = listed.filter((file) => matches(file, [gcsUri]));
+      const found = matched.get(gcsUri) ?? [];
       const file = found.find((candidate) => candidate.state === 'ACTIVE') ?? found[0];
       if (!file) return { gcs_uri: gcsUri };
       return {
@@ -3854,7 +4710,7 @@ export class DomainExpertService {
     bytes: Uint8Array,
     scale: AnnasArtifactScale,
     sourcePath: string,
-    context: AnnasIngestContext,
+    context: SourceImportContext,
   ): Promise<Record<string, unknown>> {
     // Shared with planAnnasArchiveImport so the dry run cannot report a
     // different target than this executes against. A configured domain's
@@ -3865,9 +4721,28 @@ export class DomainExpertService {
       return { status: 'needs_corpus_decision', reason: NO_TARGET_CORPUS_REASON };
     }
     const corpusId = corpusTarget.target_corpus_id;
-    // The single choke point for every ingest, so the scale gate sits here: a
-    // positively measured sub-book-scale artifact stops before anything is
-    // uploaded or imported, and the downloaded file stays on disk for
+    const source: SourceImport = {
+      manifest, corpusId, corpusTarget, context,
+      ...(annasFastDownloadMd5(params) ? { legacyLocator: `annas:${annasFastDownloadMd5(params)}` } : {}),
+      kept: `the download is still on disk at ${sourcePath}`,
+      rerun: 'Re-run annas_archive_import with ingest: true for the same record',
+      partNames: async () => ({ ...this.annasImportDirectory(manifest), ...await this.annasObjectStems(manifest, params, locator, 'pdf') }),
+      wholeCopyInCorpus: (pdf) => this.wholeAnnasPdfInCorpus(manifest, params, locator, corpusId, pdf),
+      recordProgress: (snapshot) => this.registerAnnasIngest(manifest, params, locator, 'pdf', context, snapshot, { progress: true }),
+    };
+    // One identity per source, the original file's sha256. A source the registry
+    // records as held in this corpus, whole or as parts of any split (including
+    // one registered with domain_source add), is reported present before anything
+    // is uploaded or imported again.
+    const holding = await this.sourceHolding(source);
+    if (holding.kind === 'present') return { status: 'imported', ...corpusTarget, source_sha256: context.sha256, ...holding.result };
+    if (holding.kind === 'conflict') return { status: 'blocked', ...corpusTarget, error: sourceIdentityConflict(source, holding) };
+    if (holding.kind === 'unknown') return { status: 'blocked', ...corpusTarget, error: sourceHoldingUnverified(source, holding) };
+    if (holding.kind === 'in_progress') return { status: 'blocked', ...corpusTarget, error: sourceImportPending(source, holding) };
+    // The single choke point for every ingest, so the scale gate sits here, after
+    // the identity check (a source already in the corpus is present whatever its
+    // scale): a positively measured sub-book-scale artifact stops before anything
+    // is uploaded or imported, and the downloaded file stays on disk for
     // inspection. Returned rather than thrown because the catch below carries no
     // extra facts and the measurement is the whole point of the refusal.
     if (scale.below_min_pdf_pages && !scale.short_artifact_override) {
@@ -3882,34 +4757,6 @@ export class DomainExpertService {
         scale,
       };
     }
-    // One identity per source, the original file's sha256. A source the registry
-    // records as held in this corpus, whole or as parts of any split (including
-    // one registered with domain_source add), is reported present before anything
-    // is uploaded or imported again.
-    const holding = await this.annasSourceHolding(manifest, params, corpusId, context);
-    if (holding.kind === 'present') return { status: 'imported', ...corpusTarget, source_sha256: context.sha256, ...holding.result };
-    if (holding.kind === 'conflict') {
-      return {
-        status: 'blocked',
-        ...corpusTarget,
-        error: {
-          code: 'source_identity_conflict',
-          message: `The source registry records this file (sha256 ${context.sha256.slice(0, 12)}) as ${holding.source_id}, held in corpus ${holding.corpus}. A source keeps one holding, so nothing was uploaded or imported into ${corpusId}; the download is still on disk at ${sourcePath}.`,
-          suggestion: `Import into ${holding.corpus}, where the source already is, or remove the source with domain_source remove first.`,
-        },
-      };
-    }
-    if (holding.kind === 'unknown') {
-      return {
-        status: 'blocked',
-        ...corpusTarget,
-        error: {
-          code: 'source_holding_unverified',
-          message: `The source registry records this file (sha256 ${context.sha256.slice(0, 12)}) as ${holding.source_id}, and whether that copy is in the corpus could not be read (${holding.reason}). Importing it now could put the source in twice, so nothing was uploaded or imported; the download is still on disk at ${sourcePath}.`,
-          suggestion: 'Re-run annas_archive_import with ingest: true once the corpus answers; a copy already in the corpus is then reported as present.',
-        },
-      };
-    }
     // Vertex RAG parses PDF, text, Markdown and HTML. On 2026-09-20 sixteen
     // EPUB/DJVU/MOBI uploads each completed with importedRagFilesCount=0 and
     // no error, and every one was reported as import_requested. Ebooks are
@@ -3921,27 +4768,21 @@ export class DomainExpertService {
     }
     const conversion = artifact.conversion ? { conversion: artifact.conversion } : {};
     if (artifact.format === 'pdf') {
-      const route = await this.routeAnnasPdf(manifest, params, locator, corpusId, artifact.bytes, scale, sourcePath, holding);
+      const route = await this.routePdf(source, artifact.bytes, scale, holding);
       if ('refusal' in route) return { status: 'blocked', ...corpusTarget, error: route.refusal, source_path: sourcePath, ...(route.split ? { split: route.split } : {}) };
-      if ('plan' in route) {
-        return this.ingestSplitAnnasPdf({
-          manifest, params, locator, corpusId, corpusTarget, context, sourcePath,
-          bytes: artifact.bytes, qpdf: route.qpdf, pages: route.pages, plan: route.plan,
-          recorded: route.recorded,
-        });
-      }
+      if ('plan' in route) return this.ingestSplitPdf(source, { ...route, bytes: artifact.bytes });
     }
     try {
       const { stem, priorStems } = await this.annasObjectStems(manifest, params, locator, artifact.format);
-      const gcsUri = await this.uploadApprovedImportToGcs(manifest, stem, artifact.format, artifact.bytes, priorStems);
+      const gcsUri = await this.uploadApprovedImportToGcs(manifest, this.annasImportDirectory(manifest), stem, artifact.format, artifact.bytes, priorStems);
       // One budget for the whole ingest: waiting out a busy corpus and waiting
       // for the operation both draw from it, so a tool call has one bound.
       const deadline = Date.now() + this.annasImportPollTimeoutMs;
-      const submission = await this.submitAnnasImportWithBackoff(manifest, corpusId, gcsUri, deadline);
+      const submission = await this.submitImportWithBackoff(manifest, corpusId, gcsUri, deadline);
       if ('blocked' in submission) {
         return { status: 'blocked', ...corpusTarget, gcs_uri: gcsUri, ...conversion, error: submission.blocked };
       }
-      const outcome = await this.annasSkippedImportAsPresent(
+      const outcome = await this.skippedImportAsPresent(
         manifest,
         corpusId,
         submission.result,
@@ -3976,17 +4817,15 @@ export class DomainExpertService {
   // (a transient read never downgrades a known import). Partial: a recorded
   // split with parts still to import. Unknown: a recorded copy whose corpus
   // state cannot be read and that the registry does not know as imported.
-  private async annasSourceHolding(
-    manifest: ReturnType<typeof domainManifest>,
-    params: AnnasArchiveImportParams,
-    corpusId: string,
-    context: AnnasIngestContext,
-  ): Promise<AnnasSourceHolding> {
-    const md5 = annasFastDownloadMd5(params);
-    const found = await this.registeredSourceForIdentity(manifest, context.sha256, md5 ? `annas:${md5}` : undefined);
+  // reconcile: write the outcome of a finished import the registry still records as
+  // requested (a dry run reads it without writing).
+  private async sourceHolding(source: SourceImport, options: { reconcile?: boolean } = {}): Promise<SourceHolding> {
+    const { manifest, corpusId, context } = source;
+    const found = await this.registeredSourceForIdentity(manifest, context.sha256, source.legacyLocator);
     if (!found) return { kind: 'none' };
-    context.sourceId = found.sourceId;
-    const holding = recordedSourceHolding(found.holding);
+    // A batch record that lists this file among others identifies it, but is not its source record.
+    if (!found.viaBatchEntry) context.sourceId = found.sourceId;
+    const holding = recordedSourceHolding(found.holding, context.sha256);
     if (!holding) return { kind: 'none' };
     const uris = holding.whole ? [holding.whole.gcs_uri] : holding.parts.map((part) => part.gcs_uri);
     let listed: Array<Record<string, unknown>> | undefined;
@@ -3994,13 +4833,14 @@ export class DomainExpertService {
     try {
       listed = await this.ragFilesForImportedUris(manifest, await this.resolveRagCorpus(manifest, corpusId), uris);
     } catch (error) {
-      listingError = annasIngestErrorRecord(error).code;
+      listingError = ingestErrorRecord(error).code;
     }
     const verification = listed ? 'corpus' : 'registry';
     const unverified = {
       ...(listingError ? { corpus_check_error: listingError } : {}),
-      // Registered from a split's parts: the sha256 is the operator's, not measured.
-      ...(found.holding?.sha256_verified === false ? { identity_verified: false } : {}),
+      // Any record of these objects without proof of the sha256 (a hand split, an object
+      // that changed during its import) leaves the identity unverified.
+      ...(found.unverified ? { identity_verified: false } : {}),
     };
     // A source keeps one holding: one recorded in another corpus is not imported again here.
     const recordedCorpus = stringRecordField(found.holding ?? {}, 'target_corpus_id');
@@ -4019,8 +4859,16 @@ export class DomainExpertService {
         };
       }
       if (!listed) return { kind: 'unknown', source_id: found.sourceId, reason: listingError ?? 'rag_file_listing_failed' };
-      // The recorded copy is not in the corpus: the source is imported as usual.
-      return { kind: 'none' };
+      // Recorded imported before the listing ever showed its ragFile: the listing lags imports, so
+      // the copy may be there. One whose ragFile was listed and is gone now was deleted.
+      if (typeof file?.state !== 'string' && holding.whole.status === 'imported' && !holding.whole.rag_file_name) {
+        return { kind: 'unknown', source_id: found.sourceId, reason: 'its import is recorded but the corpus does not list its ragFile yet' };
+      }
+      // An import recorded as requested may still be running. A retry under another batch
+      // stages another URI, so Vertex would not skip it: the operation decides.
+      const pending = await this.pendingImportHolding(manifest, corpusId, found, holding.whole.gcs_uri, file, options.reconcile !== false);
+      // Otherwise the recorded copy is not in the corpus: the source is imported as usual.
+      return pending ?? { kind: 'none' };
     }
     const parts = holding.parts.map((part, position) => {
       const file = listed?.[position];
@@ -4047,7 +4895,108 @@ export class DomainExpertService {
         },
       };
     }
+    // A missing part whose recorded import may still be running is asked about first: a retry
+    // under another batch cuts parts under new URIs, so resuming now could import its range twice.
+    // A part whose ragFile is listed in ERROR failed, whatever its operation reports: it is resumed.
+    const pendingNames = [...new Set(parts.filter((part, position) => !part.present && part.status === 'import_requested' && listed?.[position]?.state !== 'ERROR')
+      .map((part) => part.rag_operation_name).filter((name): name is string => name !== undefined))];
+    if (pendingNames.length) {
+      let outcomes: Array<ReturnType<typeof classifyRagImportOperation>>;
+      try {
+        const resolved = await this.resolveRagCorpus(manifest, corpusId);
+        const scope = { project: manifest.gcp_project, location: manifest.rag_location, corpusName: resolved.resourceName };
+        outcomes = await Promise.all(pendingNames.map(async (name) => classifyRagImportOperation(await this.google.getRagImportOperation(scope, name), name, 'pdf')));
+      } catch (error) {
+        return { kind: 'unknown', source_id: found.sourceId, reason: `a part's import operation is unreadable (${ingestErrorRecord(error).code})` };
+      }
+      if (outcomes.some((outcome) => outcome === undefined)) return { kind: 'in_progress', source_id: found.sourceId, operations: pendingNames };
+      if (outcomes.some((outcome) => mayHaveImported(outcome!.status))) {
+        return { kind: 'unknown', source_id: found.sourceId, reason: "a part's import finished but its ragFile is not listed yet" };
+      }
+    }
     return { kind: 'partial', source_id: found.sourceId, parts, ...(listingError ? { listing_error: listingError } : {}) };
+  }
+
+  // How long an operation waits for a source's lock: its response budget, or as long as it takes without one.
+  private sourceLockDeadline(): number | undefined {
+    return this.annasResponseBudgetMs > 0 ? Date.now() + this.annasResponseBudgetMs : undefined;
+  }
+
+  // A whole holding whose latest record says import_requested, with no ACTIVE ragFile yet:
+  // each recorded operation is read once. One still running makes the holding in progress;
+  // when all are done and the file did not import, the failure is recorded now and the
+  // source can be imported again (undefined); an operation that cannot be read, or one that
+  // imported a file not yet listed, leaves it unknown.
+  private async pendingImportHolding(
+    manifest: ReturnType<typeof domainManifest>,
+    corpusId: string,
+    found: NonNullable<ReturnType<typeof sourceForIdentity>>,
+    gcsUri: string,
+    file: Record<string, unknown> | undefined,
+    reconcile: boolean,
+  ): Promise<SourceHolding | undefined> {
+    const record = found.holding;
+    if (!record || record.ingest_status !== 'import_requested') return undefined;
+    // Only an operation whose request named this object can be importing it. A record that
+    // lists each operation's URIs says which; an object none of them named (a request never
+    // submitted) is not being imported. An older record names its operations alone.
+    const listed = Array.isArray(record.rag_operations)
+      ? record.rag_operations.map((operation) => asOptionalRecord(operation)).filter((operation): operation is Record<string, unknown> => operation !== undefined)
+      : undefined;
+    const names = listed
+      ? listed.filter((operation) => Array.isArray(operation.uris) && operation.uris.includes(gcsUri)).map((operation) => operation.name).filter((name): name is string => typeof name === 'string')
+      : [...new Set([...(Array.isArray(record.rag_operation_names) ? record.rag_operation_names : []), record.rag_operation_name]
+        .filter((name): name is string => typeof name === 'string'))];
+    if (!names.length) return undefined;
+    const outcomes: Array<ReturnType<typeof classifyRagImportOperation>> = [];
+    try {
+      const resolved = await this.resolveRagCorpus(manifest, corpusId);
+      const scope = { project: manifest.gcp_project, location: manifest.rag_location, corpusName: resolved.resourceName };
+      for (const name of names) outcomes.push(classifyRagImportOperation(await this.google.getRagImportOperation(scope, name), name, 'pdf'));
+    } catch (error) {
+      return { kind: 'unknown', source_id: found.sourceId, reason: `import operation unreadable (${ingestErrorRecord(error).code})` };
+    }
+    if (outcomes.some((outcome) => outcome === undefined)) return { kind: 'in_progress', source_id: found.sourceId, operations: names };
+    // Only this file's ERROR, or operations that imported nothing, prove it failed: a partly
+    // imported request may hold it in a ragFile the listing does not show yet.
+    const failed = file?.state === 'ERROR' || outcomes.every((outcome) => !mayHaveImported(outcome!.status));
+    if (!failed) return { kind: 'unknown', source_id: found.sourceId, reason: 'its import finished but its ragFile is not listed yet' };
+    // The record's outcome is written only when these were all its operations: another one
+    // may still be importing other files the record lists.
+    const allOperations = !listed || listed.every((operation) => typeof operation.name === 'string' && names.includes(operation.name));
+    if (reconcile && allOperations) {
+      const reason = outcomes.map((outcome) => ragImportReason(outcome!.detail)).join('; ');
+      try {
+        const root = this.roots.get(manifest.workspace_root_id);
+        if (root) {
+          const registryPath = resolveInside(await checkedRootPath(root), `${manifest.workspace_relative_path}/references/source-registry.jsonl`);
+          await this.appendRegistryJsonLine(registryPath, {
+            ...Object.fromEntries(Object.entries(record).filter(([key]) => key !== 'verification' && key !== 'ingest_reason' && key !== 'registered_at')),
+            ingest_status: 'import_failed',
+            ingest_reason: `Reconciled from the recorded operation: ${reason}`,
+            registered_at: new Date().toISOString(),
+          });
+        }
+      } catch {
+        // The outcome is still known; the next check records it.
+      }
+    }
+    return undefined;
+  }
+
+  // The answer when another operation holds this file's lock past the response budget:
+  // in progress, pointing at the source that operation records.
+  private async sourceImportBusy(manifest: ReturnType<typeof domainManifest>, sha256: string, heldBy: string): Promise<Record<string, unknown>> {
+    const found = await this.registeredSourceForIdentity(manifest, sha256, undefined);
+    return {
+      status: 'import_in_progress',
+      ...(found ? { source_id: found.sourceId } : {}),
+      error: {
+        code: 'source_import_in_progress',
+        message: `Another operation on this file (${heldBy}) is still running${found ? ` and records it as ${found.sourceId}` : ''}. Nothing was imported here.`,
+        suggestion: 'Check domain_source status for this source once that operation settles; do not import it again meanwhile.',
+      },
+    };
   }
 
   // The domain's registry record for a source identity: the latest source
@@ -4071,17 +5020,19 @@ export class DomainExpertService {
     manifest: ReturnType<typeof domainManifest>,
     sha256: string,
     legacyLocator: string | undefined,
-  ): Promise<{ sourceId: string; current: Record<string, unknown>; holding: Record<string, unknown> | undefined } | undefined> {
+  ): Promise<ReturnType<typeof sourceForIdentity>> {
+    return sourceForIdentity(await this.domainRegistryRecords(manifest), sha256, legacyLocator);
+  }
+
+  // The domain's registry records; a missing or unreadable registry has none.
+  private async domainRegistryRecords(manifest: ReturnType<typeof domainManifest>): Promise<DomainSourceRegistryRecord[]> {
     const root = this.roots.get(manifest.workspace_root_id);
-    if (!root) return undefined;
-    let records: DomainSourceRegistryRecord[];
+    if (!root) return [];
     try {
-      const registryPath = resolveInside(await checkedRootPath(root), `${manifest.workspace_relative_path}/references/source-registry.jsonl`);
-      ({ records } = await readDomainSourceRegistry(registryPath));
+      return (await readDomainSourceRegistry(resolveInside(await checkedRootPath(root), `${manifest.workspace_relative_path}/references/source-registry.jsonl`))).records;
     } catch {
-      return undefined;
+      return [];
     }
-    return sourceForIdentity(records, sha256, legacyLocator);
   }
 
   // How a PDF enters the corpus while imports use the LLM parser, which takes
@@ -4090,20 +5041,20 @@ export class DomainExpertService {
   // longer and the worker cannot split it. A recorded partial split is resumed
   // on its own page ranges whatever the parser or split size is now, so a
   // source never gains a second holding.
-  private async routeAnnasPdf(
-    manifest: ReturnType<typeof domainManifest>,
-    params: AnnasArchiveImportParams,
-    locator: string,
-    corpusId: string,
+  private async routePdf(
+    source: SourceImport,
     bytes: Uint8Array,
-    scale: AnnasArtifactScale,
-    sourcePath: string,
-    holding: AnnasSourceHolding,
+    // The byte scan's signals (measurePdfArtifactScale): the larger and the corroborated count.
+    scale: { pages?: number; corroborated_pages?: number },
+    holding: SourceHolding,
   ): Promise<
     | { whole: true }
-    | { pages: number; plan: PdfPartPlan[]; qpdf: string; recorded: AnnasRecordedPart[] }
+    | { pages: number; plan: PdfPartPlan[]; qpdf: string; recorded: RecordedPart[] }
     | { refusal: { code: string; message: string; suggestion: string }; split?: Record<string, unknown> }
   > {
+    // The default parser has no page limit: a new PDF goes in whole, uncounted. Only a recorded
+    // partial split is still resumed by its parts.
+    if (this.google.ragParserModel() === undefined && holding.kind !== 'partial') return { whole: true };
     const limit = this.annasPdfSplitPages;
     const disabled = 'splitting is disabled (EXPERT_AGENTS_DOMAIN_EXPERT_ANNAS_PDF_SPLIT_PAGES=0)';
     const qpdf = Bun.which(this.annasQpdfBin) ?? undefined;
@@ -4130,7 +5081,7 @@ export class DomainExpertService {
         return {
           refusal: {
             code: 'source_parts_resume_unavailable',
-            message: `The source registry records ${holding.parts.filter((part) => part.present).length} of ${holding.parts.length} parts of this file (${holding.source_id}) in the corpus, and the remaining parts cannot be cut: ${why}. Nothing was uploaded or imported; the download is still on disk at ${sourcePath}.`,
+            message: `The source registry records ${holding.parts.filter((part) => part.present).length} of ${holding.parts.length} parts of this file (${holding.source_id}) in the corpus, and the remaining parts cannot be cut: ${why}. Nothing was uploaded or imported; ${source.kept}.`,
             suggestion: 'Install qpdf on the worker host (and enable splitting) and re-run. If the recorded parts are wrong, remove the source with domain_source remove and import it again.',
           },
         };
@@ -4139,25 +5090,34 @@ export class DomainExpertService {
     }
     if (this.google.ragParserModel() === undefined) return { whole: true };
     if (pages === undefined || !qpdf) {
-      // Without qpdf's count only pages both byte-scan signals report may refuse.
-      const measured = scale.corroborated_pages;
-      if (measured !== undefined && measured > limit) {
-        return { refusal: pdfPageLimitRefusal(measured, limit, qpdf ? String(unreadable) : `${this.annasQpdfBin} (qpdf) is not installed on the worker host`, sourcePath) };
-      }
-      return { whole: true };
+      const why = qpdf ? String(unreadable) : `${this.annasQpdfBin} (qpdf) is not installed on the worker host`;
+      // Without qpdf's count, only pages both byte-scan signals report may refuse a PDF as too
+      // long or admit one an over-counting signal makes look long; zero corroborates nothing. A
+      // PDF whose one signal stays within the limit is short. Any other fails closed below.
+      const corroborated = scale.corroborated_pages || undefined;
+      if (corroborated !== undefined && corroborated > limit) return { refusal: pdfPageLimitRefusal(corroborated, limit, why, source.kept) };
+      if (corroborated !== undefined || (scale.pages !== undefined && scale.pages > 0 && scale.pages <= limit)) return { whole: true };
+      // A count nothing can establish fails closed: the LLM parser fails a PDF over its limit.
+      return {
+        refusal: {
+          code: 'pdf_page_count_unavailable',
+          message: `The PDF's pages could not be counted (${why}), and imports with the LLM parser take at most ${limit} pages per PDF on this deployment. Nothing was uploaded or imported; ${source.kept}.`,
+          suggestion: 'Install qpdf on the worker host so the PDF is counted and split if long, or acquire an EPUB edition of the same work; a deployment set to the default parser (EXPERT_AGENTS_DOMAIN_EXPERT_RAG_PARSER_MODEL=default) imports PDFs whole without a page limit.',
+        },
+      };
     }
     if (pages <= limit) return { whole: true };
-    if (this.annasPdfSplitDisabled) return { refusal: pdfPageLimitRefusal(pages, limit, disabled, sourcePath) };
+    if (this.annasPdfSplitDisabled) return { refusal: pdfPageLimitRefusal(pages, limit, disabled, source.kept) };
     // A long book imported whole before the registry carried its identity stays
     // whole: the parts would put it in the corpus a second time.
-    const whole = await this.wholeAnnasPdfInCorpus(manifest, params, locator, corpusId, bytes);
+    const whole = source.wholeCopyInCorpus ? await source.wholeCopyInCorpus(bytes) : 'absent';
     if (whole === 'present') return { whole: true };
     if (whole !== 'absent') {
       return {
         refusal: {
           code: 'annas_pdf_whole_copy_unverified',
-          message: `This ${pages}-page PDF is already uploaded whole, and whether that copy is in the corpus could not be read (${whole.unknown}). Splitting it now could import the book twice, so nothing was split or imported; the download is still on disk at ${sourcePath}.`,
-          suggestion: 'Re-run annas_archive_import with ingest: true once the corpus answers; a whole copy already in the corpus is then reported as present, and otherwise the PDF is split.',
+          message: `This ${pages}-page PDF is already uploaded whole, and whether that copy is in the corpus could not be read (${whole.unknown}). Splitting it now could import the book twice, so nothing was split or imported; ${source.kept}.`,
+          suggestion: `${source.rerun} once the corpus answers; a whole copy already in the corpus is then reported as present, and otherwise the PDF is split.`,
         },
         split: { pages, max_part_pages: limit },
       };
@@ -4196,7 +5156,7 @@ export class DomainExpertService {
         if (existing && gcsObjectHoldsBytes(existing, bytes)) found.push(`gs://${bucket}/${objectName}`);
       } catch (error) {
         // An unreadable name could hold the whole copy; unknown, like a failed listing.
-        return { unknown: annasIngestErrorRecord(error).code };
+        return { unknown: ingestErrorRecord(error).code };
       }
     }
     if (!found.length) return 'absent';
@@ -4205,7 +5165,7 @@ export class DomainExpertService {
       const files = await this.ragFilesForImportedUris(manifest, resolved, found);
       return files.some((file) => file.state === 'ACTIVE') ? 'present' : 'absent';
     } catch (error) {
-      return { unknown: annasIngestErrorRecord(error).code };
+      return { unknown: ingestErrorRecord(error).code };
     }
   }
 
@@ -4217,21 +5177,15 @@ export class DomainExpertService {
   // Progress is written to the source registry after the uploads and after
   // every part, so a restart or re-run resumes only the unfinished parts.
   // Imported parts then get a coverage check.
-  private async ingestSplitAnnasPdf(input: {
-    manifest: ReturnType<typeof domainManifest>;
-    params: AnnasArchiveImportParams;
-    locator: string;
-    corpusId: string;
-    corpusTarget: Record<string, unknown>;
-    context: AnnasIngestContext;
-    sourcePath: string;
+  private async ingestSplitPdf(source: SourceImport, input: {
     bytes: Uint8Array;
     qpdf: string;
     pages: number;
     plan: PdfPartPlan[];
-    recorded: AnnasRecordedPart[];
+    recorded: RecordedPart[];
   }): Promise<Record<string, unknown>> {
-    const { manifest, params, locator, corpusId, corpusTarget, context, pages, plan } = input;
+    const { manifest, corpusId, corpusTarget, context } = source;
+    const { pages, plan } = input;
     const split = { pages, max_part_pages: this.annasPdfSplitPages, parts: plan.length };
     let parts: PdfPart[];
     try {
@@ -4241,27 +5195,25 @@ export class DomainExpertService {
         status: 'blocked',
         ...corpusTarget,
         error: {
-          code: 'annas_pdf_split_failed',
-          message: `The ${pages}-page PDF is above the ${this.annasPdfSplitPages}-page split size for LLM-parser imports, and splitting it failed: ${error instanceof Error ? error.message : String(error)} Nothing was uploaded or imported; the download is still on disk at ${input.sourcePath}.`,
+          code: 'pdf_split_failed',
+          message: `The ${pages}-page PDF is above the ${this.annasPdfSplitPages}-page split size for LLM-parser imports, and splitting it failed: ${error instanceof Error ? error.message : String(error)} Nothing was uploaded or imported; ${source.kept}.`,
           suggestion: 'Acquire an EPUB edition of the same work, or a PDF split into volumes; annas_archive_search with ingest_intent: true ranks EPUB first.',
         },
         split,
       };
     }
-    let stems: { stem: string; priorStems: string[] };
-    let directoryUri: string;
+    let stems: { bucket: string; directory: string; stem: string; priorStems: string[] };
     try {
-      stems = await this.annasObjectStems(manifest, params, input.locator, 'pdf');
-      const { bucket, directory } = this.annasImportDirectory(manifest);
-      directoryUri = `gs://${bucket}/${directory}`;
+      stems = await source.partNames();
     } catch (error) {
-      return { status: 'blocked', ...corpusTarget, error: annasIngestErrorRecord(error) };
+      return { status: 'blocked', ...corpusTarget, error: ingestErrorRecord(error) };
     }
-    const results: AnnasSplitPartResult[] = parts.map((part) => {
+    const directoryUri = `gs://${stems.bucket}/${stems.directory}`;
+    const results: SplitPartResult[] = parts.map((part) => {
       const recorded = input.recorded.find((candidate) => candidate.first_page === part.firstPage && candidate.last_page === part.lastPage);
-      if (!recorded?.present) return { ...annasSplitPartBase(part), source_sha256: context.sha256, status: 'not_attempted' };
+      if (!recorded?.present) return { ...splitPartBase(part), source_sha256: context.sha256, status: 'not_attempted' };
       return {
-        ...annasSplitPartBase(part),
+        ...splitPartBase(part),
         source_sha256: context.sha256,
         gcs_uri: recorded.gcs_uri,
         status: 'imported',
@@ -4279,7 +5231,7 @@ export class DomainExpertService {
     });
     const recordProgress = async () => {
       context.snapshot = snapshot('import_requested');
-      await this.registerAnnasIngest(manifest, params, locator, 'pdf', context, context.snapshot, { progress: true });
+      await source.recordProgress(context.snapshot);
     };
     // Every missing part is uploaded before the first import, as the manual
     // workaround did, so each part has its object and name even when a later
@@ -4297,7 +5249,7 @@ export class DomainExpertService {
           ...(recordedStem && !recordedStem.includes('/') ? [recordedStem] : []),
           ...stems.priorStems.map((prior) => pdfPartStem(stripPdfPartSuffix(prior), part)),
         ];
-        result.gcs_uri = await this.uploadApprovedImportToGcs(manifest, pdfPartStem(stems.stem, part), 'pdf', part.bytes, priorStems);
+        result.gcs_uri = await this.uploadApprovedImportToGcs(manifest, stems, pdfPartStem(stems.stem, part), 'pdf', part.bytes, priorStems);
         result.status = 'uploaded';
       }
     } catch (error) {
@@ -4307,7 +5259,7 @@ export class DomainExpertService {
         status: 'blocked',
         ...corpusTarget,
         split: { ...split, imported_parts: results.filter((result) => result.status === 'imported').length },
-        error: { ...annasIngestErrorRecord(error), message: `Uploading part ${pending[uploaded]!.part} of ${parts.length} failed: ${annasIngestErrorRecord(error).message} Nothing more was imported.` },
+        error: { ...ingestErrorRecord(error), message: `Uploading part ${pending[uploaded]!.part} of ${parts.length} failed: ${ingestErrorRecord(error).message} Nothing more was imported.` },
       };
     }
     await recordProgress();
@@ -4322,7 +5274,7 @@ export class DomainExpertService {
         // Each part has the whole ingest budget; the response budget, not this,
         // bounds how long the tool call waits (annasIngestWithinResponseBudget).
         const deadline = Date.now() + this.annasImportPollTimeoutMs;
-        const submission = await this.submitAnnasImportWithBackoff(manifest, corpusId, gcsUri, deadline);
+        const submission = await this.submitImportWithBackoff(manifest, corpusId, gcsUri, deadline);
         if ('blocked' in submission) {
           Object.assign(result, { status: 'blocked', error: submission.blocked });
           stopped = `Part ${result.part} of ${result.of} was blocked (${submission.blocked.code}), so later parts were not submitted.`;
@@ -4333,7 +5285,7 @@ export class DomainExpertService {
         const operationName = asOptionalRecord(submission.result.submission_receipt)?.operation_name;
         Object.assign(result, { status: 'import_requested', ...(typeof operationName === 'string' ? { import_outcome: { operation_name: operationName } } : {}) });
         await recordProgress();
-        const outcome = await this.annasSkippedImportAsPresent(
+        const outcome = await this.skippedImportAsPresent(
           manifest,
           corpusId,
           submission.result,
@@ -4346,24 +5298,24 @@ export class DomainExpertService {
           ...(submission.retries ? { submission_retries: submission.retries } : {}),
         });
       } catch (error) {
-        Object.assign(result, { status: 'blocked', error: annasIngestErrorRecord(error) });
+        Object.assign(result, { status: 'blocked', error: ingestErrorRecord(error) });
         stopped = `Part ${result.part} of ${result.of} was blocked, so later parts were not submitted.`;
       }
       await recordProgress();
     }
     await this.checkSplitPartCoverage(manifest, corpusId, parts, results);
-    const status = annasSplitStatus(results);
+    const status = splitStatus(results);
     const imported = results.filter((result) => result.status === 'imported').length;
     const incomplete = results.filter((result) => result.status !== 'imported');
     return {
       ...snapshot(status),
-      split: { ...split, imported_parts: imported, coverage: annasSplitCoverageSummary(results) },
+      split: { ...split, imported_parts: imported, coverage: splitCoverageSummary(results) },
       ...(incomplete.length
         ? {
             error: {
-              code: 'annas_pdf_split_import_incomplete',
-              message: `${imported} of ${parts.length} parts of the ${pages}-page PDF imported. ${incomplete.map(describeAnnasSplitPart).join(' ')}`,
-              suggestion: 'Re-run annas_archive_import with ingest: true for the same record once the cause is cleared; parts already in the corpus are kept, a failed part\'s ragFile is removed, and only the parts not yet imported are imported again. Report the failing parts with their page ranges; do not substitute another copy without telling the owner.',
+              code: 'pdf_split_import_incomplete',
+              message: `${imported} of ${parts.length} parts of the ${pages}-page PDF imported. ${incomplete.map(describeSplitPart).join(' ')}`,
+              suggestion: `${source.rerun} once the cause is cleared; parts already in the corpus are kept, a failed part's ragFile is removed, and only the parts not yet imported are imported again. Report the failing parts with their page ranges; do not substitute another copy without telling the owner.`,
             },
           }
         : {}),
@@ -4380,7 +5332,7 @@ export class DomainExpertService {
     manifest: ReturnType<typeof domainManifest>,
     corpusId: string,
     parts: PdfPart[],
-    results: AnnasSplitPartResult[],
+    results: SplitPartResult[],
   ): Promise<void> {
     const imported = results.filter((result) => result.status === 'imported' && result.gcs_uri);
     if (!imported.length) return;
@@ -4408,7 +5360,7 @@ export class DomainExpertService {
           textError = 'pdf_text_extraction_failed';
         }
       }
-      result.coverage = annasSplitPartCoverage(part, file, listingError, text, textError);
+      result.coverage = splitPartCoverage(part, file, listingError, text, textError);
     }
   }
 
@@ -4437,7 +5389,7 @@ export class DomainExpertService {
   // answers skippedRagFilesCount=1. On 2026-10-07 an agent read three such skips
   // of a book already in its corpus as failed ingests. When the object's
   // ragFile is ACTIVE the book is in the library, so it is reported imported.
-  private async annasSkippedImportAsPresent(
+  private async skippedImportAsPresent(
     manifest: ReturnType<typeof domainManifest>,
     corpusId: string,
     importResult: Record<string, unknown>,
@@ -4548,7 +5500,7 @@ export class DomainExpertService {
   // requests: FAILED_PRECONDITION "other operations running" and 429 both mean
   // "not now", not "never". Retry with backoff inside the ingest budget instead
   // of surfacing them as a blocked ingest on the first answer.
-  private async submitAnnasImportWithBackoff(
+  private async submitImportWithBackoff(
     manifest: ReturnType<typeof domainManifest>,
     corpusId: string,
     gcsUri: string,
@@ -4558,10 +5510,10 @@ export class DomainExpertService {
     let delay = this.annasImportPollIntervalMs;
     for (;;) {
       try {
-        const result = await this.ragCorpus({ action: 'import', domainId: manifest.domain_id, corpusId, gcsUri, dryRun: false });
+        const result = await this.ragCorpus({ action: 'import', domainId: manifest.domain_id, corpusId, gcsUri, dryRun: false }, { wholeObject: true });
         return { result: asOptionalRecord(result) ?? {}, retries };
       } catch (error) {
-        const transient = annasImportTransientReason(error);
+        const transient = importTransientReason(error);
         if (!transient) throw error;
         if (Date.now() + delay > deadline) {
           return {
@@ -4721,8 +5673,15 @@ export class DomainExpertService {
   // under any of them are reused, so a re-acquisition never imports a book
   // twice (2026-10-07: a retry with a different year duplicated Syme). Nothing
   // new is ever written under a prior name.
-  private async uploadApprovedImportToGcs(manifest: ReturnType<typeof domainManifest>, stem: string, format: string, bytes: Uint8Array, priorStems: string[] = []): Promise<string> {
-    const { bucket, directory } = this.annasImportDirectory(manifest);
+  private async uploadApprovedImportToGcs(
+    manifest: ReturnType<typeof domainManifest>,
+    location: { bucket: string; directory: string },
+    stem: string,
+    format: string,
+    bytes: Uint8Array,
+    priorStems: string[] = [],
+  ): Promise<string> {
+    const { bucket, directory } = location;
     const base = `${directory}${stem}`;
     for (const prior of new Set(priorStems.filter((candidate) => candidate && candidate !== stem))) {
       const priorName = `${directory}${prior}.${format}`;
@@ -5390,16 +6349,39 @@ export class DomainExpertService {
     scale: AnnasArtifactScale,
     sourcePath: string,
   ): Promise<{ ragIngest: Record<string, unknown>; registry: Record<string, unknown> }> {
-    const context: AnnasIngestContext = { sha256 };
+    const context: SourceImportContext = { sha256 };
+    // The source's lock is held until this ingest's outcome is recorded (see SourceIdentityLocks).
+    const lock = await this.sourceLocks.acquire(sourceLockKey(manifest, sha256), `annas_archive_import of ${locator}`, this.sourceLockDeadline());
+    if ('heldBy' in lock) {
+      const busy = await this.sourceImportBusy(manifest, sha256, lock.heldBy);
+      return {
+        ragIngest: { ...busy, ...(params.corpusId ? { target_corpus_id: params.corpusId } : {}) },
+        registry: { status: 'not_recorded', reason: 'Another operation on this file holds it and records its outcome.' },
+      };
+    }
     // An unexpected throw still ends the run with a record, like any other outcome.
     const work = this.tryAnnasRagIngest(manifest, params, locator, format, bytes, scale, sourcePath, context)
-      .catch((error: unknown): Record<string, unknown> => ({ status: 'blocked', error: annasIngestErrorRecord(error) }));
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const pending = this.annasResponseBudgetMs > 0
-      ? new Promise<undefined>((resolveBudget) => { timer = setTimeout(() => resolveBudget(undefined), this.annasResponseBudgetMs); })
-      : undefined;
-    const settled = pending ? await Promise.race([work, pending]) : await work;
-    if (timer) clearTimeout(timer);
+      .catch((error: unknown): Record<string, unknown> => ({ status: 'blocked', error: ingestErrorRecord(error) }));
+    let handedOff = false;
+    try {
+      return await this.answerAnnasIngest(manifest, params, locator, format, context, sourcePath, work, () => { handedOff = true; return lock.release; });
+    } finally {
+      if (!handedOff) lock.release();
+    }
+  }
+
+  private async answerAnnasIngest(
+    manifest: ReturnType<typeof domainManifest>,
+    params: AnnasArchiveImportParams,
+    locator: string,
+    format: string,
+    context: SourceImportContext,
+    sourcePath: string,
+    work: Promise<Record<string, unknown>>,
+    // Hands the lock to the background work, which releases it once the outcome is recorded.
+    handOff: () => () => void,
+  ): Promise<{ ragIngest: Record<string, unknown>; registry: Record<string, unknown> }> {
+    const settled = await this.raceResponseBudget(work);
     if (settled) {
       return { ragIngest: settled, registry: await this.registerAnnasIngest(manifest, params, locator, format, context, settled) };
     }
@@ -5411,6 +6393,7 @@ export class DomainExpertService {
     };
     // A split already running has written its parts; the in-progress record keeps them.
     const registry = await this.registerAnnasIngest(manifest, params, locator, format, context, context.snapshot ?? ragIngest, { inProgress: true });
+    const release = handOff();
     void work
       .then(async (outcome) => {
         await this.registerAnnasIngest(manifest, params, locator, format, context, outcome, { recordOutcome: true });
@@ -5433,38 +6416,74 @@ export class DomainExpertService {
           domain_id: manifest.domain_id,
           code: error instanceof DomainExpertWorkerError ? error.code : 'error',
         }));
-      });
+      })
+      .finally(release);
     return { ragIngest, registry };
   }
 
   // Every source that reaches the corpus is tracked and titled (owner ruling
   // 2026-09-20): an acquisition that Vertex counted writes the same
-  // source-registry record the skill's manual registration would. The record
-  // is the source's: the one holding its sha256 (the original file's, which a
-  // record registered with domain_source add carries too), else the one for
-  // the Anna's Archive locator, so a re-ingest revises the record instead of
-  // adding a second one. The registry is workspace state; a worker without a
-  // configured root reports that plainly rather than failing an ingest that
-  // already succeeded.
+  // source-registry record the skill's manual registration would, keyed by the
+  // Anna's Archive locator unless the source's sha256 already names a record.
   private async registerAnnasIngest(
     manifest: ReturnType<typeof domainManifest>,
     params: AnnasArchiveImportParams,
     locator: string,
     format: string,
-    context: AnnasIngestContext,
+    context: SourceImportContext,
     ragIngest: Record<string, unknown>,
     mode: { inProgress?: boolean; recordOutcome?: boolean; progress?: boolean } = {},
   ): Promise<Record<string, unknown>> {
+    const md5 = annasFastDownloadMd5(params);
+    const sourceLocator = `annas:${md5 ?? locator}`;
+    const title = params.title?.trim();
+    const author = params.author?.trim();
+    const year = params.year?.trim();
+    const result = await this.registerSourceImport({
+      manifest, context, ragIngest, mode,
+      logLabel: 'annas_archive_import ingest',
+      sameSource: (record) => stringRecordField(record, 'locator') === sourceLocator,
+      catalogue: {
+        source_id: `${manifest.domain_id}-annas-${safeObjectName(md5 ?? locator).slice(0, 48)}`,
+        domain_id: manifest.domain_id,
+        kind: annasSourceKind(format),
+        ...(title ? { title } : {}),
+        ...(author ? { author } : {}),
+        ...(year ? { year } : {}),
+        locator: sourceLocator,
+        ...(params.url ? { canonical_url: canonicalAnnasAuditUrl(params.url) } : {}),
+        acquisition: 'annas_archive_import',
+        trust_posture: manifest.trust_posture,
+        copyright_posture: params.copyrightPosture,
+      },
+    });
+    return result.status === 'registered' || result.status === 'updated' ? { ...result, locator: sourceLocator } : result;
+  }
+
+  // The registry record of one source import, written by every import route.
+  // The record is the source's: the one its sha256 already names (a record
+  // registered with domain_source add carries it too), else the route's own
+  // match, else a new one with the catalogue's source_id, so a re-import
+  // revises the record instead of adding a second one. Only an imported source
+  // is registered, or a split with imported parts, or one still running: the
+  // split writes its progress as it goes, and the outcome of an import that
+  // outlived the response budget is recorded when it settles, so the registry
+  // never keeps claiming an import is in flight. A worker without a configured
+  // root reports that plainly rather than failing an ingest that succeeded.
+  private async registerSourceImport(input: {
+    manifest: ReturnType<typeof domainManifest>;
+    context: SourceImportContext;
+    ragIngest: Record<string, unknown>;
+    mode: { inProgress?: boolean; recordOutcome?: boolean; progress?: boolean };
+    catalogue: Record<string, unknown> & { source_id: string };
+    sameSource?: (record: Record<string, unknown>) => boolean;
+    logLabel: string;
+  }): Promise<Record<string, unknown>> {
+    const { manifest, context, ragIngest, mode } = input;
     // The in-progress record is built from the split's progress as it stands when
     // the record is appended, so it never lands after, and older than, a progress record.
     const current = () => (mode.inProgress && context.snapshot ? context.snapshot : ragIngest);
-    // An import still running is registered as import_requested, with the
-    // parts a split has reached; the split writes its progress as it goes, and
-    // the background completion of the import records whatever it ended as,
-    // so the registry never keeps claiming an import is in flight.
-    // A split PDF with some parts imported has those parts in the corpus, so it
-    // is registered with its real status and the parts it holds.
-    const splitParts = annasSplitPartRecords(ragIngest);
+    const splitParts = splitPartRecords(ragIngest);
     const running = mode.inProgress || mode.progress;
     // A run that wrote a running record always writes its end, whatever the outcome.
     if (ragIngest.status !== 'imported' && !running && !mode.recordOutcome && !context.running && !splitParts.some((part) => part.status === 'imported')) {
@@ -5480,57 +6499,50 @@ export class DomainExpertService {
       const rootPath = await checkedRootPath(root);
       const registryRelativePath = `${manifest.workspace_relative_path}/references/source-registry.jsonl`;
       const registryPath = resolveInside(rootPath, registryRelativePath);
-      const md5 = annasFastDownloadMd5(params);
-      const sourceLocator = `annas:${md5 ?? locator}`;
       const registry = await readDomainSourceRegistry(registryPath);
-      // Identity is the sha256: the locator finds a source only when that source
-      // carries no sha256 or this one, and a different file gets a source of its own.
+      // Identity is the sha256: the route's match finds a source only when that
+      // source carries no sha256 or this one, and a different file gets a source of its own.
       const groups = groupDomainSourceRecords(registry.records);
+      const sameSource = (entries: DomainSourceRegistryRecord[]) => (input.sameSource
+        ? entries.some((entry) => input.sameSource!(entry.record))
+        : entries[0]!.sourceId === input.catalogue.source_id);
       const history = context.sourceId
         ? groups.get(context.sourceId) ?? []
-        : [...groups.values()].find((entries) => entries.some((entry) => stringRecordField(entry.record, 'locator') === sourceLocator)
-          && sameIdentityHistory(entries, context.sha256)) ?? [];
+        : [...groups.values()].find((entries) => sameSource(entries) && sameIdentityHistory(entries, context.sha256)) ?? [];
       const previous = history.length ? latestDomainSourceRecord(history) : undefined;
-      const baseId = `${manifest.domain_id}-annas-${safeObjectName(md5 ?? locator).slice(0, 48)}`;
+      // Removed (domain_source remove) after this run recorded it running: it stays removed,
+      // and this run's later records are not written. A removal before the run is re-imported as usual.
+      if (context.running && previous?.removed) {
+        return { status: 'removed', source_id: previous.sourceId, reason: 'The source was removed while this import was running; nothing more was recorded.', registry_relative_path: registryRelativePath };
+      }
+      const baseId = input.catalogue.source_id;
       const sourceId = previous?.sourceId ?? (groups.has(baseId) ? `${baseId}-${context.sha256.slice(0, 12)}` : baseId);
       // Found present again under the identity it is already registered with: nothing to revise.
       if (asOptionalRecord(ragIngest.import_outcome)?.already_present === true && ragIngest.status === 'imported' && previous && !previous.removed
         && previous.record.source_sha256 === context.sha256 && previous.record.ingest_status === 'imported') {
         return { status: 'unchanged', source_id: sourceId, registry_relative_path: registryRelativePath };
       }
-      const title = params.title?.trim();
-      const author = params.author?.trim();
-      const year = params.year?.trim();
       await mkdir(dirname(registryPath), { recursive: true });
       const latest = current();
-      const parts = annasSplitPartRecords(latest);
+      const parts = splitPartRecords(latest);
       const importOutcome = asOptionalRecord(latest.import_outcome);
       const split = asOptionalRecord(latest.split);
       const registeredAt = new Date().toISOString();
       const record: Record<string, unknown> = {
+        ...input.catalogue,
         source_id: sourceId,
-        domain_id: manifest.domain_id,
-        kind: annasSourceKind(format),
-        ...(title ? { title } : {}),
-        ...(author ? { author } : {}),
-        ...(year ? { year } : {}),
-        locator: sourceLocator,
-        ...(params.url ? { canonical_url: canonicalAnnasAuditUrl(params.url) } : {}),
-        acquisition: 'annas_archive_import',
         ...(typeof latest.target_corpus_id === 'string' ? { target_corpus_id: latest.target_corpus_id } : {}),
-        trust_posture: manifest.trust_posture,
-        copyright_posture: params.copyrightPosture,
         source_sha256: context.sha256,
         ingest_status: ingestStatus,
         ...(typeof ingestError?.code === 'string' ? { ingest_reason: ingestError.code } : {}),
         ...(typeof latest.gcs_uri === 'string' ? { gcs_uri: latest.gcs_uri } : {}),
         ...(typeof importOutcome?.operation_name === 'string' ? { rag_operation_name: importOutcome.operation_name } : {}),
-        // One record for the book; its parts are the rag_files list a batch import also writes.
+        // One record for the source; its parts are the rag_files list a batch import also writes.
         ...(parts.length
           ? {
               ...(typeof split?.pages === 'number' ? { pages: split.pages } : {}),
               split_parts: parts.length,
-              rag_files: annasSplitRegistryFiles(parts, context.sha256),
+              rag_files: splitRegistryFiles(parts, context.sha256),
             }
           : {}),
         registered_at: registeredAt,
@@ -5539,17 +6551,22 @@ export class DomainExpertService {
       // while the source still holds any of them; only parts cut here from the
       // original's bytes are proven.
       if (heldUnverified(history, registryRecordGcsUris(record))) record.sha256_verified = false;
-      await this.appendRegistryJsonLine(registryPath, record);
+      if (context.running) {
+        if (!(await this.appendRegistryJsonLineUnlessRemoved(registryPath, record))) {
+          return { status: 'removed', source_id: sourceId, reason: 'The source was removed while this import was running; nothing more was recorded.', registry_relative_path: registryRelativePath };
+        }
+      } else {
+        await this.appendRegistryJsonLine(registryPath, record);
+      }
       context.sourceId = sourceId;
       if (running) context.running = true;
       if (!mode.progress) {
         const logPath = resolveInside(rootPath, `${manifest.workspace_relative_path}/references/ingest-log.md`);
-        await appendFile(logPath, `- ${registeredAt} ${previous ? 'updated' : 'registered'} ${sourceId} (annas_archive_import ingest)\n`, 'utf8');
+        await appendFile(logPath, `- ${registeredAt} ${previous ? 'updated' : 'registered'} ${sourceId} (${input.logLabel})\n`, 'utf8');
       }
       return {
         status: previous ? 'updated' : 'registered',
         source_id: sourceId,
-        locator: sourceLocator,
         registry_relative_path: registryRelativePath,
       };
     } catch (error) {
@@ -5570,6 +6587,17 @@ export class DomainExpertService {
 
   private async appendRegistryJsonLine(path: string, record: Record<string, unknown>): Promise<void> {
     await this.withRegistryAppendLock(() => appendCompleteLine(path, JSON.stringify(record)));
+  }
+
+  // Appends a run's later record unless its source was removed meanwhile, checked and written
+  // under the append lock so a removal (whose tombstone takes the same lock) cannot fall between.
+  private async appendRegistryJsonLineUnlessRemoved(path: string, record: Record<string, unknown>): Promise<boolean> {
+    return this.withRegistryAppendLock(async () => {
+      const history = (await readDomainSourceRegistry(path)).records.filter((entry) => entry.sourceId === String(record.source_id));
+      if (history.length && latestDomainSourceRecord(history).removed) return false;
+      await appendCompleteLine(path, JSON.stringify(record));
+      return true;
+    });
   }
 
   private async withRagCorpusMappingLock<T>(operation: () => Promise<T>): Promise<T> {
@@ -6148,6 +7176,8 @@ class GoogleRuntimeClient {
     location: string;
     corpusName: string;
     gcsUri?: string;
+    // Several objects, each named: GcsSource.uris is a repeated string.
+    gcsUris?: string[];
     driveFileId?: string;
     chunkTokens: number;
     chunkOverlap: number;
@@ -6163,7 +7193,7 @@ class GoogleRuntimeClient {
     importResultGcsSink?: string;
   }): Promise<unknown> {
     requireGoogleProject(options.project);
-    if (!options.gcsUri && !options.driveFileId) {
+    if (!options.gcsUri && !options.gcsUris?.length && !options.driveFileId) {
       throw new DomainExpertWorkerError(400, 'invalid_rag_import', 'rag_corpus import requires gcs_uri or drive_file_id.');
     }
     const importRagFilesConfig: Record<string, unknown> = ragIngestionConfig({
@@ -6177,7 +7207,8 @@ class GoogleRuntimeClient {
     if (options.importResultGcsSink) {
       importRagFilesConfig.importResultGcsSink = { outputUriPrefix: options.importResultGcsSink };
     }
-    if (options.gcsUri) importRagFilesConfig.gcsSource = { uris: [options.gcsUri] };
+    if (options.gcsUris?.length) importRagFilesConfig.gcsSource = { uris: options.gcsUris };
+    else if (options.gcsUri) importRagFilesConfig.gcsSource = { uris: [options.gcsUri] };
     if (options.driveFileId) {
       importRagFilesConfig.googleDriveSource = {
         resourceIds: [{ resourceId: options.driveFileId, resourceType: 'RESOURCE_TYPE_FILE' }],
@@ -6416,6 +7447,17 @@ class GoogleRuntimeClient {
       headers: { 'Content-Type': 'application/octet-stream' },
       body: new Blob([copyToArrayBuffer(bytes)], { type: 'application/octet-stream' }),
     });
+  }
+
+  // The object's first bytes, by a ranged read; null when it does not exist.
+  async readGcsObjectHead(bucket: string, objectName: string, length: number): Promise<Uint8Array | null> {
+    const response = await this.authedFetch(
+      `https://storage.googleapis.com/storage/v1/b/${encodeURIComponent(bucket)}/o/${encodeURIComponent(objectName)}?alt=media`,
+      { headers: { Range: `bytes=0-${length - 1}` } },
+    );
+    if (response.status === 404) { await response.body?.cancel(); return null; }
+    if (!response.ok) throw googleError(response, await responseTextOrJson(response));
+    return new Uint8Array(await response.arrayBuffer()).subarray(0, length);
   }
 
   async getGcsObjectMetadata(bucket: string, objectName: string): Promise<GcsObjectMetadata | null> {
@@ -7750,10 +8792,10 @@ async function planStageImportFiles(
   targetPath: string,
   destinationBucket: string,
   destinationObjectPrefix: string,
-  options: { includeMedia?: boolean } = {},
+  options: { includeMedia?: boolean; deferBatchCap?: boolean } = {},
 ): Promise<{ eligible: StageImportEligibleFile[]; skipped: StageImportSkippedFile[]; totalBytes: number }> {
   const files = await collectStageImportFiles(rootPath, targetPath);
-  return planStageImportCandidates(files, destinationBucket, destinationObjectPrefix, options);
+  return await planStageImportCandidates(files, destinationBucket, destinationObjectPrefix, options);
 }
 
 function preflightDerivativeWrites<T extends { fileName: string; bytes: Uint8Array }>(
@@ -7777,17 +8819,19 @@ function preflightDerivativeWrites<T extends { fileName: string; bytes: Uint8Arr
   return { files: accepted, skipped };
 }
 
-function planStageImportCandidates(
+async function planStageImportCandidates(
   files: Array<{
     workspaceRelativePath: string;
     uploadRelativePath: string;
     absolutePath: string;
     bytes: number;
+    content?: Uint8Array;
   }>,
   destinationBucket: string,
   destinationObjectPrefix: string,
-  options: { includeMedia?: boolean } = {},
-): { eligible: StageImportEligibleFile[]; skipped: StageImportSkippedFile[]; totalBytes: number } {
+  // deferBatchCap: the batch cap is applied later, to the files actually staged (capStagedBatch).
+  options: { includeMedia?: boolean; deferBatchCap?: boolean } = {},
+): Promise<{ eligible: StageImportEligibleFile[]; skipped: StageImportSkippedFile[]; totalBytes: number }> {
   const eligible: StageImportEligibleFile[] = [];
   const skipped: StageImportSkippedFile[] = [];
   let totalBytes = 0;
@@ -7802,7 +8846,10 @@ function planStageImportCandidates(
       });
       continue;
     }
-    if (!allowedExtensions.has(extension)) {
+    // A PDF is known by its bytes before its name or any limit is judged: one named .bin, .txt
+    // or nothing is still staged as a PDF and takes the PDF limit.
+    const pdf = extension === '.pdf' || hasPdfHeader(file.content ?? await readFileHead(file.absolutePath, PDF_SNIFF_BYTES));
+    if (!pdf && !allowedExtensions.has(extension)) {
       skipped.push({
         workspace_relative_path: file.workspaceRelativePath,
         reason: `extension_not_allowed:${extension || '<none>'}`,
@@ -7810,7 +8857,7 @@ function planStageImportCandidates(
       });
       continue;
     }
-    const maxFileBytes = maxStageFileBytes(file.workspaceRelativePath);
+    const maxFileBytes = pdf ? PDF_PROCESSING_MAX_BYTES : maxStageFileBytes(file.workspaceRelativePath);
     if (file.bytes > maxFileBytes) {
       skipped.push({
         workspace_relative_path: file.workspaceRelativePath,
@@ -7820,7 +8867,7 @@ function planStageImportCandidates(
       continue;
     }
     const countsAgainstTextBatchCap = !isTranscribableMediaPath(file.workspaceRelativePath);
-    if (countsAgainstTextBatchCap && totalBytes + file.bytes > STAGE_IMPORT_MAX_BATCH_BYTES) {
+    if (!options.deferBatchCap && countsAgainstTextBatchCap && totalBytes + file.bytes > STAGE_IMPORT_MAX_BATCH_BYTES) {
       skipped.push({
         workspace_relative_path: file.workspaceRelativePath,
         reason: 'batch_size_limit_exceeded',
@@ -7836,9 +8883,30 @@ function planStageImportCandidates(
       uploadRelativePath,
       absolutePath: file.absolutePath,
       bytes: file.bytes,
+      ...(file.content ? { content: file.content } : {}),
+      pdf,
       objectName,
       gcsUri: `gs://${destinationBucket}/${objectName}`,
     });
+  }
+  return { eligible, skipped, totalBytes };
+}
+
+// The batch cap over the files a batch actually stages, in order: a PDF the
+// shared pipeline routed out is bounded only by the per-file limit. Media do not
+// count against the text batch cap.
+function capStagedBatch(files: StageImportEligibleFile[]): { eligible: StageImportEligibleFile[]; skipped: StageImportSkippedFile[]; totalBytes: number } {
+  const eligible: StageImportEligibleFile[] = [];
+  const skipped: StageImportSkippedFile[] = [];
+  let totalBytes = 0;
+  for (const file of files) {
+    const counts = !isTranscribableMediaPath(file.workspaceRelativePath);
+    if (counts && totalBytes + file.bytes > STAGE_IMPORT_MAX_BATCH_BYTES) {
+      skipped.push({ workspace_relative_path: file.workspaceRelativePath, reason: 'batch_size_limit_exceeded', bytes: file.bytes });
+      continue;
+    }
+    if (counts) totalBytes += file.bytes;
+    eligible.push(file);
   }
   return { eligible, skipped, totalBytes };
 }
@@ -8975,20 +10043,21 @@ interface AnnasArtifactScale {
   short_artifact_override?: boolean;
 }
 
-type AnnasImportOutcomeStatus = 'imported' | 'import_failed' | 'import_empty' | 'import_requested';
+// import_partial: a request of several objects imported some and not others.
+type AnnasImportOutcomeStatus = 'imported' | 'import_failed' | 'import_empty' | 'import_requested' | 'import_partial';
 
 // The acquisition's top-level status must not read as success when the
 // ingest did not verify: a caller that only looks at the outer status saw
 // 'downloaded' on 2026-09-20 for sixteen books that never entered the corpus.
-function annasSplitPartRecords(ragIngest: Record<string, unknown>): AnnasSplitPartResult[] {
-  return Array.isArray(ragIngest.parts) ? ragIngest.parts as AnnasSplitPartResult[] : [];
+function splitPartRecords(ragIngest: Record<string, unknown>): SplitPartResult[] {
+  return Array.isArray(ragIngest.parts) ? ragIngest.parts as SplitPartResult[] : [];
 }
 
 // A split book's parts for its registry record: each part's object, its page
 // range in the original file, the original file's sha256 and its status. The
 // run's parts already carry every part the registry knew as imported, so a
 // part is never downgraded by a run that did not reach it.
-function annasSplitRegistryFiles(parts: AnnasSplitPartResult[], sha256: string): Array<Record<string, unknown>> {
+function splitRegistryFiles(parts: SplitPartResult[], sha256: string): Array<Record<string, unknown>> {
   return parts.flatMap((part) => {
     if (!part.gcs_uri) return [];
     const present = asOptionalRecord(Array.isArray(part.import_outcome?.rag_files) ? part.import_outcome.rag_files[0] : undefined);
@@ -9011,7 +10080,7 @@ function annasSplitRegistryFiles(parts: AnnasSplitPartResult[], sha256: string):
 // What an Anna ingest carries while it runs: the original file's sha256 (the
 // source's one identity), the registry source already holding that identity,
 // and the latest part-level progress of a split, written as it happens.
-interface AnnasIngestContext {
+interface SourceImportContext {
   sha256: string;
   sourceId?: string;
   snapshot?: Record<string, unknown>;
@@ -9019,9 +10088,78 @@ interface AnnasIngestContext {
   running?: boolean;
 }
 
+// One source on its way into a corpus, whatever route brought it: the original
+// file's identity, where a split's parts go, and how its progress is recorded.
+// Every PDF import goes through sourceHolding, routePdf and, for a long PDF,
+// ingestSplitPdf with one of these.
+// A batch whose every file was a routed PDF: imported (or present, or still
+// importing) when any was, refused when every one was.
+// A batch that staged nothing but PDFs reports the most actionable state: one still in
+// progress (here or under another operation's lock), else all refused or duplicates.
+export function routedPdfStatus(pdfSources: Array<Record<string, unknown>>): string {
+  if (pdfSources.some((pdf) => pdf.route === 'in_progress' || pdf.status === 'import_in_progress')) return 'pdf_sources_in_progress';
+  return pdfSources.every((pdf) => pdf.status === 'blocked' || pdf.status === 'skipped_duplicate') ? 'pdf_sources_refused' : 'pdf_sources_routed';
+}
+
+// A staged PDF the shared pipeline took out of its batch: reported present or
+// refused, or split and imported after the batch.
+interface RoutedStagedPdf {
+  entry: { workspace_relative_path: string; source_sha256: string };
+  corpusId: string;
+  route: 'present' | 'split' | 'refused' | 'duplicate' | 'in_progress';
+  pages?: number;
+  parts?: number;
+  outcome?: Record<string, unknown>;
+  split?: () => Promise<Record<string, unknown>>;
+  register?: (ragIngest: Record<string, unknown>, mode: { inProgress?: boolean; recordOutcome?: boolean; progress?: boolean }) => Promise<Record<string, unknown>>;
+}
+
+interface SourceImport {
+  manifest: ReturnType<typeof domainManifest>;
+  corpusId: string;
+  corpusTarget: Record<string, unknown>;
+  context: SourceImportContext;
+  // The Anna locator of a record written before sources carried their sha256.
+  legacyLocator?: string;
+  // Where the original stays when nothing is imported, for refusal messages.
+  kept: string;
+  // How the caller re-runs this import, for suggestions.
+  rerun: string;
+  // The directory a split's parts are uploaded to, their stem, and names an earlier upload may have used.
+  partNames: () => Promise<{ bucket: string; directory: string; stem: string; priorStems: string[] }>;
+  // A whole copy uploaded before sources carried their sha256 (acquisitions only).
+  wholeCopyInCorpus?: (bytes: Uint8Array) => Promise<'present' | 'absent' | { unknown: string }>;
+  // Writes the split's progress to the source registry.
+  recordProgress: (snapshot: Record<string, unknown>) => Promise<unknown>;
+}
+
+function sourceIdentityConflict(source: SourceImport, holding: { source_id: string; corpus: string }): { code: string; message: string; suggestion: string } {
+  return {
+    code: 'source_identity_conflict',
+    message: `The source registry records this file (sha256 ${source.context.sha256.slice(0, 12)}) as ${holding.source_id}, held in corpus ${holding.corpus}. A source keeps one holding, so nothing was uploaded or imported into ${source.corpusId}; ${source.kept}.`,
+    suggestion: `Import into ${holding.corpus}, where the source already is, or remove the source with domain_source remove first.`,
+  };
+}
+
+function sourceImportPending(source: SourceImport, holding: { source_id: string; operations: string[] }): { code: string; message: string; suggestion: string } {
+  return {
+    code: 'source_import_in_progress',
+    message: `The source registry records this file (sha256 ${source.context.sha256.slice(0, 12)}) as ${holding.source_id}, and its import (${holding.operations.join(', ')}) is still running in Vertex. Nothing was uploaded or imported; ${source.kept}.`,
+    suggestion: `Check domain_source status for ${holding.source_id}; ${source.rerun} only if that import fails.`,
+  };
+}
+
+function sourceHoldingUnverified(source: SourceImport, holding: { source_id: string; reason: string }): { code: string; message: string; suggestion: string } {
+  return {
+    code: 'source_holding_unverified',
+    message: `The source registry records this file (sha256 ${source.context.sha256.slice(0, 12)}) as ${holding.source_id}, and whether that copy is in the corpus could not be read (${holding.reason}). Importing it now could put the source in twice, so nothing was uploaded or imported; ${source.kept}.`,
+    suggestion: `${source.rerun} once the corpus answers; a copy already in the corpus is then reported as present.`,
+  };
+}
+
 // A part of a recorded split, as the registry lists it. Page ranges are those
 // of the original file; a record written before they were recorded has none.
-interface AnnasRecordedPart {
+interface RecordedPart {
   index: number;
   of: number;
   name: string;
@@ -9031,14 +10169,110 @@ interface AnnasRecordedPart {
   last_page?: number;
   pages?: number;
   rag_file_name?: string;
+  // The operation a part recorded as import_requested was submitted in.
+  rag_operation_name?: string;
   present?: boolean;
 }
 
-type AnnasSourceHolding =
+// One operation at a time per source identity. Every path that routes or imports a
+// file (acquisition, rag_corpus import, staged routing and its deferred splits,
+// domain_source add) holds its sha256's lock from checking the holding until it has
+// written the outcome or an in-progress record, so the next one sees that record
+// instead of a stale holding. A holder that answers in progress keeps the lock in the
+// background until its outcome is recorded. A waiter waits at most the response budget
+// (forever when there is none) and then answers in progress, naming the holder. The
+// worker is one process, so the lock is in memory; several worker processes on one
+// registry would need a distributed lock.
+class SourceIdentityLocks {
+  readonly #held = new Map<string, { holder: string; wake: Array<() => void> }>();
+
+  // Several keys, taken in sorted order; all or none.
+  async acquireAll(keys: string[], holder: string, deadline: number | undefined): Promise<{ release: () => void } | { heldBy: string }> {
+    const releases: Array<() => void> = [];
+    for (const key of [...new Set(keys)].sort()) {
+      const lock = await this.acquire(key, holder, deadline);
+      if ('heldBy' in lock) {
+        for (const release of releases) release();
+        return lock;
+      }
+      releases.push(lock.release);
+    }
+    return { release: () => { for (const release of releases) release(); } };
+  }
+
+  // deadline: when to stop waiting (ms since epoch); undefined waits as long as it takes.
+  async acquire(key: string, holder: string, deadline: number | undefined): Promise<{ release: () => void } | { heldBy: string }> {
+    deadline ??= Number.POSITIVE_INFINITY;
+    for (;;) {
+      const current = this.#held.get(key);
+      if (!current) {
+        const entry = { holder, wake: [] as Array<() => void> };
+        this.#held.set(key, entry);
+        let released = false;
+        return {
+          release: () => {
+            if (released) return;
+            released = true;
+            if (this.#held.get(key) === entry) this.#held.delete(key);
+            for (const wake of entry.wake) wake();
+          },
+        };
+      }
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) return { heldBy: current.holder };
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      await new Promise<void>((resolveWait) => {
+        current.wake.push(resolveWait);
+        if (Number.isFinite(remaining)) timer = setTimeout(resolveWait, remaining);
+      });
+      clearTimeout(timer);
+    }
+  }
+}
+
+// The source locks a staged batch holds, by sha256. Each is released once that PDF's
+// outcome (or in-progress record) is written; a split running past the response budget
+// is handed off and releases its own when its outcome is recorded.
+class HeldSources {
+  readonly #releases = new Map<string, () => void>();
+  readonly #handedOff = new Set<string>();
+
+  add(sha256: string, release: () => void): void { this.#releases.set(sha256, release); }
+  handOff(sha256: string): void { this.#handedOff.add(sha256); }
+  release(sha256: string): void {
+    this.#releases.get(sha256)?.();
+    this.#releases.delete(sha256);
+  }
+  // Everything not handed off to background work: the batch is done with it.
+  releaseRest(): void {
+    for (const sha256 of [...this.#releases.keys()]) if (!this.#handedOff.has(sha256)) this.release(sha256);
+  }
+}
+
+function sourceLockKey(manifest: ReturnType<typeof domainManifest>, sha256: string): string {
+  return `${manifest.domain_id}:${sha256.toLowerCase()}`;
+}
+
+// A source named by its id is locked too: two imports naming one new source_id with
+// different files take different sha256 locks but the same id lock. Every caller takes
+// its keys in one sorted order (sha256 and id keys together), so none waits in a cycle.
+function sourceIdLockKey(manifest: ReturnType<typeof domainManifest>, sourceId: string): string {
+  return `${manifest.domain_id}:source:${sourceId.trim()}`;
+}
+
+// A GCS object imported by URI: two reads of one object overwritten between them hash
+// differently, so its URI is locked as well, and the second sees what the first recorded.
+function objectLockKey(manifest: ReturnType<typeof domainManifest>, gcsUri: string): string {
+  return `${manifest.domain_id}:object:${gcsUri}`;
+}
+
+type SourceHolding =
   | { kind: 'none' }
   | { kind: 'present'; result: Record<string, unknown> }
-  | { kind: 'partial'; source_id: string; parts: AnnasRecordedPart[]; listing_error?: string }
+  | { kind: 'partial'; source_id: string; parts: RecordedPart[]; listing_error?: string }
   | { kind: 'unknown'; source_id: string; reason: string }
+  // A recorded import whose operation Vertex reports still running.
+  | { kind: 'in_progress'; source_id: string; operations: string[] }
   | { kind: 'conflict'; source_id: string; corpus: string };
 
 // The registry source for an identity. A source matches by the sha256 any of
@@ -9048,7 +10282,7 @@ function sourceForIdentity(
   records: DomainSourceRegistryRecord[],
   sha256: string,
   legacyLocator: string | undefined,
-): { sourceId: string; current: Record<string, unknown>; holding: Record<string, unknown> | undefined } | undefined {
+): { sourceId: string; current: Record<string, unknown>; holding: Record<string, unknown> | undefined; viaBatchEntry: boolean; unverified: boolean } | undefined {
   const bySha: Array<DomainSourceRegistryRecord[]> = [];
   const byLocator: Array<DomainSourceRegistryRecord[]> = [];
   for (const history of groupDomainSourceRecords(records).values()) {
@@ -9064,10 +10298,15 @@ function sourceForIdentity(
   // Only records of this identity hold it (an older record without a sha256 counts).
   const holdings = history.entries.filter((entry) => registryRecordGcsUris(entry.record).length > 0
     && (registryRecordSha256s(entry.record).length === 0 || registryRecordSha256s(entry.record).includes(sha256)));
+  const holding = holdings.length ? latestDomainSourceRecord(holdings).record : undefined;
   return {
     sourceId: history.current.sourceId,
     current: history.current.record,
-    holding: holdings.length ? latestDomainSourceRecord(holdings).record : undefined,
+    holding,
+    // The file is one entry of a record that lists several, such as a staged batch.
+    viaBatchEntry: holding !== undefined && holding.source_sha256 !== sha256 && Array.isArray(holding.rag_files)
+      && holding.rag_files.length > 1 && typeof holding.split_parts !== 'number',
+    unverified: holding !== undefined && heldUnverified(history.entries, registryRecordGcsUris(holding)),
   };
 }
 
@@ -9075,6 +10314,34 @@ function sourceForIdentity(
 function sameIdentityHistory(history: DomainSourceRegistryRecord[], sha256: string): boolean {
   const hashes = new Set(history.flatMap((entry) => registryRecordSha256s(entry.record)));
   return hashes.size === 0 || (hashes.size === 1 && hashes.has(sha256));
+}
+
+// A sha256 any record of the source holds other than this file's, at the top level or in any
+// rag_files entry (a batch record keeps each file's there): a source that records another file
+// is another source, even after a later record without a sha256 (a re-add) became current.
+function otherHistoryIdentity(records: DomainSourceRegistryRecord[], sourceId: string, sha256: string): string | undefined {
+  return records.filter((entry) => entry.sourceId === sourceId).flatMap((entry) => registryRecordSha256s(entry.record)).find((hash) => hash !== sha256);
+}
+
+// The sha256 a live source recorded for this exact object, when it is not this file's: the
+// object was overwritten in place. A batch entry's own hash decides; a record's top-level
+// hash only for the object it names alone. A record whose import of it failed leaves
+// nothing in the corpus for Vertex to skip.
+function replacedObjectIdentity(records: DomainSourceRegistryRecord[], gcsUri: string, sha256: string): string | undefined {
+  for (const history of groupDomainSourceRecords(records).values()) {
+    if (latestDomainSourceRecord(history).removed) continue;
+    for (const { record } of history) {
+      const uris = registryRecordGcsUris(record);
+      if (!uris.includes(gcsUri)) continue;
+      const entry = Array.isArray(record.rag_files) ? record.rag_files.map(asOptionalRecord).find((file) => file?.gcs_uri === gcsUri) : undefined;
+      const status = typeof entry?.status === 'string' ? entry.status : new Set(uris).size === 1 ? record.ingest_status : undefined;
+      if (status === 'import_failed' || status === 'import_empty') continue;
+      const hash = typeof entry?.source_sha256 === 'string' ? entry.source_sha256
+        : new Set(uris).size === 1 && typeof record.source_sha256 === 'string' ? record.source_sha256 : undefined;
+      if (hash && hash !== sha256) return hash;
+    }
+  }
+  return undefined;
 }
 
 function registryRecordSha256s(record: Record<string, unknown>): string[] {
@@ -9092,13 +10359,14 @@ function registryRecordSha256s(record: Record<string, unknown>): string[] {
 // or the parts of a split (a record with split_parts, or rag_files naming parts).
 function recordedSourceHolding(
   record: Record<string, unknown> | undefined,
-): { whole: { gcs_uri: string; status: string }; parts?: undefined } | { whole?: undefined; parts: AnnasRecordedPart[] } | undefined {
+  sha256?: string,
+): { whole: { gcs_uri: string; status: string; rag_file_name?: string }; parts?: undefined } | { whole?: undefined; parts: RecordedPart[] } | undefined {
   if (!record) return undefined;
   const status = stringRecordField(record, 'ingest_status') ?? 'unknown';
   const files = Array.isArray(record.rag_files) ? record.rag_files.map((file) => asOptionalRecord(file) ?? {}) : [];
   const isSplit = typeof record.split_parts === 'number' || files.some((file) => typeof file.part === 'string' || typeof file.first_page === 'number');
   if (isSplit) {
-    const parts = files.flatMap((file, position): AnnasRecordedPart[] => {
+    const parts = files.flatMap((file, position): RecordedPart[] => {
       if (typeof file.gcs_uri !== 'string') return [];
       const named = typeof file.part === 'string' ? /^part(\d+)of(\d+)$/.exec(file.part) : null;
       const index = named ? Number(named[1]) : position + 1;
@@ -9111,12 +10379,23 @@ function recordedSourceHolding(
         status: typeof file.status === 'string' ? file.status : status,
         ...range,
         ...(typeof file.rag_file_name === 'string' ? { rag_file_name: file.rag_file_name } : {}),
+        ...(typeof file.rag_operation_name === 'string' ? { rag_operation_name: file.rag_operation_name } : {}),
       }];
     });
     return parts.length ? { parts: parts.sort((left, right) => left.index - right.index) } : undefined;
   }
+  // A batch record lists each file with its own sha256; this source is the matching entry.
+  const entry = sha256 && record.source_sha256 !== sha256 ? files.find((file) => file.source_sha256 === sha256) : undefined;
+  // Its own outcome when the record has one per file (a batch that partly imported).
+  if (entry) {
+    return typeof entry.gcs_uri === 'string' ? { whole: {
+      gcs_uri: entry.gcs_uri, status: typeof entry.status === 'string' ? entry.status : status,
+      ...(typeof entry.rag_file_name === 'string' ? { rag_file_name: entry.rag_file_name } : {}),
+    } } : undefined;
+  }
   const whole = stringRecordField(record, 'gcs_uri', 'gcsUri') ?? (files.length === 1 && typeof files[0]!.gcs_uri === 'string' ? files[0]!.gcs_uri : undefined);
-  return whole ? { whole: { gcs_uri: whole, status } } : undefined;
+  const ragFileName = stringRecordField(record, 'rag_file_name') ?? (files.length === 1 && typeof files[0]!.rag_file_name === 'string' ? files[0]!.rag_file_name : undefined);
+  return whole ? { whole: { gcs_uri: whole, status, ...(ragFileName ? { rag_file_name: ragFileName } : {}) } } : undefined;
 }
 
 // A holding's objects in page order: one whole object, or the parts of a split,
@@ -9144,13 +10423,13 @@ function sourceHoldingObjects(records: DomainSourceRegistryRecord[], uris: strin
     const holding = latestDomainSourceRecord(holdings).record;
     const recorded = recordedSourceHolding(holding);
     const held = recorded?.whole ? [recorded.whole.gcs_uri] : recorded?.parts.map((part) => part.gcs_uri) ?? [];
-    if (held.join('\n') === uris.join('\n')) return { sourceId: current.sourceId, current: current.record, holding };
+    if (held.join('\n') === uris.join('\n')) return { sourceId: current.sourceId, current: current.record, holding, viaBatchEntry: false, unverified: heldUnverified(history, held) };
   }
   return undefined;
 }
 
 // Parts 1 to N of one N-part split, each recorded once.
-function completeRecordedSplit(parts: AnnasRecordedPart[]): boolean {
+function completeRecordedSplit(parts: RecordedPart[]): boolean {
   const of = parts[0]?.of;
   return of !== undefined && parts.length === of && parts.every((part, position) => part.of === of && part.index === position + 1);
 }
@@ -9160,7 +10439,7 @@ function completeRecordedSplit(parts: AnnasRecordedPart[]): boolean {
 // parts at the split size, or at ceil(pages / parts) when the split size gives
 // another number of parts. Undefined when the parts are not one complete split or
 // no plan with that many parts exists.
-function recordedPartsWithRanges(parts: AnnasRecordedPart[], pages: number | undefined, splitPages: number): AnnasRecordedPart[] | undefined {
+function recordedPartsWithRanges(parts: RecordedPart[], pages: number | undefined, splitPages: number): RecordedPart[] | undefined {
   if (pages === undefined || !completeRecordedSplit(parts)) return undefined;
   if (parts.every((part) => part.first_page !== undefined)) return parts;
   if (parts.some((part) => part.first_page !== undefined)) return undefined;
@@ -9172,7 +10451,7 @@ function recordedPartsWithRanges(parts: AnnasRecordedPart[], pages: number | und
 
 // The recorded parts as a split plan, when their page ranges cover a file of
 // this many pages exactly once, in order.
-function recordedPartPlan(parts: AnnasRecordedPart[], pages: number | undefined): PdfPartPlan[] | undefined {
+function recordedPartPlan(parts: RecordedPart[], pages: number | undefined): PdfPartPlan[] | undefined {
   if (pages === undefined || !parts.length) return undefined;
   let next = 1;
   const plan: PdfPartPlan[] = [];
@@ -9186,10 +10465,10 @@ function recordedPartPlan(parts: AnnasRecordedPart[], pages: number | undefined)
 
 // The one refusal for a PDF longer than the LLM parser takes per file when the
 // worker cannot split it (docs/vertex-rag-limits.md).
-function pdfPageLimitRefusal(pages: number, limit: number, why: string, sourcePath: string): { code: string; message: string; suggestion: string } {
+function pdfPageLimitRefusal(pages: number, limit: number, why: string, kept: string): { code: string; message: string; suggestion: string } {
   return {
     code: 'pdf_exceeds_parser_page_limit',
-    message: `Measured ${pages} pages in the PDF. Imports with the LLM parser take at most ${limit} pages per PDF on this deployment, and the worker cannot split this one into parts: ${why}. Nothing was uploaded or imported; the download is still on disk at ${sourcePath}.`,
+    message: `Measured ${pages} pages in the PDF. Imports with the LLM parser take at most ${limit} pages per PDF on this deployment, and the worker cannot split this one into parts: ${why}. Nothing was uploaded or imported; ${kept}.`,
     suggestion: 'Install qpdf on the worker host so long PDFs are split into parts, or acquire an EPUB edition of the same work; annas_archive_search with ingest_intent: true ranks EPUB first.',
   };
 }
@@ -9199,6 +10478,10 @@ function heldUnverified(history: DomainSourceRegistryRecord[], uris: string[]): 
   const unverified = new Set(history.filter((entry) => entry.record.sha256_verified === false).flatMap((entry) => registryRecordGcsUris(entry.record)));
   return uris.some((uri) => unverified.has(uri));
 }
+
+// A corpus object as citations attribute it: its source, a split's part and range, and
+// whether the registry ever recorded it without proof of the source's sha256.
+interface CitedHolding { source_id: string; part?: string; first_page?: number; last_page?: number; unverified?: boolean; pdf?: boolean }
 
 // The objects a registry record holds: its gcs_uri, or each entry of its rag_files list.
 function registryRecordGcsUris(record: Record<string, unknown>): string[] {
@@ -9214,7 +10497,7 @@ function registryRecordGcsUris(record: Record<string, unknown>): string[] {
   return uris;
 }
 
-interface AnnasSplitPartResult {
+interface SplitPartResult {
   part: number;
   of: number;
   name: string;
@@ -9233,11 +10516,11 @@ interface AnnasSplitPartResult {
   coverage?: Record<string, unknown>;
 }
 
-function annasSplitPartBase(part: PdfPartPlan): Pick<AnnasSplitPartResult, 'part' | 'of' | 'name' | 'first_page' | 'last_page' | 'pages'> {
+function splitPartBase(part: PdfPartPlan): Pick<SplitPartResult, 'part' | 'of' | 'name' | 'first_page' | 'last_page' | 'pages'> {
   return { part: part.index, of: part.of, name: `part${part.index}of${part.of}`, first_page: part.firstPage, last_page: part.lastPage, pages: part.pages };
 }
 
-function annasIngestErrorRecord(error: unknown): { code: string; message: string; suggestion?: string } {
+function ingestErrorRecord(error: unknown): { code: string; message: string; suggestion?: string } {
   return error instanceof DomainExpertWorkerError
     ? { code: error.code, message: error.message, ...(error.suggestion ? { suggestion: error.suggestion } : {}) }
     : { code: 'rag_ingest_error', message: error instanceof Error ? error.message : String(error) };
@@ -9246,7 +10529,7 @@ function annasIngestErrorRecord(error: unknown): { code: string; message: string
 // The book is imported only when every part is. Otherwise the status is the
 // most actionable part outcome: something blocked, then a failure, then an
 // import still running.
-function annasSplitStatus(results: AnnasSplitPartResult[]): string {
+function splitStatus(results: SplitPartResult[]): string {
   if (results.every((result) => result.status === 'imported')) return 'imported';
   for (const status of ['blocked', 'import_failed', 'import_empty', 'import_requested'] as const) {
     if (results.some((result) => result.status === status)) return status;
@@ -9254,7 +10537,7 @@ function annasSplitStatus(results: AnnasSplitPartResult[]): string {
   return 'blocked';
 }
 
-function describeAnnasSplitPart(result: AnnasSplitPartResult): string {
+function describeSplitPart(result: SplitPartResult): string {
   const range = `Part ${result.part} of ${result.of} (pages ${result.first_page}-${result.last_page})`;
   if (result.status === 'not_attempted') return `${range} was not attempted.`;
   if (result.error) return `${range} was blocked: ${result.error.code}: ${result.error.message}`;
@@ -9262,7 +10545,7 @@ function describeAnnasSplitPart(result: AnnasSplitPartResult): string {
   return `${range} ended ${result.status}: ${detail}`;
 }
 
-function annasSplitPartCoverage(
+function splitPartCoverage(
   part: PdfPartPlan,
   file: Record<string, unknown> | undefined,
   listingError: string | undefined,
@@ -9291,7 +10574,7 @@ function annasSplitPartCoverage(
 }
 
 // covered only when every imported part is covered; otherwise the parts to look at.
-function annasSplitCoverageSummary(results: AnnasSplitPartResult[]): Record<string, unknown> {
+function splitCoverageSummary(results: SplitPartResult[]): Record<string, unknown> {
   const checked = results.filter((result) => result.coverage);
   const attention = checked.filter((result) => result.coverage!.status !== 'covered').map((result) => ({ part: result.name, status: result.coverage!.status }));
   return {
@@ -9314,7 +10597,7 @@ function annasAcquisitionStatus(base: 'downloaded' | 'ingested_existing', ingest
 // Vertex signals "not now" two ways: FAILED_PRECONDITION with "other
 // operations running" on a corpus that is mid-import, and 429 / RESOURCE_EXHAUSTED
 // from the embedding backend. Both are transient; everything else is not.
-function annasImportTransientReason(error: unknown): { code: string; message: string } | undefined {
+function importTransientReason(error: unknown): { code: string; message: string } | undefined {
   if (!(error instanceof DomainExpertWorkerError) || error.code !== 'google_api_error') return undefined;
   const body = asOptionalRecord(asOptionalRecord(error.googleErrorBody)?.error);
   const status = typeof body?.status === 'string' ? body.status : '';
@@ -9361,6 +10644,10 @@ function classifyRagImportOperation(
     failed_rag_files_count: ragImportCount(response.failedRagFilesCount),
     skipped_rag_files_count: ragImportCount(response.skippedRagFilesCount),
   };
+  // Some imported and some failed is not an import of the request's files.
+  if (counts.imported_rag_files_count >= 1 && counts.failed_rag_files_count >= 1) {
+    return { status: 'import_partial', detail: { operation_name: operationName, ...counts } };
+  }
   if (counts.imported_rag_files_count >= 1) return { status: 'imported', detail: { operation_name: operationName, ...counts } };
   if (counts.failed_rag_files_count >= 1) {
     return {
@@ -9388,17 +10675,71 @@ function classifyRagImportOperation(
 // into a new import drops them, so a re-import never inherits the last one's
 // ragFile or verification.
 const RAG_IMPORT_OUTCOME_FIELDS = new Set([
-  'ingest_status', 'rag_operation_name', 'rag_file_name', 'rag_files', 'gcs_uri', 'split_parts',
+  'ingest_status', 'rag_operation_name', 'rag_operation_names', 'rag_operations', 'rag_file_name', 'rag_files', 'gcs_uri', 'split_parts',
   'verification', 'ingest_reason', 'import_batch_source_id', 'registered_at',
 ]);
 
 // One imported object is recorded flat, the shape the hand-corrected records
 // use; a batch of several keeps a rag_files list.
-function ragImportFileFields(files: Array<Record<string, unknown>>): Record<string, unknown> {
+// How many of a file's first bytes tell whether it is a PDF (hasPdfHeader): a file is a
+// PDF by its bytes, whatever its name, for GCS imports, staged files and web imports alike.
+const PDF_SNIFF_BYTES = ANNAS_PDF_HEADER_WINDOW_BYTES;
+
+// HeldSources' entry for the lock on the source a staged import names.
+const NAMED_SOURCE_LOCK = 'named-source';
+
+// A file's first bytes, enough to tell a PDF.
+async function readFileHead(path: string, length: number): Promise<Uint8Array> {
+  const handle = await open(path, 'r');
+  try {
+    const buffer = new Uint8Array(length);
+    const { bytesRead } = await handle.read(buffer, 0, length, 0);
+    return buffer.subarray(0, bytesRead);
+  } finally {
+    await handle.close();
+  }
+}
+const PDF_CONTENT_TYPE = 'application/pdf';
+
+function isPdfUri(uri: string): boolean {
+  return /\.pdf$/i.test(uri);
+}
+
+// A request of several objects, by each ragFile's state: imported when all are ACTIVE,
+// failed when all are in ERROR, and partial otherwise (some ERROR or not listed).
+function requestOutcomeByFile(files: Array<Record<string, unknown>>): { status: AnnasImportOutcomeStatus; hint?: string } {
+  const active = files.filter((file) => file.state === 'ACTIVE').length;
+  const failed = files.filter((file) => file.state === 'ERROR').length;
+  if (active === files.length) return { status: 'imported' };
+  const rerun = 'Re-run the batch: files already in the corpus keep their URIs and are skipped, and the rest are imported again.';
+  if (failed === files.length) return { status: 'import_failed', hint: `Every ragFile of the request is in ERROR. ${rerun}` };
+  return { status: 'import_partial', hint: `${active} of ${files.length} files are ACTIVE; ${failed} in ERROR, ${files.length - active - failed} not listed. ${rerun}` };
+}
+
+// Whether an operation with this outcome may have imported a given file of its request.
+function mayHaveImported(status: string): boolean {
+  return status === 'imported' || status === 'import_partial';
+}
+
+// The reason a settled import stays import_requested: Vertex counted it, its ragFile is not listed yet.
+const RAG_FILE_UNLISTED = 'rag_file_unlisted';
+
+function ragImportFileFields(files: Array<Record<string, unknown>>, sha256ByUri?: Map<string, string>): Record<string, unknown> {
   if (files.length === 0) return {};
-  if (files.length > 1) return { rag_files: files.map(({ gcs_uri, rag_file_name }) => ({ gcs_uri, ...(rag_file_name ? { rag_file_name } : {}) })) };
+  const identity = (uri: unknown) => {
+    const digest = typeof uri === 'string' ? sha256ByUri?.get(uri) : undefined;
+    return digest ? { source_sha256: digest } : {};
+  };
+  // Each object's own outcome, where its ragFile was read: holding checks use it per file.
+  const outcome = (state: unknown) => (state === 'ACTIVE' ? { state, status: 'imported' } : state === 'ERROR' ? { state, status: 'import_failed' } : {});
+  if (files.length > 1) return { rag_files: files.map(({ gcs_uri, rag_file_name, state }) => ({ gcs_uri, ...(rag_file_name ? { rag_file_name } : {}), ...identity(gcs_uri), ...outcome(state) })) };
   const [file] = files;
-  return { ...(file!.rag_file_name ? { rag_file_name: file!.rag_file_name } : {}), gcs_uri: file!.gcs_uri };
+  return { ...(file!.rag_file_name ? { rag_file_name: file!.rag_file_name } : {}), gcs_uri: file!.gcs_uri, ...identity(file!.gcs_uri) };
+}
+
+// The staged PDFs' sha256s by their staged URI: a PDF's identity across every import route.
+function stagedFileSha256s(stagedFiles: Array<Record<string, unknown>>): Map<string, string> {
+  return new Map(stagedFiles.flatMap((file) => (typeof file.gcs_uri === 'string' && typeof file.sha256 === 'string' && isPdfUri(file.gcs_uri) ? [[file.gcs_uri, file.sha256] as [string, string]] : [])));
 }
 
 function ragImportFormatLabel(gcsUris: string[]): string {
@@ -9725,7 +11066,16 @@ function assertReviewedLiveRagImport(manifest: ReturnType<typeof domainManifest>
   }
 }
 
-function stageDestination(allowedPrefixes: string[], domainId: string, batchId: string): { bucket: string; objectPrefix: string; directoryUri: string } {
+interface StageDestination {
+  bucket: string;
+  // The batch's prefix, staged/<domain>/<batch>/. Each object under it sits in a
+  // directory named by its own bytes (addressStagedFiles); split parts go beside
+  // it, in <batch>--parts/.
+  objectPrefix: string;
+  directoryUri: string;
+}
+
+function stageDestination(allowedPrefixes: string[], domainId: string, batchId: string): StageDestination {
   const primaryPrefix = allowedPrefixes[0];
   if (!primaryPrefix) {
     throw new DomainExpertWorkerError(403, 'gcs_destination_not_allowed', 'Domain manifest has no allowed_gcs_prefixes entry for stage_import.');
@@ -9735,6 +11085,43 @@ function stageDestination(allowedPrefixes: string[], domainId: string, batchId: 
   const directoryUri = `gs://${parsed.bucket}/${objectPrefix}`;
   assertAllowedGcsDestination(directoryUri, allowedPrefixes);
   return { bucket: parsed.bucket, objectPrefix, directoryUri };
+}
+
+// 128 bits of the sha256: a collision between two files of one batch is not a practical concern.
+const STAGED_OBJECT_DIGEST_HEX = 32;
+
+// Each staged object is addressed by its bytes: staged/<domain>/<batch>/<sha256, 32 hex>/<file name>,
+// the name kept safe and shortened as before. A batch imports exactly its own objects'
+// URIs, never a directory (importStagedBatch), so an unchanged file keeps its URI and
+// Vertex skips it, a changed file gets a new URI, an object no run names now is never
+// imported again, and two runs of one batch_id cannot reach each other's objects.
+// Nothing is deleted.
+async function addressStagedFiles(destination: StageDestination, files: StageImportEligibleFile[]): Promise<StageImportEligibleFile[]> {
+  const addressed: StageImportEligibleFile[] = [];
+  for (const file of files) {
+    const digest = file.sha256 ?? (file.content ? sha256(file.content) : await sha256OfFile(file.absolutePath));
+    const objectName = `${destination.objectPrefix}${digest.slice(0, STAGED_OBJECT_DIGEST_HEX)}/${file.uploadRelativePath}`;
+    addressed.push({ ...file, sha256: digest, objectName, gcsUri: `gs://${destination.bucket}/${objectName}` });
+  }
+  return addressed;
+}
+
+async function sha256OfFile(path: string): Promise<string> {
+  const hash = createHash('sha256');
+  for await (const chunk of createReadStream(path)) hash.update(chunk as Buffer);
+  return hash.digest('hex');
+}
+
+// Where a stage receipt says the batch was staged.
+function stageDestinationRecord(destination: StageDestination, batchId: string, allowedPrefixes: string[]): Record<string, unknown> {
+  return {
+    gcs_uri_prefix: destination.directoryUri,
+    bucket: destination.bucket,
+    object_prefix: destination.objectPrefix,
+    batch_id: batchId,
+    object_naming: `${destination.objectPrefix}<first ${STAGED_OBJECT_DIGEST_HEX} hex of the file's sha256>/<file name>`,
+    allowed_gcs_prefixes: allowedPrefixes,
+  };
 }
 
 // Where a live import asks Vertex to write its per-file results
@@ -9754,17 +11141,40 @@ function importResultSinkUri(allowedPrefixes: string[], domainId: string, batchI
   return directoryUri;
 }
 
-function ragFileMatchesTargets(file: Record<string, unknown>, targetUris: string[]): boolean {
-  const sourceUri = typeof file.sourceUri === 'string' ? file.sourceUri : undefined;
-  if (sourceUri) {
-    // A directory target (trailing slash) covers every record staged under it.
-    return targetUris.some((target) => (target.endsWith('/') ? sourceUri.startsWith(target) : sourceUri === target));
+// Each target's ragFiles in a corpus listing. A ragFile whose sourceUri is the target
+// (or, for a directory target with a trailing slash, under it) is its; only a target
+// that no ragFile names exactly falls back to display name, which Vertex derives from
+// the object's file name, and only when exactly one ragFile in the corpus carries that
+// name. Content-addressed objects of one batch share file names across versions, so a
+// name two ragFiles carry matches nothing: the object is then unmatched, never guessed.
+// Nor does a name two targets share, or one ragFile would stand for both.
+// exact: sourceUri only, no display-name fallback.
+export function ragFilesByTarget(
+  files: Array<Record<string, unknown>>,
+  targets: string[],
+  options: { exact?: boolean } = {},
+): Map<string, Array<Record<string, unknown>>> {
+  const byName = new Map<string, Array<Record<string, unknown>>>();
+  for (const file of files) {
+    if (typeof file.displayName !== 'string') continue;
+    byName.set(file.displayName, [...(byName.get(file.displayName) ?? []), file]);
   }
-  // A record that surfaces no URI can still be matched by display name, which
-  // Vertex derives from the imported object's file name.
-  const displayName = typeof file.displayName === 'string' ? file.displayName : undefined;
-  if (!displayName) return false;
-  return targetUris.some((target) => !target.endsWith('/') && target.split('/').pop() === displayName);
+  const baseName = (target: string) => target.split('/').pop() ?? '';
+  const targetNames = new Map<string, number>();
+  for (const target of new Set(targets)) targetNames.set(baseName(target), (targetNames.get(baseName(target)) ?? 0) + 1);
+  const matched = new Map<string, Array<Record<string, unknown>>>();
+  for (const target of targets) {
+    const directory = target.endsWith('/');
+    const exact = files.filter((file) => typeof file.sourceUri === 'string'
+      && (directory ? file.sourceUri.startsWith(target) : file.sourceUri === target));
+    if (exact.length || directory || options.exact) {
+      matched.set(target, exact);
+      continue;
+    }
+    const named = targetNames.get(baseName(target)) === 1 ? byName.get(baseName(target)) ?? [] : [];
+    matched.set(target, named.length === 1 && typeof named[0]!.sourceUri !== 'string' ? named : []);
+  }
+  return matched;
 }
 
 function gcsPrefixesCover(prefixes: string[], uri: string): boolean {
@@ -9921,7 +11331,31 @@ function citationHeader(context: Record<string, unknown>): string {
   const display = title
     ? (creator ? `${creator} — ${title}` : title)
     : String(context.sourceDisplayName ?? context.sourceUri ?? 'source');
-  return `[${String(context.citation_id)}] ${display}`;
+  const pages = asOptionalRecord(context.originalPages);
+  const range = pages ? (pages.first === pages.last ? `, page ${String(pages.first)}` : `, pages ${String(pages.first)}-${String(pages.last)}`) : '';
+  // The object is cited, but the registry cannot prove it holds that source's bytes.
+  const unverified = context.sourceIdentityVerified === false ? ' (source identity unverified)' : '';
+  return `[${String(context.citation_id)}] ${display}${range}${unverified}`;
+}
+
+// The original source and pages a citation resolves to (see originalSourcePages).
+function citationOriginalFields(context: Record<string, unknown>): Record<string, unknown> {
+  const pages = asOptionalRecord(context.originalPages);
+  return {
+    ...(typeof context.sourceId === 'string' ? { source_id: context.sourceId } : {}),
+    ...(typeof context.sourcePart === 'string' ? { source_part: context.sourcePart } : {}),
+    // The object is cited, but the registry cannot prove it holds that source's bytes.
+    ...(context.sourceIdentityVerified === false ? { identity_verified: false } : {}),
+    ...(pages ? { original_pages: { first_page: pages.first, last_page: pages.last, basis: pages.basis } } : {}),
+  };
+}
+
+// The chunk's 1-based page span within its file, when Vertex reports one (RagChunk.pageSpan).
+function chunkPageSpan(context: Record<string, unknown>): { first: number; last: number } | undefined {
+  const span = asOptionalRecord(asOptionalRecord(context.chunk)?.pageSpan);
+  const first = Number(span?.firstPage);
+  const last = Number(span?.lastPage ?? span?.firstPage);
+  return Number.isInteger(first) && Number.isInteger(last) && first >= 1 && last >= first ? { first, last } : undefined;
 }
 
 function annasSourceKind(format: string): 'pdf' | 'epub' | 'book' {
@@ -11133,6 +12567,8 @@ function directFileExtension(url: string, headers: Headers, bytes: Uint8Array): 
   return contentType ? byContentType[contentType] : undefined;
 }
 
+// Whether the bytes open with a PDF header (%PDF-1.x or %PDF-2.x), after nothing but
+// whitespace, within the first PDF_SNIFF_BYTES. The one test of "is this a PDF" by content.
 function hasPdfHeader(bytes: Uint8Array): boolean {
   const window = bytes.subarray(0, Math.min(bytes.byteLength, 1024));
   for (let at = 0; at <= window.byteLength - 8; at += 1) {
@@ -11814,12 +13250,14 @@ function rootFromRecord(record: Record<string, unknown>): DomainExpertWorkspaceR
   });
 }
 
-// The split size: a positive page count, or 0 to split nothing. A bad value names the setting.
+// The split size: a positive page count, or 0 to split nothing (pdfPageLimitSetting,
+// shared with the materializer). A bad value names the setting.
 function pdfSplitPagesSetting(value: unknown): number {
   try {
-    return normalizeNonNegativeInteger(value, DEFAULT_ANNAS_PDF_SPLIT_PAGES);
-  } catch {
-    throw new DomainExpertWorkerError(400, 'invalid_config', `EXPERT_AGENTS_DOMAIN_EXPERT_ANNAS_PDF_SPLIT_PAGES must be a whole number of pages (default ${DEFAULT_ANNAS_PDF_SPLIT_PAGES}), or 0 to split no PDF; got ${JSON.stringify(String(value)).slice(0, 40)}.`);
+    const setting = pdfPageLimitSetting(value);
+    return setting.splitDisabled ? 0 : setting.maxPages;
+  } catch (error) {
+    throw new DomainExpertWorkerError(400, 'invalid_config', error instanceof Error ? error.message : String(error));
   }
 }
 

@@ -45,7 +45,18 @@ What the worker does with it, while imports use the LLM parser:
   imported and coverage-checked on its own (`pdftotext` reads each part's
   text layer);
 - a longer PDF the worker cannot split (no `qpdf`, or a file `qpdf` cannot
-  read) is refused before upload with `pdf_exceeds_parser_page_limit`.
+  read) is refused before upload with `pdf_exceeds_parser_page_limit`;
+- a PDF whose pages nothing can count (no `qpdf` or a file it cannot read, and
+  neither a count both byte-scan signals report nor a single signal within the
+  limit) is refused before upload with
+  `pdf_page_count_unavailable`. Under Google's default parser, which has no
+  page limit, such a PDF is imported whole.
+
+The worker applies this to acquisitions, to `rag_corpus import` of one GCS PDF
+object, and to the PDFs of `stage_import` and `web_import` batches. A
+`rag_corpus import` of a GCS directory or a Drive file is imported as before,
+without the check. The library materializer does not split; it rejects a
+longer PDF, or one it cannot count, before import.
 
 Worker health reports `pdf_import.status: degraded` while the LLM parser is
 configured and `qpdf` or `pdftotext` is missing.
@@ -63,6 +74,23 @@ those records were deleted. The worker deletes ERROR records for a URI before
 importing it, so a failed import (a failed split part included) can be
 retried, and it reports a skipped import as present only when the URI's
 ragFile is ACTIVE.
+
+A staged batch relies on this dedupe across re-runs: each file is staged at
+`staged/<domain>/<batch>/<first 32 hex of its sha256>/<file name>` and the
+batch imports exactly those URIs, so an unchanged file is skipped and a changed
+one is imported under a new URI. The changed file's previous version stays in
+the corpus; an object no run names is never imported again.
+
+The worker matches a ragFile to an object by its exact source URI. When Vertex
+lists a ragFile without one, it falls back to the display name (the object's
+file name) only when no ragFile names the URI and exactly one ragFile in the
+corpus carries that name. A changed file and its previous version share a file
+name, so such an object is left unmatched (its state unknown) rather than taken
+for the other version.
+
+`ImportRagFiles` takes several URIs per request (`GcsSource.uris` is a repeated
+string) and documents no maximum; the worker sends at most 25 per request, a
+cautious guess rather than a known limit.
 
 ## Sources
 
