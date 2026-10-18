@@ -137,6 +137,52 @@ describe('ported retrieval regressions', () => {
     expect(await rejected.text()).toContain('output must be answer or passages');
   });
 
+  test('domain_ask reports non-negative stage timings on passages and answers and logs them without the question', async () => {
+    const corpusResource = 'projects/fixture-project/locations/us-central1/ragCorpora/1001';
+    const worker = createDomainExpertWorker({
+      gcpProject: 'fixture-project',
+      google: {
+        accessToken: 'fixture-google-token',
+        multiQuery: true,
+        fetchImpl: fakeGoogleFetch([], {
+          ragCorpora: [{ name: corpusResource, displayName: 'history-library' }],
+        }),
+      },
+    });
+    const question = 'Which neutral timing sentinel question?';
+    const infoLines: string[] = [];
+    const originalInfo = console.info;
+    console.info = (...args: unknown[]) => { infoLines.push(args.map(String).join(' ')); };
+    let passages: Record<string, any>;
+    let answer: Record<string, any>;
+    try {
+      passages = await postDomain(worker, 'domain_ask', { domain_id: 'history', question, output: 'passages' }) as Record<string, any>;
+      answer = await postDomain(worker, 'domain_ask', { domain_id: 'history', question }) as Record<string, any>;
+    } finally {
+      console.info = originalInfo;
+    }
+
+    const stages = ['setup_ms', 'rewrite_ms', 'retrieve_ms', 'rerank_ms', 'fuse_ms', 'complete_ms', 'cite_ms', 'total_ms'];
+    for (const [result, expected] of [[passages!, stages], [answer!, [...stages, 'synthesize_ms']]] as const) {
+      expect(Object.keys(result.timings).sort()).toEqual([...expected].sort());
+      for (const value of Object.values(result.timings)) {
+        expect(Number.isInteger(value)).toBeTrue();
+        expect(value as number).toBeGreaterThanOrEqual(0);
+      }
+      const staged = Object.entries(result.timings)
+        .filter(([key]) => key !== 'total_ms')
+        .reduce((sum, [, value]) => sum + (value as number), 0);
+      // Each stage rounds on its own, so allow one millisecond per stage.
+      expect(staged).toBeLessThanOrEqual(result.timings.total_ms + expected.length);
+    }
+    const logged = infoLines
+      .map((line) => { try { return JSON.parse(line) as Record<string, any>; } catch { return undefined; } })
+      .filter((entry) => entry?.kind === 'domain_expert_ask_timings');
+    expect(logged.map((entry) => entry!.output)).toEqual(['passages', 'answer']);
+    expect(logged[1]).toMatchObject({ domain_id: 'history', selected_context_count: 1, timings: answer!.timings });
+    expect(infoLines.join('\n')).not.toContain(question);
+  });
+
   test('configured domain_ask uses the declared corpus and retrieval overrides', async () => {
     const calls: CapturedCall[] = [];
     const corpusResource = 'projects/fixture-project/locations/us-central1/ragCorpora/1001';
@@ -710,7 +756,7 @@ describe('RAG ingestion configuration', () => {
 
     expect(config.ragFileParsingConfig).toEqual({
       llmParser: {
-        modelName: 'projects/fixture-project/locations/us-central1/publishers/google/models/gemini-2.5-flash',
+        modelName: 'projects/fixture-project/locations/global/publishers/google/models/gemini-3.5-flash-lite',
       },
     });
     expect(config.ragFileTransformationConfig).toEqual({
@@ -721,12 +767,12 @@ describe('RAG ingestion configuration', () => {
   test('a configured parser model overrides the default', async () => {
     const config = await importConfig(
       'gs://fixture-shared-library/v1/objects/book.pdf',
-      { ragParserModel: 'gemini-2.5-flash-lite' },
+      { ragParserModel: 'gemini-3.1-flash-lite' },
     );
 
     expect(config.ragFileParsingConfig).toEqual({
       llmParser: {
-        modelName: 'projects/fixture-project/locations/us-central1/publishers/google/models/gemini-2.5-flash-lite',
+        modelName: 'projects/fixture-project/locations/global/publishers/google/models/gemini-3.1-flash-lite',
       },
     });
   });
@@ -977,7 +1023,7 @@ describe('RAG ingestion configuration', () => {
     expect(manifest.embedding_model).toBe('text-embedding-005');
     expect(manifest.chunking).toEqual({
       parser: 'llm',
-      parser_model: 'gemini-2.5-flash',
+      parser_model: 'gemini-3.5-flash-lite',
       chunk_tokens: 1024,
       chunk_overlap: 256,
     });

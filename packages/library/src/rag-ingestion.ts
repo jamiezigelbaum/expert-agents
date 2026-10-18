@@ -29,9 +29,12 @@ export const RAG_CHUNK_OVERLAP = 256;
 
 // The LLM parser reads documents with a Gemini model instead of the default
 // text extractor, which is what makes books with tables, figures and multi
-// column layouts parse usefully. Flash is the cost/accuracy default; the guide
-// lists Gemini 2.5 Pro, Flash and Flash-Lite as the supported parser models.
-export const DEFAULT_RAG_PARSER_MODEL = "gemini-2.5-flash";
+// column layouts parse usefully. Gemini 2.5 retires on 2026-10-20 (Vertex model
+// versions page); the parser guide now also lists 3.8 Flash, 3.5 Flash,
+// 3.5 Flash-Lite and 3.1 Flash-Lite. 3.5 Flash-Lite costs what 2.5 Flash did,
+// runs without thinking tokens, and in a 41-page bake-off on library books
+// transcribed within 2% of 3.8 Flash.
+export const DEFAULT_RAG_PARSER_MODEL = "gemini-3.5-flash-lite";
 
 // The one configured value that turns the parser off and lets Google apply its
 // own default parser to everything.
@@ -91,7 +94,7 @@ export function ragIngestionConfig(options: RagIngestionConfigOptions): Record<s
   return {
     ...(parserModel === undefined ? {} : {
       ragFileParsingConfig: {
-        llmParser: { modelName: parserModelResourceName(options.project, options.location, parserModel) },
+        llmParser: { modelName: parserModelResourceName(options.project, parserModel) },
       },
     }),
     ragFileTransformationConfig: {
@@ -107,8 +110,12 @@ export function ragIngestionConfig(options: RagIngestionConfigOptions): Record<s
 
 // The API wants a publisher model resource name; a bare model id is the
 // convenient thing to configure, so expand it unless one was given in full.
-function parserModelResourceName(project: string, location: string, model: string): string {
+// Gemini 3.x models are served only from the global, us and eu locations, not
+// from a corpus region such as us-central1, so a bare id expands to the global
+// endpoint. A regional corpus accepts a global parser model (import verified
+// 2026-10-17 from a us-central1 corpus).
+function parserModelResourceName(project: string, model: string): string {
   return model.startsWith("projects/")
     ? model
-    : `projects/${project}/locations/${location}/publishers/google/models/${model}`;
+    : `projects/${project}/locations/global/publishers/google/models/${model}`;
 }
