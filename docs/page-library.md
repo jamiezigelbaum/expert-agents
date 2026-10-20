@@ -80,6 +80,7 @@ docker compose --env-file page-library.env run --rm -T gbrain init --url "$GBRAI
 ./configure.sh <domain>
 docker compose --env-file page-library.env run --rm -T gbrain import /library --source-id <domain> --workers 8
 docker compose --env-file page-library.env run --rm -T gbrain auth create worker --scopes read   # token → worker env
+docker compose --env-file page-library.env run --rm -T gbrain auth rescope --token worker --sources <domain>
 docker compose --env-file page-library.env up -d gbrain                                          # gbrain serve --http :3131
 ```
 

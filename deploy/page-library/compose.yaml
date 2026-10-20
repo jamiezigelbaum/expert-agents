@@ -35,6 +35,9 @@ services:
       - gbrain-home:/var/lib/gbrain
       # The assembled tree, read-only: GBrain can never rewrite the units it imports.
       - ${PAGE_LIBRARY_TREE:?set in page-library.env}:/library:ro
+    # Listens on all container interfaces so the port mapping works; the host
+    # side is published on loopback only.
+    command: ["serve", "--http", "--port", "3131", "--bind", "0.0.0.0"]
     ports:
       - "127.0.0.1:3131:3131"
 volumes:

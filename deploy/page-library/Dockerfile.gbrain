@@ -10,4 +10,4 @@ RUN git clone -q https://github.com/garrytan/gbrain.git . \
  && bun install --frozen-lockfile
 ENV GBRAIN_HOME=/var/lib/gbrain
 ENTRYPOINT ["bun", "/opt/gbrain/src/cli.ts"]
-CMD ["serve", "--http", "--port", "3131"]
+CMD ["serve", "--http", "--port", "3131", "--bind", "0.0.0.0"]

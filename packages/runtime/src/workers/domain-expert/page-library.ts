@@ -305,7 +305,13 @@ export class GbrainSearchClient {
       'Content-Type': 'application/json', Accept: 'application/json, text/event-stream', Authorization: `Bearer ${this.token}`,
     };
     if (this.session) headers['mcp-session-id'] = this.session;
-    const res = await this.fetchImpl(this.url, { method: 'POST', headers, body: JSON.stringify(body), signal: AbortSignal.timeout(60_000) });
+    let res: Response;
+    try {
+      res = await this.fetchImpl(this.url, { method: 'POST', headers, body: JSON.stringify(body), signal: AbortSignal.timeout(60_000) });
+    } catch {
+      this.session = undefined;
+      throw new PageLibraryError('page_search_unavailable', 'The search service is not reachable.', 503);
+    }
     if (!res.ok && res.status !== 202) throw new PageLibraryError('page_search_unavailable', `The search service answered ${res.status}.`, 502);
     const sid = res.headers.get('mcp-session-id');
     if (sid) this.session = sid;
@@ -332,6 +338,9 @@ export class GbrainSearchClient {
     const text = result.content?.find((c) => c.type === 'text')?.text ?? '[]';
     let rows: unknown;
     try { rows = JSON.parse(text); } catch { throw new PageLibraryError('page_search_failed', 'The search service returned an unreadable result.', 502); }
+    if (!Array.isArray(rows) && typeof (rows as { error?: unknown }).error === 'string') {
+      throw new PageLibraryError('page_search_failed', `The search service refused the query (${String((rows as { code?: unknown }).code ?? (rows as { error: string }).error).slice(0, 60)}).`, 502);
+    }
     const list = Array.isArray(rows) ? rows : (rows as { results?: unknown[] }).results ?? [];
     return (list as Array<Record<string, unknown>>)
       .filter((x) => typeof x.slug === 'string')

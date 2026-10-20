@@ -120,6 +120,12 @@ describe('GBrain search client', () => {
     expect(calls[2]!.body.params).toEqual({ name: 'query', arguments: { query: 'q', limit: 7, source_id: 'research' } });
   });
 
+  test('a refused query is an error, never an empty result', async () => {
+    const refusal = JSON.stringify({ jsonrpc: '2.0', id: 1, result: { content: [{ type: 'text', text: JSON.stringify({ error: 'permission_denied', code: 'permission_denied' }) }] } });
+    const client = new GbrainSearchClient('http://127.0.0.1:3131/mcp', 't', (async () => new Response(refusal, { headers: { 'content-type': 'application/json' } })) as unknown as typeof fetch);
+    await expect(client.search('q', 1, 'r')).rejects.toThrow('permission_denied');
+  });
+
   test('a failed call names no secret', async () => {
     const client = new GbrainSearchClient('http://127.0.0.1:3131/mcp', 'secret-token', (async () => new Response('no', { status: 401 })) as unknown as typeof fetch);
     const error = await client.search('q', 1, 'r').catch((e) => e as Error);
