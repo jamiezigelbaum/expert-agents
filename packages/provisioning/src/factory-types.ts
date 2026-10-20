@@ -82,7 +82,7 @@ export interface FactoryState {
   domainRegistered?: boolean;
   /** The worker reported every required seed file of the domain's workspace present. Re-proven on every resume. */
   workspaceSeeded?: boolean;
-  /** Legacy: an operation recorded before agents moved to the page library. Ignored. */
+  /** Legacy: present only on operations the corpus-era release recorded; such operations are refused. */
   corpusReady?: boolean;
   botId?: number;
   tokenInstalled?: boolean;

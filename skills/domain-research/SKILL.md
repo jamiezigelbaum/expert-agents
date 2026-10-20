@@ -1,11 +1,12 @@
 ---
 name: domain-research
-version: 0.2.0
+version: 0.2.1
 description: Answer any question about what a library book, paper, talk, or author says — domain_library first, with your domain_id, before web search, memory, or any other lane. Also covers adding approved sources to the page library and reviewable document collaboration for a configured expert.
 tools:
   - domain_library
   - library_ingest
   - domain_doc
+  - domain_ask
 mutating: true
 ---
 
@@ -19,7 +20,9 @@ where X and Y disagree, what a report claimed — is a library question: call
 before any web search, memory search, or another product's source tools.
 Repository and code search tools cannot see the library; reaching for one on
 a library question is always the wrong tool, not a fallback. If the library
-errors, report the error verbatim and stop — there is no fallback lane.
+errors, report the error verbatim and stop — there is no fallback lane. The
+one exception is `page_library_not_configured`: see "Domains not yet on the
+page library" below.
 
 ## Reading the library
 

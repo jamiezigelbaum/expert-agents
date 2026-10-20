@@ -568,6 +568,15 @@ describe("expert:release disclosure summary", () => {
     }
   });
 
+  test("a page-library agent with no corpus points at its deployment route", () => {
+    const { targetCorpusDisplayName: _omit, ...pageLibrary } = manifest([]);
+    const lines = formatDisclosureSummary(pageLibrary).join("\n");
+    expect(lines).toContain("page library");
+    expect(lines).toContain("disclosure policy");
+    expect(lines).not.toContain("undefined");
+    expect(lines).not.toContain("WARNING");
+  });
+
   test("carries no absolute path or file content", () => {
     const lines = formatDisclosureSummary(manifest([{ corpusId: "neutral-public", disclosure: "full" }])).join("\n");
     expect(lines).not.toMatch(/\//);
