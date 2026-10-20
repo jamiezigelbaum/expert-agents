@@ -36,7 +36,7 @@ async function fixture() {
   const workers: { tool: string; params: Record<string, unknown> }[] = [];
   const state = {
     agents: [] as Record<string, unknown>[], accounts: {} as Record<string, unknown>,
-    bindings: [] as Record<string, unknown>[], corpusReady: true, confirmed: false,
+    bindings: [] as Record<string, unknown>[], confirmed: false,
     running: true, probeOk: true, observedBotId: 987654321, ownerSeen: 0,
     beginCount: 0, provisionCount: 0, probeCount: 0, validationFails: false,
     channelError: false, registrationStatus: 'registered',
@@ -119,7 +119,6 @@ async function fixture() {
     gatewayReloadMode: async () => state.reloadMode,
     worker: async (tool, params) => {
       workers.push({ tool, params });
-      if (tool === 'rag_corpus') return { status: state.corpusReady ? 'ready' : 'pending' };
       if (params.action === 'status') {
         return { kind: 'domain_agent_status', health: state.seeded ? 'healthy' : 'degraded',
           workspace: { exists: state.seeded, missing_requirements: state.seeded ? [] : [{ relative_path: 'example/PROPOSAL.md', kind: 'proposal' }] } };
@@ -204,7 +203,6 @@ describe('conversational expert factory', () => {
       || (call.argv[1] === 'config' && call.argv[2] === 'get'))).toBe(true);
     expect(f.state.beginCount).toBe(1);
     expect(f.state.provisionCount).toBe(1);
-    expect(f.workers.filter((call) => call.tool === 'rag_corpus')).toHaveLength(3);
     expect(f.workers.filter((call) => call.params.action === 'register' && call.params.dry_run === false)).toHaveLength(1);
     expect(f.state.bootstrapCount).toBe(1);
     expect((await stat(join(f.config.rootDir, 'operations', 'example', 'state.json'))).mode & 0o077).toBe(0);
@@ -311,21 +309,6 @@ describe('conversational expert factory', () => {
     expect(f.state.provisionCount).toBe(1);
   }, 60_000);
 
-  test('pending corpus resumes ensure with the same approval and never installs Telegram early', async () => {
-    const f = await fixture(); f.state.corpusReady = false;
-    const pending = await f.run();
-    expect(pending.status).toBe('waiting_for_corpus');
-    expect(pending.confirmation_url).toBeDefined();
-    expect(f.state.provisionCount).toBe(0);
-    expect(f.state.probeCount).toBe(1);
-    f.state.corpusReady = true;
-    expect((await f.resume()).status).toBe('waiting_for_telegram');
-    const ensures = f.workers.filter((call) => call.tool === 'rag_corpus');
-    expect(ensures).toHaveLength(2);
-    expect(ensures[0]!.params).toEqual(ensures[1]!.params);
-    expect(f.state.beginCount).toBe(1);
-  }, 60_000);
-
   test.each(['../escape', '/tmp/escape', 'main', 'default', 'Example', 'a.b', 'a'])('rejects unsafe agent id %s before effects', async (agent_id) => {
     const f = await fixture();
     await expect(f.run({ ...request, agent_id })).rejects.toMatchObject({ code: 'factory_invalid_request' });
@@ -404,10 +387,10 @@ describe('conversational expert factory', () => {
     expect(f.state.beginCount).toBe(1);
   }, 60_000);
 
-  test('failed registration does not create a corpus or configure an agent', async () => {
+  test('failed registration does not seed a workspace or configure an agent', async () => {
     const f = await fixture(); f.state.registrationStatus = 'error';
     await expect(f.run()).rejects.toMatchObject({ code: 'factory_registration_incomplete' });
-    expect(f.workers.some((call) => call.tool === 'rag_corpus')).toBe(false);
+    expect(f.workers.some((call) => call.params.action === 'bootstrap')).toBe(false);
     expect(f.state.agents).toEqual([]);
     f.state.registrationStatus = 'registered';
     expect((await f.resume()).status).toBe('waiting_for_telegram');
@@ -575,25 +558,19 @@ describe('conversational expert factory', () => {
     expect((await f.resume()).status).toBe('ready_empty_library');
   }, 60_000);
 
-  test.each(['worker_unavailable', 'route_removed', 'corpus_inactive'])('fresh %s worker proof cannot reuse an old ready receipt', async (failure) => {
+  test('fresh worker proof cannot reuse an old ready receipt', async () => {
     const f = await fixture(); await f.run(); f.state.confirmed = true;
     expect((await f.resume()).status).toBe('ready_empty_library');
     const worker = f.dependencies.worker;
     const freshCalls: string[] = [];
-    f.dependencies.worker = async (tool, params) => {
+    f.dependencies.worker = async (tool) => {
       freshCalls.push(tool);
-      const durable = JSON.parse(await readFile(join(f.config.rootDir, 'operations', 'example', 'state.json'), 'utf8'));
-      expect(durable.corpusReady).toBe(false);
-      if (failure === 'worker_unavailable' || (failure === 'route_removed' && tool === 'rag_corpus')) throw new Error('Fixture worker proof unavailable');
-      if (failure === 'corpus_inactive' && tool === 'rag_corpus') return { status: 'create_requested', creation_pending: true };
-      return worker(tool, params);
+      throw new Error('Fixture worker proof unavailable');
     };
-    if (failure === 'corpus_inactive') expect((await f.resume()).status).toBe('waiting_for_corpus');
-    else await expect(f.resume()).rejects.toThrow();
+    await expect(f.resume()).rejects.toThrow();
     const status = await f.run({ action: 'status', agent_id: 'example' });
     expect(status.status).not.toBe('ready_empty_library');
-    expect(status.corpus_ready).toBe(false);
-    expect(freshCalls).toEqual(failure === 'worker_unavailable' ? ['domain_agent'] : ['domain_agent', 'domain_agent', 'rag_corpus']);
+    expect(freshCalls).toEqual(['domain_agent']);
     expect(f.state.provisionCount).toBe(1);
     f.dependencies.worker = worker;
     expect((await f.resume()).status).toBe('ready_empty_library');
@@ -771,11 +748,11 @@ describe('conversational expert factory', () => {
   describe('workspace seed', () => {
     const statePath = (f: Awaited<ReturnType<typeof fixture>>) => join(f.config.rootDir, 'operations', 'example', 'state.json');
 
-    test('creation bootstraps the registered domain workspace once, between registration and the corpus', async () => {
+    test('creation bootstraps the registered domain workspace once, after registration', async () => {
       const f = await fixture();
       await f.run();
       const order = f.workers.filter((call) => call.params.dry_run !== true).map((call) => `${call.tool} ${call.params.action}`);
-      expect(order).toEqual(['domain_agent register', 'domain_agent status', 'domain_agent bootstrap', 'domain_agent status', 'rag_corpus ensure']);
+      expect(order).toEqual(['domain_agent register', 'domain_agent status', 'domain_agent bootstrap', 'domain_agent status']);
       expect(f.workers.find((call) => call.params.action === 'bootstrap')!.params).toEqual({ action: 'bootstrap', domain_id: 'example', dry_run: false });
       // A resume re-proves the seed read-only and never rewrites a seeded workspace.
       f.state.confirmed = true;
@@ -805,11 +782,20 @@ describe('conversational expert factory', () => {
       expect(JSON.parse(await readFile(statePath(f), 'utf8')).workspaceSeeded).toBe(true);
     }, 60_000);
 
+    test('an operation recorded while it waited for a Vertex corpus resumes without one', async () => {
+      const f = await fixture(); await f.run();
+      const earlier = JSON.parse(await readFile(statePath(f), 'utf8'));
+      await writeFile(statePath(f), JSON.stringify({ ...earlier, phase: 'waiting_for_corpus', corpusReady: false }) + '\n', { mode: 0o600 });
+      f.state.confirmed = true;
+      expect((await f.resume()).status).toBe('ready_empty_library');
+      expect(f.workers.every((call) => call.tool === 'domain_agent')).toBe(true);
+    }, 60_000);
+
     test.each([
       ['an unconfirmed bootstrap', { status: 'dry_run_scaffold_ready' }, 'factory_workspace_seed_incomplete'],
       ['a bootstrap that leaves seed files missing', 'still-missing', 'factory_workspace_seed_incomplete'],
       ['a refused bootstrap', Object.assign(new Error('Workspace root is not configured.'), { code: 'workspace_root_not_configured' }), 'workspace_root_not_configured'],
-    ])('%s stops at bootstrapping_workspace before the corpus and resumes there', async (_name, outcome, code) => {
+    ])('%s stops at bootstrapping_workspace and resumes there', async (_name, outcome, code) => {
       const f = await fixture();
       const worker = f.dependencies.worker;
       f.dependencies.worker = async (tool, params) => {
@@ -820,29 +806,11 @@ describe('conversational expert factory', () => {
       };
       await expect(f.run()).rejects.toMatchObject({ code, details: { phase: 'bootstrapping_workspace' } });
       expect((await f.run({ action: 'status', agent_id: 'example' })).status).toBe('bootstrapping_workspace');
-      expect(f.workers.some((call) => call.tool === 'rag_corpus')).toBe(false);
       f.dependencies.worker = worker;
       expect((await f.resume()).status).toBe('waiting_for_telegram');
       expect(f.state.seeded).toBe(true);
     }, 60_000);
   });
-
-  test('a corpus that was never requested resumes as creating_corpus, not as a pending Vertex creation', async () => {
-    const f = await fixture();
-    const worker = f.dependencies.worker;
-    f.dependencies.worker = async (tool, params) => {
-      if (tool === 'rag_corpus') throw Object.assign(new Error('Vertex unavailable.'), { code: 'rag_corpus_unavailable' });
-      return worker(tool, params);
-    };
-    await expect(f.run()).rejects.toMatchObject({ code: 'rag_corpus_unavailable', details: { phase: 'creating_corpus', step: 'worker corpus ensure' } });
-    await expect(f.resume()).rejects.toMatchObject({ code: 'rag_corpus_unavailable', details: { phase: 'creating_corpus' } });
-    const status = await f.run({ action: 'status', agent_id: 'example' });
-    expect(status.status).toBe('creating_corpus');
-    expect(status.next_action).not.toContain('pending');
-    expect(status.confirmation_url).toBe('https://t.me/FactoryManagerBot?start=fixture');
-    f.dependencies.worker = worker;
-    expect((await f.resume()).status).toBe('waiting_for_telegram');
-  }, 60_000);
 
   describe('remote history wiring', () => {
     async function gitOutput(cwd: string, args: string[]): Promise<string> {
@@ -1090,18 +1058,14 @@ describe('conversational expert factory', () => {
       }
     }, 60_000);
 
-    test.each([
-      ['not_configured', 'not_configured'], ['project_not_configured', 'project_not_configured'], ['unreadable', 'unreadable'],
-      [undefined, 'not ready'], ['private-detail', 'not ready'],
-    ])('refuses before anything is created when the worker reports Google %p', async (google, reported) => {
-      const f = await fixture(); f.state.googleStatus = google;
-      const error = await f.run().catch((caught: unknown) => caught);
-      expect(error).toMatchObject({ code: 'factory_google_not_ready', details: { phase: 'preflight', step: 'worker health' } });
-      expect(String(error)).toContain(`Google configuration as ${reported},`);
-      expect(String(error)).not.toContain('private-detail');
-      await nothingCreated(f);
-      f.state.googleStatus = 'ready';
+    test('a worker without Google is enough: a page library needs no Vertex corpus', async () => {
+      const f = await fixture(); f.state.googleStatus = 'not_configured';
       expect((await f.run()).status).toBe('waiting_for_telegram');
+      const register = f.workers.find((call) => call.params.action === 'register' && call.params.dry_run === false)!;
+      expect(register.params.page_library).toEqual({});
+      expect(register.params).not.toHaveProperty('target_corpus_display_name');
+      f.state.confirmed = true;
+      expect((await f.resume()).status).toBe('ready_empty_library');
     }, 60_000);
 
     test('an unreachable worker health check refuses with its own code before the Telegram link', async () => {
@@ -1109,16 +1073,6 @@ describe('conversational expert factory', () => {
       f.dependencies.workerHealth = async () => { throw Object.assign(new Error('Domain expert worker is unreachable.'), { code: 'domain_expert_unreachable' }); };
       await expect(f.run()).rejects.toMatchObject({ code: 'domain_expert_unreachable', details: { phase: 'preflight', step: 'worker health' } });
       await nothingCreated(f);
-    }, 60_000);
-
-    test('a resume also needs Google, since it re-proves the corpus', async () => {
-      const f = await fixture(); await f.run(); f.state.confirmed = true;
-      f.state.googleStatus = 'unreadable';
-      await expect(f.resume()).rejects.toMatchObject({ code: 'factory_google_not_ready', details: { phase: 'preflight' } });
-      expect((await f.run({ action: 'status', agent_id: 'example' })).status).toBe('waiting_for_telegram');
-      expect(f.state.provisionCount).toBe(0);
-      f.state.googleStatus = 'ready';
-      expect((await f.resume()).status).toBe('ready_empty_library');
     }, 60_000);
 
     test.each([
@@ -1362,20 +1316,6 @@ describe('conversational expert factory', () => {
       expect(await Bun.file(join(f.config.rootDir, 'operations', 'example', 'state.json')).exists()).toBe(false);
     }, 60_000);
 
-    test('a resume records the step it is in, so a corpus re-check failure is not reported as another step', async () => {
-      const f = await fixture(); await f.run(); f.state.confirmed = true;
-      expect((await f.resume()).status).toBe('ready_empty_library');
-      const worker = f.dependencies.worker;
-      f.dependencies.worker = async (tool, params) => {
-        if (tool === 'rag_corpus') throw Object.assign(new Error('Corpus check unavailable.'), { code: 'rag_corpus_unavailable' });
-        return worker(tool, params);
-      };
-      await expect(f.resume()).rejects.toMatchObject({ code: 'rag_corpus_unavailable', details: { phase: 'waiting_for_corpus', step: 'worker corpus ensure' } });
-      expect((await f.run({ action: 'status', agent_id: 'example' })).status).toBe('waiting_for_corpus');
-      f.dependencies.worker = worker;
-      expect((await f.resume()).status).toBe('ready_empty_library');
-    }, 60_000);
-
     test('every phase an operation records is a declared phase', async () => {
       const f = await fixture(); f.wireRemote(); f.state.running = false;
       const seen = new Set<string>();
@@ -1392,7 +1332,7 @@ describe('conversational expert factory', () => {
       f.state.running = true;
       seen.add((await f.resume()).status);
       expect([...seen].filter((phase) => !(FACTORY_PHASES as readonly string[]).includes(phase))).toEqual([]);
-      for (const phase of ['registering_library', 'bootstrapping_workspace', 'creating_corpus', 'configuring_gateway', 'ready_empty_library']) expect(seen.has(phase)).toBe(true);
+      for (const phase of ['registering_library', 'bootstrapping_workspace', 'configuring_gateway', 'ready_empty_library']) expect(seen.has(phase)).toBe(true);
     }, 60_000);
   });
 });

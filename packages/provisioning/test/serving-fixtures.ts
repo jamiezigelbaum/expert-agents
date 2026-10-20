@@ -61,7 +61,6 @@ export function scaffoldOptions(targetDir: string): ExpertScaffoldOptions {
     agentId: "neutral-agent",
     displayName: "Neutral Agent",
     domainId: "neutral-domain",
-    targetCorpusDisplayName: "neutral-corpus",
     emoji: "◉",
   };
 }

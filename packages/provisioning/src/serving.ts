@@ -154,7 +154,7 @@ export function createServingManifest(
     agentId: manifest.agentId,
     displayName: manifest.displayName,
     domainId: manifest.domainId,
-    targetCorpusDisplayName: manifest.targetCorpusDisplayName,
+    ...(manifest.targetCorpusDisplayName === undefined ? {} : { targetCorpusDisplayName: manifest.targetCorpusDisplayName }),
     ...(manifest.emoji === undefined ? {} : { emoji: manifest.emoji }),
     // The avatar is public-safe, so it may ship — but it is named only when the
     // serving set actually materialized it, so the manifest never points a

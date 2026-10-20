@@ -416,23 +416,19 @@ export function planDomainAgent(
       workspace: manifest.workspace_relative_path,
       created_by_skill: AGENT_WORKSHOP_SKILL,
       operating_skill: operatingSkillForDomain(manifest.domain_id),
-      scoped_tools: [
-        'domain_ask',
-        'domain_read',
-        'domain_source',
-        'rag_corpus',
-        'domain_doc',
-        'annas_archive_search',
-        'annas_archive_import',
-        'expert_agents_workspace',
-      ],
+      scoped_tools: servesPageLibrary(manifest)
+        ? ['domain_library', 'library_ingest', 'domain_doc', 'annas_archive_search', 'annas_archive_import', 'expert_agents_workspace']
+        // Legacy: a domain still served from a Vertex corpus.
+        : ['domain_ask', 'domain_read', 'domain_source', 'rag_corpus', 'domain_doc', 'annas_archive_search', 'annas_archive_import', 'expert_agents_workspace'],
     },
     policy: domainPolicy(),
     next_steps: [
       'Materialize these paths through the bounded workspace adapter or live OpenClaw runtime.',
       'Initialize version control and wire the private remote before the workspace accumulates working memory.',
       'Share a test Google Doc with the per-domain service account before enabling document edits.',
-      'Create or verify Gemini Enterprise RAG corpora before asking grounded questions.',
+      servesPageLibrary(manifest)
+        ? 'Ingest approved sources into the page library with library_ingest before asking grounded questions.'
+        : 'Create or verify Gemini Enterprise RAG corpora before asking grounded questions.',
     ],
   };
 }
@@ -1067,6 +1063,11 @@ export function requireConfiguredAgent(manifest: DomainManifest, toolName: strin
  * a corpus and a library location. A page-library-only route has neither and
  * is refused here instead of failing deeper with an undefined corpus.
  */
+/** The domain reads its page library (domain_library); the Vertex tools are legacy for it. */
+export function servesPageLibrary(manifest: DomainManifest): boolean {
+  return Boolean(manifest.routing.page_library);
+}
+
 export function requireVertexAgent(manifest: DomainManifest, toolName: string): void {
   requireConfiguredAgent(manifest, toolName);
   if (manifest.routing.target_corpus_display_name && manifest.routing.library) return;

@@ -53,7 +53,6 @@ describe("serving artifact packaging", () => {
       agentId: "neutral-agent",
       displayName: "Neutral Agent",
       domainId: "neutral-domain",
-      targetCorpusDisplayName: "neutral-corpus",
       emoji: "◉",
       corpora: [
         { corpusId: "neutral-public", disclosure: "full" },

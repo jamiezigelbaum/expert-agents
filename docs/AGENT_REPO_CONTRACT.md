@@ -52,7 +52,7 @@ USER.md
 HEARTBEAT.md
 references/
 library/
-  scope-manifest.json
+  scope-manifest.json (legacy Vertex agents only)
   eval-questions.json
 derived/ (optional)
   <artifact-id>/
@@ -102,13 +102,16 @@ may also load one from a local checkout.
   "agentId": "neutral-agent",
   "displayName": "Neutral Agent",
   "domainId": "neutral-domain",
-  "targetCorpusDisplayName": "neutral-corpus",
   "emoji": "◉",
   "avatar": "avatar.png"
 }
 ```
 
 `emoji`, `avatar`, and `serving` are optional; all other fields are required.
+An agent reads its domain's page library ([`page-library.md`](./page-library.md)),
+so it names no corpus. `targetCorpusDisplayName` is accepted only from a legacy
+agent still served from a Vertex corpus, which also keeps
+`library/scope-manifest.json`; both go when the Vertex machinery is removed.
 Unknown fields are rejected. IDs use lowercase letters, digits, dots,
 underscores, and hyphens, begin and end with a letter or digit, and have at most
 128 characters. Human-facing values must be non-empty, trimmed, single-line
@@ -125,8 +128,8 @@ valid.
 
 The manifest is consistent only when:
 
-- `agentId` equals `library/scope-manifest.json`'s `agentId`;
-- `targetCorpusDisplayName` equals the scope manifest's target; and
+- for a legacy Vertex agent, `agentId` and `targetCorpusDisplayName` equal
+  `library/scope-manifest.json`'s; and
 - `domainId` equals `library/eval-questions.json`'s `domainId`.
 
 ## Deployment posture and the serving set
@@ -381,7 +384,7 @@ verification workflow.
 
 ## Library files
 
-`library/scope-manifest.json` is an agent-owned
+A legacy Vertex agent's `library/scope-manifest.json` is an agent-owned
 [`ScopeManifest`](./LIBRARY_ARCHITECTURE.md) validated by
 `@expert-agents/library`. It never moves into this machinery repository or the
 shared-library bucket.
@@ -418,7 +421,6 @@ bun run expert:create -- \
   --agent-id <agent-id> \
   --display-name <display-name> \
   --domain-id <domain-id> \
-  --target-corpus <corpus-display-name> \
   --receipt <approved-receipt-path> \
   [--emoji <emoji>] \
   [--avatar <image-path>] \

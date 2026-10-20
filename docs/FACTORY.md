@@ -2,7 +2,7 @@
 
 An owner can ask an OpenClaw assistant with this plugin to create a new expert.
 The `expert_factory` tool creates an independent local Git repository and soul,
-connects a new domain to its own Vertex corpus, obtains a managed Telegram bot
+connects a new domain to its own page library ([`page-library.md`](./page-library.md)), obtains a managed Telegram bot
 after the owner's confirmation, and applies the agent/account binding through
 OpenClaw's supported commands. Every returned state describes observed progress.
 
@@ -29,9 +29,12 @@ The installation owner must provide these prerequisites through its normal
 configuration and credential process. Repository delivery does not enable them.
 
 - Bun 1.3+ and a supported OpenClaw CLI on a POSIX host, both with absolute executable paths.
-- An authenticated Expert Agents worker and a configured Google project with
-  Vertex RAG permissions. The GCS library bucket already exists; the factory
-  creates a per-agent prefix and corpus, not cloud billing/IAM or a new bucket.
+- An authenticated Expert Agents worker with the page library configured: the
+  page index (`EXPERT_AGENTS_DOMAIN_EXPERT_PAGE_INDEX_DATABASE_URL` and its
+  writer URL), `VOYAGE_API_KEY`, the OCR lanes, and the page-library root
+  (`EXPERT_AGENTS_DOMAIN_EXPERT_PAGE_LIBRARY_ROOT`). The GCS library bucket
+  already exists; the factory registers a per-agent prefix, where originals
+  land, not cloud billing/IAM or a new bucket. No Vertex corpus is created.
   The worker's workspace root (`EXPERT_AGENTS_DOMAIN_EXPERT_ROOTS_JSON`) must be
   configured with `allow_overwrite` false: the factory seeds each new domain's
   workspace there, and the worker's bootstrap rewrites existing seed files,
@@ -77,13 +80,13 @@ EXPERT_AGENTS_DOMAIN_EXPERT_REGISTRATION_LIBRARY_JSON='{"bucket":"example-librar
 ```
 
 Requests must stay in that bucket and prefix. Existing environment routes and
-already-existing corpus names are protected. Dynamic registrations persist in
+page libraries are protected. The factory registers `page_library: {}`; the
+worker derives the tree (`<page-library-root>/<domain>`) and the index source
+(the domain id) itself, so a caller cannot name another domain's library. Dynamic registrations persist in
 the worker's private data directory; do not add them to Git. A new registration
 does not modify the static environment routing manifest.
-Registered routes use client import receipts and omit Vertex's optional GCS
-results sink. This avoids requiring the Vertex service agent to write an
-additional results object. The same default applies when older registrations
-are loaded; explicit deployment routes retain their configured sink behavior.
+Legacy registrations that name a Vertex corpus use client import receipts and
+omit Vertex's optional GCS results sink.
 The registration request does not accept an ingestion-policy override.
 
 The following is a configuration shape, not a command to edit live config. Verify
@@ -211,7 +214,7 @@ Example authorized tool request:
 Omitting `apply` makes a read-only plan. It never writes files or contacts
 external services. Creation validates existing identities, authorizes the
 worker route, writes and commits the agent repository, registers the domain,
-seeds its worker workspace, ensures the corpus, then returns Telegram's
+seeds its worker workspace, then returns Telegram's
 confirmation link. Share that link immediately. The link is issued before the
 repository is written, so if a later step fails, `status` still returns it as
 `confirmation_url`.
@@ -232,11 +235,6 @@ repository or the GitHub repository exists:
   registration manifest names, or that root's `allow_overwrite` is not false.
   Every create and resume checks it, because each one seeds or re-proves the
   workspace.
-- `factory_google_not_ready`: the worker's authenticated health
-  (`configuration_status.google`) does not report its Google credentials and
-  project as ready, so the corpus could not be created or re-checked. Every
-  create and resume checks it. It proves configuration, not Vertex IAM
-  permissions; a permission failure still surfaces at `creating_corpus`.
 - For an `https://github.com/` remote that is not yet pushed: `git ls-remote`
   and then `gh auth status --active --hostname github.com` run with exactly the
   push's System GitHub identity, helper and isolated environment. The remote
@@ -259,7 +257,7 @@ completion, another session or a scheduled turn is refused with
 Failures are located without revealing private output. Every factory error
 raised after an applied invocation takes the deployment lock names its `phase`
 (`preflight`, or the recorded step below) and usually a fixed `step` label (for
-example `git push`, `agents.update` or `worker corpus ensure`). Errors before
+example `git push`, `agents.update` or `worker workspace bootstrap`). Errors before
 the lock (invalid request or configuration, `factory_busy`) carry neither. A
 failed command also names a `category`: `auth`, `not_found`, `rejected`,
 `unavailable`, `invalid`, `timeout`, `missing_command` or `failed`. The
@@ -285,20 +283,18 @@ After the owner confirms, call:
 | `wiring_remote` | The initial commit exists but the configured remote has not proven the pushed head. Fix the remote or its credentials, then resume; the commit is never repeated. |
 | `registering_library` | The worker is registering the domain. |
 | `bootstrapping_workspace` | The worker's domain workspace is being checked with `domain_agent status` and, when seed files are missing, seeded with `domain_agent bootstrap`, which creates only the missing files because preflight refuses a root that allows overwrite; `factory_workspace_seed_incomplete` means the worker did not confirm every seed file. |
-| `creating_corpus` | The Vertex corpus is being requested; no request has been confirmed yet. |
-| `waiting_for_corpus` | A Vertex create operation has been submitted, or a resume is re-checking corpus readiness. Resume checks its result without replaying an uncertain submission. |
 | `waiting_for_telegram` | Use `confirmation_url` with the configured owner account; keep the suggested username or pick another if Telegram reports it taken. Then resume. |
 | `installing_telegram_token` | The confirmed bot's token is being installed. |
 | `configuring_gateway` | The agent, its route and its Telegram account are being configured and validated. |
 | `waiting_for_activation` | Config is validated; live polling and bot identity are not yet proven, and the bot is silent. With hybrid reload the Gateway starts the account after in-flight runs finish, which can take several minutes; then resume. With reload off, complete approved activation first. |
-| `ready_empty_library` | Repository commit, corpus readiness, account configuration and matching Telegram polling are established. The owner messaging the bot is the real test. Import sources and prove an agent answer. |
+| `ready_empty_library` | Repository commit, domain registration, account configuration and matching Telegram polling are established. The owner messaging the bot is the real test. Ingest sources and prove an agent answer. |
 
 `status` reads stored progress only; it is not a live health check. `resume`
 performs a fresh readiness check. A resume first records the first unfinished
 step, which also downgrades an earlier readiness receipt, and re-proves the
-workspace seed and corpus readiness. A corpus that was never requested stays
-at `creating_corpus`. An operation recorded before the workspace step existed
-is seeded on its next resume. Spec changes for an existing id are refused.
+workspace seed. An operation recorded before the workspace step existed
+is seeded on its next resume. An operation recorded while it waited for a
+Vertex corpus (`creating_corpus`, `waiting_for_corpus`) resumes without one. Spec changes for an existing id are refused.
 Never delete and recreate an operation to work around a provider failure.
 
 The route to the new agent is installed before its Telegram account is enabled,
@@ -317,12 +313,12 @@ existing experts keep their domain bindings when creation is disabled.
 
 ## Library population and proof
 
-A ready corpus is empty. The factory does not invent a library selection or
-claim expertise from the presence of a cloud resource. Use the normal reviewed
-scope/materialization flow for a shared library, or the bounded `rag_corpus`
-import operations for approved URLs, GCS objects, Drive files or worker-local
-staged files. Confirm Vertex import completion and ACTIVE files, then run a
-cited answer and an explicit knowledge-gap test. Avatars and more elaborate
+A new page library is empty. The factory does not invent a library selection
+or claim expertise from the presence of a resource. The agent adds approved
+sources with `library_ingest` (a workspace file or folder, or a `gs://` original
+in its library) or acquires them with `annas_archive_import`; check each job's
+`status` for failed, empty and unresolved pages. Then run a cited answer and an
+explicit knowledge-gap test. Avatars and more elaborate
 personality workshops remain optional subsequent work.
 
 An OpenClaw attachment path and a worker-local path are different authorities.
@@ -330,7 +326,7 @@ The current host tool context exposes the workspace and owner identity, but no
 trusted current-turn attachment list. The plugin therefore does not read the
 shared inbound-media directory based on a caller-supplied path. Use an approved
 host intake adapter to place the requested attachment in the worker workspace,
-then `stage_import`; `domain_source add` alone only registers metadata.
+then `library_ingest`.
 
 ## Recovery and operational limits
 
@@ -359,7 +355,10 @@ verifiable owner, such as one left by an earlier factory version, is refused
 with `factory_busy` until the deployment owner confirms no factory process runs
 and removes it. A killed process can still leave a partially published
 scaffold; the owner must inspect it before recovery. Existing arbitrary directories and token files are
-never silently adopted. Uncertain Vertex creation remains recorded and is not
+never silently adopted.
+
+The rest of this section applies to legacy Vertex corpora only, pending their
+removal. Uncertain Vertex creation remains recorded and is not
 reissued; operator reconciliation may be required after an ambiguous submission.
 When Vertex returns a numeric project alias but Resource Manager lookup is
 unavailable, the worker retains the bounded operation reference privately and

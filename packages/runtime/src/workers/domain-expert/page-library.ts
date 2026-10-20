@@ -134,7 +134,11 @@ export class PageLibrary {
     if (!this.catalogCache) {
       let parsed: { books?: CatalogBook[] };
       try { parsed = JSON.parse(await readFile(join(this.config.root, 'catalog.json'), 'utf8')); }
-      catch { throw new PageLibraryError('page_library_unavailable', 'The page library catalog is not readable.', 503); }
+      catch (error) {
+        // A library nothing has been ingested into yet has no catalog: it is empty, not broken.
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw new PageLibraryError('page_library_unavailable', 'The page library catalog is not readable.', 503);
+        return { books: [], byBook: new Map() };
+      }
       const books = (parsed.books ?? []).filter((b) => typeof b.book === 'string' && /^[a-z0-9][a-z0-9-]{0,63}$/.test(b.book));
       this.catalogCache = { books, byBook: new Map(books.map((b) => [b.book, b])) };
     }

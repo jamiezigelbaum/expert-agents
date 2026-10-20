@@ -11,7 +11,7 @@ import {
   type ExpertScaffoldOptions,
 } from "../packages/provisioning/src/index.ts";
 
-const USAGE = `Usage: bun run expert:create -- --target <directory> --agent-id <id> --display-name <name> --domain-id <id> --target-corpus <display-name> --receipt <path> [--emoji <emoji>] [--avatar <image-path>] [--telegram-token-path <absolute-path>] [--issue-tracker <channel>] [--remote <url>] [--no-git]
+const USAGE = `Usage: bun run expert:create -- --target <directory> --agent-id <id> --display-name <name> --domain-id <id> --receipt <path> [--emoji <emoji>] [--avatar <image-path>] [--telegram-token-path <absolute-path>] [--issue-tracker <channel>] [--remote <url>] [--no-git]
 
 Creates a tenant-neutral agent repository scaffold. Git initialization and the first commit run by default and stage only the scaffold files; --no-git opts out. --remote wires an origin remote locally and never pushes. --avatar copies one ${AVATAR_EXTENSIONS.join("/")} image of at most ${AVATAR_MAX_BYTES} bytes into the scaffold.`;
 
@@ -53,7 +53,6 @@ export function parseExpertCreateArguments(argv: string[]): ExpertCreateCliArgum
     "--agent-id",
     "--display-name",
     "--domain-id",
-    "--target-corpus",
     "--receipt",
     "--emoji",
     "--avatar",
@@ -85,7 +84,6 @@ export function parseExpertCreateArguments(argv: string[]): ExpertCreateCliArgum
     "--agent-id",
     "--display-name",
     "--domain-id",
-    "--target-corpus",
     "--receipt",
   ];
   if (required.some((flag) => !values.has(flag))) throw new Error(USAGE);
@@ -94,7 +92,6 @@ export function parseExpertCreateArguments(argv: string[]): ExpertCreateCliArgum
     agentId: values.get("--agent-id")!,
     displayName: values.get("--display-name")!,
     domainId: values.get("--domain-id")!,
-    targetCorpusDisplayName: values.get("--target-corpus")!,
     ...(values.has("--emoji") ? { emoji: values.get("--emoji")! } : {}),
     ...(values.has("--avatar") ? { avatarPath: values.get("--avatar")! } : {}),
     ...(values.has("--telegram-token-path")
@@ -155,7 +152,7 @@ export async function runExpertCreateCli(
     targetDir: scaffold.targetDir,
     receiptPath,
     receipt: scaffold.receipt,
-    routingSnippet: createRoutingSnippet(scaffold.manifest, scaffold.targetDir),
+    routingSnippet: createRoutingSnippet(scaffold.manifest),
     githubCommand: createGithubCommand(scaffold.manifest.agentId, scaffold.targetDir),
     remoteWiringSteps: createRemoteWiringSteps({
       agentId: scaffold.manifest.agentId,
@@ -198,9 +195,7 @@ export function createRoutingSnippet(
   manifest: {
     domainId: string;
     displayName: string;
-    targetCorpusDisplayName: string;
   },
-  targetDir: string,
 ): string {
   const value = JSON.stringify({
     [manifest.domainId]: {
@@ -209,8 +204,11 @@ export function createRoutingSnippet(
         bucket: "<configured-bucket>",
         prefix: "<configured-prefix>",
       },
-      targetCorpusDisplayName: manifest.targetCorpusDisplayName,
-      scopeManifestPath: join(resolve(targetDir), "library/scope-manifest.json"),
+      // The domain's page library: its assembled tree and its search index source.
+      pageLibrary: {
+        root: `<page-library-root>/${manifest.domainId}`,
+        sourceId: manifest.domainId,
+      },
     },
   });
   return `EXPERT_AGENTS_DOMAIN_EXPERT_AGENTS_JSON=${shellQuote(value)}`;

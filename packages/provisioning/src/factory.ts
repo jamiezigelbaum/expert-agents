@@ -14,8 +14,8 @@ export interface FactoryCommandOptions {
 export type FactoryCommand = (argv: string[], cwd?: string, options?: FactoryCommandOptions) => Promise<string>;
 export interface FactoryDependencies {
   command: FactoryCommand;
-  worker: (tool: 'domain_agent' | 'rag_corpus', params: Record<string, unknown>) => Promise<unknown>;
-  /** The worker's authenticated health report; its `configuration_status.google` gates Vertex steps. */
+  worker: (tool: 'domain_agent', params: Record<string, unknown>) => Promise<unknown>;
+  /** The worker's authenticated health report; it names the workspace root the domain is seeded in. */
   workerHealth: () => Promise<unknown>;
   /** The running Gateway's `gateway.reload.mode`; undefined means its default (hybrid). */
   gatewayReloadMode?: () => Promise<unknown>;
@@ -25,8 +25,6 @@ export interface FactoryDependencies {
 }
 
 const SLUG = /^[a-z][a-z0-9-]{1,47}$/;
-// The worker's own names for a Google configuration that is not ready; anything else is not echoed.
-const GOOGLE_NOT_READY: unknown[] = ['not_configured', 'unreadable', 'project_not_configured'];
 const BOT = /^[A-Za-z][A-Za-z0-9_]{1,28}bot$/i;
 
 /** Content-free causes for a failed command, derived privately from its exit status and output. */
@@ -65,7 +63,7 @@ export async function runFactory(config: FactoryConfig, request: FactoryRequest,
   }
   if (request.apply !== true) return {
     kind: 'expert_factory', agent_id: spec.agentId, status: 'planned', repository_path: workspace,
-    domain_id: spec.agentId, next_action: 'With owner authorization, repeat with apply=true. Creates a private local agent repository, a bounded Vertex corpus, and a Telegram confirmation link; no sources are imported.',
+    domain_id: spec.agentId, next_action: 'With owner authorization, repeat with apply=true. Creates a private local agent repository, an empty page library, and a Telegram confirmation link; no sources are imported.',
   };
   await mkdir(join(paths.root, 'operations'), { recursive: true, mode: 0o700 });
   await mkdir(operation, { recursive: true, mode: 0o700 });
@@ -119,13 +117,6 @@ export async function runFactory(config: FactoryConfig, request: FactoryRequest,
       const registration = record(await during('worker registration check', () => io.worker('domain_agent', registrationParams(state!, config, true))));
       if (registration.status !== 'dry_run_registration_ready') throw new FactoryError('factory_registration_preflight_failed', 'The worker did not confirm that the domain registration is safe to apply.');
       const health = record(await during('worker health', io.workerHealth));
-      // Every invocation ensures or re-proves the Vertex corpus, which needs the worker's Google
-      // credentials and project. Its authenticated health names that configuration.
-      const google = record(health.configuration_status).google;
-      if (google !== 'ready') {
-        const reported = GOOGLE_NOT_READY.includes(google) ? google : 'not ready';
-        throw new FactoryError('factory_google_not_ready', `preflight: worker health: the Expert Agents worker reports its Google configuration as ${reported}, so it could not create or check the Vertex corpus. Configure the worker's Google credentials and project, then repeat this request.`, { phase: 'preflight', step: 'worker health' });
-      }
       // Every invocation also seeds or re-proves the domain workspace in that root. A root that
       // allows overwrite would make the worker's bootstrap rewrite existing seed files, including
       // the source registry, so the factory never seeds there.
@@ -154,11 +145,9 @@ export async function runFactory(config: FactoryConfig, request: FactoryRequest,
     };
     if (current) {
       // A previous readiness receipt is downgraded to the first unfinished step before anything
-      // is inspected. The workspace seed and corpus readiness are re-proven on every resume; a
-      // corpus that was never requested stays unrequested, so its step keeps its own phase.
+      // is inspected. The workspace seed is re-proven on every resume.
       const resumeAt = pendingPhase(state, config);
       if (state.workspaceSeeded) state.workspaceSeeded = false;
-      if (state.corpusReady) state.corpusReady = false;
       await save(resumeAt);
     }
     await requireUniqueTelegramIdentity(paths.root, state);
@@ -189,7 +178,7 @@ export async function runFactory(config: FactoryConfig, request: FactoryRequest,
       // A process that died halfway through scaffold publication cannot safely guess which files it owns.
       if (await exists(workspace)) throw new FactoryError('factory_partial_scaffold', 'A partial repository exists. Inspect it before recovery; the factory will not overwrite it.');
       await scaffoldExpert({ targetDir: workspace, agentId: spec.agentId, displayName: spec.displayName,
-        domainId: spec.agentId, targetCorpusDisplayName: corpusName(spec.agentId), telegramTokenFilePath: tokenPath });
+        domainId: spec.agentId, telegramTokenFilePath: tokenPath });
       await writeFile(join(workspace, 'SOUL.md'), spec.soul, { mode: 0o600 });
       await writeFile(join(workspace, 'TOOLS.md'), toolsText(spec.agentId), { mode: 0o600 });
       await writeFile(join(workspace, 'binding.json'), JSON.stringify({ schemaVersion: 1,
@@ -202,7 +191,7 @@ export async function runFactory(config: FactoryConfig, request: FactoryRequest,
       await enter();
       // No host template: it could seed hooks or URL, HTTP or credential settings into the repository.
       await command(['git', 'init', '--template='], workspace);
-      await command(['git', 'add', '--', '.gitignore', 'agent.json', 'binding.json', 'AGENTS.md', 'HEARTBEAT.md', 'IDENTITY.md', 'SOUL.md', 'TOOLS.md', 'USER.md', 'library/scope-manifest.json', 'library/eval-questions.json', 'references/.gitkeep'], workspace);
+      await command(['git', 'add', '--', '.gitignore', 'agent.json', 'binding.json', 'AGENTS.md', 'HEARTBEAT.md', 'IDENTITY.md', 'SOUL.md', 'TOOLS.md', 'USER.md', 'library/eval-questions.json', 'references/.gitkeep'], workspace);
       await command(['git', '-c', 'user.name=Expert Agent Factory', '-c', 'user.email=factory@expert-agent.invalid', 'commit', '--allow-empty', '-m', 'Initialize independent expert agent'], workspace);
       const commit = (await command(['git', 'rev-parse', 'HEAD'], workspace)).trim();
       if (!/^[a-f0-9]{40,64}$/.test(commit)) throw new FactoryError('factory_git_proof_missing', 'Git did not return a valid initial commit.');
@@ -248,13 +237,6 @@ export async function runFactory(config: FactoryConfig, request: FactoryRequest,
       }
       state.workspaceSeeded = true;
       await advance();
-    }
-    if (!state.corpusReady) {
-      await enter();
-      const corpus = record(await during('worker corpus ensure', () => io.worker('rag_corpus', { action: 'ensure', domain_id: spec.agentId, approval_id: state!.operationId, dry_run: false })));
-      state.corpusReady = corpus.status === 'ready';
-      await advance();
-      if (!state.corpusReady) return summarize(state, spec.agentId, workspace);
     }
     // Only a later invocation may consume a confirmation after its link has been returned.
     if (!current) return summarize(state, spec.agentId, workspace);
@@ -354,7 +336,8 @@ export async function runFactory(config: FactoryConfig, request: FactoryRequest,
 
 function registrationParams(state: FactoryState, config: FactoryConfig, dryRun: boolean): Record<string, unknown> {
   return { action: 'register', domain_id: state.spec.agentId, display_name: state.spec.displayName,
-    target_corpus_display_name: corpusName(state.spec.agentId),
+    // The worker derives the page library's tree and index source from the domain id.
+    page_library: {},
     library: { bucket: config.libraryBucket, prefix: `${config.libraryPrefix.replace(/\/$/, '')}/${state.spec.agentId}` },
     approval_id: state.operationId, dry_run: dryRun };
 }
@@ -443,16 +426,14 @@ async function channelReady(cli: (args: string[]) => Promise<string>, id: string
 function summarize(state: FactoryState | undefined, id: string, workspace: string): FactoryResult {
   const status = state?.phase ?? 'not_found';
   const next = status === 'ready_empty_library'
-    ? 'Telegram polling and bot identity are verified. The owner messaging the bot is the real test. The new corpus is empty: import approved sources, run retrieval evaluation, and prove a natural agent answer before claiming a populated expert.'
+    ? 'Telegram polling and bot identity are verified. The owner messaging the bot is the real test. The new page library is empty: ingest approved sources with library_ingest or annas_archive_import, run retrieval evaluation, and prove a natural agent answer before claiming a populated expert.'
     : status === 'waiting_for_telegram'
       ? 'Open the confirmation link with the configured owner Telegram account and create the bot, then call resume with apply=true in the owner\'s next turn. The suggested username is only a suggestion: if Telegram reports it taken, pick any other name in the same flow and the factory adopts the bot you actually created. The bot stays silent until activation completes.'
-      : status === 'waiting_for_corpus'
-        ? 'Vertex creation is pending. Call resume with apply=true to check it; do not create another corpus.'
-        : status === 'waiting_for_activation'
+      : status === 'waiting_for_activation'
           ? 'Gateway configuration is validated but the bot is not proven running, and it stays silent until then. With hybrid config reload the Gateway starts the new Telegram account after in-flight runs finish, which can take several minutes. Call resume with apply=true in the owner\'s next turn to check readiness; if reload is off, the deployment owner must complete the approved activation pathway first. Resume never repeats an activation attempt.'
           : state ? 'Call resume with apply=true to continue this recorded operation.' : 'No factory operation exists for this id.';
   return { kind: 'expert_factory', agent_id: id, status, ...(state ? { repository_path: workspace,
-    domain_id: id, corpus_ready: state.corpusReady === true,
+    domain_id: id,
     ...(state.commit ? { commit: state.commit } : {}),
     ...(state.remotePushed && state.remoteUrl ? { repository_remote: state.remoteUrl } : {}),
     ...(state.botUsername ? { telegram_url: `https://t.me/${state.botUsername}` } : {}),
@@ -540,8 +521,6 @@ function pendingPhase(state: FactoryState, config: FactoryConfig): string {
   if (config.remoteUrlTemplate && !state.remotePushed) return 'wiring_remote';
   if (!state.domainRegistered) return 'registering_library';
   if (!state.workspaceSeeded) return 'bootstrapping_workspace';
-  if (state.corpusReady === undefined) return 'creating_corpus';
-  if (!state.corpusReady) return 'waiting_for_corpus';
   if (!state.botId) return 'waiting_for_telegram';
   if (!state.tokenInstalled) return 'installing_telegram_token';
   if (!state.gatewayConfigured) return 'configuring_gateway';
@@ -550,8 +529,8 @@ function pendingPhase(state: FactoryState, config: FactoryConfig): string {
 
 /** Every phase an operation can record, in step order. */
 export const FACTORY_PHASES = [
-  'creating_repository', 'committing_repository', 'wiring_remote', 'registering_library', 'bootstrapping_workspace', 'creating_corpus',
-  'waiting_for_corpus', 'waiting_for_telegram', 'installing_telegram_token', 'configuring_gateway',
+  'creating_repository', 'committing_repository', 'wiring_remote', 'registering_library', 'bootstrapping_workspace',
+  'waiting_for_telegram', 'installing_telegram_token', 'configuring_gateway',
   'waiting_for_activation', 'ready_empty_library',
 ] as const;
 
@@ -747,7 +726,6 @@ async function exists(path: string): Promise<boolean> { try { await lstat(path);
 function missing(error: unknown): boolean { return record(error).code === 'ENOENT'; }
 function record(value: unknown): Record<string, any> { return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, any> : {}; }
 function digest(value: string): string { return createHash('sha256').update(value).digest('hex'); }
-function corpusName(id: string): string { return `expert-${id}`; }
 function toolsText(id: string): string {
-  return `# Expert tools\n\nAlways pass domain_id: "${id}" to every Expert Agents tool. Never rely on the deployment-wide default domain.\n\nUse domain_agent status to inspect the library, domain_ask to answer from it with citations, and rag_corpus to import approved sources. A newly created corpus is empty: report missing evidence explicitly.\n`;
+  return `# Expert tools\n\nAlways pass domain_id: "${id}" to every Expert Agents tool. Never rely on the deployment-wide default domain.\n\nUse domain_library to read the page library (catalog, search, grep, read, read_range, view_page) and cite the label every result carries. Use library_ingest to add approved sources and check its status. A new library is empty: report missing evidence explicitly.\n`;
 }

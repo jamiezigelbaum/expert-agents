@@ -82,6 +82,7 @@ export interface FactoryState {
   domainRegistered?: boolean;
   /** The worker reported every required seed file of the domain's workspace present. Re-proven on every resume. */
   workspaceSeeded?: boolean;
+  /** Legacy: an operation recorded before agents moved to the page library. Ignored. */
   corpusReady?: boolean;
   botId?: number;
   tokenInstalled?: boolean;
@@ -106,7 +107,6 @@ export interface FactoryResult {
   commit?: string;
   repository_remote?: string;
   domain_id?: string;
-  corpus_ready?: boolean;
   telegram_url?: string;
   telegram_username_changed_from?: string;
   confirmation_url?: string;

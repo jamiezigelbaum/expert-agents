@@ -1,11 +1,12 @@
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { renderUnitMarkdown } from '@expert-agents/library';
 import { AgentRoutingConfigError, pageLibraryOriginalBuckets, validateAgentRoutingConfig } from '../src/core/agent-routing.ts';
 import { AgentRegistrationStore } from '../src/core/agent-registration.ts';
 import { createDomainExpertWorker } from '../src/workers/domain-expert/index.ts';
+import { domainManifest, planDomainAgent } from '../src/core/domain-expert.ts';
 
 let tree: string;
 let dataDir: string;
@@ -149,5 +150,55 @@ describe('page-library registrations', () => {
       expect(body.manifest.routing.page_library).toEqual({ source_id: 'history' });
       expect(body.manifest.routing.target_corpus_display_name).toBeUndefined();
     } finally { await rm(dir, { recursive: true, force: true }); }
+  });
+});
+
+describe('a page-library domain is seeded for the page library', () => {
+  const routing = validateAgentRoutingConfig({ history: { pageLibrary: { root: '/srv/pages/history', sourceId: 'history', originalBuckets: ['originals-bucket'] } } });
+
+  test('a library nothing has been ingested into reads as empty', async () => {
+    const empty = await mkdtemp(join(tmpdir(), 'page-route-empty-'));
+    try {
+      const worker = createDomainExpertWorker({
+        dataDir, gcpProject: 'neutral-project',
+        agentRouting: validateAgentRoutingConfig({ history: { pageLibrary: { root: join(empty, 'history'), sourceId: 'history', originalBuckets: ['originals-bucket'] } } }),
+        pageSearch: async () => [],
+        google: { accessToken: 'synthetic-token', fetchImpl: (async () => { throw new Error('no network'); }) as unknown as typeof fetch },
+      });
+      const response = await worker.fetch(new Request('http://worker.test/v1/domain', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ tool: 'domain_library', params: { domain_id: 'history', action: 'catalog' } }),
+      }));
+      expect(response.status).toBe(200);
+      expect(await response.json()).toMatchObject({ books: [], total: 0 });
+    } finally { await rm(empty, { recursive: true, force: true }); }
+  });
+
+  test('its agent plan scopes the page library tools and no Vertex tool', () => {
+    const plan = planDomainAgent({ action: 'status', domainId: 'history' }, domainManifest('history', 'History', { agentRouting: routing })) as Record<string, any>;
+    expect(plan.openclaw_agent.scoped_tools).toEqual(['domain_library', 'library_ingest', 'domain_doc', 'annas_archive_search', 'annas_archive_import', 'expert_agents_workspace']);
+    expect(JSON.stringify(plan.next_steps)).not.toMatch(/RAG|corpora/);
+  });
+
+  test('its workspace seed teaches domain_library, not domain_ask', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'page-route-seed-'));
+    try {
+      const worker = createDomainExpertWorker({
+        dataDir: root, gcpProject: 'neutral-project', agentRouting: routing,
+        roots: [{ rootId: 'expert_agents_workspace', path: root, maxWriteBytes: 1024 * 1024, allowOverwrite: false }],
+        fetchImpl: (async () => { throw new Error('no network'); }) as unknown as typeof fetch,
+      });
+      const response = await worker.fetch(new Request('http://worker.test/v1/domain', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ tool: 'domain_agent', params: { action: 'bootstrap', domain_id: 'history', dry_run: false } }),
+      }));
+      expect(response.status).toBe(200);
+      const craft = await readFile(join(root, 'experts/history/references/retrieval-craft.md'), 'utf8');
+      const proposal = await readFile(join(root, 'experts/history/PROPOSAL.md'), 'utf8');
+      for (const text of [craft, proposal]) {
+        expect(text).toContain('domain_library');
+        expect(text).not.toMatch(/domain_ask|rag_corpus|domain_source|corpus/);
+      }
+    } finally { await rm(root, { recursive: true, force: true }); }
   });
 });

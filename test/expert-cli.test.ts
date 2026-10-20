@@ -52,7 +52,6 @@ describe("expert create CLI", () => {
       "--agent-id", "neutral-agent",
       "--display-name", "Neutral Agent",
       "--domain-id", "neutral-domain",
-      "--target-corpus", "neutral-corpus",
       "--receipt", "/tmp/creation-receipt.json",
       "--emoji", "◉",
       "--telegram-token-path", "/run/secrets/telegram-neutral-agent.token",
@@ -65,7 +64,6 @@ describe("expert create CLI", () => {
       agentId: "neutral-agent",
       displayName: "Neutral Agent",
       domainId: "neutral-domain",
-      targetCorpusDisplayName: "neutral-corpus",
       receiptPath: "/tmp/creation-receipt.json",
       emoji: "◉",
       telegramTokenFilePath: "/run/secrets/telegram-neutral-agent.token",
@@ -108,7 +106,8 @@ describe("expert create CLI", () => {
     expect(JSON.parse(await readFile(receipt, "utf8"))).toEqual(result.receipt);
     expect(result.routingSnippet).toContain("EXPERT_AGENTS_DOMAIN_EXPERT_AGENTS_JSON=");
     expect(result.routingSnippet).toContain("<configured-bucket>");
-    expect(result.routingSnippet).toContain(resolve(target));
+    expect(result.routingSnippet).toContain('"pageLibrary":{"root":"<page-library-root>/neutral-domain","sourceId":"neutral-domain"}');
+    expect(result.routingSnippet).not.toContain("targetCorpusDisplayName");
     expect(result.githubCommand).toContain("gh repo create");
     expect(result.workspaceHydrationSteps).toContain(
       "git clone <agent-repository-url> <workspace-path>",
@@ -279,7 +278,7 @@ describe("expert create CLI", () => {
       expect(agents).toContain("## Harness discipline");
       expect(agents).toContain("## Closing out");
       expect(agents).toContain("## How acquisition works");
-      expect(agents).toContain("Your library corpus is `neutral-corpus`");
+      expect(agents).toContain("lands in your page library");
       expect(agents).toContain("the escalation tracker declared by this deployment");
     },
     SUBPROCESS_TIMEOUT_MS,
@@ -455,7 +454,6 @@ function createArgs(target: string, receipt: string): string[] {
     "--agent-id", "neutral-agent",
     "--display-name", "Neutral Agent",
     "--domain-id", "neutral-domain",
-    "--target-corpus", "neutral-corpus",
     "--receipt", receipt,
   ];
 }

@@ -47,7 +47,8 @@ describe("agent repository contract", () => {
 
     expect(report.valid).toBe(true);
     expect(report.findings).toEqual([]);
-    expect(report.items).toHaveLength(11);
+    expect(report.items).toHaveLength(10);
+    expect(report.items.map((item) => item.path)).not.toContain("library/scope-manifest.json");
     expect(report.items.every((item) => item.present && item.valid)).toBe(true);
   });
 
@@ -64,8 +65,19 @@ describe("agent repository contract", () => {
     });
   });
 
+  test("a legacy corpus agent still needs its scope manifest", async () => {
+    const directory = await legacyCorpusFixture();
+    expect((await expertStatus(directory)).valid).toBe(true);
+    await unlink(join(directory, "library/scope-manifest.json"));
+    expect((await expertStatus(directory)).findings).toContainEqual({
+      file: "library/scope-manifest.json",
+      ruleId: "contract.required",
+      severity: "error",
+    });
+  });
+
   test("rejects agent and scope identity mismatches", async () => {
-    const directory = await scaffoldFixture();
+    const directory = await legacyCorpusFixture();
     const path = join(directory, "library/scope-manifest.json");
     const scope = JSON.parse(await readFile(path, "utf8")) as Record<string, unknown>;
     scope.agentId = "other-agent";
@@ -87,7 +99,7 @@ describe("agent repository contract", () => {
   });
 
   test("rejects invalid scope and retrieval eval documents", async () => {
-    const scopeDirectory = await scaffoldFixture();
+    const scopeDirectory = await legacyCorpusFixture();
     await writeFile(
       join(scopeDirectory, "library/scope-manifest.json"),
       '{"schemaVersion":1,"invalid":true}\n',
@@ -275,10 +287,7 @@ describe("binding artifact emission", () => {
     expect(first.descriptor).toEqual(second.descriptor);
     expect(first.checklist).toBe(second.checklist);
     expect(first.receipt).toEqual(second.receipt);
-    expect(first.descriptor.routing).toEqual({
-      domainId: "neutral-domain",
-      targetCorpusDisplayName: "neutral-corpus",
-    });
+    expect(first.descriptor.routing).toEqual({ domainId: "neutral-domain" });
     expect(first.checklist).toContain("[MANUAL] Talk to @BotFather");
     expect(first.checklist).toContain("[MANUAL] Provision the Telegram token file");
     expect(first.checklist).toContain("agents.list[]");
@@ -491,7 +500,7 @@ describe("expert scaffold", () => {
   // An agent that cannot connect "get me this book" to the acquisition skill,
   // or does not know which corpus is its own, asks the owner for both. The
   // scaffold states them once, at birth.
-  test("seeds the acquisition mechanics and names the agent's own library corpus", async () => {
+  test("seeds the acquisition mechanics and points them at the page library", async () => {
     const directory = await scaffoldFixture();
     const agents = await readFile(join(directory, "AGENTS.md"), "utf8");
 
@@ -500,8 +509,13 @@ describe("expert scaffold", () => {
     expect(agents).toContain("annas_archive_search");
     expect(agents).toContain("annas_archive_import");
     expect(agents).toContain("Never substitute the open web");
-    expect(agents).toContain("Your library corpus is `neutral-corpus`");
-    expect(agents).toContain("no `corpus_id` lands there by default");
+    expect(agents).toContain("lands in your page library");
+    expect(agents).not.toMatch(/corpus|Vertex|domain_ask|rag_corpus/);
+    const tools = await readFile(join(directory, "TOOLS.md"), "utf8");
+    expect(tools).toContain("`domain_id: \"neutral-domain\"`");
+    expect(tools).toContain("domain_library");
+    expect(tools).toContain("library_ingest");
+    expect(tools).not.toMatch(/corpus|Vertex|domain_ask|domain_read|rag_corpus/);
     // The pre-existing posture section stays, and stays free of the shell
     // escaping that once leaked into it.
     expect(agents).toContain("## Acquisition posture");
@@ -817,13 +831,24 @@ function tinyPngBytes(): Uint8Array<ArrayBuffer> {
   return Uint8Array.from(Buffer.from(TINY_PNG_BASE64, "base64"));
 }
 
+/** A scaffold made into a pre-page-library agent: a corpus in agent.json and its scope manifest. */
+async function legacyCorpusFixture(): Promise<string> {
+  const directory = await scaffoldFixture();
+  const agentPath = join(directory, "agent.json");
+  const agent = JSON.parse(await readFile(agentPath, "utf8")) as Record<string, unknown>;
+  await writeFile(agentPath, `${JSON.stringify({ ...agent, targetCorpusDisplayName: "neutral-corpus" }, null, 2)}\n`);
+  await writeFile(join(directory, "library/scope-manifest.json"), `${JSON.stringify({
+    agentId: "neutral-agent", schemaVersion: 1, selection: { objectIds: [] }, targetCorpusDisplayName: "neutral-corpus", masterRevision: 0,
+  }, null, 2)}\n`);
+  return directory;
+}
+
 function scaffoldOptions(targetDir: string): ExpertScaffoldOptions {
   return {
     targetDir,
     agentId: "neutral-agent",
     displayName: "Neutral Agent",
     domainId: "neutral-domain",
-    targetCorpusDisplayName: "neutral-corpus",
     emoji: "◉",
   };
 }

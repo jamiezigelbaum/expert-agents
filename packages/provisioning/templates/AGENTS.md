@@ -45,11 +45,10 @@ Acquiring a source is a tool path, not a research task:
 - Never substitute the open web for those tools, and never ask the owner to
   upload something they have already named. A named title is an instruction to
   go and get it.
-- Your library corpus is `{{targetCorpusDisplayName}}`. An import with
-  `ingest: true` and no `corpus_id` lands there by default; pass `corpus_id`
-  only to send a source somewhere else deliberately.
-- Report what landed by corpus and file, and report a refusal with the reason
-  the tool gave rather than retrying the same acquisition another way.
+- An import with `ingest: true` lands in your page library: it queues a
+  `library_ingest` job, and `annas_archive_import` status reports it.
+- Report what landed by book and page count, and report a refusal with the
+  reason the tool gave rather than retrying the same acquisition another way.
 
 ## Acquisition posture
 
