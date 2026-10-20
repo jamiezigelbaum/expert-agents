@@ -16,6 +16,8 @@
     "library:materialize": "bun scripts/materialize-scope.ts",
     "library:annotate": "bun scripts/annotate-library.ts",
     "library:partition": "bun scripts/partition-for-import.ts",
+    "library:pages": "bun scripts/library-pages.ts",
+    "library:index": "bun scripts/page-index.ts",
     "worker:domain-expert": "bun packages/runtime/dist/server.js",
     "parity:battery": "bun scripts/parity-battery.ts",
     "plugin:ownership": "bun scripts/plugin-ownership-fingerprint.ts",

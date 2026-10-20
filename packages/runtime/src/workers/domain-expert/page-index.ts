@@ -86,10 +86,11 @@ export function reciprocalRankFusion(lists: ReadonlyArray<readonly string[]>, k 
   return [...scores].map(([slug, score]) => ({ slug, score })).sort((a, b) => b.score - a.score || a.slug.localeCompare(b.slug));
 }
 
-/** Read every unit of an assembled tree (books/<book>/<unit>.md). */
-export async function readTreeUnits(root: string): Promise<PageIndexUnit[]> {
+/** Read every unit of an assembled tree (books/<book>/<unit>.md), or of the named books only. */
+export async function readTreeUnits(root: string, only?: readonly string[]): Promise<PageIndexUnit[]> {
   const units: PageIndexUnit[] = [];
-  const books = (await readdir(join(root, 'books'), { withFileTypes: true })).filter((d) => d.isDirectory()).map((d) => d.name).sort();
+  const books = (await readdir(join(root, 'books'), { withFileTypes: true }))
+    .filter((d) => d.isDirectory() && (!only || only.includes(d.name))).map((d) => d.name).sort();
   for (const book of books) {
     for (const file of (await readdir(join(root, 'books', book))).filter((f) => f.endsWith('.md')).sort()) {
       const slug = `books/${book}/${file.slice(0, -3)}`;
@@ -210,15 +211,24 @@ export class PageIndex {
     `);
   }
 
-  /** Make the index for `source` match `units` exactly. Vectors survive for unchanged text. */
-  async importUnits(source: string, units: readonly PageIndexUnit[], opts: { chunk?: boolean } = {}): Promise<ImportResult> {
+  /**
+   * Make the index for `source` match `units` exactly. Vectors survive for unchanged text.
+   * With `books`, only those books are compared: their units not in `units` are deleted and
+   * every other book of the source is left alone (one book's ingest).
+   */
+  async importUnits(source: string, units: readonly PageIndexUnit[], opts: { chunk?: boolean; books?: readonly string[] } = {}): Promise<ImportResult> {
+    if (opts.books && units.some((u) => !opts.books!.includes(u.book))) throw new Error('a unit lies outside the books being imported');
+    if (opts.books && !opts.books.length) return { units: 0, inserted: 0, updated: 0, unchanged: 0, deleted: 0, chunks: 0, reusedVectors: 0 };
     const existing = new Map<string, string>();
     // A unit without chunks (an import cut short) counts as changed.
-    for (const r of await this.sql`
+    const rows = opts.books
+      ? await this.sql`
       SELECT u.slug, CASE WHEN EXISTS (SELECT 1 FROM page_chunks c WHERE c.source = u.source AND c.slug = u.slug) THEN u.content_hash ELSE '' END AS content_hash
-      FROM page_units u WHERE u.source = ${source}` as Array<{ slug: string; content_hash: string }>) {
-      existing.set(r.slug, r.content_hash);
-    }
+      FROM page_units u WHERE u.source = ${source} AND u.book = ANY(string_to_array(${csv(opts.books)}, ','))`
+      : await this.sql`
+      SELECT u.slug, CASE WHEN EXISTS (SELECT 1 FROM page_chunks c WHERE c.source = u.source AND c.slug = u.slug) THEN u.content_hash ELSE '' END AS content_hash
+      FROM page_units u WHERE u.source = ${source}`;
+    for (const r of rows as Array<{ slug: string; content_hash: string }>) existing.set(r.slug, r.content_hash);
     const result: ImportResult = { units: units.length, inserted: 0, updated: 0, unchanged: 0, deleted: 0, chunks: 0, reusedVectors: 0 };
     const seen = new Set<string>();
     const changed: Array<PageIndexUnit & { hash: string }> = [];
@@ -256,7 +266,14 @@ export class PageIndex {
       await this.sql`DELETE FROM page_units WHERE source = ${source} AND slug = ANY(string_to_array(${csv(gone.slice(i, i + 1000))}, ','))`;
     }
     result.deleted = gone.length;
+    this.invalidate(source);
     return result;
+  }
+
+  /** Forget this source's cached keyword statistics after its units change. */
+  invalidate(source: string): void {
+    this.chunkCount.delete(source);
+    for (const key of [...this.docFreq.keys()]) if (key.startsWith(`${source}\0`)) this.docFreq.delete(key);
   }
 
   async pendingEmbeddings(source: string): Promise<number> {
