@@ -183,6 +183,34 @@ describe("expert:library worker target and token handling", () => {
 });
 
 describe("expert:library worker commands", () => {
+  test("library sends domain_library and writes a viewed page to --out, not the transcript", async () => {
+    const captured = capture();
+    const fetchImpl = fetchStub(captured, (call) => (call.body?.params as Record<string, unknown>).action === "view_page"
+      ? jsonResponse({ kind: "domain_library_result", slug: "books/b/p0001", cite: "A, B, p.1", image: { mime_type: "image/jpeg", data: Buffer.from([0xff, 0xd8, 1]).toString("base64") } })
+      : jsonResponse({ kind: "domain_library_result", results: [{ slug: "books/b/p0001", cite: "A, B, p.1", text: "Evidence." }] }));
+    expect(await runExpertLibraryCli(["library", "--domain", "example", "--worker", WORKER, "--action", "search", "--query", "evidence", "--k", "5", "--book", "b", "--session", "s1"], workerDependencies(captured, fetchImpl))).toBe(0);
+    expect(captured.calls[0]!.body).toEqual({ tool: "domain_library", params: { domain_id: "example", action: "search", query: "evidence", book: "b", session_id: "s1", k: 5 } });
+    const dir = await mkdtemp(join(tmpdir(), "expert-library-view-"));
+    temporaryRoots.push(dir);
+    const out = join(dir, "page.jpg");
+    expect(await runExpertLibraryCli(["library", "--domain", "example", "--worker", WORKER, "--action", "view_page", "--slug", "books/b/p0001", "--out", out], workerDependencies(captured, fetchImpl))).toBe(0);
+    expect([...await readFile(out)]).toEqual([0xff, 0xd8, 1]);
+    expect(JSON.parse(captured.out.at(-1)!).image).toEqual({ mime_type: "image/jpeg", bytes: 3, written_to: out });
+    expect(() => parseExpertLibraryArguments(["library", "--domain", "example", "--action", "view_page", "--slug", "books/b/p0001"])).toThrow("--out");
+  });
+
+  test("library-ingest starts as a dry run unless --apply, and a live start needs an approval id", async () => {
+    expect(parseExpertLibraryArguments(["library-ingest", "--domain", "example", "--action", "start", "--gcs", "gs://lib/x.pdf"])).toEqual({
+      command: "library-ingest", domainId: "example", params: { action: "start", gcs_uri: "gs://lib/x.pdf", dry_run: true },
+    });
+    expect(() => parseExpertLibraryArguments(["library-ingest", "--domain", "example", "--action", "start", "--gcs", "gs://lib/x.pdf", "--apply"])).toThrow("--approval-id");
+    expect(() => parseExpertLibraryArguments(["library-ingest", "--domain", "example", "--action", "start"])).toThrow("exactly one of");
+    const captured = capture();
+    const fetchImpl = fetchStub(captured, () => jsonResponse({ kind: "library_ingest_result", job: { job_id: "j1", state: "failed", error: "x" } }));
+    expect(await runExpertLibraryCli(["library-ingest", "--domain", "example", "--worker", WORKER, "--action", "status", "--job", "j1"], workerDependencies(captured, fetchImpl))).toBe(1);
+    expect(captured.calls[0]!.body).toEqual({ tool: "library_ingest", params: { domain_id: "example", action: "status", job_id: "j1" } });
+  });
+
   test("read preserves source identity, revision and continuation fields", async () => {
     const captured = capture();
     const fetchImpl = fetchStub(captured, () => jsonResponse({ kind: "domain_read_result", text: "Reference", next_offset: 120, complete: false }));
