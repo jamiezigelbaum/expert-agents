@@ -26,6 +26,16 @@ const USAGE = "Usage: bun run expert:release -- --dir <agent-repository> --tag <
  * judge rather than inventing a match.
  */
 export function formatDisclosureSummary(manifest: ServingManifest): string[] {
+  if (!manifest.targetCorpusDisplayName && manifest.corpora.length === 0) {
+    // A page-library agent has no corpus: what it may disclose is set by the
+    // disclosure policy on each deployment's worker route, not by this artifact.
+    return [
+      "This agent reads a page library and declares no corpus.",
+      "Each deployment's worker route sets its disclosure: a route without a",
+      "disclosure policy serves the library in full. Confirm the route this",
+      "release will use before releasing it to anyone outside the owner.",
+    ];
+  }
   const lines = ["Corpora this artifact exposes:"];
   if (manifest.corpora.length === 0) {
     lines.push("  (none declared)");

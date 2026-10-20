@@ -782,13 +782,27 @@ describe('conversational expert factory', () => {
       expect(JSON.parse(await readFile(statePath(f), 'utf8')).workspaceSeeded).toBe(true);
     }, 60_000);
 
-    test('an operation recorded while it waited for a Vertex corpus resumes without one', async () => {
+    test('an operation the corpus-era release recorded is refused, not re-registered', async () => {
       const f = await fixture(); await f.run();
       const earlier = JSON.parse(await readFile(statePath(f), 'utf8'));
       await writeFile(statePath(f), JSON.stringify({ ...earlier, phase: 'waiting_for_corpus', corpusReady: false }) + '\n', { mode: 0o600 });
       f.state.confirmed = true;
-      expect((await f.resume()).status).toBe('ready_empty_library');
-      expect(f.workers.every((call) => call.tool === 'domain_agent')).toBe(true);
+      const calls = f.workers.length;
+      await expect(f.resume()).rejects.toMatchObject({ code: 'factory_legacy_operation' });
+      expect(f.workers.length).toBe(calls);
+    }, 60_000);
+
+    test('a repository scaffolded for a corpus is refused before registration', async () => {
+      const f = await fixture(); await f.run();
+      const earlier = JSON.parse(await readFile(statePath(f), 'utf8'));
+      const { workspaceSeeded: _s, domainRegistered: _r, ...unregistered } = earlier;
+      await writeFile(statePath(f), JSON.stringify({ ...unregistered, phase: 'registering_library' }) + '\n', { mode: 0o600 });
+      const agentPath = join(f.workspace, 'agent.json');
+      const agent = JSON.parse(await readFile(agentPath, 'utf8'));
+      await writeFile(agentPath, JSON.stringify({ ...agent, targetCorpusDisplayName: 'expert-example' }));
+      const calls = f.workers.length;
+      await expect(f.resume()).rejects.toMatchObject({ code: 'factory_legacy_operation' });
+      expect(f.workers.length).toBe(calls);
     }, 60_000);
 
     test.each([

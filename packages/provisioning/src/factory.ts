@@ -77,6 +77,11 @@ export async function runFactory(config: FactoryConfig, request: FactoryRequest,
     if (current && (current.configFingerprint !== configFingerprint || JSON.stringify(current.spec) !== JSON.stringify(spec))) {
       throw new FactoryError('factory_state_conflict', 'The operation changed before this invocation acquired its lock.');
     }
+    if (current && await startedForVertex(current, workspace)) {
+      // Its repository, registration or corpus were made for a Vertex corpus. Registering a page
+      // library for it now would conflict with that route or leave a corpus-based repository behind.
+      throw new FactoryError('factory_legacy_operation', 'This creation was started by an earlier release that made agents on a Vertex corpus, and this release creates page-library agents only. Finish it with the earlier release, or create the agent under a new id.');
+    }
     state = current ?? { schemaVersion: 1, spec, configFingerprint, operationId: randomUUID(), phase: 'preflight' };
     const save = async (phase: string): Promise<void> => { state!.phase = phase; await saveState(statePath, state!); };
     const advance = () => save(pendingPhase(state!, config));
@@ -332,6 +337,16 @@ export async function runFactory(config: FactoryConfig, request: FactoryRequest,
   } catch (error) {
     throw withPhase(error, stage ?? state?.phase ?? 'preflight');
   } finally { releaseLock(); }
+}
+
+/** An operation the corpus-era release recorded: it reached a corpus phase, or scaffolded a repository naming a corpus. */
+async function startedForVertex(state: FactoryState, workspace: string): Promise<boolean> {
+  if (state.corpusReady !== undefined || state.phase.includes('corpus')) return true;
+  if (!state.scaffolded) return false;
+  try {
+    const agent = JSON.parse(await readFile(join(workspace, 'agent.json'), 'utf8')) as Record<string, unknown>;
+    return typeof agent.targetCorpusDisplayName === 'string';
+  } catch { return false; }
 }
 
 function registrationParams(state: FactoryState, config: FactoryConfig, dryRun: boolean): Record<string, unknown> {
