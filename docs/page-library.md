@@ -9,10 +9,10 @@ The page library is the expert-agent library design chosen by the
 - a six-tool belt that lets the agent search, verify, read whole ranges and
   look at pages.
 
-It runs as a **shadow** next to the Vertex RAG Engine path. Nothing here
-changes `domain_ask`, `domain_read`, the Vertex corpora or the gateway's tool
-surface. Cutover, and any deletion of the Vertex import path, is a separate,
-owner-approved change.
+It runs next to the Vertex RAG Engine path. Nothing here changes
+`domain_ask`, `domain_read` or the Vertex corpora. A domain switches to it by
+declaring a `pageLibrary` route (section 3); any deletion of the Vertex import
+path is a separate, owner-approved change.
 
 ## 1. Parse once: page-addressed units
 
@@ -154,9 +154,10 @@ Slugs are `books/<book>/<unit>`. Every hit carries a citation label
 (`Author, Title, p.N` or `section N`). The tool refuses a domain with a
 disclosure policy, as `domain_read` does.
 
-It is deliberately **not** registered as a gateway tool yet. That happens at
-cutover, together with the agent instructions. The 2026-10-20 test found two
-things those instructions need:
+The OpenClaw plugin registers it as the gateway tool `domain_library`; a
+`view_page` image reaches the model as an image block, not base64 text. The
+`domain-research` skill tells the agent how to use it. The 2026-10-20 test
+found two things an agent's instructions need:
 - abstain when the library is silent;
 - a larger step budget (about 30) for synthesis.
 

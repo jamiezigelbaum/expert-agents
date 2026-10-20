@@ -1065,9 +1065,9 @@ export class DomainExpertService {
   }
 
   /**
-   * The page library tool belt (docs/page-library.md). Worker-side only until
-   * it replaces the Vertex path; refused for a domain without a pageLibrary
-   * route block and for any route with a disclosure policy.
+   * The page library tool belt (docs/page-library.md). Refused for a domain
+   * without a pageLibrary route block and for any route with a disclosure
+   * policy.
    */
   private async domainLibrary(params: Record<string, unknown>): Promise<unknown> {
     try {
