@@ -8,6 +8,7 @@ export type DomainExpertTool =
   | 'domain_ask'
   | 'domain_read'
   | 'domain_library'
+  | 'library_ingest'
   | 'domain_source'
   | 'rag_corpus'
   | 'domain_doc'
@@ -63,6 +64,10 @@ const WORKER_ERROR_MESSAGES: Readonly<Record<string, string>> = Object.freeze({
   rag_file_foreign_corpus: 'The rag file does not belong to the resolved corpus.',
   annas_archive_url_not_allowed: 'The acquisition URL is not an allowed library endpoint.',
   drive_import_review_required: 'Drive imports require owner review before ingestion.',
+  vertex_not_configured: 'This domain is served from the page library. Use domain_library to read and library_ingest to add sources.',
+  page_library_not_configured: 'This domain has no page library.',
+  page_ingest_writer_not_configured: 'The page library index writer is not configured on the worker.',
+  page_ingest_no_original_store: 'The worker has no acquisition directory for this domain, so a workspace file cannot be stored for view_page.',
 });
 
 export class DomainExpertClient {

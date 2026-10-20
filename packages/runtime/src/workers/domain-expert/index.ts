@@ -115,6 +115,7 @@ import { completePassageSentences, completionSourceObject, SourceTextCache } fro
 import { LibraryReader, LibraryReadError, parseLibraryReadParams, type LibraryReadRoute } from './library-reader.ts';
 import { PageIndex, voyageClient } from './page-index.ts';
 import { PageLibrary, PageLibraryError, parsePageLibraryParams, type PageLibraryDependencies } from './page-library.ts';
+import { PageIngestError, PageIngestQueue, type IngestSourceInput, type PageIndexWriter } from './page-ingest.ts';
 
 export const DOMAIN_EXPERT_NOTION_CREDENTIAL_GUIDANCE = `notion_import requires EXPERT_AGENTS_DOMAIN_EXPERT_NOTION_TOKEN. Configure it as documented in ${DOMAIN_EXPERT_ENV_EXAMPLE}.`;
 
@@ -272,6 +273,20 @@ export interface DomainExpertWorkerOptions {
   voyageApiKey?: string;
   /** Test seam: replaces the page index search. */
   pageSearch?: PageLibraryDependencies['search'];
+  /**
+   * Postgres URL library_ingest writes the index with; defaults to
+   * EXPERT_AGENTS_DOMAIN_EXPERT_PAGE_INDEX_WRITER_DATABASE_URL. Separate from the
+   * search URL so the serving role can stay read-only.
+   */
+  pageIndexWriterDatabaseUrl?: string;
+  /** Test seam: replaces the page index writer. */
+  pageIndexWriter?: PageIndexWriter;
+  /**
+   * Local OCR lanes for library_ingest: DeepSeek-OCR through Ollama, and the
+   * vision lane (OpenAI-compatible) for escalations and figures. Default from
+   * EXPERT_AGENTS_DOMAIN_EXPERT_OLLAMA_URL, _VISION_URL and _VISION_MODEL.
+   */
+  ocrLanes?: { ollamaUrl?: string; visionUrl?: string; visionModel?: string; fetch?: typeof fetch };
 }
 
 type ResolveHostImpl = (hostname: string) => Promise<string[]>;
@@ -285,6 +300,7 @@ type DomainExpertTool =
   | 'domain_ask'
   | 'domain_read'
   | 'domain_library'
+  | 'library_ingest'
   | 'domain_source'
   | 'rag_corpus'
   | 'domain_doc'
@@ -783,6 +799,7 @@ export class DomainExpertService {
   private voyageApiKey: string | undefined;
   private pageIndex: PageIndex | undefined;
   private pageSearch: PageLibraryDependencies['search'] | undefined;
+  private pageIngest!: PageIngestQueue;
   private annas: DomainExpertAnnasConfig;
   private annasBooksRoot: string;
   private annasMaxDownloadBytes: number;
@@ -868,6 +885,7 @@ export class DomainExpertService {
     this.registrationLibrary = options.registrationLibrary ?? registrationLibraryFromEnv();
     this.registrations = new AgentRegistrationStore(this.dataDir, this.agentRouting, this.registrationLibrary, options.pageLibraryRoot ?? pageLibraryRootFromEnv());
     this.agentRouting = this.registrations.routes();
+    this.pageIngest = this.createPageIngest(options);
     this.resolveHostImpl = options.resolveHostImpl ?? defaultResolveHost;
     // Only a configured path is forwarded: an unset value leaves summarize to
     // resolve yt-dlp the way it normally does.
@@ -1055,6 +1073,8 @@ export class DomainExpertService {
         return this.domainRead(request.params);
       case 'domain_library':
         return this.domainLibrary(request.params);
+      case 'library_ingest':
+        return this.libraryIngest(request.params);
       case 'domain_source':
         return this.domainSource(parseDomainSourceParams(request.params));
       case 'rag_corpus':
@@ -1102,7 +1122,8 @@ export class DomainExpertService {
           };
         })();
         library = new PageLibrary(
-          { root: config.root, sourceId: config.sourceId, originalBuckets: pageLibraryOriginalBuckets(route) },
+          // The domain's acquisition directory holds originals library_ingest stored for it.
+          { root: config.root, sourceId: config.sourceId, originalBuckets: [...new Set([...pageLibraryOriginalBuckets(route), ...(this.acquisitionDirectory(manifest.domain_id) ? [this.acquisitionDirectory(manifest.domain_id)!.bucket] : [])])] },
           { search, download: (bucket, name, maxBytes, timeoutMs) => this.google.downloadLibraryObject(bucket, name, maxBytes, timeoutMs) },
         );
         this.pageLibraries.set(key, library);
@@ -1113,6 +1134,206 @@ export class DomainExpertService {
       throw error;
     }
   }
+
+  private createPageIngest(options: DomainExpertWorkerOptions): PageIngestQueue {
+    const lanesConfig = {
+      ollamaUrl: options.ocrLanes?.ollamaUrl ?? process.env.EXPERT_AGENTS_DOMAIN_EXPERT_OLLAMA_URL?.trim(),
+      visionUrl: options.ocrLanes?.visionUrl ?? process.env.EXPERT_AGENTS_DOMAIN_EXPERT_VISION_URL?.trim(),
+      visionModel: options.ocrLanes?.visionModel ?? process.env.EXPERT_AGENTS_DOMAIN_EXPERT_VISION_MODEL?.trim(),
+    };
+    const writerUrl = options.pageIndexWriterDatabaseUrl ?? process.env.EXPERT_AGENTS_DOMAIN_EXPERT_PAGE_INDEX_WRITER_DATABASE_URL;
+    let writer: PageIndexWriter | undefined = options.pageIndexWriter;
+    const queue = new PageIngestQueue({
+      stateDir: join(this.dataDir, 'page-ingest'),
+      ...(lanesConfig.ollamaUrl ? { lanes: {
+        ollamaUrl: lanesConfig.ollamaUrl,
+        ...(lanesConfig.visionUrl ? { visionUrl: lanesConfig.visionUrl } : {}),
+        ...(lanesConfig.visionModel ? { visionModel: lanesConfig.visionModel } : {}),
+        ...(options.ocrLanes?.fetch ? { fetch: options.ocrLanes.fetch } : {}),
+      } } : {}),
+      writer: () => {
+        if (writer) return writer;
+        if (!writerUrl || !this.voyageApiKey) throw new PageIngestError('page_ingest_writer_not_configured', 'The page index writer is not configured.', 503);
+        const index = new PageIndex(writerUrl, voyageClient(this.voyageApiKey), { maxConnections: 4 });
+        writer = { importUnits: (s, u, o) => index.importUnits(s, u, o), embedPending: (s) => index.embedPending(s), pendingEmbeddings: (s) => index.pendingEmbeddings(s) };
+        return writer;
+      },
+      changed: (domainId) => {
+        for (const key of [...this.pageLibraries.keys()]) if (key.startsWith(`${domainId}\u0000`)) this.pageLibraries.delete(key);
+        const sourceId = this.agentRouting[domainId]?.pageLibrary?.sourceId;
+        if (sourceId) this.pageIndex?.invalidate(sourceId);
+      },
+      log: (record) => console.info(JSON.stringify(record)),
+    });
+    this.pageIngestWriterConfigured = () => Boolean(writer || (writerUrl && this.voyageApiKey));
+    void queue.resume().catch((error: unknown) => console.warn(JSON.stringify({ kind: 'page_ingest_resume_failed', error: String(error).slice(0, 200) })));
+    return queue;
+  }
+
+  private pageIngestWriterConfigured: () => boolean = () => false;
+
+  /**
+   * library_ingest: add workspace files or library originals to a domain's page library
+   * (page-ingest.ts). Every original gets a gs:// home view_page can render from: a library
+   * object keeps its own; a workspace file is stored in the domain's acquisition directory.
+   */
+  private async libraryIngest(params: Record<string, unknown>): Promise<unknown> {
+    const allowed = ['domain_id', 'action', 'workspace_relative_path', 'gcs_uri', 'title', 'creator', 'job_id', 'dry_run', 'approval_id'];
+    const extra = Object.keys(params).filter((key) => !allowed.includes(key));
+    if (extra.length) throw new DomainExpertWorkerError(400, 'invalid_params', `library_ingest does not take: ${extra.join(', ')}.`);
+    const action = params.action;
+    if (action !== 'start' && action !== 'status' && action !== 'list') throw new DomainExpertWorkerError(400, 'invalid_params', 'action must be start, status or list.');
+    const manifest = this.manifest(optionalStringField(params.domain_id, 'domainId').domainId);
+    requireConfiguredAgent(manifest, 'library_ingest');
+    const route = this.agentRouting[manifest.domain_id]!;
+    if (!route.pageLibrary) throw new DomainExpertWorkerError(404, 'page_library_not_configured', 'This domain has no page library.');
+    if (route.disclosure) throw new DomainExpertWorkerError(403, 'page_ingest_not_disclosable', 'This deployment serves under a disclosure policy; ingest into its library from the owner deployment.');
+    const result = (body: Record<string, unknown>) => ({ kind: 'library_ingest_result', domain_id: manifest.domain_id, action, ...body, policy: domainPolicy() });
+    try {
+      if (action === 'status') return result({ job: await this.pageIngest.get(manifest.domain_id, requireString(params.job_id, 'job_id')) });
+      if (action === 'list') return result({ jobs: await this.pageIngest.list(manifest.domain_id) });
+    } catch (error) {
+      if (error instanceof PageIngestError) throw new DomainExpertWorkerError(error.status, error.code, error.message);
+      throw error;
+    }
+
+    const workspacePath = params.workspace_relative_path === undefined ? undefined : requireString(params.workspace_relative_path, 'workspace_relative_path');
+    const gcsUri = params.gcs_uri === undefined ? undefined : requireString(params.gcs_uri, 'gcs_uri');
+    if (Boolean(workspacePath) === Boolean(gcsUri)) throw new DomainExpertWorkerError(400, 'invalid_params', 'start takes exactly one of workspace_relative_path or gcs_uri.');
+    const title = params.title === undefined ? undefined : requireString(params.title, 'title');
+    const creator = params.creator === undefined ? undefined : requireString(params.creator, 'creator');
+    const dryRun = params.dry_run === undefined ? true : params.dry_run === true;
+    const acquisitions = this.acquisitionDirectory(manifest.domain_id);
+
+    type Candidate = { name: string; bytes: number; read: () => Promise<Uint8Array>; uri?: string };
+    const candidates: Candidate[] = [];
+    const skipped: Array<{ path: string; reason: string }> = [];
+    if (workspacePath) {
+      const rootPath = await checkedRootPath(this.rootFor(manifest.workspace_root_id));
+      for (const file of await collectStageImportFiles(rootPath, resolveInside(rootPath, workspacePath))) {
+        const ext = extname(file.absolutePath).toLowerCase();
+        if (isJunkStageImportPath(file.workspaceRelativePath)) continue;
+        if (!PAGE_INGEST_EXTENSIONS.has(ext)) { skipped.push({ path: file.workspaceRelativePath, reason: 'unsupported_type' }); continue; }
+        if (file.bytes > PAGE_INGEST_MAX_BYTES) { skipped.push({ path: file.workspaceRelativePath, reason: 'too_large' }); continue; }
+        candidates.push({ name: basename(file.absolutePath), bytes: file.bytes, read: async () => new Uint8Array(await readFile(file.absolutePath)) });
+      }
+    } else {
+      const readable = [route.library, ...(route.readOnlySourceRoots ?? [])].filter((r): r is NonNullable<typeof r> => Boolean(r))
+        .map((r) => `gs://${r.bucket}/${r.prefix}`).concat(acquisitions ? [acquisitions.uri] : []);
+      if (gcsUri!.slice(5).split('/').some((segment) => segment === '.' || segment === '..') || !gcsPrefixesCover(readable, gcsUri!)) {
+        throw new DomainExpertWorkerError(403, 'gcs_source_not_allowed', 'gcs_uri must be an object in this domain\'s library or acquisition directory.');
+      }
+      const m = /^gs:\/\/([^/]+)\/(.+)$/.exec(gcsUri!);
+      if (!m) throw new DomainExpertWorkerError(400, 'invalid_params', 'gcs_uri must be gs://<bucket>/<object>.');
+      candidates.push({ name: basename(m[2]!), bytes: 0, uri: gcsUri!, read: async () => {
+        const bytes = await this.google.downloadLibraryObject(m[1]!, m[2]!, PAGE_INGEST_MAX_BYTES, 120_000);
+        if (!bytes) throw new DomainExpertWorkerError(404, 'gcs_source_not_found', 'The gcs_uri object does not exist.');
+        return bytes;
+      } });
+    }
+    if (!candidates.length) throw new DomainExpertWorkerError(400, 'page_ingest_no_sources', 'No PDF, EPUB, Markdown or text file was found to ingest.');
+    if ((title || creator) && candidates.length > 1) throw new DomainExpertWorkerError(400, 'invalid_params', 'title and creator name one source; ingest a folder without them.');
+    const plan = {
+      sources: candidates.map((c) => ({ name: c.name, ...(c.bytes ? { bytes: c.bytes } : {}), ...(c.uri ? { gcs_uri: c.uri } : {}) })),
+      skipped,
+      lanes: this.pageIngest.lanes(),
+      index_writer_configured: this.pageIngestWriterConfigured(),
+    };
+    if (dryRun) return result({ status: 'dry_run', ...plan });
+    requireApprovalId(typeof params.approval_id === 'string' ? params.approval_id : undefined, 'library_ingest start');
+    if (!this.pageIngestWriterConfigured()) throw new DomainExpertWorkerError(503, 'page_ingest_writer_not_configured', 'The page index writer is not configured.');
+    const job = await this.enqueuePageIngest(manifest, candidates.map((c) => ({
+      name: c.name, read: c.read, ...(c.uri ? { uri: c.uri } : {}), ...(title ? { title } : {}), ...(creator ? { creator } : {}),
+    })));
+    return result({ status: 'queued', job, lanes: plan.lanes, skipped });
+  }
+
+  /**
+   * Store each original where view_page can render it (a library object keeps its own URI; other
+   * bytes go to the domain's acquisition directory, content-addressed), copy it for the job, and
+   * queue the job.
+   */
+  private async enqueuePageIngest(
+    manifest: ReturnType<typeof domainManifest>,
+    sources: Array<{ name: string; read: () => Promise<Uint8Array>; uri?: string; title?: string; creator?: string }>,
+  ): Promise<unknown> {
+    const route = this.agentRouting[manifest.domain_id]!;
+    if (!route.pageLibrary) throw new DomainExpertWorkerError(404, 'page_library_not_configured', 'This domain has no page library.');
+    if (!this.pageIngestWriterConfigured()) throw new DomainExpertWorkerError(503, 'page_ingest_writer_not_configured', 'The page index writer is not configured.');
+    const acquisitions = this.acquisitionDirectory(manifest.domain_id);
+    if (sources.some((c) => !c.uri) && !acquisitions) {
+      throw new DomainExpertWorkerError(503, 'page_ingest_no_original_store', 'No acquisition directory is configured for this domain, so the original has nowhere to be stored for view_page.');
+    }
+    const scratch = await this.pageIngest.scratch(manifest.domain_id);
+    const inputs: IngestSourceInput[] = [];
+    for (const [i, c] of sources.entries()) {
+      // One original in memory at a time.
+      const bytes = await c.read();
+      const hex = createHash('sha256').update(bytes).digest('hex');
+      const ext = extname(c.name).toLowerCase() || '.bin';
+      const file = join(scratch, `${i}-${hex.slice(0, 16)}${ext}`);
+      await writeFile(file, bytes, { mode: 0o600 });
+      let uri = c.uri;
+      if (!uri) {
+        const objectName = `${acquisitions!.prefix}/originals/${hex}${ext}`;
+        uri = `gs://${acquisitions!.bucket}/${objectName}`;
+        assertAllowedGcsDestination(uri, manifest.allowed_gcs_prefixes);
+        try { await this.google.uploadGcsObject(acquisitions!.bucket, objectName, bytes, { ifGenerationMatch: '0' }); }
+        catch (error) {
+          // 412: the same content-addressed original is already stored.
+          if (!(error instanceof DomainExpertWorkerError && error.status === 412)) throw error;
+        }
+      }
+      inputs.push({ name: c.name, uri, file, ...(c.title ? { title: c.title } : {}), ...(c.creator ? { creator: c.creator } : {}) });
+    }
+    try {
+      return await this.pageIngest.enqueue(manifest.domain_id, route.pageLibrary, inputs);
+    } catch (error) {
+      if (error instanceof PageIngestError) throw new DomainExpertWorkerError(error.status, error.code, error.message);
+      throw error;
+    }
+  }
+
+  /** A page-library domain's acquisition goes to its page library, never to a Vertex corpus. */
+  private async annasPageLibraryIngest(
+    manifest: ReturnType<typeof domainManifest>,
+    params: AnnasArchiveImportParams,
+    format: string,
+    bytes: Uint8Array,
+    sourcePath: string,
+    scale: AnnasArtifactScale,
+  ): Promise<{ ragIngest: Record<string, unknown>; registry: Record<string, unknown> }> {
+    const notStarted = { status: 'skipped', reason: 'The page-library ingest did not start.' };
+    if (scale.below_min_pdf_pages && !scale.short_artifact_override) {
+      return { ragIngest: { status: 'blocked', target: 'page_library', scale, error: {
+        code: 'annas_artifact_scale_implausible',
+        message: `Measured ${scale.pages} page(s) in the downloaded ${scale.format}, below the ${scale.min_pdf_pages}-page floor for a book-scale artifact. Nothing was ingested; the file is still on disk.`,
+        suggestion: 'Confirm the file is the edition its metadata advertised. To ingest it deliberately anyway, re-run annas_archive_import with allow_short_artifact: true.',
+      } }, registry: notStarted };
+    }
+    if (!PAGE_INGEST_EXTENSIONS.has(`.${format}`)) {
+      return { ragIngest: { status: 'blocked', target: 'page_library', error: {
+        code: 'page_ingest_format_unsupported',
+        message: `The page library reads PDF, EPUB, Markdown and text; this download is ${format}. It is still on disk at ${sourcePath}.`,
+        suggestion: 'Acquire a PDF or EPUB edition instead.',
+      } }, registry: notStarted };
+    }
+    try {
+      const name = `${basename(sourcePath).replace(/\.[a-z0-9]{1,5}$/i, '')}.${format}`;
+      const job = await this.enqueuePageIngest(manifest, [{
+        name, read: async () => bytes, ...(params.title ? { title: params.title } : {}), ...(params.author ? { creator: params.author } : {}),
+      }]) as { job_id: string; state: string };
+      return {
+        ragIngest: { status: 'page_ingest_queued', target: 'page_library', job_id: job.job_id, next: 'Check library_ingest status with this job_id.' },
+        registry: { status: 'skipped', reason: 'Page-library sources are catalogued by the page library.' },
+      };
+    } catch (error) {
+      return { ragIngest: { status: 'blocked', target: 'page_library', error: ingestErrorRecord(error) }, registry: notStarted };
+    }
+  }
+
+  /** Test seam: wait for queued ingest jobs. */
+  async pageIngestIdle(): Promise<void> { await this.pageIngest.idle(); }
 
   private async domainRead(params: Record<string, unknown>): Promise<unknown> {
     try {
@@ -4578,12 +4799,13 @@ export class DomainExpertService {
   private async annasImport(params: AnnasArchiveImportParams): Promise<unknown> {
     const dryRun = params.dryRun ?? true;
     const manifest = this.manifest(params.domainId);
-    // Only an ingest chooses a corpus; a download-only acquisition is unaffected.
-    if (params.ingest) this.requireExplicitCorpus(manifest, 'annas_archive_import', params.corpusId);
+    const toPageLibrary = Boolean(params.ingest && this.agentRouting[manifest.domain_id]?.pageLibrary);
+    // Only a Vertex ingest chooses a corpus; a download-only acquisition is unaffected.
+    if (params.ingest && !toPageLibrary) this.requireExplicitCorpus(manifest, 'annas_archive_import', params.corpusId);
     const plan = planAnnasArchiveImport({ ...params, dryRun: true }, manifest);
     if (dryRun) return plan;
     requireApprovalId(params.approvalId, 'annas_archive_import');
-    if (params.ingest && resolveTargetCorpus(params.corpusId, manifest)) requireGoogleProject(manifest.gcp_project);
+    if (params.ingest && !toPageLibrary && resolveTargetCorpus(params.corpusId, manifest)) requireGoogleProject(manifest.gcp_project);
     if (!this.annas.apiKey) throw new DomainExpertWorkerError(503, 'annas_archive_not_configured', 'Anna Archive API key is not configured.');
     // The owner naming a book authorizes the download regardless of routing
     // state (the skill's promise: an unrouted domain still downloads, and the
@@ -4653,7 +4875,9 @@ export class DomainExpertService {
       created_at: new Date().toISOString(),
     });
 
-    const { ragIngest, registry } = params.ingest
+    const { ragIngest, registry } = toPageLibrary
+      ? await this.annasPageLibraryIngest(manifest, params, format, bytes, finalPath.targetPath, scale)
+      : params.ingest
       ? await this.annasIngestWithinResponseBudget(manifest, params, locator ?? digest, format, bytes, digest, scale, finalPath.targetPath)
       : { ragIngest: { status: 'not_requested' }, registry: { status: 'skipped', reason: 'rag_ingest was not requested.' } };
 
@@ -4693,7 +4917,9 @@ export class DomainExpertService {
       format,
     };
     const scale = this.measureArtifactScale(format, bytes, params);
-    const { ragIngest, registry } = await this.annasIngestWithinResponseBudget(manifest, params, locator ?? digest, format, bytes, digest, scale, duplicate.targetPath);
+    const { ragIngest, registry } = this.agentRouting[manifest.domain_id]?.pageLibrary
+      ? await this.annasPageLibraryIngest(manifest, params, format, bytes, duplicate.targetPath, scale)
+      : await this.annasIngestWithinResponseBudget(manifest, params, locator ?? digest, format, bytes, digest, scale, duplicate.targetPath);
     await appendAnnasAudit(this.annasBooksRoot, {
       kind: 'annas_archive_acquisition_audit',
       action: 'ingested_existing',
@@ -8997,6 +9223,9 @@ function allowedStageImportExtensions(includeMedia: boolean): Set<string> {
     : new Set(STAGE_IMPORT_ALLOWED_EXTENSIONS);
 }
 
+const PAGE_INGEST_EXTENSIONS = new Set(['.pdf', '.epub', '.md', '.markdown', '.txt']);
+const PAGE_INGEST_MAX_BYTES = 300_000_000;
+
 function maxStageFileBytes(path: string): number {
   if (extname(path).toLowerCase() === '.pdf') return PDF_PROCESSING_MAX_BYTES;
   return isTranscribableMediaPath(path) ? MEDIA_TRANSCRIBE_MAX_BYTES : STAGE_IMPORT_MAX_FILE_BYTES;
@@ -10670,7 +10899,7 @@ function annasAcquisitionStatus(base: 'downloaded' | 'ingested_existing', ingest
   if (ingestStatus === 'blocked' || ingestStatus === 'needs_corpus_decision') return `${prefix}_ingest_blocked`;
   if (ingestStatus === 'import_failed' || ingestStatus === 'import_empty') return `${prefix}_ingest_failed`;
   if (base === 'ingested_existing' && ingestStatus === 'import_requested') return 'skipped_duplicate_ingest_requested';
-  if (ingestStatus === 'import_in_progress') return `${prefix}_ingest_in_progress`;
+  if (ingestStatus === 'import_in_progress' || ingestStatus === 'page_ingest_queued') return `${prefix}_ingest_in_progress`;
   return base;
 }
 
@@ -13363,6 +13592,7 @@ function asDomainExpertTool(value: unknown): DomainExpertTool {
     || value === 'domain_ask'
     || value === 'domain_read'
     || value === 'domain_library'
+    || value === 'library_ingest'
     || value === 'domain_source'
     || value === 'rag_corpus'
     || value === 'domain_doc'

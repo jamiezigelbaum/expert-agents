@@ -32,6 +32,7 @@ describe('Expert Agents OpenClaw plugin', () => {
       'domain_agent',
       'domain_ask',
       'domain_library',
+      'library_ingest',
       'domain_read',
       'domain_source',
       'rag_corpus',

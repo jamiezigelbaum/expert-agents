@@ -102,6 +102,17 @@ export const researchToolSchemas: Record<DomainExpertTool, ToolParameterSchema> 
     from_unit: text('read_range: first unit, e.g. p0012 or s0003.'),
     to_unit: text('read_range: last unit (inclusive).'),
   }, ['action']),
+  library_ingest: schema('Add sources to the domain page library. start ingests a workspace file or folder (PDF, EPUB, Markdown, text) or a gs:// original in the domain\'s library: each PDF page becomes a unit read locally (text layer, then DeepSeek-OCR, then the vision lane), figures are described, then the book is indexed and embedded. It runs in the background and answers with a job_id; status reports each source per page: parsers used, failed pages, empty pages, unresolved readings and undescribed figures. Nothing is dropped silently. Re-ingesting the same file replaces its book. dry_run (default true) lists what would be ingested; a live start needs approval_id.', {
+    domain_id: domainId,
+    action: choice(['start', 'status', 'list'], 'start a job, status of one job, or list recent jobs.'),
+    workspace_relative_path: text('start: a file or folder in the worker workspace.'),
+    gcs_uri: text('start: a gs:// original inside this domain\'s library or acquisition directory.'),
+    title: text('start, one source only: the book title (default: from the file name or EPUB metadata).'),
+    creator: text('start, one source only: the author.'),
+    job_id: text('status: the job id start returned.'),
+    dry_run: dryRun,
+    approval_id: approvalId,
+  }, ['action']),
   domain_source: schema('Manage source registry metadata. add does not ingest bytes or make a source searchable; follow with a supported rag_corpus import operation. add with sha256 and gcs_uris instead registers objects already in the corpus (for example a book split by hand and imported outside the worker), so imports find the source present.', {
     action: choice(DOMAIN_SOURCE_ACTIONS, 'add requires url, relative_path or gcs_uris; status/remove require source_id; list reads the registry.'),
     domain_id: domainId,

@@ -161,6 +161,48 @@ found two things an agent's instructions need:
 - abstain when the library is silent;
 - a larger step budget (about 30) for synthesis.
 
+## 4. Ingest: `library_ingest`
+
+Agents add sources through the gateway tool `library_ingest` (worker tool of
+the same name). It runs the same parse code as the operator CLI
+(`packages/library/src/page-parse.ts`).
+
+| action | parameters | returns |
+|---|---|---|
+| `start` | `workspace_relative_path` or `gcs_uri`; `title?`, `creator?` (one source); `dry_run` (default true); `approval_id` | `job_id`, the lanes in use, skipped files |
+| `status` | `job_id` | the job: state, and per source its book, units, parsers used, failed pages, empty pages, unresolved escalations, undescribed figure pages, refusals; then the index counts |
+| `list` | | recent jobs |
+
+- **Where originals live.** A `gcs_uri` must be inside the domain's library,
+  read-only roots or acquisition directory, and keeps its own URI. A workspace
+  file is stored content-addressed in the domain's acquisition directory
+  (`<acquisition prefix>/<domain>/originals/<sha256>.<ext>`), so `view_page`
+  can render it.
+- **Per source:** page units, local OCR, figure descriptions, then the book's
+  unit files are written into the domain's tree and its catalog entry is
+  replaced. Re-ingesting an original replaces its earlier book, even under a
+  new title.
+- **Per job:** the job's books are imported into the index (only those books
+  are compared, so the rest of the source is untouched) and embedded.
+- **Background and observable.** Jobs run one at a time. Each job's state is a
+  JSON file under the worker's data directory, rewritten as it moves. A job
+  interrupted by a restart resumes, and lane results are cached per page.
+- **Nothing silent.** A page whose lane failed, a page without an OCR lane, a
+  reading no vision lane re-read and a figure page nobody described are each
+  listed. A job with any failed page ends `done_with_failures`.
+- **Acquisitions.** `annas_archive_import` with `ingest: true` on a domain with
+  a page library queues a `library_ingest` job instead of a Vertex import, and
+  answers with its `job_id`. The book-scale floor still applies.
+
+The worker needs, besides the search settings in section 3:
+- `EXPERT_AGENTS_DOMAIN_EXPERT_PAGE_INDEX_WRITER_DATABASE_URL`, a role that
+  may write (the serving URL can stay read-only);
+- `EXPERT_AGENTS_DOMAIN_EXPERT_OLLAMA_URL` for DeepSeek-OCR;
+- optionally `EXPERT_AGENTS_DOMAIN_EXPERT_VISION_URL` and `_VISION_MODEL`.
+
+The operator CLIs are `bun run library:pages` (parse, upload, assemble a
+whole library) and `bun run library:index` (migrate, import, embed, search).
+
 ## Evaluation
 
 Eval sets and receipts live in each agent's own repository, never here. The
