@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { mkdir, readdir, stat, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { canonicalJson } from "../../library/src/index.ts";
-import type { RetrievalEvalSet } from "../../../scripts/retrieval-eval.ts";
+import type { RetrievalEvalSetV2 } from "../../../scripts/retrieval-eval.ts";
 import agentsTemplate from "../templates/AGENTS.md" with { type: "text" };
 import heartbeatTemplate from "../templates/HEARTBEAT.md" with { type: "text" };
 import identityTemplate from "../templates/IDENTITY.md" with { type: "text" };
@@ -81,18 +81,24 @@ export async function scaffoldExpert(
           },
         }),
   });
-  const evalSet: RetrievalEvalSet = {
-    schemaVersion: 1,
+  // A page-library agent is evaluated on what its library search returns (passages mode);
+  // its answers are evaluated through the agent itself.
+  const evalSet: RetrievalEvalSetV2 = {
+    schemaVersion: 2,
     domainId: manifest.domainId,
+    mode: "passages",
     thresholds: {
-      minRecall: 0.8,
-      maxInvalidCitationRate: 0.05,
-      maxMissRate: 0.2,
+      minPassageRecallAt: { k: 10, min: 0.8 },
     },
     questions: [{
       id: `${manifest.domainId}-replace-me`,
       question: "Replace this placeholder with an approved retrieval evaluation question.",
-      expectedObjectIds: [`sha256:${"0".repeat(64)}`],
+      category: "quote",
+      answerable: true,
+      evidence: [{
+        objectId: `sha256:${"0".repeat(64)}`,
+        quote: "replace this placeholder with a short quote the answer must find in the library",
+      }],
     }],
   };
 

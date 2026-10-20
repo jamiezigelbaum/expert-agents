@@ -19,10 +19,12 @@ where X and Y disagree, what a report claimed — is a library question: call
 `domain_library` FIRST, with the expert's stable `domain_id` named explicitly,
 before any web search, memory search, or another product's source tools.
 Repository and code search tools cannot see the library; reaching for one on
-a library question is always the wrong tool, not a fallback. If the library
-errors, report the error verbatim and stop — there is no fallback lane. The
-one exception is `page_library_not_configured`: see "Domains not yet on the
-page library" below.
+a library question is always the wrong tool, not a fallback. An agent whose
+tools include `domain_ask` but not `domain_library` is on a legacy domain:
+call `domain_ask` first instead. If the library errors, report the error
+verbatim and stop — there is no fallback lane. The one exception is
+`page_library_not_configured`: see "Domains not yet on the page library"
+below.
 
 ## Reading the library
 

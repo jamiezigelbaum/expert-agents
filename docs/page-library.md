@@ -219,6 +219,13 @@ whole library) and `bun run library:index` (migrate, import, embed, search).
 
 ## Evaluation
 
+`bun run retrieval:eval` evaluates a page-library domain in passages mode: each
+question runs one `domain_library` search, and each hit is matched against the
+evidence through the `source_uri` of its book's stored original. The worker
+writes no answers for a page library, so answer mode is refused there; answers
+are evaluated through the agent. The factory scaffolds a schema-2 passages set
+in `library/eval-questions.json`.
+
 Eval sets and receipts live in each agent's own repository, never here. The
 page library was scored on the same questions as Vertex. Each passage is
 scored three ways:

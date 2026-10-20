@@ -193,7 +193,9 @@ export class PageLibrary {
     for (const h of hits) {
       const parsed = parseUnitSlug(h.slug);
       if (!parsed || (book && parsed.book !== book)) continue;
-      out.push({ slug: h.slug, cite: await this.cite(parsed.book, parsed.unit), text: h.text.slice(0, 700) });
+      // source_uri names the stored original, as domain_ask passages do, so evaluations can match evidence.
+      const source = (await this.bookIdentity(parsed.book).catch(() => undefined))?.sources[0];
+      out.push({ slug: h.slug, cite: await this.cite(parsed.book, parsed.unit), ...(source ? { source_uri: source } : {}), text: h.text.slice(0, 700) });
       if (out.length >= k) break;
     }
     return { results: out };

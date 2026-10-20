@@ -1,4 +1,4 @@
-import type { RetrievalEvalSet } from "../../../scripts/retrieval-eval.ts";
+import type { AnyRetrievalEvalSet } from "../../../scripts/retrieval-eval.ts";
 import type { ScopeManifest } from "../../library/src/index.ts";
 
 // The gateway's native value is "allowlist" (channels.telegram.dmPolicy).
@@ -206,7 +206,7 @@ export interface ExpertScaffoldResult {
   manifest: AgentManifest;
   binding: AgentBindingManifest;
   scopeManifest?: ScopeManifest;
-  evalSet: RetrievalEvalSet;
+  evalSet: AnyRetrievalEvalSet;
   receipt: ExpertCreationReceipt;
 }
 
