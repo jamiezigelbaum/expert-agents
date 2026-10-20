@@ -5,7 +5,7 @@ import { PageIndex, readTreeUnits, voyageClient } from "../packages/runtime/src/
  *
  *   migrate                                      create tables and indexes
  *   import  --source <id> --tree <dir>           make the index match the tree (idempotent)
- *   embed   --source <id> [--max-tokens N]       embed rows without a vector
+ *   embed   --source <id> [--max-tokens N]       embed chunks without a vector
  *   search  --source <id> --query <text> [--k 10]
  *
  * env: PAGE_INDEX_DATABASE_URL, VOYAGE_API_KEY (never printed).
@@ -41,7 +41,7 @@ export async function main(argv: string[]): Promise<void> {
       const max = flag(rest, "max-tokens");
       const r = await index.embedPending(need(rest, "source"), {
         concurrency: Number(flag(rest, "concurrency") ?? 4), ...(max ? { maxTokens: Number(max) } : {}),
-        onProgress: (done, tokens) => { if (done % 2048 < 64) console.error(`[embed] ${done} units, ${tokens} tokens`); },
+        onProgress: (done, tokens) => { if (done % 2048 < 64) console.error(`[embed] ${done} chunks, ${tokens} tokens`); },
       });
       console.log(JSON.stringify({ ...r, pending: await index.pendingEmbeddings(need(rest, "source")) }));
     } else if (command === "search") {

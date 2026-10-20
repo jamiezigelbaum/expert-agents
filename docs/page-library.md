@@ -59,6 +59,10 @@ and a bounding box. Figures inside page scans are reached through
 cut at headings and never mid-paragraph.
 
 Lane results are cached per page, so a rerun only reads pages it has not seen.
+A failed call is not cached and is retried by the next run. When both lanes
+share one machine's memory, run the parse twice: first without `VISION_URL`
+(DeepSeek reads every page), then with it once Ollama has unloaded the OCR
+model (only escalations and figures go to the vision lane).
 
 `upload` writes the derivatives beside the originals in the library bucket. It
 only ever adds objects under `derivatives/`; originals and the master manifest
@@ -87,14 +91,18 @@ Postgres full text plus pgvector, fused with reciprocal rank fusion, then
 reranked by Voyage.
 
 - **Rows:** one per unit (page, section or figure), keyed by `(source, slug)`
-  with a content hash.
-- **Import is idempotent.** It updates only rows whose text changed and
-  deletes rows whose file is gone, so a second run leaves the index unchanged.
-- **Embeddings:** Voyage `voyage-4`, 1024 dimensions, one vector per unit
+  with a content hash, plus its search chunks. A unit of up to ~480 words (a
+  typical page) is one chunk; a longer one is cut into ~380-word windows that
+  overlap by 60 words. One vector per long section missed passages buried
+  inside it; hits and citations are still whole units.
+- **Import is idempotent.** It updates only units whose text changed and
+  deletes units whose file is gone, so a second run leaves the index unchanged.
+- **Embeddings:** Voyage `voyage-4`, 1024 dimensions, one vector per chunk
   (title plus text). Vectors are also kept by text hash, so text that comes
   back unchanged, including under another source, is never paid for twice.
-- **Search** runs two arms, merged with RRF (k = 60); Voyage `rerank-3` then
-  orders the top 60.
+- **Search** runs two arms over the chunks, each keeping a unit's best chunk,
+  merged by unit with RRF (k = 60); Voyage `rerank-3` then orders the top 60
+  by that best chunk.
   - Keyword arm: Postgres full text with the query's words **ORed**. A
     sentence query is not an AND of every word, the failure that made GBrain's
     keyword arm useless on whole questions.

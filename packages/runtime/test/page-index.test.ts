@@ -6,6 +6,7 @@ import { renderUnitMarkdown } from '@expert-agents/library';
 import {
   contentHash,
   embeddingKey,
+  chunkText,
   readTreeUnits,
   reciprocalRankFusion,
   unitDocument,
@@ -39,6 +40,18 @@ describe('page index', () => {
     expect(contentHash(u)).toBe(contentHash({ title: 'T', body: 'B' }));
     expect(contentHash(u)).not.toBe(contentHash({ title: 'T', body: 'C' }));
     expect(embeddingKey('voyage-4', 1024, 'x')).not.toBe(embeddingKey('voyage-4', 512, 'x'));
+  });
+
+  test('a page stays one chunk; a long section is cut into overlapping windows that cover it', () => {
+    const words = (n: number, from = 0) => Array.from({ length: n }, (_, i) => `w${from + i}`).join(' ');
+    expect(chunkText(words(300))).toEqual([words(300)]);
+    const chunks = chunkText(words(1200));
+    expect(chunks.length).toBe(4);
+    expect(chunks[0]).toBe(words(380));
+    expect(chunks[1]!.startsWith('w320 ')).toBe(true);
+    expect(chunks.at(-1)!.endsWith('w1199')).toBe(true);
+    // A short tail is folded into the last window, not left as a scrap.
+    expect(chunkText(words(700)).map((c) => c.split(' ').length)).toEqual([380, 380]);
   });
 
   test('reciprocal rank fusion rewards agreement between the arms', () => {
