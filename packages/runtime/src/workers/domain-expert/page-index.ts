@@ -10,10 +10,11 @@
 //   embed    Voyage `voyage-4` (1024 dimensions) for chunks without a vector.
 //            Vectors are also kept by text hash, so a chunk whose text comes
 //            back unchanged is never paid for twice.
-//   search   two arms over one source's chunks: full text with the query's
-//            words ORed (a sentence query is not an AND of every word), and
-//            nearest vectors. Each arm keeps a unit's best chunk; RRF merges
-//            the units and `rerank-3` orders the top of the list by that chunk.
+//   search   two arms over one source's chunks: full text scored by the IDF
+//            of the query's content words (ORed, never an AND of a sentence), and
+//            nearest vectors. Each arm keeps a unit's best chunk; `rerank-3`
+//            orders the vector arm's top 100 and the keyword arm's top 50 by
+//            that chunk.
 //            Hits are units, so citations stay page- and section-addressed.
 //
 // Secrets (the database URL and the Voyage key) come from the caller and are
@@ -35,7 +36,11 @@ export const CHUNK_OVERLAP_WORDS = 60;
 const CHUNK_SPLIT_WORDS = 480;
 const ARM_LIMIT = 100;
 const ARM_CHUNKS = 400;
-const RERANK_POOL = 60;
+// The rerank pool is the vector arm's top 100 and the keyword arm's top 50, deduplicated.
+const VECTOR_POOL = 100;
+const KEYWORD_POOL = 50;
+// Query words in more than this share of the source's chunks carry no signal for the keyword arm.
+const KEYWORD_MAX_DF_SHARE = 0.2;
 const EMBED_BATCH = 64;
 const EMBED_DOC_CHARS = 24_000;
 const RERANK_DOC_CHARS = 4_000;
@@ -206,7 +211,7 @@ export class PageIndex {
   }
 
   /** Make the index for `source` match `units` exactly. Vectors survive for unchanged text. */
-  async importUnits(source: string, units: readonly PageIndexUnit[]): Promise<ImportResult> {
+  async importUnits(source: string, units: readonly PageIndexUnit[], opts: { chunk?: boolean } = {}): Promise<ImportResult> {
     const existing = new Map<string, string>();
     // A unit without chunks (an import cut short) counts as changed.
     for (const r of await this.sql`
@@ -229,7 +234,7 @@ export class PageIndex {
     for (let i = 0; i < changed.length; i += 500) {
       const batch = changed.slice(i, i + 500);
       const rows = batch.map((u) => ({ source, slug: u.slug, book: u.book, unit: u.unit, title: u.title, body: u.body, content_hash: u.hash }));
-      const chunks = batch.flatMap((u) => chunkText(u.body).map((text, chunk) => ({
+      const chunks = batch.flatMap((u) => (opts.chunk === false ? [u.body] : chunkText(u.body)).map((text, chunk) => ({
         source, slug: u.slug, chunk, title: u.title, text, embed_key: embeddingKey(this.model, PAGE_INDEX_DIMENSIONS, unitDocument({ title: u.title, body: text })),
       })));
       await this.sql.begin(async (tx) => {
@@ -288,16 +293,42 @@ export class PageIndex {
     return { embedded, tokens };
   }
 
-  /** Units whose chunks match the query's words (ORed), best chunk first. */
+  private readonly docFreq = new Map<string, number>();
+  private readonly chunkCount = new Map<string, number>();
+
+  /**
+   * Units whose chunks hold the query's content words, best chunk first. Postgres full text has no
+   * notion of a word's rarity, so ts_rank over a sentence's words ORed favours long chunks full of
+   * common words. Each chunk instead scores the summed IDF of the query words it holds (BM25's
+   * weight without length normalisation); words in over a fifth of the chunks are dropped.
+   */
   async keywordArm(source: string, query: string, limit = ARM_LIMIT): Promise<ArmHit[]> {
+    const lexemes = await this.sql`SELECT unnest(tsvector_to_array(to_tsvector('english', ${query}))) AS t` as Array<{ t: string }>;
+    const terms = [...new Set(lexemes.map((r) => r.t))].filter((t) => /^[\p{L}\p{N}]+$/u.test(t));
+    if (!terms.length) return [];
+    if (!this.chunkCount.has(source)) {
+      const [r] = await this.sql`SELECT count(*)::int AS n FROM page_chunks WHERE source = ${source}` as Array<{ n: number }>;
+      this.chunkCount.set(source, r?.n ?? 0);
+    }
+    const n = this.chunkCount.get(source)!;
+    const unknown = terms.filter((t) => !this.docFreq.has(`${source}\0${t}`));
+    if (unknown.length) {
+      const rows = await this.sql`
+        SELECT t, (SELECT count(*)::int FROM page_chunks WHERE source = ${source} AND tsv @@ to_tsquery('simple', t)) AS df
+        FROM unnest(string_to_array(${csv(unknown)}, ',')) AS t` as Array<{ t: string; df: number }>;
+      for (const r of rows) this.docFreq.set(`${source}\0${r.t}`, r.df);
+    }
+    const weighted = terms
+      .map((t) => ({ t, df: this.docFreq.get(`${source}\0${t}`) ?? 0 }))
+      .filter((w) => w.df > 0 && w.df <= n * KEYWORD_MAX_DF_SHARE)
+      .map((w) => ({ t: w.t, idf: Math.log(1 + (n - w.df + 0.5) / (w.df + 0.5)) }));
+    if (!weighted.length) return [];
     return await this.sql`
-      WITH q AS (SELECT to_tsquery('english', replace(plainto_tsquery('english', ${query})::text, ' & ', ' | ')) AS q),
-      hits AS (
-        SELECT slug, chunk, ts_rank_cd(tsv, q.q, 1) AS r FROM page_chunks, q
-        WHERE source = ${source} AND q.q::text <> '' AND tsv @@ q.q
-        ORDER BY r DESC, slug, chunk LIMIT ${ARM_CHUNKS})
-      SELECT slug, chunk FROM (SELECT DISTINCT ON (slug) slug, chunk, r FROM hits ORDER BY slug, r DESC, chunk) best
-      ORDER BY r DESC, slug LIMIT ${limit}` as ArmHit[];
+      WITH w AS (SELECT t, idf::float8 AS idf FROM unnest(string_to_array(${csv(weighted.map((x) => x.t))}, ','), string_to_array(${weighted.map((x) => x.idf.toFixed(6)).join(',')}, ',')) AS x(t, idf)),
+      cand AS (SELECT slug, chunk, tsv FROM page_chunks WHERE source = ${source} AND tsv @@ to_tsquery('simple', ${weighted.map((x) => x.t).join(' | ')})),
+      scored AS (SELECT c.slug, c.chunk, sum(w.idf) AS score FROM cand c JOIN w ON c.tsv @@ to_tsquery('simple', w.t) GROUP BY c.slug, c.chunk)
+      SELECT slug, chunk FROM (SELECT DISTINCT ON (slug) slug, chunk, score FROM scored ORDER BY slug, score DESC, chunk) best
+      ORDER BY score DESC, slug LIMIT ${limit}` as ArmHit[];
   }
 
   /** Units whose chunks lie nearest the query vector, best chunk first. */
@@ -319,7 +350,8 @@ export class PageIndex {
     const [keyword, embedded] = await Promise.all([this.keywordArm(source, q), this.voyage.embed([q], 'query')]);
     this.tokens.embed += embedded.tokens;
     const vector = await this.vectorArm(source, embedded.vectors[0]!);
-    const fused = reciprocalRankFusion([keyword.map((h) => h.slug), vector.map((h) => h.slug)]).slice(0, RERANK_POOL);
+    const pooled = new Set([...vector.slice(0, VECTOR_POOL), ...keyword.slice(0, KEYWORD_POOL)].map((h) => h.slug));
+    const fused = reciprocalRankFusion([keyword.map((h) => h.slug), vector.map((h) => h.slug)]).filter((f) => pooled.has(f.slug));
     if (!fused.length) return [];
     // Each unit is reranked by its best chunk: the vector arm's when it has one, else the keyword arm's.
     const bestChunk = new Map<string, number>();

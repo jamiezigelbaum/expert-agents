@@ -4,7 +4,7 @@ import { PageIndex, readTreeUnits, voyageClient } from "../packages/runtime/src/
  * Operator CLI for the page library's search engine (docs/page-library.md).
  *
  *   migrate                                      create tables and indexes
- *   import  --source <id> --tree <dir>           make the index match the tree (idempotent)
+ *   import  --source <id> --tree <dir> [--whole-units]  make the index match the tree (idempotent)
  *   embed   --source <id> [--max-tokens N]       embed chunks without a vector
  *   search  --source <id> --query <text> [--k 10]
  *
@@ -34,7 +34,7 @@ export async function main(argv: string[]): Promise<void> {
     } else if (command === "import") {
       const units = await readTreeUnits(need(rest, "tree"));
       const t = Date.now();
-      const r = await index.importUnits(need(rest, "source"), units);
+      const r = await index.importUnits(need(rest, "source"), units, { chunk: !rest.includes("--whole-units") });
       console.log(JSON.stringify({ ...r, pendingEmbeddings: await index.pendingEmbeddings(need(rest, "source")), seconds: Math.round((Date.now() - t) / 1000) }));
     } else if (command === "embed") {
       if (!process.env.VOYAGE_API_KEY) throw new Error("VOYAGE_API_KEY is not set");
