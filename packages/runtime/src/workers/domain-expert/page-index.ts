@@ -62,7 +62,8 @@ export async function readTreeUnits(root: string): Promise<PageIndexUnit[]> {
     for (const file of (await readdir(join(root, 'books', book))).filter((f) => f.endsWith('.md')).sort()) {
       const slug = `books/${book}/${file.slice(0, -3)}`;
       if (!parseUnitSlug(slug)) continue;
-      const md = await readFile(join(root, 'books', book, file), 'utf8');
+      // Postgres text cannot hold NUL, which some PDF text layers carry.
+      const md = (await readFile(join(root, 'books', book, file), 'utf8')).replaceAll('\0', '');
       const title = /^title:\s*(.*)$/m.exec(md.slice(0, md.indexOf('\n---', 4)))?.[1] ?? '';
       let parsedTitle = title;
       try { parsedTitle = JSON.parse(title); } catch { /* plain YAML scalar */ }

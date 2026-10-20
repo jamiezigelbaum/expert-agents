@@ -2,12 +2,14 @@ import { describe, expect, test } from 'bun:test';
 import {
   DEEPSEEK_OCR_PROMPT,
   DENSE_PAGE_JPEG_BYTES,
+  escalatePage,
   figurePagesFromImageList,
   hasFigureCaption,
   looksLikeRefusal,
   ocrEscalationReason,
   ocrPage,
   parseFigureReply,
+  readPage,
 } from '../src/page-ocr.ts';
 
 const prose = 'The witness is not an object of experience, and the argument of this chapter turns on that point. '.repeat(3);
@@ -47,6 +49,16 @@ describe('local page OCR', () => {
     expect(ocrEscalationReason('| a | b |\n|---|---|\n| 1 | 2 |\n' + prose)).toBe('table');
   });
 
+  test('the two steps run apart: a failed vision call is marked, so it can be retried later', async () => {
+    const first = await readPage(new Uint8Array(DENSE_PAGE_JPEG_BYTES), lanes('', 'unused', []));
+    expect(first).toMatchObject({ text: '', reason: 'empty' });
+    const down = { ollamaUrl: 'http://ollama.invalid', visionUrl: 'http://vision.invalid/v1', fetch: (async () => { throw new Error('The operation timed out.'); }) as unknown as typeof fetch };
+    const e = await escalatePage(new Uint8Array([1]), '', 't', down);
+    expect(e.text).toBeUndefined();
+    expect(e.call).toMatchObject({ lane: 'vision', finish: 'error', error: 'The operation timed out.' });
+    expect((await escalatePage(new Uint8Array([1]), '', 't', lanes('', prose, []))).text).toBe(prose.trim());
+  });
+
   test('a refusal is logged and never used as page text', async () => {
     const calls: string[] = [];
     const r = await ocrPage(new Uint8Array(DENSE_PAGE_JPEG_BYTES), 't', lanes('', "I'm sorry, I can't transcribe copyrighted material.", calls));
@@ -70,6 +82,13 @@ describe('figures', () => {
 
   test('a figure smaller than the page is found; a page scan and a tiny ornament are not', () => {
     expect(figurePagesFromImageList(list, letter)).toEqual([2]);
+    // A page without a text layer is a scan, whatever the size of its image.
+    expect(figurePagesFromImageList(list, letter, new Set([2]))).toEqual([]);
+  });
+
+  test('an image size repeated across many pages is page art, not a figure', () => {
+    const rows = Array.from({ length: 10 }, (_, i) => `  ${i + 1}     ${i} image     600   400  rgb     3   8  jpeg   no   ${20 + i}  0   150   150   40K 5.0%`);
+    expect(figurePagesFromImageList([...list.split('\n').slice(0, 2), ...rows].join('\n'), letter)).toEqual([]);
   });
 
   test('caption lines mark text-layer figure and table pages', () => {

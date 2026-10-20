@@ -23,7 +23,8 @@ import {
   describeFigures,
   figurePagesFromImageList,
   hasFigureCaption,
-  ocrPage,
+  escalatePage,
+  readPage,
   type LaneCall,
   type OcrLanes,
 } from "../packages/library/src/index.ts";
@@ -126,7 +127,7 @@ async function renderPage(pdf: string, page: number, dir: string): Promise<Uint8
 }
 
 /** Pages holding an embedded image that is not a whole-page scan (judged per page). */
-async function figurePages(pdf: string, pageCount: number): Promise<number[]> {
+async function figurePages(pdf: string, pageCount: number, scanPages: ReadonlySet<number>): Promise<number[]> {
   let list = "", info = "";
   try {
     list = (await run("pdfimages", ["-list", pdf], { maxBuffer: 64 * 1024 * 1024 })).stdout;
@@ -134,7 +135,7 @@ async function figurePages(pdf: string, pageCount: number): Promise<number[]> {
   } catch { return []; }
   const sizes = new Map<number, { w: number; h: number }>();
   for (const m of info.matchAll(/^Page\s+(\d+) size:\s+([\d.]+) x ([\d.]+)/gm)) sizes.set(Number(m[1]), { w: Number(m[2]), h: Number(m[3]) });
-  return figurePagesFromImageList(list, (p) => sizes.get(p));
+  return figurePagesFromImageList(list, (p) => sizes.get(p), scanPages);
 }
 
 // ---------- parse ----------
@@ -168,7 +169,7 @@ interface Usage { ocrPages: number; deepseekPages: number; visionPages: number; 
 
 interface PageCache { ocr?: { text: string; parser: UnitParser; escalated?: string }; figures?: FigureRecord[]; calls: LaneCall[] }
 
-async function lanePage(cacheDir: string, hex: string, page: number, kind: "ocr" | "figures", read: () => Promise<PageCache>): Promise<PageCache> {
+async function lanePage(cacheDir: string, hex: string, page: number, kind: "ocr" | "vision" | "figures", read: () => Promise<PageCache>): Promise<PageCache> {
   const path = join(cacheDir, LANE_CACHE, hex.slice(0, 2), hex, `${page}-${kind}.json`);
   if (existsSync(path)) return JSON.parse(await readFile(path, "utf8"));
   const result = await read();
@@ -208,7 +209,7 @@ async function parseOne(row: SourceRow, out: string, cache: string, opts: ParseO
       try {
         const ocrPages = opts.ocr ? units.filter((u) => u.parser === "none").map((u) => u.sourcePage!) : [];
         const figPages = opts.figures && lanes.visionUrl
-          ? [...new Set([...await figurePages(row.file, pages.length),
+          ? [...new Set([...await figurePages(row.file, pages.length, new Set(units.filter((u) => pageNeedsOcr(u.text)).map((u) => u.sourcePage!))),
             ...units.filter((u) => u.parser === "pdftotext" && hasFigureCaption(u.text)).map((u) => u.sourcePage!)])].sort((a, b) => a - b)
           : [];
         const jobs = [...ocrPages.map((p) => ({ p, kind: "ocr" as const })), ...figPages.map((p) => ({ p, kind: "figures" as const }))];
@@ -216,17 +217,32 @@ async function parseOne(row: SourceRow, out: string, cache: string, opts: ParseO
           const unit = units[p - 1];
           if (!unit) return;
           let r: PageCache;
+          const lanePath = join(cache, "lane-pages");
+          const tag = `${hex.slice(0, 12)}:${p}:${kind}`;
           try {
-            r = await lanePage(join(cache, "lane-pages"), hex, p, kind, async () => {
+            // OCR is two cached steps: DeepSeek's reading, then (when it is unusable and a vision
+            // lane is configured) the vision lane's. A run without VISION_URL does every page's
+            // first step; a later run with it does only the escalations. A failed call is not
+            // cached, so the next run retries it.
+            r = await lanePage(lanePath, hex, p, kind, async () => {
               const img = await renderPage(row.file, p, tmp);
-              const tag = `${hex.slice(0, 12)}:${p}:${kind}`;
               if (kind === "ocr") {
-                const o = await ocrPage(img, tag, lanes);
-                return { ocr: { text: o.text, parser: o.parser, ...(o.escalated ? { escalated: o.escalated } : {}) }, calls: o.calls };
+                const o = await readPage(img, lanes);
+                if (o.calls.some((c) => c.finish === "error")) throw new Error(o.calls.find((c) => c.error)?.error ?? "DeepSeek-OCR failed");
+                return { ocr: { text: o.text, parser: o.text.trim() ? "deepseek-ocr" : "none", ...(o.reason ? { escalated: o.reason } : {}) }, calls: o.calls };
               }
               const f = await describeFigures(img, unit.unit, tag, lanes);
               return { figures: f.figures, calls: [f.call] };
             });
+            const first = r.ocr;
+            if (first?.escalated && lanes.visionUrl) {
+              const v = await lanePage(lanePath, hex, p, "vision", async () => {
+                const e = await escalatePage(await renderPage(row.file, p, tmp), first.text, `${hex.slice(0, 12)}:${p}:vision`, lanes);
+                if (e.call.finish === "error") throw new Error(e.call.error ?? "vision lane failed");
+                return { ...(e.text !== undefined ? { ocr: { text: e.text, parser: "vision" as const, escalated: first.escalated } } : {}), calls: [e.call] };
+              });
+              r = { ocr: v.ocr ?? first, calls: [...r.calls, ...v.calls] };
+            }
           } catch (error) {
             usage.failed++;
             await appendFile(opts.callLog, JSON.stringify({ object: objectId, page: p, kind, error: (error as Error).message.slice(0, 160) }) + "\n");

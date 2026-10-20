@@ -18,7 +18,7 @@ let root: string;
 beforeAll(async () => {
   root = await mkdtemp(join(tmpdir(), 'page-index-test-'));
   await mkdir(join(root, 'books', 'sample-book-aaaaaa'), { recursive: true });
-  await writeFile(join(root, 'books', 'sample-book-aaaaaa', 'p0001.md'), renderUnitMarkdown({ title: 'A. Author, Sample — p.1', unit: 'p0001' }, 'First page.'));
+  await writeFile(join(root, 'books', 'sample-book-aaaaaa', 'p0001.md'), renderUnitMarkdown({ title: 'A. Author, Sample — p.1', unit: 'p0001' }, 'First\0 page.'));
   await writeFile(join(root, 'books', 'sample-book-aaaaaa', 'fig-p0001-1.md'), renderUnitMarkdown({ title: 'A. Author, Sample — figure on p.1' }, 'A diagram.'));
   await writeFile(join(root, 'books', 'sample-book-aaaaaa', 'notes.md'), 'not a unit');
 });

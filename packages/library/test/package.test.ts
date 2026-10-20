@@ -24,8 +24,8 @@ describe("@expert-agents/library package", () => {
       "PdfSplitError", "pdfPageLimitSetting", "pdfPartStem", "pdfTextLayer", "planPdfParts", "qpdfPageCount", "splitPdf", "stripPdfPartSuffix",
       "bookId", "offsetUnits", "pageDerivativePrefix", "pageNeedsOcr", "parseUnitSlug", "partOf", "renderUnitMarkdown",
       "sectionText", "slugify", "splitPdfText", "unitBody", "unitName", "unitNumber", "unitSlug",
-      "describeFigures", "figurePagesFromImageList", "hasFigureCaption", "looksLikeRefusal", "ocrEscalationReason", "ocrPage",
-      "parseFigureReply", "stripGrounding", "visionCall",
+      "describeFigures", "escalatePage", "figurePagesFromImageList", "hasFigureCaption", "looksLikeRefusal", "ocrEscalationReason", "ocrPage",
+      "parseFigureReply", "readPage", "stripGrounding", "visionCall",
     ] as const;
     const numbers = [
       "EXTRACTION_MAX_OUTPUT_BYTES", "EXTRACTION_TIMEOUT_MS", "LIBRARY_SCHEMA_VERSION",

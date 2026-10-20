@@ -95,7 +95,10 @@ export async function visionCall(img: Uint8Array, prompt: string, tag: string, l
       ] }],
     }),
     signal: AbortSignal.timeout(lanes.timeoutMs ?? 3_600_000),
-  });
+    // The lane queues requests (one at a time, and while memory is short); Bun's own
+    // 300 s idle timeout would cut a queued call off before the signal above.
+    timeout: false,
+  } as RequestInit);
   if (!res.ok) throw new Error(`vision lane answered ${res.status}`);
   const r = await res.json() as { choices?: Array<{ finish_reason?: string; message?: { content?: string } }> };
   const choice = r.choices?.[0];
@@ -106,32 +109,46 @@ export async function visionCall(img: Uint8Array, prompt: string, tag: string, l
 const TRANSCRIBE_PROMPT = 'Transcribe this book page faithfully as Markdown in reading order: headings, running text, footnotes; '
   + 'tables as Markdown tables; equations as LaTeX. Do not summarise or comment. Output only the transcription.';
 
-/** OCR one rendered page (JPEG): DeepSeek-OCR first, the vision lane when DeepSeek's reading is unusable. */
-export async function ocrPage(img: Uint8Array, tag: string, lanes: OcrLanes): Promise<OcrResult> {
-  const calls: LaneCall[] = [];
-  let first = '';
-  let reason: string | undefined = 'deepseek_failed';
+/** Step one: DeepSeek-OCR's reading of a page, and why it should go to the vision lane, if it should. */
+export async function readPage(img: Uint8Array, lanes: OcrLanes): Promise<{ text: string; reason?: string; calls: LaneCall[] }> {
+  const t = Date.now();
   try {
     const d = await deepseek(img, lanes);
-    calls.push(d.call);
-    if (!d.call.refusal) { first = d.text; reason = ocrEscalationReason(first, img.length); }
-    else reason = 'refusal';
+    if (d.call.refusal) return { text: '', reason: 'refusal', calls: [d.call] };
+    const reason = ocrEscalationReason(d.text, img.length);
+    return { text: d.text, ...(reason ? { reason } : {}), calls: [d.call] };
   } catch (error) {
-    calls.push({ lane: 'deepseek-ocr', finish: 'error', chars: 0, ms: 0, error: (error as Error).message.slice(0, 120) });
+    return { text: '', reason: 'deepseek_failed', calls: [{ lane: 'deepseek-ocr', finish: 'error', chars: 0, ms: Date.now() - t, error: (error as Error).message.slice(0, 120) }] };
   }
-  if (!reason) return { text: first, parser: first ? 'deepseek-ocr' : 'none', calls };
+}
+
+/**
+ * Step two: the vision lane's transcription of a page DeepSeek read badly. `text` is set only when
+ * it should replace DeepSeek's reading; a call that failed has finish 'error' and can be retried.
+ */
+export async function escalatePage(img: Uint8Array, first: string, tag: string, lanes: OcrLanes): Promise<{ text?: string; call: LaneCall }> {
+  const t = Date.now();
+  try {
+    const v = await visionCall(img, TRANSCRIBE_PROMPT, tag, lanes);
+    // The vision reading wins unless DeepSeek read more (a table page it did read keeps the fuller one).
+    const wins = !v.call.refusal && v.text.trim() !== '' && v.text.length >= first.length * 0.8;
+    return { ...(wins ? { text: v.text } : {}), call: v.call };
+  } catch (error) {
+    return { call: { lane: 'vision', finish: 'error', chars: 0, ms: Date.now() - t, error: (error as Error).message.slice(0, 120) } };
+  }
+}
+
+/** OCR one rendered page (JPEG): DeepSeek-OCR first, the vision lane when DeepSeek's reading is unusable. */
+export async function ocrPage(img: Uint8Array, tag: string, lanes: OcrLanes): Promise<OcrResult> {
+  const r = await readPage(img, lanes);
+  if (!r.reason) return { text: r.text, parser: r.text ? 'deepseek-ocr' : 'none', calls: r.calls };
   if (lanes.visionUrl) {
-    try {
-      const v = await visionCall(img, TRANSCRIBE_PROMPT, tag, lanes);
-      calls.push(v.call);
-      // The vision reading wins unless DeepSeek read more (a table page it did read keeps the fuller one).
-      if (!v.call.refusal && v.text.trim() && v.text.length >= first.length * 0.8) return { text: v.text, parser: 'vision', escalated: reason, calls };
-    } catch (error) {
-      calls.push({ lane: 'vision', finish: 'error', chars: 0, ms: 0, error: (error as Error).message.slice(0, 120) });
-    }
+    const v = await escalatePage(img, r.text, tag, lanes);
+    r.calls.push(v.call);
+    if (v.text !== undefined) return { text: v.text, parser: 'vision', escalated: r.reason, calls: r.calls };
   }
   // A short or imperfect reading still beats none; the caller lists near-empty units.
-  return { text: first, parser: first.trim() ? 'deepseek-ocr' : 'none', escalated: reason, calls };
+  return { text: r.text, parser: r.text.trim() ? 'deepseek-ocr' : 'none', escalated: r.reason, calls: r.calls };
 }
 
 const FIGURE_PROMPT = [
@@ -170,13 +187,25 @@ export async function describeFigures(img: Uint8Array, unit: string, tag: string
  * `pdfimages -list` output. Judged per page: a scanned book's full-page images
  * are skipped, and a figure on a text-layer page is still found.
  */
-export function figurePagesFromImageList(list: string, pageSize: (page: number) => { w: number; h: number } | undefined): number[] {
+export function figurePagesFromImageList(
+  list: string,
+  pageSize: (page: number) => { w: number; h: number } | undefined,
+  scanPages: ReadonlySet<number> = new Set(),
+): number[] {
   const pages = new Set<number>();
+  const images: Array<{ page: number; w: number; h: number; xppi: number; yppi: number }> = [];
   for (const line of list.split('\n').slice(2)) {
     const c = line.trim().split(/\s+/);
     if (c.length < 14 || !/^\d+$/.test(c[0]!) || c[2] !== 'image') continue;
-    const page = Number(c[0]), w = Number(c[3]), h = Number(c[4]), xppi = Number(c[12]), yppi = Number(c[13]);
-    if (w < 120 || h < 120) continue;
+    images.push({ page: Number(c[0]), w: Number(c[3]), h: Number(c[4]), xppi: Number(c[12]), yppi: Number(c[13]) });
+  }
+  // An image size repeated across many pages is page art, a running ornament or a scan, not a figure.
+  const bySize = new Map<string, Set<number>>();
+  for (const i of images) bySize.set(`${i.w}x${i.h}`, (bySize.get(`${i.w}x${i.h}`) ?? new Set()).add(i.page));
+  for (const { page, w, h, xppi, yppi } of images) {
+    // A page without a text layer is a scan: its figures are reached by viewing the page.
+    if (scanPages.has(page) || w < 120 || h < 120) continue;
+    if ((bySize.get(`${w}x${h}`)?.size ?? 0) >= 8) continue;
     const size = pageSize(page);
     // Printed size of the image, in points, against the page.
     // A page scan (with its margins) covers most of the page; a figure does not.
