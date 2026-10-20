@@ -28,13 +28,14 @@
 
 Expert Agents turns an [OpenClaw](https://docs.openclaw.ai) assistant into a
 team of specialists. Each expert has its own curated library — books, papers,
-transcripts, web pages — indexed in a Google Vertex AI RAG corpus. When you ask
-it something, it retrieves from that library, answers with numbered citations
-back to the exact source, and says plainly when the library doesn't cover the
+transcripts, web pages — kept as a page library: every page addressed, read
+locally (text layer, then local OCR), and indexed for hybrid search. When you
+ask it something, it searches and reads that library, answers with citations
+back to the exact page, and says plainly when the library doesn't cover the
 question.
 
 You can create a new expert by asking for one in chat. The factory gives it its
-own Git repository, its own library and corpus, and its own Telegram bot, then
+own Git repository, its own page library, and its own Telegram bot, then
 walks you through confirming each step.
 
 ## Why
@@ -53,14 +54,16 @@ where an answer came from. Expert Agents gives you the opposite trade:
 
 ## Features
 
-- **Grounded answers** — multi-query retrieval over Vertex AI RAG with
-  reranking, fusion, and passage-level citations that carry title and creator.
+- **Grounded answers** — hybrid keyword and vector search with reranking over
+  page-addressed units, plus exact grep, whole-range reading and page images;
+  every citation carries author, title and page.
 - **Conversational factory** — `expert_factory` creates an expert end to end:
-  repository and soul, library route, Vertex corpus, and a managed Telegram bot.
+  repository and soul, page library route, and a managed Telegram bot.
   Progress is saved, so creation resumes cleanly after each confirmation.
-- **Library intake** — ingest PDFs (up to 100 MB, split with page provenance),
-  EPUB and other ebooks, web pages, YouTube transcripts, and reviewed text into a
-  content-addressed shared library with per-expert scope manifests.
+- **Library intake** — `library_ingest` turns PDFs, EPUBs, Markdown and text
+  into page units: the PDF text layer, then DeepSeek-OCR and a vision lane run
+  locally for scans, with figures described. Every failed or empty page is
+  listed; nothing is dropped silently, and no page is refused.
 - **Approval-gated acquisition** — search book catalogs for candidates, then
   download and import only what the owner approves.
 - **Document collaboration** — read, comment on, and apply approved edits to
@@ -78,11 +81,12 @@ flowchart LR
     U([You]) -->|chat| OC[OpenClaw agent]
     OC -->|tools| P[Expert Agents plugin]
     P -->|HTTP + bearer| W[Domain-expert worker]
-    W -->|retrieve| V[(Vertex AI RAG corpus)]
-    W -->|stage & import| G[(GCS shared library)]
-    W -->|generate| M[Gemini]
-    F[expert_factory] -.->|creates| R[Expert repository<br/>soul · scope manifest]
-    F -.->|creates| V
+    W -->|search| I[(Page index<br/>Postgres + Voyage)]
+    W -->|read| L[(Page library tree)]
+    W -->|originals| G[(GCS library)]
+    W -->|OCR| O[Local OCR lanes]
+    F[expert_factory] -.->|creates| R[Expert repository<br/>soul]
+    F -.->|registers| L
     F -.->|provisions| T[Telegram bot]
 ```
 
@@ -90,15 +94,16 @@ flowchart LR
 | --- | --- | --- |
 | **Plugin** | `src/` | Registers the tools with OpenClaw and forwards calls to the worker. |
 | **Worker** | `packages/runtime` | Plans, retrieves, cites, ingests and acquires. Runs as a systemd service or container. |
-| **Library** | `packages/library`, `packages/library-materializer` | Content-addressed objects in GCS, per-expert scope manifests, append-only import into Vertex. |
-| **Factory** | `packages/provisioning` | Creates and resumes experts: repository, corpus, bot and binding. |
+| **Library** | `packages/library`, `packages/runtime` | Page units, local OCR and figure description, the page index, and ingest. (`packages/library-materializer` is the legacy Vertex import.) |
+| **Factory** | `packages/provisioning` | Creates and resumes experts: repository, page library, bot and binding. |
 | **Skills** | `skills/` | Tenant-neutral operating instructions the agent follows when using the tools. |
 
 ## Quickstart
 
 **Requirements:** [Bun](https://bun.sh) 1.3+ to build. To run an expert you also
-need an OpenClaw installation and a Google Cloud project with Vertex AI RAG
-enabled and a GCS bucket for the shared library.
+need an OpenClaw installation, a GCS bucket for originals, Postgres with
+pgvector for the page index (`deploy/page-library/compose.yaml`), a Voyage API
+key, and an Ollama host serving DeepSeek-OCR.
 
 ```sh
 git clone https://github.com/jamiezigelbaum/expert-agents.git
@@ -133,15 +138,16 @@ SecretRef; prefer the SecretRef.
 }
 ```
 
-The worker reads its routing — which domains exist, their library prefix and
-target corpus — from `EXPERT_AGENTS_DOMAIN_EXPERT_AGENTS_JSON`:
+The worker reads its routing — which domains exist, where their originals live
+and their page library — from `EXPERT_AGENTS_DOMAIN_EXPERT_AGENTS_JSON`
+(experts the factory creates are registered for you):
 
 ```json
 {
   "history": {
     "displayName": "History Expert",
-    "library": { "bucket": "<shared-library-bucket>", "prefix": "<shared-library-prefix>" },
-    "targetCorpusDisplayName": "history-library"
+    "library": { "bucket": "<library-bucket>", "prefix": "<library-prefix>" },
+    "pageLibrary": { "root": "/var/lib/expert-agents/page-library/history", "sourceId": "history" }
   }
 }
 ```
@@ -161,33 +167,32 @@ The agent calls `expert_factory`, which:
 
 1. Creates the expert's own Git repository with a purpose-based soul (or runs
    the guided `soul-workshop` if you want to shape its identity).
-2. Registers its library route and creates its Vertex corpus.
+2. Registers its page library and seeds its workspace.
 3. Returns Telegram's confirmation link for a new managed bot — you tap once.
 4. Binds the bot to the new agent and checks readiness.
 
-A new corpus starts empty. Add sources in chat through the `domain-research`
-skill, or from a shell:
+A new library starts empty. Add sources in chat (the agent uses
+`library_ingest` and the acquisition skill), or from a shell:
 
 ```sh
-bun run expert:library -- ingest --scope <agent-repo>/library/scope-manifest.json \
-  --library ./candidates --bucket "$LIBRARY_BUCKET" --prefix "$LIBRARY_PREFIX" \
-  --receipts ./receipts https://example.com/paper.pdf
+bun run expert:library -- library-ingest --domain climate --action start --gcs gs://<library-bucket>/<prefix>/report.pdf --apply --approval-id <ref>
+bun run expert:library -- library-ingest --domain climate --action status --job <job-id>
 ```
 
-Then ask it something:
+Then search it:
 
 ```sh
-bun run expert:library -- ask --domain climate "What drives sea-level rise?" --passages
+bun run expert:library -- library --domain climate --action search --query "sea-level rise drivers"
 ```
 
 ## Tools
 
 | Tool | What it does |
 | --- | --- |
-| `domain_ask` | Answer a question from the expert's corpus with citations and explicit gaps. |
+| `domain_library` | The page library: catalog, search, grep, read, read_range and view_page, every result cited. |
+| `library_ingest` | Add sources to the page library and report each page's outcome. |
 | `domain_agent` | Plan or inspect a domain expert's configuration. |
-| `domain_source` | Register and manage sources in an expert's source registry. |
-| `rag_corpus` | Plan or perform bounded corpus operations: status, staging and import. |
+| `domain_ask`, `domain_read`, `domain_source`, `rag_corpus` | Legacy Vertex tools, for domains not yet on the page library. |
 | `domain_doc` | Read, comment on, or apply an approved edit to a configured document. |
 | `annas_archive_search` | Search book catalogs for candidates without downloading. |
 | `annas_archive_import` | Download and import an explicitly approved item. |
@@ -204,17 +209,19 @@ Everything the agent can do, an operator can do from a shell with
 
 | Command | Purpose |
 | --- | --- |
-| `health` | Check the worker is up and authenticated. |
-| `ask` | Ask an expert a question, optionally returning raw passages. |
+| `health` | Check the worker is up and authenticated, and the page library ready. |
+| `library` | Query a domain's page library (`domain_library`). |
+| `library-ingest` | Start, follow or list page-library ingest jobs. |
 | `search` | Find candidate books for a domain. |
-| `acquire` | Download and import an approved book, waiting out busy corpora. |
-| `source register` | Record a source with its title, author and locator. |
-| `status` | Show a domain's corpus status. |
-| `ingest` | Stage local files or URLs into the library and import them, using Google credentials directly. |
+| `acquire` | Download an approved book and queue its ingest. |
+| `ask`, `read`, `source register`, `status`, `ingest` | Legacy Vertex lanes. |
+
+`bun run library:pages` and `bun run library:index` build and index a whole
+library on the host that holds it ([page library](docs/page-library.md)).
 
 The worker token is read only from `EXPERT_AGENTS_WORKER_TOKEN` or a token file —
-never from an argument, and never printed. See the
-[CLI reference](docs/LIBRARY_ARCHITECTURE.md#operator-cli).
+never from an argument, and never printed. `--help` on each CLI is the full
+reference.
 
 ## Project layout
 
@@ -224,7 +231,7 @@ never from an argument, and never printed. See the
 ├── packages/
 │   ├── runtime/                  domain-expert worker (HTTP server)
 │   ├── library/                  library model, ingestion, retrieval preferences
-│   ├── library-materializer/     plan/execute import into Vertex corpora
+│   ├── library-materializer/     legacy: plan/execute import into Vertex corpora
 │   └── provisioning/             expert factory and agent-repository scaffolding
 ├── skills/                       OpenClaw operating skills
 ├── scripts/                      operator CLIs, packaging and verification gates
@@ -238,7 +245,7 @@ never from an argument, and never printed. See the
 | Guide | Covers |
 | --- | --- |
 | [Factory](docs/FACTORY.md) | Setting up and running conversational expert creation. |
-| [Library architecture](docs/LIBRARY_ARCHITECTURE.md) | Object identity, manifests, materialization, and the operator CLI. |
+| [Page library](docs/page-library.md) | Page units, local OCR, the search index, and the library tools. |
 | [Agent repository contract](docs/AGENT_REPO_CONTRACT.md) | What each expert's own repository contains, and deployment postures. |
 | [Deployment guide](deploy/README.md) | Installing, configuring, upgrading and rolling back the worker. |
 | [Retrieval evaluation](docs/RETRIEVAL_EVAL.md) | Measuring answer quality against a question set. |

@@ -1,5 +1,9 @@
 # Vertex RAG Engine limits
 
+> **Legacy.** This describes the Vertex RAG path, which only domains not yet on
+> the [page library](page-library.md) still use. It is deleted after their
+> cutover (owner decision 2026-10-20). New experts read a page library.
+
 Platform facts the worker's import code depends on, with how each was
 established. Code that enforces one of these limits links here; change the
 code and this page together.

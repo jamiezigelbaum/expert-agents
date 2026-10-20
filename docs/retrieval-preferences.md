@@ -1,5 +1,9 @@
 # Persistent editorial retrieval preferences
 
+> **Legacy.** This describes the Vertex RAG path, which only domains not yet on
+> the [page library](page-library.md) still use. It is deleted after their
+> cutover (owner decision 2026-10-20). New experts read a page library.
+
 An operator can configure `retrieval.preferenceProfilePath` on any domain in
 `EXPERT_AGENTS_DOMAIN_EXPERT_AGENTS_JSON`. It is an absolute path to a private,
 UTF-8 JSON profile, read afresh on each request. Keep source holdings and real

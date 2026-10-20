@@ -1,5 +1,9 @@
 # Direct library reading
 
+> **Legacy.** This describes the Vertex RAG path, which only domains not yet on
+> the [page library](page-library.md) still use. It is deleted after their
+> cutover (owner decision 2026-10-20). New experts read a page library.
+
 `domain_read` reads a selected source from the shared cloud library without a
 Vertex relevance query or model-generated reconstruction. Use `domain_ask` for
 discovery and synthesis across sources; use direct reading for exhaustive work
