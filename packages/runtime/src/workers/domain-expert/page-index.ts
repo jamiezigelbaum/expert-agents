@@ -7,6 +7,9 @@
 //            ~380-word windows that overlap by 60 words. A re-import changes
 //            only units whose text changed and deletes units whose file is
 //            gone, so running it twice leaves the index as it was.
+//            Each unit row also keeps its front matter (`meta`), and
+//            page_books one catalog entry per book, so the database alone is
+//            the library: a worker serves it without a tree on disk.
 //   embed    Voyage `voyage-4` (1024 dimensions) for chunks without a vector.
 //            Vectors are also kept by text hash, so a chunk whose text comes
 //            back unchanged is never paid for twice.
@@ -23,7 +26,7 @@ import { createHash } from 'node:crypto';
 import { readdir, readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { SQL } from 'bun';
-import { parseUnitSlug, unitBody } from '@expert-agents/library';
+import { parseUnitSlug, unitBody, unitFrontmatter, type CatalogEntry } from '@expert-agents/library';
 import { PageLibraryError, type PageSearchHit } from './page-library.ts';
 
 export const PAGE_INDEX_EMBED_MODEL = 'voyage-4';
@@ -42,11 +45,17 @@ const KEYWORD_POOL = 50;
 // Query words in more than this share of the source's chunks carry no signal for the keyword arm.
 const KEYWORD_MAX_DF_SHARE = 0.2;
 const EMBED_BATCH = 64;
+// Ingest on another host does not tell this process, so keyword statistics are re-read this often.
+const STATS_TTL_MS = 5 * 60_000;
 const EMBED_DOC_CHARS = 24_000;
 const RERANK_DOC_CHARS = 4_000;
 const VOYAGE_URL = 'https://api.voyageai.com/v1';
 
-export interface PageIndexUnit { slug: string; book: string; unit: string; title: string; body: string }
+export interface PageIndexUnit {
+  slug: string; book: string; unit: string; title: string; body: string;
+  /** The unit file's front matter (source, source_page, …); view_page reads it. */
+  meta?: Record<string, unknown>;
+}
 
 /** The text a unit or chunk is embedded and reranked as: its citation title, then its text. */
 export function unitDocument(u: Pick<PageIndexUnit, 'title' | 'body'>, maxChars = EMBED_DOC_CHARS): string {
@@ -100,10 +109,18 @@ export async function readTreeUnits(root: string, only?: readonly string[]): Pro
       const title = /^title:\s*(.*)$/m.exec(md.slice(0, md.indexOf('\n---', 4)))?.[1] ?? '';
       let parsedTitle = title;
       try { parsedTitle = JSON.parse(title); } catch { /* plain YAML scalar */ }
-      units.push({ slug, book, unit: file.slice(0, -3), title: parsedTitle, body: unitBody(md) });
+      units.push({ slug, book, unit: file.slice(0, -3), title: parsedTitle, body: unitBody(md), meta: unitFrontmatter(md) });
     }
   }
   return units;
+}
+
+/** The catalog of an assembled tree, or of the named books only; a tree without one has none. */
+export async function readTreeCatalog(root: string, only?: readonly string[]): Promise<CatalogEntry[]> {
+  let books: CatalogEntry[];
+  try { books = (JSON.parse(await readFile(join(root, 'catalog.json'), 'utf8')) as { books?: CatalogEntry[] }).books ?? []; }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return []; throw error; }
+  return books.filter((b) => !only || only.includes(b.book));
 }
 
 export interface VoyageClient {
@@ -208,7 +225,58 @@ export class PageIndex {
         embed_key text PRIMARY KEY,
         embedding vector(${PAGE_INDEX_DIMENSIONS}) NOT NULL
       );
+      ALTER TABLE page_units ADD COLUMN IF NOT EXISTS meta jsonb NOT NULL DEFAULT '{}';
+      CREATE TABLE IF NOT EXISTS page_books (
+        source text NOT NULL,
+        book text NOT NULL,
+        entry jsonb NOT NULL,
+        PRIMARY KEY (source, book)
+      );
     `);
+  }
+
+  /**
+   * Grant the serving role read on the library and the ingest role write on it (never schema
+   * changes). Run after migrate, so tables added since the roles were made are covered.
+   */
+  async grant(roles: { reader?: string; writer?: string }): Promise<void> {
+    const tables = 'page_units, page_chunks, page_embeddings, page_books';
+    for (const role of [roles.reader, roles.writer]) {
+      if (role !== undefined && !/^[a-z_][a-z0-9_]{0,62}$/.test(role)) throw new Error('a role name must be a plain lower-case identifier');
+    }
+    if (roles.reader) await this.sql.unsafe(`GRANT SELECT ON ${tables} TO ${roles.reader}`);
+    if (roles.writer) await this.sql.unsafe(`GRANT SELECT, INSERT, UPDATE, DELETE ON ${tables} TO ${roles.writer}`);
+  }
+
+  /** The library's catalog: one entry per book, in book order. */
+  async catalog(source: string): Promise<CatalogEntry[]> {
+    const rows = await this.sql`SELECT entry FROM page_books WHERE source = ${source} ORDER BY book` as Array<{ entry: unknown }>;
+    return rows.map((r) => (typeof r.entry === 'string' ? JSON.parse(r.entry) : r.entry) as CatalogEntry);
+  }
+
+  /**
+   * Make the catalog for `source` hold exactly `entries`. With `books`, only those books are
+   * replaced (each entry must be one of them) and every other book is left alone.
+   */
+  async replaceBooks(source: string, entries: readonly CatalogEntry[], opts: { books?: readonly string[] } = {}): Promise<{ books: number; removed: number }> {
+    if (opts.books && entries.some((e) => !opts.books!.includes(e.book))) throw new Error('a catalog entry lies outside the books being replaced');
+    if (new Set(entries.map((e) => e.book)).size !== entries.length) throw new Error('a book appears twice in the catalog');
+    let removed = 0;
+    await this.sql.begin(async (tx) => {
+      const keep = csv(entries.map((e) => e.book));
+      const gone = opts.books
+        ? await tx`DELETE FROM page_books WHERE source = ${source} AND book = ANY(string_to_array(${csv(opts.books)}, ','))
+            AND NOT book = ANY(string_to_array(${keep}, ',')) RETURNING book`
+        : await tx`DELETE FROM page_books WHERE source = ${source} AND NOT book = ANY(string_to_array(${keep}, ',')) RETURNING book`;
+      removed = gone.length;
+      for (let i = 0; i < entries.length; i += 500) {
+        const json = JSON.stringify(entries.slice(i, i + 500).map((entry) => ({ book: entry.book, entry })));
+        await tx`INSERT INTO page_books (source, book, entry)
+          SELECT ${source}, x.book, x.entry FROM jsonb_to_recordset(${json}::text::jsonb) AS x(book text, entry jsonb)
+          ON CONFLICT (source, book) DO UPDATE SET entry = EXCLUDED.entry`;
+      }
+    });
+    return { books: entries.length, removed };
   }
 
   /**
@@ -232,26 +300,31 @@ export class PageIndex {
     const result: ImportResult = { units: units.length, inserted: 0, updated: 0, unchanged: 0, deleted: 0, chunks: 0, reusedVectors: 0 };
     const seen = new Set<string>();
     const changed: Array<PageIndexUnit & { hash: string }> = [];
+    const same: PageIndexUnit[] = [];
     for (const u of units) {
       if (seen.has(u.slug)) throw new Error(`duplicate unit ${u.slug}`);
       seen.add(u.slug);
       const hash = contentHash(u);
       const before = existing.get(u.slug);
-      if (before === hash) { result.unchanged++; continue; }
+      if (before === hash) { result.unchanged++; same.push(u); continue; }
       if (before === undefined) result.inserted++; else result.updated++;
       changed.push({ ...u, hash });
     }
     for (let i = 0; i < changed.length; i += 500) {
       const batch = changed.slice(i, i + 500);
-      const rows = batch.map((u) => ({ source, slug: u.slug, book: u.book, unit: u.unit, title: u.title, body: u.body, content_hash: u.hash }));
+      const rows = batch.map((u) => ({ slug: u.slug, book: u.book, unit: u.unit, title: u.title, body: u.body, content_hash: u.hash, meta: u.meta ?? {} }));
       const chunks = batch.flatMap((u) => (opts.chunk === false ? [u.body] : chunkText(u.body)).map((text, chunk) => ({
         source, slug: u.slug, chunk, title: u.title, text, embed_key: embeddingKey(this.model, PAGE_INDEX_DIMENSIONS, unitDocument({ title: u.title, body: text })),
       })));
       await this.sql.begin(async (tx) => {
+        // One JSON parameter (sent as text: Bun would encode a string bound to jsonb as a JSON string),
+        // so Postgres types every column, front matter included, from the record shape.
         await tx`
-          INSERT INTO page_units ${tx(rows)}
+          INSERT INTO page_units (source, slug, book, unit, title, body, content_hash, meta)
+          SELECT ${source}, x.slug, x.book, x.unit, x.title, x.body, x.content_hash, x.meta
+          FROM jsonb_to_recordset(${JSON.stringify(rows)}::text::jsonb) AS x(slug text, book text, unit text, title text, body text, content_hash text, meta jsonb)
           ON CONFLICT (source, slug) DO UPDATE SET book = EXCLUDED.book, unit = EXCLUDED.unit, title = EXCLUDED.title,
-            body = EXCLUDED.body, content_hash = EXCLUDED.content_hash`;
+            body = EXCLUDED.body, content_hash = EXCLUDED.content_hash, meta = EXCLUDED.meta`;
         await tx`DELETE FROM page_chunks WHERE source = ${source} AND slug = ANY(string_to_array(${csv(rows.map((r) => r.slug))}, ','))`;
         for (let j = 0; j < chunks.length; j += 1000) await tx`INSERT INTO page_chunks ${tx(chunks.slice(j, j + 1000))}`;
       });
@@ -260,6 +333,12 @@ export class PageIndex {
         UPDATE page_chunks c SET embedding = e.embedding FROM page_embeddings e
         WHERE c.source = ${source} AND c.embed_key = e.embed_key AND c.slug = ANY(string_to_array(${csv(rows.map((r) => r.slug))}, ',')) RETURNING c.slug`;
       result.reusedVectors += reused.length;
+    }
+    // Front matter is not searched, so a unit whose text is unchanged keeps its chunks and only its meta is refreshed.
+    for (let i = 0; i < same.length; i += 1000) {
+      const json = JSON.stringify(same.slice(i, i + 1000).filter((u) => u.meta).map((u) => ({ slug: u.slug, meta: u.meta })));
+      await this.sql`UPDATE page_units u SET meta = x.meta FROM jsonb_to_recordset(${json}::text::jsonb) AS x(slug text, meta jsonb)
+        WHERE u.source = ${source} AND u.slug = x.slug AND u.meta IS DISTINCT FROM x.meta`;
     }
     const gone = [...existing.keys()].filter((s) => !seen.has(s));
     for (let i = 0; i < gone.length; i += 1000) {
@@ -273,6 +352,7 @@ export class PageIndex {
   /** Forget this source's cached keyword statistics after its units change. */
   invalidate(source: string): void {
     this.chunkCount.delete(source);
+    this.statsAt.delete(source);
     for (const key of [...this.docFreq.keys()]) if (key.startsWith(`${source}\0`)) this.docFreq.delete(key);
   }
 
@@ -321,6 +401,7 @@ export class PageIndex {
 
   private readonly docFreq = new Map<string, number>();
   private readonly chunkCount = new Map<string, number>();
+  private readonly statsAt = new Map<string, number>();
 
   /**
    * Units whose chunks hold the query's content words, best chunk first. Postgres full text has no
@@ -332,6 +413,7 @@ export class PageIndex {
     const lexemes = await this.sql`SELECT unnest(tsvector_to_array(to_tsvector('english', ${query}))) AS t` as Array<{ t: string }>;
     const terms = [...new Set(lexemes.map((r) => r.t))].filter((t) => /^[\p{L}\p{N}]+$/u.test(t));
     if (!terms.length) return [];
+    if (Date.now() - (this.statsAt.get(source) ?? 0) > STATS_TTL_MS) { this.invalidate(source); this.statsAt.set(source, Date.now()); }
     if (!this.chunkCount.has(source)) {
       const [r] = await this.sql`SELECT count(*)::int AS n FROM page_chunks WHERE source = ${source}` as Array<{ n: number }>;
       this.chunkCount.set(source, r?.n ?? 0);

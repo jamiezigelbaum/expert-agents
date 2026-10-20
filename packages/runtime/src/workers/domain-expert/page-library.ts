@@ -9,15 +9,16 @@
 //   view_page   the image of one PDF page, rendered from the original
 //
 // Units are addressed `books/<book>/<unit>`; every result carries a citation
-// label. The tree is local, read-only state assembled by
-// `scripts/library-pages.ts assemble`; callers cannot name paths outside it.
+// label. The catalog and units come from a page store (page-store.ts): the
+// library database, or a tree assembled by `scripts/library-pages.ts
+// assemble`. Callers name books and units, never paths.
 import { execFile } from 'node:child_process';
-import { existsSync } from 'node:fs';
-import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { promisify } from 'node:util';
-import { parseUnitSlug, unitBody, unitName, unitNumber } from '@expert-agents/library';
+import { parseUnitSlug, unitName, unitNumber } from '@expert-agents/library';
+import { TreePageStore, type PageCatalogBook, type PageStore } from './page-store.ts';
 
 const run = promisify(execFile);
 
@@ -32,14 +33,16 @@ export const GREP_MAX_HITS = 50;
 const GREP_PATTERN_MAX = 200;
 const PDF_MAX_BYTES = 100_000_000;
 const VIEW_DPI = 110;
+// Books ingested by another host appear within this long.
+const CATALOG_TTL_MS = 60_000;
 
 export class PageLibraryError extends Error {
   constructor(readonly code: string, message: string, readonly status = 400) { super(message); }
 }
 
 export interface PageLibraryConfig {
-  /** Absolute path of the assembled tree (catalog.json + books/). */
-  root: string;
+  /** Absolute path of an assembled tree (catalog.json + books/); absent, `store` must be given. */
+  root?: string;
   /** Search index source id the tree was imported under. */
   sourceId: string;
   /** Buckets the originals may be read from for view_page. */
@@ -53,6 +56,8 @@ export interface PageLibraryDependencies {
   download(bucket: string, name: string, maxBytes: number, timeoutMs: number): Promise<Uint8Array | null>;
   /** JPEG bytes of one page; defaults to pdftoppm. */
   renderPage?: (pdf: Uint8Array, page: number) => Promise<Uint8Array>;
+  /** Where the catalog and units are read from; defaults to the tree at `root`. */
+  store?: PageStore;
 }
 
 export interface PageLibraryParams {
@@ -67,10 +72,7 @@ export interface PageLibraryParams {
   to_unit?: string;
 }
 
-interface CatalogBook {
-  book: string; title: string; creator: string; kind: 'pages' | 'sections'; units: number;
-  first_unit: string; last_unit: string; figures: number; sources?: string[];
-}
+type CatalogBook = PageCatalogBook;
 
 /** One unit's worth of text with its address and citation label. */
 export interface PageExcerpt { slug: string; cite: string; text: string }
@@ -118,11 +120,14 @@ export function parsePageLibraryParams(value: Record<string, unknown>): PageLibr
 }
 
 export class PageLibrary {
-  private catalogCache?: { books: CatalogBook[]; byBook: Map<string, CatalogBook> };
+  private catalogCache?: { books: CatalogBook[]; byBook: Map<string, CatalogBook>; at: number };
   private readonly extentCache = new Map<string, PageBookInfo>();
+  private readonly store: PageStore;
 
   constructor(private readonly config: PageLibraryConfig, private readonly deps: PageLibraryDependencies) {
+    if (deps.store) { this.store = deps.store; return; }
     if (!config.root || resolve(config.root) !== config.root) throw new PageLibraryError('page_library_misconfigured', 'The page library root must be an absolute path.', 500);
+    this.store = new TreePageStore(config.root);
   }
 
   async run(params: PageLibraryParams): Promise<Record<string, unknown>> {
@@ -137,16 +142,14 @@ export class PageLibrary {
   }
 
   private async books(): Promise<{ books: CatalogBook[]; byBook: Map<string, CatalogBook> }> {
-    if (!this.catalogCache) {
-      let parsed: { books?: CatalogBook[] };
-      try { parsed = JSON.parse(await readFile(join(this.config.root, 'catalog.json'), 'utf8')); }
-      catch (error) {
-        // A library nothing has been ingested into yet has no catalog: it is empty, not broken.
-        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw new PageLibraryError('page_library_unavailable', 'The page library catalog is not readable.', 503);
-        return { books: [], byBook: new Map() };
-      }
-      const books = (parsed.books ?? []).filter((b) => typeof b.book === 'string' && /^[a-z0-9][a-z0-9-]{0,63}$/.test(b.book));
-      this.catalogCache = { books, byBook: new Map(books.map((b) => [b.book, b])) };
+    if (!this.catalogCache || Date.now() - this.catalogCache.at > CATALOG_TTL_MS) {
+      const all = await this.store.catalog();
+      // A library nothing has been ingested into yet is empty, not broken; it is read again next call.
+      if (!all.length) return { books: [], byBook: new Map() };
+      const books = all.filter((b) => typeof b.book === 'string' && /^[a-z0-9][a-z0-9-]{0,63}$/.test(b.book));
+      // A re-ingested book has a new extent, so extents are re-read with the catalog.
+      this.extentCache.clear();
+      this.catalogCache = { books, byBook: new Map(books.map((b) => [b.book, b])), at: Date.now() };
     }
     return this.catalogCache;
   }
@@ -164,15 +167,13 @@ export class PageLibrary {
     return b;
   }
 
-  private async unitFile(slug: string): Promise<{ book: string; unit: string; markdown: string }> {
+  private async unitFile(slug: string): Promise<{ book: string; unit: string; body: string; meta: Record<string, unknown> }> {
     const parsed = parseUnitSlug(slug);
     if (!parsed) throw new PageLibraryError('invalid_request', 'slug must look like books/<book>/<unit>.');
     await this.requireBook(parsed.book);
-    try {
-      return { ...parsed, markdown: await readFile(join(this.config.root, 'books', parsed.book, `${parsed.unit}.md`), 'utf8') };
-    } catch {
-      throw new PageLibraryError('page_library_unknown_unit', 'No such unit in this book; check its unit range in catalog.', 404);
-    }
+    const found = await this.store.unit(parsed.book, parsed.unit);
+    if (!found) throw new PageLibraryError('page_library_unknown_unit', 'No such unit in this book; check its unit range in catalog.', 404);
+    return { ...parsed, ...found };
   }
 
   async catalog(query?: string): Promise<Record<string, unknown>> {
@@ -207,22 +208,15 @@ export class PageLibrary {
     const books = book ? [await this.requireBook(book)] : (await this.books()).books;
     const hits: Array<Record<string, string>> = [];
     let scanned = 0;
-    outer: for (const b of books) {
-      const dir = join(this.config.root, 'books', b.book);
-      let files: string[];
-      try { files = (await readdir(dir)).filter((f) => f.endsWith('.md')).sort(); } catch { continue; }
-      for (const f of files) {
-        const body = unitBody(await readFile(join(dir, f), 'utf8'));
-        scanned++;
-        let perUnit = 0;
-        for (const line of body.split('\n')) {
-          if (!re.test(line)) continue;
-          const unit = f.slice(0, -3);
-          hits.push({ slug: `books/${b.book}/${unit}`, cite: await this.cite(b.book, unit), line: line.trim().slice(0, 300) });
-          if (hits.length >= maxHits) break outer;
-          if (++perUnit >= 3) break;
-        }
+    for await (const { book: b, unit, body } of this.store.scan(books.map((x) => x.book), pattern, maxHits)) {
+      scanned++;
+      let perUnit = 0;
+      for (const line of body.split('\n')) {
+        if (!re.test(line)) continue;
+        hits.push({ slug: `books/${b}/${unit}`, cite: await this.cite(b, unit), line: line.trim().slice(0, 300) });
+        if (hits.length >= maxHits || ++perUnit >= 3) break;
       }
+      if (hits.length >= maxHits) break;
     }
     return { hits, complete: hits.length < maxHits, units_scanned: scanned };
   }
@@ -254,11 +248,11 @@ export class PageLibrary {
     let chars = 0;
     for (let n = from; n <= last; n++) {
       const unit = unitName(kind, n);
-      const path = join(this.config.root, 'books', book, `${unit}.md`);
-      if (!existsSync(path)) break;
+      const found = await this.store.unit(book, unit);
+      if (!found) break;
       const slug = `books/${book}/${unit}`;
       const cite = await this.cite(book, unit);
-      const text = unitBody(await readFile(path, 'utf8'));
+      const text = found.body;
       const size = slug.length + cite.length + text.length + 4;
       if (chars + size > RANGE_MAX_CHARS && parts.length) break;
       parts.push({ slug, cite, text }); chars += size;
@@ -272,7 +266,7 @@ export class PageLibrary {
     const f = await this.unitFile(slug);
     const unit = f.unit.replace(/^fig-(p\d+)-\d+$/, '$1');
     const page = unit === f.unit ? f : await this.unitFile(`books/${f.book}/${unit}`);
-    return { slug: `books/${f.book}/${unit}`, cite: await this.cite(f.book, unit), text: unitBody(page.markdown) };
+    return { slug: `books/${f.book}/${unit}`, cite: await this.cite(f.book, unit), text: page.body };
   }
 
   /**
@@ -284,12 +278,7 @@ export class PageLibrary {
     const cached = this.extentCache.get(book);
     if (cached) return cached;
     const identity = await this.bookIdentity(book);
-    const dir = join(this.config.root, 'books', book);
-    let chars = 0;
-    let files: string[] = [];
-    try { files = (await readdir(dir)).filter((f) => /^[ps]\d+\.md$/.test(f)); } catch { /* an empty book has no extent */ }
-    for (const f of files) chars += unitBody(await readFile(join(dir, f), 'utf8')).length;
-    const info: PageBookInfo = { ...identity, chars };
+    const info: PageBookInfo = { ...identity, chars: await this.store.extent(book) };
     this.extentCache.set(book, info);
     return info;
   }
@@ -302,8 +291,7 @@ export class PageLibrary {
 
   async viewPage(slug: string): Promise<Record<string, unknown>> {
     const f = await this.unitFile(slug);
-    const fm = frontmatter(f.markdown);
-    const source = fm.source, page = Number(fm.source_page);
+    const source = f.meta.source, page = Number(f.meta.source_page);
     const m = typeof source === 'string' ? /^gs:\/\/([^/]+)\/(.+\.pdf)$/i.exec(source) : null;
     if (!m || !Number.isInteger(page) || page < 1) throw new PageLibraryError('page_library_not_a_pdf_page', 'Only PDF pages have an image to view.');
     if (!this.config.originalBuckets.includes(m[1]!)) throw new PageLibraryError('page_library_source_not_available', 'The original is outside this library.', 404);
@@ -313,19 +301,6 @@ export class PageLibrary {
     const unit = f.unit.replace(/^fig-(p\d+)-\d+$/, '$1');
     return { slug: `books/${f.book}/${unit}`, cite: await this.cite(f.book, unit), image: { mime_type: 'image/jpeg', data: Buffer.from(jpeg).toString('base64') } };
   }
-}
-
-function frontmatter(markdown: string): Record<string, unknown> {
-  const out: Record<string, unknown> = {};
-  if (!markdown.startsWith('---\n')) return out;
-  const end = markdown.indexOf('\n---\n', 4);
-  for (const line of markdown.slice(4, end < 0 ? 0 : end).split('\n')) {
-    const i = line.indexOf(':');
-    if (i < 1) continue;
-    const raw = line.slice(i + 1).trim();
-    try { out[line.slice(0, i).trim()] = JSON.parse(raw); } catch { out[line.slice(0, i).trim()] = raw; }
-  }
-  return out;
 }
 
 async function renderWithPdftoppm(pdf: Uint8Array, page: number): Promise<Uint8Array> {

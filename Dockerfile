@@ -16,7 +16,7 @@ FROM oven/bun:1.3.14 AS package
 WORKDIR /src
 COPY package.json bun.lock tsconfig.json ./
 COPY packages ./packages
-COPY scripts/package-deploy.ts ./scripts/package-deploy.ts
+COPY scripts/package-deploy.ts scripts/page-index.ts ./scripts/
 COPY deploy ./deploy
 RUN bun install --frozen-lockfile
 RUN bun run package:deploy

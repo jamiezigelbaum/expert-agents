@@ -8,8 +8,13 @@
 //   write    the book's unit files into the domain's tree, replacing an
 //            earlier ingest of the same original, and its catalog entry;
 // then for the whole job:
-//   index    the books' units into the search index (idempotent);
+//   index    the books' units into the search index (idempotent) and, for a
+//            library kept in the database, their catalog entries;
 //   embed    chunks without a vector.
+//
+// A library kept in the database (a route without a tree root) is written
+// through a staging tree under the job's state, removed when the job ends: the
+// database is the only copy, so ingest on one host serves workers on any.
 //
 // Jobs run one at a time in the background. Their state is a JSON file per
 // job, rewritten as it moves, so status is observable while a job runs and
@@ -25,7 +30,7 @@ import {
   deepLane, emptyParseUsage, parseObject, upsertCatalog, writeParsedBook,
   type CatalogEntry, type OcrLanes, type ParseFailure,
 } from '@expert-agents/library';
-import { readTreeUnits, type ImportResult, type PageIndexUnit } from './page-index.ts';
+import { readTreeCatalog, readTreeUnits, type ImportResult, type PageIndexUnit } from './page-index.ts';
 
 export type IngestJobState = 'queued' | 'parsing' | 'indexing' | 'embedding' | 'done' | 'done_with_failures' | 'failed';
 const TERMINAL: readonly IngestJobState[] = ['done', 'done_with_failures', 'failed'];
@@ -77,6 +82,8 @@ export interface IngestJob {
   /** Inputs, kept until the job ends so a restart can resume it. */
   inputs?: IngestSourceInput[];
   root?: string;
+  /** The library is the database; `root` is the job's staging tree. */
+  database?: boolean;
 }
 
 /** What the queue needs from the search index: the writer side of PageIndex. */
@@ -84,6 +91,9 @@ export interface PageIndexWriter {
   importUnits(source: string, units: readonly PageIndexUnit[], opts: { books: readonly string[] }): Promise<ImportResult>;
   embedPending(source: string): Promise<{ embedded: number; tokens: number }>;
   pendingEmbeddings(source: string): Promise<number>;
+  /** The catalog of a library kept in the database. */
+  catalog(source: string): Promise<CatalogEntry[]>;
+  replaceBooks(source: string, entries: readonly CatalogEntry[], opts: { books: readonly string[] }): Promise<unknown>;
 }
 
 export class PageIngestError extends Error {
@@ -122,14 +132,18 @@ export class PageIngestQueue {
     return dir;
   }
 
-  async enqueue(domainId: string, config: { root: string; sourceId: string }, inputs: IngestSourceInput[]): Promise<IngestJob> {
+  async enqueue(domainId: string, config: { root?: string; sourceId: string }, inputs: IngestSourceInput[]): Promise<IngestJob> {
     if (!inputs.length) throw new PageIngestError('page_ingest_no_sources', 'There is nothing to ingest.');
+    // A library in the database needs its writer before anything is parsed.
+    if (!config.root) this.options.writer();
     const now = new Date().toISOString();
+    const jobId = randomUUID();
     const job: IngestJob = {
-      kind: 'page_ingest_job', job_id: randomUUID(), domain_id: domainId, source_id: config.sourceId, state: 'queued',
+      kind: 'page_ingest_job', job_id: jobId, domain_id: domainId, source_id: config.sourceId, state: 'queued',
       created_at: now, updated_at: now,
       sources: inputs.map((s) => ({ name: s.name, uri: s.uri, state: 'queued', ...(s.title ? { title: s.title } : {}), ...(s.creator ? { creator: s.creator } : {}) })),
-      inputs, root: config.root,
+      inputs,
+      ...(config.root ? { root: config.root } : { root: join(this.options.stateDir, domainId, 'staging', jobId), database: true }),
     };
     await this.save(job);
     this.pending.push({ domainId, jobId: job.job_id });
@@ -223,7 +237,9 @@ export class PageIngestQueue {
           };
           const entry = await writeParsedBook(root, parsed, input.uri, meta);
           // An earlier ingest of the same original under other display names is replaced, not kept twice.
-          const stale = (await booksHoldingObject(root, parsed.objectId)).filter((b) => b !== entry.book);
+          const holding = await booksHoldingObject(root, parsed.objectId);
+          if (job.database) holding.push(...(await this.options.writer().catalog(job.source_id)).filter((b) => (b.objects ?? []).includes(parsed.objectId)).map((b) => b.book));
+          const stale = [...new Set(holding)].filter((b) => b !== entry.book);
           for (const old of stale) { replaced.add(old); await rm(join(root, 'books', old), { recursive: true, force: true }); }
           // The catalog follows each book, so a restart resumes from what is already written.
           await upsertCatalog(root, [entry], stale);
@@ -250,6 +266,8 @@ export class PageIngestQueue {
         const writer = this.options.writer();
         const units = await readTreeUnits(root, entries.map((e) => e.book));
         const imported = await writer.importUnits(job.source_id, units, { books });
+        // Units first, then the catalog that lists them, so a reader never meets a listed book without pages.
+        if (job.database) await writer.replaceBooks(job.source_id, await readTreeCatalog(root, entries.map((e) => e.book)), { books });
         job.state = 'embedding';
         job.index = { ...imported, embedded: 0, pending_embeddings: await writer.pendingEmbeddings(job.source_id) };
         await this.save(job);
@@ -268,6 +286,7 @@ export class PageIngestQueue {
     if (TERMINAL.includes(job.state)) {
       for (const input of inputs) await rm(input.file, { force: true });
       delete job.inputs;
+      if (job.database) await rm(root, { recursive: true, force: true });
     }
     await this.save(job);
     this.options.log?.({ kind: 'page_ingest_job', domain_id: job.domain_id, job_id: job.job_id, state: job.state, sources: job.sources.length });

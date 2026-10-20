@@ -7,13 +7,15 @@ import { OperationError } from './operation-error.ts';
 import { writeExclusiveDurably } from './durable-file.ts';
 
 export const REGISTRATION_LIBRARY_ENV = 'EXPERT_AGENTS_DOMAIN_EXPERT_REGISTRATION_LIBRARY_JSON';
-/** Directory holding each page-library domain's assembled tree, one subdirectory per domain. */
+/**
+ * Set, a registered domain's page library is an assembled tree on local disk, one subdirectory
+ * per domain. Unset (the default), it lives in the page library database under the domain id.
+ */
 export const PAGE_LIBRARY_ROOT_ENV = 'EXPERT_AGENTS_DOMAIN_EXPERT_PAGE_LIBRARY_ROOT';
-export const DEFAULT_PAGE_LIBRARY_ROOT = '/var/lib/expert-agents/page-library';
 
-export function pageLibraryRootFromEnv(env: Record<string, string | undefined> = process.env): string {
+export function pageLibraryRootFromEnv(env: Record<string, string | undefined> = process.env): string | undefined {
   const raw = env[PAGE_LIBRARY_ROOT_ENV]?.trim();
-  if (!raw) return DEFAULT_PAGE_LIBRARY_ROOT;
+  if (!raw) return undefined;
   if (!raw.startsWith('/') || raw.split('/').includes('..')) throw new OperationError('invalid_page_library_root', `${PAGE_LIBRARY_ROOT_ENV} must be an absolute path.`);
   return raw.replace(/\/+$/, '') || '/';
 }
@@ -29,7 +31,7 @@ export function registrationLibraryFromEnv(env: Record<string, string | undefine
 export class AgentRegistrationStore {
   private readonly directory: string;
   constructor(dataDir: string, private readonly base: AgentRoutingConfig, private readonly allowed?: LibraryLocationConfig,
-    private readonly pageLibraryRoot: string = DEFAULT_PAGE_LIBRARY_ROOT) {
+    private readonly pageLibraryRoot?: string) {
     this.directory = join(dataDir, 'agent-registrations');
   }
 
@@ -64,7 +66,7 @@ export class AgentRegistrationStore {
       throw new OperationError('agent_registration_conflict', 'The corpus name is already assigned to another agent.');
     }
     if (route.pageLibrary && Object.entries(routes).some(([id, other]) => id !== domain
-      && (other.pageLibrary?.sourceId === route.pageLibrary!.sourceId || other.pageLibrary?.root === route.pageLibrary!.root))) {
+      && (other.pageLibrary?.sourceId === route.pageLibrary!.sourceId || (route.pageLibrary!.root !== undefined && other.pageLibrary?.root === route.pageLibrary!.root)))) {
       throw new OperationError('agent_registration_conflict', 'The page library is already assigned to another agent.');
     }
     const existing = routes[domain];
@@ -108,10 +110,10 @@ export class AgentRegistrationStore {
     }
     const record = value as Record<string, unknown>;
     if (record.library === undefined) throw new OperationError('invalid_agent_registration', 'A registration names the library subtree that holds its originals.');
-    // A registrant chooses only to have a page library; its tree directory
-    // and index source are the operator's, derived from the domain id, so a
+    // A registrant chooses only to have a page library; where it lives and
+    // its source id are the operator's, derived from the domain id, so a
     // registration can never point the worker at another path or source.
-    let pageLibrary: { root: string; sourceId: string } | undefined;
+    let pageLibrary: { root?: string; sourceId: string } | undefined;
     if (record.pageLibrary !== undefined) {
       const requested = record.pageLibrary;
       if (!requested || typeof requested !== 'object' || Array.isArray(requested)
@@ -119,7 +121,7 @@ export class AgentRegistrationStore {
         || ((requested as Record<string, unknown>).sourceId !== undefined && (requested as Record<string, unknown>).sourceId !== domain)) {
         throw new OperationError('invalid_agent_registration', 'A registration page library is {} or {"sourceId": <domain>}.');
       }
-      pageLibrary = { root: `${this.pageLibraryRoot}/${domain}`, sourceId: domain };
+      pageLibrary = { ...(this.pageLibraryRoot ? { root: `${this.pageLibraryRoot}/${domain}` } : {}), sourceId: domain };
     }
     // Runtime corpus lookup also accepts numeric ids and resource names. A
     // factory registration must name a new display-name identity, never one

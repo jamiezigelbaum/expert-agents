@@ -30,7 +30,11 @@ describe('page index', () => {
   test('reads every unit of a tree, figures included, and skips files that are not units', async () => {
     const units = await readTreeUnits(root);
     expect(units.map((u) => u.slug)).toEqual(['books/sample-book-aaaaaa/fig-p0001-1', 'books/sample-book-aaaaaa/p0001']);
-    expect(units[1]).toEqual({ slug: 'books/sample-book-aaaaaa/p0001', book: 'sample-book-aaaaaa', unit: 'p0001', title: 'A. Author, Sample — p.1', body: 'First page.' });
+    expect(units[1]).toEqual({
+      slug: 'books/sample-book-aaaaaa/p0001', book: 'sample-book-aaaaaa', unit: 'p0001', title: 'A. Author, Sample — p.1', body: 'First page.',
+      // The front matter travels with the unit, so a library kept in the database can render its page.
+      meta: { title: 'A. Author, Sample — p.1', unit: 'p0001' },
+    });
   });
 
   test('a unit is indexed as its citation title and body; its hash and embedding key follow that text', () => {

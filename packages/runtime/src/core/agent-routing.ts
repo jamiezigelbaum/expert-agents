@@ -82,9 +82,13 @@ export interface AgentRoutingEntry {
 }
 
 export interface AgentPageLibraryConfig {
-  /** Absolute path of the assembled tree (catalog.json + books/). */
-  root: string;
-  /** Search index source id the tree was imported under. */
+  /**
+   * Absolute path of an assembled tree (catalog.json + books/) to serve from local disk.
+   * Absent, the library is the page library database itself: its catalog and units are
+   * read under `sourceId` through the serving database URL (docs/page-library.md).
+   */
+  root?: string;
+  /** Library source id: the key of its catalog, units and search rows. */
   sourceId: string;
   /**
    * Buckets view_page may render originals from. Absent, the route's library
@@ -223,8 +227,8 @@ function validateRoutingEntry(domainId: string, value: unknown): AgentRoutingEnt
 function validatePageLibrary(value: unknown): AgentPageLibraryConfig {
   const entry = requireRecord(value, 'pageLibrary must be an object');
   requireExactKeys(entry, ['root', 'sourceId', 'originalBuckets'], 'pageLibrary');
-  const root = requireNonEmptyString(entry.root, 'pageLibrary root');
-  if (!root.startsWith('/') || root.split('/').includes('..')) throw new AgentRoutingConfigError('pageLibrary root must be an absolute path');
+  const root = entry.root === undefined ? undefined : requireNonEmptyString(entry.root, 'pageLibrary root');
+  if (root !== undefined && (!root.startsWith('/') || root.split('/').includes('..'))) throw new AgentRoutingConfigError('pageLibrary root must be an absolute path');
   const sourceId = requireNonEmptyString(entry.sourceId, 'pageLibrary sourceId');
   if (!/^[a-z0-9][a-z0-9-]{0,63}$/.test(sourceId)) throw new AgentRoutingConfigError('pageLibrary sourceId is invalid');
   let originalBuckets: string[] | undefined;
@@ -235,7 +239,7 @@ function validatePageLibrary(value: unknown): AgentPageLibraryConfig {
     }
     originalBuckets = Object.freeze([...new Set(entry.originalBuckets as string[])]) as string[];
   }
-  return Object.freeze({ root, sourceId, ...(originalBuckets ? { originalBuckets } : {}) });
+  return Object.freeze({ ...(root !== undefined ? { root } : {}), sourceId, ...(originalBuckets ? { originalBuckets } : {}) });
 }
 
 /** The buckets view_page may read originals from: explicit, else the route's library locations. */

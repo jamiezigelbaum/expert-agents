@@ -21,12 +21,16 @@ export interface PackageDeployOptions {
 export async function packageDeploy(options: PackageDeployOptions = {}): Promise<DeployReceipt> {
   const repositoryRoot = resolve(options.repositoryRoot ?? join(import.meta.dir, '..'));
   const outputRoot = resolve(options.outputRoot ?? join(repositoryRoot, 'dist/deploy-package'));
-  const workerRelativePath = 'packages/runtime/dist/server.js';
-  const workerOutputPath = join(outputRoot, workerRelativePath);
-
   await rm(outputRoot, { recursive: true, force: true });
-  await mkdir(dirname(workerOutputPath), { recursive: true });
-  await buildWorkerBundle(repositoryRoot, workerOutputPath);
+  // The worker, and the page library's operator CLI (migrate, grant, import), so a host that runs
+  // the image can prepare and fill its library database without a source checkout.
+  for (const [entry, output] of [
+    ['packages/runtime/src/workers/domain-expert/server.ts', 'packages/runtime/dist/server.js'],
+    ['scripts/page-index.ts', 'packages/runtime/dist/page-index.js'],
+  ] as const) {
+    await mkdir(dirname(join(outputRoot, output)), { recursive: true });
+    await buildBundle(repositoryRoot, join(repositoryRoot, entry), join(outputRoot, output));
+  }
   await cp(join(repositoryRoot, 'deploy'), join(outputRoot, 'deploy'), { recursive: true });
 
   const files = await walk(outputRoot);
@@ -45,8 +49,7 @@ export async function packageDeploy(options: PackageDeployOptions = {}): Promise
   return receipt;
 }
 
-async function buildWorkerBundle(repositoryRoot: string, outputPath: string): Promise<void> {
-  const entrypoint = join(repositoryRoot, 'packages/runtime/src/workers/domain-expert/server.ts');
+async function buildBundle(repositoryRoot: string, entrypoint: string, outputPath: string): Promise<void> {
   const buildProcess = Bun.spawn([
     process.execPath,
     'build',
@@ -66,7 +69,7 @@ async function buildWorkerBundle(repositoryRoot: string, outputPath: string): Pr
     new Response(buildProcess.stderr).text(),
   ]);
   if (exitCode !== 0) {
-    throw new Error(`failed to build self-contained deploy worker:\n${stderr || stdout}`);
+    throw new Error(`failed to build self-contained deploy bundle ${relative(repositoryRoot, entrypoint)}:\n${stderr || stdout}`);
   }
 }
 

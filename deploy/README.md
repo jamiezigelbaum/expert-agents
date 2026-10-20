@@ -119,7 +119,7 @@ external integrations the deployment uses.
 `EXPERT_AGENTS_DOMAIN_EXPERT_AGENTS_JSON` is **REQUIRED for live domain
 serving**. It is the domain-keyed routing manifest for the worker. Every expert
 reads a page library ([`page-library.md`](../docs/page-library.md)): an entry
-declares a `pageLibrary` (the tree's absolute `root` and its index `sourceId`)
+declares a `pageLibrary` (its `sourceId` in the library database, and a tree `root` only for one served from local disk)
 and the library bucket/prefix its originals live in. A legacy entry declares a
 target Vertex corpus instead, with optional scope-manifest path and retrieval
 overrides; those go when the Vertex machinery is removed. Registrations made
@@ -138,7 +138,6 @@ example, a governance domain served from its page library has this shape:
       "prefix": "<shared-library-prefix>"
     },
     "pageLibrary": {
-      "root": "/var/lib/expert-agents/page-library/governance",
       "sourceId": "governance"
     }
   }
@@ -151,12 +150,16 @@ A page-library domain also needs the page index and its writer
 `EXPERT_AGENTS_DOMAIN_EXPERT_VOYAGE_API_KEY`) and the local OCR lanes
 (`EXPERT_AGENTS_DOMAIN_EXPERT_OCR_ROUTER_URL`, a local model router named by
 profile, never by model).
-The index's Postgres runs from `deploy/page-library/compose.yaml`; give the
-serving URL a SELECT-only role and the writer URL a role that may insert and
-delete (`SELECT, INSERT, UPDATE, DELETE` on `page_units`, `page_chunks` and
-`page_embeddings`). `library_ingest` writes each book into the domain's tree
-under `/var/lib/expert-agents/page-library`, which the unit opens for writing
-and the service account must own.
+The library's Postgres runs from `deploy/page-library/compose.yaml`, which can
+also run the worker beside it on any host (docs/page-library.md, section 5).
+The database is the library: catalog, units and search rows under the route's
+`sourceId`, so several routes may share one library. Give the serving URL a
+SELECT-only role and the writer URL a role that may write rows;
+`bun run library:index migrate --reader <role> --writer <role>` grants both on
+every table, `page_books` included, and must be rerun after an upgrade. A
+route that also names a `root` serves a tree from local disk instead; for
+those, `library_ingest` writes under `/var/lib/expert-agents/page-library`,
+which the unit opens for writing and the service account must own.
 
 The worker does not generate buckets, prefixes, or corpora for missing domain
 entries. Offline status and dry-run planning remain available and report the
