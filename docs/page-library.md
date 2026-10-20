@@ -100,12 +100,16 @@ reranked by Voyage.
 - **Embeddings:** Voyage `voyage-4`, 1024 dimensions, one vector per chunk
   (title plus text). Vectors are also kept by text hash, so text that comes
   back unchanged, including under another source, is never paid for twice.
-- **Search** runs two arms over the chunks, each keeping a unit's best chunk,
-  merged by unit with RRF (k = 60); Voyage `rerank-3` then orders the top 60
-  by that best chunk.
-  - Keyword arm: Postgres full text with the query's words **ORed**. A
-    sentence query is not an AND of every word, the failure that made GBrain's
-    keyword arm useless on whole questions.
+- **Search** runs two arms over the chunks, each keeping a unit's best chunk.
+  Voyage `rerank-3` orders the vector arm's top 100 and the keyword arm's top
+  50 (deduplicated) by that best chunk.
+  - Keyword arm: the query's content words **ORed** (a sentence query is not
+    an AND of every word, the failure that made GBrain's keyword arm useless
+    on whole questions), each chunk scored by the summed IDF of the words it
+    holds. Words in over a fifth of the chunks are dropped. Plain `ts_rank`
+    over ORed words favours long chunks full of common words: on the golden
+    set it put the right page in the top 5 for 5% of questions; IDF scoring
+    for 44%.
   - Vector arm: nearest neighbours over HNSW.
 
 `deploy/page-library/compose.yaml` runs Postgres 17 with pgvector on loopback.
