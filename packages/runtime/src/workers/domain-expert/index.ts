@@ -111,6 +111,7 @@ import {
 } from '../../core/disclosure.ts';
 import { completePassageSentences, completionSourceObject, SourceTextCache } from './passage-completion.ts';
 import { LibraryReader, LibraryReadError, parseLibraryReadParams } from './library-reader.ts';
+import { GbrainSearchClient, PageLibrary, PageLibraryError, parsePageLibraryParams, type PageLibraryDependencies } from './page-library.ts';
 
 export const DOMAIN_EXPERT_NOTION_CREDENTIAL_GUIDANCE = `notion_import requires EXPERT_AGENTS_DOMAIN_EXPERT_NOTION_TOKEN. Configure it as documented in ${DOMAIN_EXPERT_ENV_EXAMPLE}.`;
 
@@ -260,6 +261,10 @@ export interface DomainExpertWorkerOptions {
   summarizeBin?: string;
   summarizeExtract?: ReferenceExtractor;
   basePath?: string;
+  /** Bearer token for the page library's search service; defaults to EXPERT_AGENTS_DOMAIN_EXPERT_PAGE_SEARCH_TOKEN. */
+  pageSearchToken?: string;
+  /** Test seam: replaces the GBrain search client. */
+  pageSearch?: PageLibraryDependencies['search'];
 }
 
 type ResolveHostImpl = (hostname: string) => Promise<string[]>;
@@ -272,6 +277,7 @@ type DomainExpertTool =
   | 'domain_agent'
   | 'domain_ask'
   | 'domain_read'
+  | 'domain_library'
   | 'domain_source'
   | 'rag_corpus'
   | 'domain_doc'
@@ -765,6 +771,9 @@ export class DomainExpertService {
   private gcpProject: string;
   private google: GoogleRuntimeClient;
   private libraryReader: LibraryReader;
+  private pageLibraries = new Map<string, PageLibrary>();
+  private pageSearchToken: string | undefined;
+  private pageSearch: PageLibraryDependencies['search'] | undefined;
   private annas: DomainExpertAnnasConfig;
   private annasBooksRoot: string;
   private annasMaxDownloadBytes: number;
@@ -825,6 +834,8 @@ export class DomainExpertService {
       download: (bucket, name, maxBytes, timeoutMs) => this.google.downloadLibraryObject(bucket, name, maxBytes, timeoutMs),
       list: (bucket, prefix, timeoutMs) => this.google.listLibraryObjectNames(bucket, prefix, timeoutMs),
     });
+    this.pageSearchToken = options.pageSearchToken ?? process.env.EXPERT_AGENTS_DOMAIN_EXPERT_PAGE_SEARCH_TOKEN;
+    this.pageSearch = options.pageSearch;
     this.annas = options.annas ?? {};
     this.annasBooksRoot = options.annas?.booksRoot ?? DEFAULT_ANNAS_BOOKS_ROOT;
     this.annasMaxDownloadBytes = normalizePositiveInteger(options.annas?.maxDownloadBytes, DEFAULT_ANNAS_ARCHIVE_MAX_DOWNLOAD_BYTES);
@@ -1030,6 +1041,8 @@ export class DomainExpertService {
         return this.domainAsk(parseDomainAskParams(request.params));
       case 'domain_read':
         return this.domainRead(request.params);
+      case 'domain_library':
+        return this.domainLibrary(request.params);
       case 'domain_source':
         return this.domainSource(parseDomainSourceParams(request.params));
       case 'rag_corpus':
@@ -1042,6 +1055,41 @@ export class DomainExpertService {
         return this.annasImport(parseAnnasArchiveImportParams(request.params));
       default:
         throw new DomainExpertWorkerError(400, 'invalid_tool', 'Unsupported domain expert tool.');
+    }
+  }
+
+  /**
+   * The page library tool belt (docs/page-library.md). Worker-side only until
+   * it replaces the Vertex path; refused for a domain without a pageLibrary
+   * route block and for any route with a disclosure policy.
+   */
+  private async domainLibrary(params: Record<string, unknown>): Promise<unknown> {
+    try {
+      const parsed = parsePageLibraryParams(params);
+      const manifest = this.manifest(optionalStringField(params.domain_id, 'domainId').domainId);
+      requireConfiguredAgent(manifest, 'domain_library');
+      const route = this.agentRouting[manifest.domain_id]!;
+      if (route.disclosure) throw new PageLibraryError('page_library_not_disclosable', 'This deployment serves under a disclosure policy; the page library is not available.', 403);
+      if (!route.pageLibrary) throw new PageLibraryError('page_library_not_configured', 'This domain has no page library.', 404);
+      const config = route.pageLibrary;
+      const key = `${manifest.domain_id}\u0000${config.root}\u0000${config.sourceId}\u0000${config.searchUrl}`;
+      let library = this.pageLibraries.get(key);
+      if (!library) {
+        const search = this.pageSearch ?? (() => {
+          if (!this.pageSearchToken) throw new PageLibraryError('page_search_not_configured', 'The page search token is not configured.', 503);
+          const client = new GbrainSearchClient(config.searchUrl, this.pageSearchToken);
+          return (query: string, k: number, sourceId: string) => client.search(query, k, sourceId);
+        })();
+        library = new PageLibrary(
+          { root: config.root, sourceId: config.sourceId, originalBuckets: [route.library, ...(route.readOnlySourceRoots ?? [])].map((r) => r.bucket) },
+          { search, download: (bucket, name, maxBytes, timeoutMs) => this.google.downloadLibraryObject(bucket, name, maxBytes, timeoutMs) },
+        );
+        this.pageLibraries.set(key, library);
+      }
+      return { kind: 'domain_library_result', domain_id: manifest.domain_id, action: parsed.action, ...await library.run(parsed), policy: domainPolicy() };
+    } catch (error) {
+      if (error instanceof PageLibraryError) throw new DomainExpertWorkerError(error.status, error.code, error.message);
+      throw error;
     }
   }
 
@@ -13282,6 +13330,7 @@ function asDomainExpertTool(value: unknown): DomainExpertTool {
     value === 'domain_agent'
     || value === 'domain_ask'
     || value === 'domain_read'
+    || value === 'domain_library'
     || value === 'domain_source'
     || value === 'rag_corpus'
     || value === 'domain_doc'
