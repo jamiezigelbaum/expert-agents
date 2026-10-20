@@ -1,10 +1,11 @@
 # Page library
 
 The page library is the expert-agent library design chosen by the
-2026-10-20 retrieval test. It is three pieces:
+2026-10-20 retrieval test. It has three pieces:
 
-- a parse-once lane that turns every original into page-addressed units;
-- a hybrid search index over those units;
+- a parse-once lane that turns every original into page-addressed units, read
+  locally so that no page can be refused;
+- a lean hybrid search index over those units, built into this repository;
 - a six-tool belt that lets the agent search, verify, read whole ranges and
   look at pages.
 
@@ -23,20 +24,41 @@ derivative keyed by the original's SHA-256:
 <library prefix>/derivatives/pages/v1/<first two hex>/<64 hex>/manifest.json
 ```
 
-- **PDFs** become one unit per physical page (`p0001`), from the text layer
-  (`pdftotext`).
-  - A page with no text layer is rendered and parsed by Gemini 3.5
-    Flash-Lite.
-  - A page Gemini refuses (RECITATION) goes to DeepSeek-OCR at `OLLAMA_URL`,
-    when that is set.
-  - Pages still empty are listed in `emptyUnits`, never silently dropped.
-- **Text and converted ebooks** become sections of about 1,200 words (`s0001`),
-  cut at headings and never mid-paragraph.
-- **Figures:** a page holding an embedded image smaller than the page gets a
-  Gemini figure description (label, caption, 2–5 sentences, bounding box).
-  Scan-only documents are skipped by this heuristic; their scan pages already
-  return figures from the OCR call.
-- Model results are cached per page, so a rerun pays only for new pages.
+**PDFs** become one unit per physical page (`p0001`). Each page is read in
+this order, and no cloud model is on the path:
+
+1. The PDF text layer (`pdftotext`). Most pages need nothing more.
+2. DeepSeek-OCR through Ollama (`OLLAMA_URL`), with its native prompt
+   `<image>\nFree OCR.`. The markdown prompt returns empty output on many scan
+   pages.
+3. The vision lane (`VISION_URL`, an OpenAI-compatible endpoint such as
+   `delphi/vision-deep`), for pages DeepSeek reads badly:
+   - a dense page that yields little text;
+   - a looping or garbled reading;
+   - a table.
+
+How the results are kept:
+- A short reading of a title or blank page stands.
+- Pages still near-empty are listed in `emptyUnits`, never silently dropped.
+- Every lane call's finish reason, and any refusal, is logged to
+  `<out>/lane-calls.jsonl`.
+- A refusal is never used as page text.
+
+**Figures** are found on every page, not only on OCR'd ones. A page
+qualifies when either holds:
+- it carries an embedded image smaller than the page (a page scan is not a
+  figure);
+- its text layer has a `Figure N` / `Table N` caption line, which catches
+  vector art and set tables.
+
+The vision lane describes each figure with a label, caption, 2–5 sentences
+and a bounding box. Figures inside page scans are reached through
+`view_page`.
+
+**Text and converted ebooks** become sections of about 1,200 words (`s0001`),
+cut at headings and never mid-paragraph.
+
+Lane results are cached per page, so a rerun only reads pages it has not seen.
 
 `upload` writes the derivatives beside the originals in the library bucket. It
 only ever adds objects under `derivatives/`; originals and the master manifest
@@ -51,52 +73,59 @@ are never touched.
 ```
 
 Parts of a split source (`…-part-2-of-4.pdf`) are merged back into one book
-with the original's page or section numbering; `source_page` and
-`source_unit` keep each part's own locator. Titles and authors come from the
-master manifest, then from `author---title` file names, then from the first
-heading.
+with continuous page or section numbering; `source_page` and `source_unit`
+keep each part's own locator. Titles and authors come from these sources, in
+order:
+1. the master manifest;
+2. `author---title` file names;
+3. the first heading.
 
-## 2. Search: GBrain on Postgres
+## 2. Search: the page index
 
-`deploy/page-library/` runs [GBrain](https://github.com/garrytan/gbrain) (MIT)
-at a pinned commit, on Postgres 17 with pgvector, both bound to loopback.
+`packages/runtime/src/workers/domain-expert/page-index.ts` is the engine:
+Postgres full text plus pgvector, fused with reciprocal rank fusion, then
+reranked by Voyage.
 
-- **Embeddings:** Voyage `voyage-4`, 1024 dimensions.
-- **Search:** Postgres full text plus vectors, fused, then reranked with
-  Voyage `rerank-3`.
-- **Kept off by `configure.sh`:** writeback, fact and chronicle extraction,
-  write-through, personal-brain boosts and self-upgrade. The index is a pure
-  function of the tree.
-- **Read-only tree:** the container mounts the tree read-only, so GBrain can
-  never rewrite the files it imports.
-- **Version:** the pin is the version. Moving it means rerunning the
-  retrieval eval.
+- **Rows:** one per unit (page, section or figure), keyed by `(source, slug)`
+  with a content hash.
+- **Import is idempotent.** It updates only rows whose text changed and
+  deletes rows whose file is gone, so a second run leaves the index unchanged.
+- **Embeddings:** Voyage `voyage-4`, 1024 dimensions, one vector per unit
+  (title plus text). Vectors are also kept by text hash, so text that comes
+  back unchanged, including under another source, is never paid for twice.
+- **Search** runs two arms, merged with RRF (k = 60); Voyage `rerank-3` then
+  orders the top 60.
+  - Keyword arm: Postgres full text with the query's words **ORed**. A
+    sentence query is not an AND of every word, the failure that made GBrain's
+    keyword arm useless on whole questions.
+  - Vector arm: nearest neighbours over HNSW.
+
+`deploy/page-library/compose.yaml` runs Postgres 17 with pgvector on loopback.
+`scripts/page-index.ts` is the operator CLI:
 
 ```sh
-cp page-library.env.example page-library.env   # fill from the credential broker
-docker compose --env-file page-library.env build gbrain
 docker compose --env-file page-library.env up -d postgres
-docker compose --env-file page-library.env run --rm -T gbrain init --url "$GBRAIN_DATABASE_URL" --non-interactive --db-only --embedding-model voyage:voyage-4 --embedding-dimensions 1024 --search-mode balanced
-./configure.sh <domain>
-docker compose --env-file page-library.env run --rm -T gbrain import /library --source-id <domain> --workers 8
-docker compose --env-file page-library.env run --rm -T gbrain auth create worker --scopes read   # token → worker env
-docker compose --env-file page-library.env run --rm -T gbrain auth rescope --token worker --sources <domain>
-docker compose --env-file page-library.env up -d gbrain                                          # gbrain serve --http :3131
+bun scripts/page-index.ts migrate
+bun scripts/page-index.ts import --source <domain> --tree <tree>
+bun scripts/page-index.ts embed  --source <domain>
+bun scripts/page-index.ts search --source <domain> --query "…"
 ```
 
-Re-imports are idempotent by content hash; only changed units re-embed.
+It reads `PAGE_INDEX_DATABASE_URL` and `VOYAGE_API_KEY` from the environment
+and never prints them.
 
 ## 3. Tools: `domain_library`
 
 The worker answers `POST /v1/domain` with `{"tool": "domain_library", ...}`.
-The domain's route must declare
+The domain's route must declare:
 
 ```json
-"pageLibrary": { "root": "/abs/path/to/tree", "sourceId": "<domain>", "searchUrl": "http://127.0.0.1:3131/mcp" }
+"pageLibrary": { "root": "/abs/path/to/tree", "sourceId": "<domain>" }
 ```
 
-and the worker reads the search token from
-`EXPERT_AGENTS_DOMAIN_EXPERT_PAGE_SEARCH_TOKEN`.
+The worker reads the index's credentials from
+`EXPERT_AGENTS_DOMAIN_EXPERT_PAGE_INDEX_DATABASE_URL` and
+`EXPERT_AGENTS_DOMAIN_EXPERT_VOYAGE_API_KEY`.
 
 | action | parameters | returns |
 |---|---|---|
@@ -113,15 +142,19 @@ disclosure policy, as `domain_read` does.
 
 It is deliberately **not** registered as a gateway tool yet. That happens at
 cutover, together with the agent instructions. The 2026-10-20 test found two
-things the agent instructions need:
+things those instructions need:
 - abstain when the library is silent;
 - a larger step budget (about 30) for synthesis.
 
 ## Evaluation
 
-Eval sets and receipts live in each agent's own repository, never here. The shadow is scored on the same questions
-as Vertex. Each passage is scored three ways:
+Eval sets and receipts live in each agent's own repository, never here. The
+shadow is scored on the same questions as Vertex. Each passage is scored
+three ways:
 - the repo rule (`scripts/retrieval-eval.ts`): source match plus ordered-word
   quote coverage;
 - a source-blind quote rule;
 - for page units, the pinned evidence unit.
+
+Before any agent run, the engine must match GBrain's one-shot result from
+the test: passage@5 0.66 overall and 0.53 on conceptual questions.

@@ -1,7 +1,7 @@
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, extname, join, resolve } from "node:path";
 import { promisify } from "node:util";
@@ -20,6 +20,12 @@ import {
   type PageDerivativeManifest,
   type PageUnit,
   type UnitParser,
+  describeFigures,
+  figurePagesFromImageList,
+  hasFigureCaption,
+  ocrPage,
+  type LaneCall,
+  type OcrLanes,
 } from "../packages/library/src/index.ts";
 
 /**
@@ -34,30 +40,23 @@ import {
  *             plus catalog.json. This tree is what the worker's page tools
  *             read and what the search index imports (from a copy).
  *
- * PDF pages use the text layer (pdftotext). A page without one goes to
- * Gemini 3.5 Flash-Lite as an image; a page Gemini refuses (RECITATION) goes to
- * DeepSeek-OCR at OLLAMA_URL when set. Pages that look like they hold figures
- * get a Gemini figure description. Model results are cached per page, so a
- * rerun pays only for pages it has not seen.
+ * PDF pages use the text layer (pdftotext). A page without one is rendered and
+ * read locally: DeepSeek-OCR through Ollama (OLLAMA_URL), then the vision lane
+ * (VISION_URL, an OpenAI-compatible endpoint such as `delphi/vision-deep`) for
+ * pages DeepSeek reads badly. No cloud model is on this path, so no page can
+ * be refused. Every page holding an embedded image that is not a whole-page
+ * scan gets figure descriptions from the vision lane. Lane results are cached
+ * per page, so a rerun reads only pages it has not seen; every call's finish
+ * reason and any refusal go to `<out>/lane-calls.jsonl`.
  *
- * Secrets: GEMINI_API_KEY and the Google access token are read from the
- * environment only and never printed.
+ * Secrets: the Google access token (download and upload only) is read from
+ * the environment and never printed.
  */
 
 const run = promisify(execFile);
-const GEMINI_MODEL = process.env.PAGE_PARSE_MODEL ?? "gemini-3.5-flash-lite";
 const RENDER_DPI = 150;
-
-const PARSE_PROMPT = [
-  "You are parsing one page of a book for a search index. Return JSON only:",
-  '{"printed_page": "<page number printed on the page or empty>",',
-  ' "markdown": "<faithful transcription of all running text in reading order as Markdown; keep headings, footnotes,',
-  ' block quotes; tables as Markdown tables; equations as LaTeX; do not summarise>",',
-  ' "figures": [{"label": "<e.g. Figure 3.2 or empty>", "caption": "<printed caption or empty>",',
-  '   "box_2d": [ymin, xmin, ymax, xmax] (0-1000 normalised, tight around the figure),',
-  '   "description": "<2-5 sentences: what it shows, its labels/axes/parts and relationships, and the point it makes>"}]}',
-  "Figures are diagrams, charts, tables, maps, photos, illustrations. Omit decorative ornaments.",
-].join("\n");
+// Lane results are cached under this name; a change of lanes or prompts takes a new one.
+const LANE_CACHE = "local-lanes-v1";
 
 interface Args { [key: string]: string | boolean | undefined }
 
@@ -116,11 +115,7 @@ async function gcsUpload(bucket: string, name: string, body: string, contentType
   if (!res.ok) throw new Error(`GCS upload failed (${res.status}) for gs://${bucket}/${name}`);
 }
 
-// ---------- page models ----------
-
-class RecitationError extends Error {}
-
-interface ModelPage { markdown: string; printed_page?: string; figures?: Array<{ label?: string; caption?: string; description?: string; box_2d?: number[] }> }
+// ---------- pages ----------
 
 async function renderPage(pdf: string, page: number, dir: string): Promise<Uint8Array> {
   const out = join(dir, `p${page}`);
@@ -130,60 +125,16 @@ async function renderPage(pdf: string, page: number, dir: string): Promise<Uint8
   return jpg;
 }
 
-async function geminiPage(img: Uint8Array): Promise<{ page: ModelPage; usage: { in: number; out: number } }> {
-  const key = process.env.GEMINI_API_KEY;
-  if (!key) throw new Error("GEMINI_API_KEY is not set");
-  const body = {
-    contents: [{ parts: [{ inline_data: { mime_type: "image/jpeg", data: Buffer.from(img).toString("base64") } }, { text: PARSE_PROMPT }] }],
-    generationConfig: { responseMimeType: "application/json", maxOutputTokens: 8192 },
-  };
-  for (let attempt = 0; ; attempt++) {
-    const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`,
-      { method: "POST", headers: { "Content-Type": "application/json", "x-goog-api-key": key }, body: JSON.stringify(body) });
-    if ((res.status === 429 || res.status >= 500) && attempt < 5) { await Bun.sleep(5000 * (attempt + 1)); continue; }
-    if (!res.ok) throw new Error(`Gemini ${res.status}`);
-    const r = await res.json() as { candidates?: Array<{ finishReason?: string; content?: { parts?: Array<{ text?: string }> } }>; usageMetadata?: { promptTokenCount?: number; candidatesTokenCount?: number } };
-    const cand = r.candidates?.[0];
-    if (!cand || cand.finishReason === "RECITATION" || !cand.content?.parts?.length) throw new RecitationError(cand?.finishReason ?? "no candidate");
-    const text = cand.content.parts.map((p) => p.text ?? "").join("");
-    let page: ModelPage;
-    try {
-      const v = JSON.parse(text);
-      page = Array.isArray(v) ? v[0] : v;
-    } catch {
-      page = { markdown: text, figures: [] };
-    }
-    return { page, usage: { in: r.usageMetadata?.promptTokenCount ?? 0, out: r.usageMetadata?.candidatesTokenCount ?? 0 } };
-  }
-}
-
-async function deepseekPage(img: Uint8Array): Promise<string> {
-  const url = process.env.OLLAMA_URL;
-  if (!url) throw new Error("OLLAMA_URL is not set");
-  const res = await fetch(`${url}/api/generate`, {
-    method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ model: "deepseek-ocr:latest", prompt: "Convert the document to markdown.", images: [Buffer.from(img).toString("base64")], stream: false, options: { num_predict: 4096, temperature: 0 } }),
-    signal: AbortSignal.timeout(600_000),
-  });
-  if (!res.ok) throw new Error(`DeepSeek-OCR ${res.status}`);
-  const r = await res.json() as { response?: string };
-  return (r.response ?? "").replace(/<\|ref\|>.*?<\|\/ref\|><\|det\|>.*?<\|\/det\|>/gs, "").trim();
-}
-
-/** Pages with an embedded image smaller than the page: likely figures. Whole-page scans are not. */
-async function figureCandidatePages(pdf: string, pageCount: number): Promise<number[]> {
-  let stdout = "";
-  try { stdout = (await run("pdfimages", ["-list", pdf], { maxBuffer: 64 * 1024 * 1024 })).stdout; } catch { return []; }
-  const images: Array<{ page: number; w: number; h: number }> = [];
-  for (const line of stdout.split("\n").slice(2)) {
-    const c = line.trim().split(/\s+/);
-    if (c.length > 5 && /^\d+$/.test(c[0]!) && c[2] === "image") images.push({ page: Number(c[0]), w: Number(c[3]), h: Number(c[4]) });
-  }
-  if (!images.length) return [];
-  const mx = Math.max(...images.map((i) => i.w)), my = Math.max(...images.map((i) => i.h));
-  const pages = [...new Set(images.filter((i) => i.w > 150 && i.h > 150 && (i.w < 0.85 * mx || i.h < 0.85 * my)).map((i) => i.page))];
-  // A document where most pages qualify is page art or a scan, not a figure-bearing book.
-  return pages.length > pageCount * 0.5 ? [] : pages.sort((a, b) => a - b);
+/** Pages holding an embedded image that is not a whole-page scan (judged per page). */
+async function figurePages(pdf: string, pageCount: number): Promise<number[]> {
+  let list = "", info = "";
+  try {
+    list = (await run("pdfimages", ["-list", pdf], { maxBuffer: 64 * 1024 * 1024 })).stdout;
+    info = (await run("pdfinfo", ["-f", "1", "-l", String(pageCount), pdf], { maxBuffer: 64 * 1024 * 1024 })).stdout;
+  } catch { return []; }
+  const sizes = new Map<number, { w: number; h: number }>();
+  for (const m of info.matchAll(/^Page\s+(\d+) size:\s+([\d.]+) x ([\d.]+)/gm)) sizes.set(Number(m[1]), { w: Number(m[2]), h: Number(m[3]) });
+  return figurePagesFromImageList(list, (p) => sizes.get(p));
 }
 
 // ---------- parse ----------
@@ -213,26 +164,14 @@ async function loadSources(args: Args): Promise<SourceRow[]> {
   return rows;
 }
 
-interface Usage { geminiPages: number; geminiIn: number; geminiOut: number; recitation: number; deepseekPages: number; failed: number }
+interface Usage { ocrPages: number; deepseekPages: number; visionPages: number; escalated: Record<string, number>; figurePages: number; figures: number; refusals: number; failed: number }
 
-async function cachedModelPage(cacheDir: string, hex: string, page: number, pdf: string, tmp: string, usage: Usage, allowDeepseek: boolean)
-  : Promise<{ parser: UnitParser; page?: ModelPage; text?: string }> {
-  const path = join(cacheDir, hex.slice(0, 2), hex, `${page}.json`);
+interface PageCache { ocr?: { text: string; parser: UnitParser; escalated?: string }; figures?: FigureRecord[]; calls: LaneCall[] }
+
+async function lanePage(cacheDir: string, hex: string, page: number, kind: "ocr" | "figures", read: () => Promise<PageCache>): Promise<PageCache> {
+  const path = join(cacheDir, LANE_CACHE, hex.slice(0, 2), hex, `${page}-${kind}.json`);
   if (existsSync(path)) return JSON.parse(await readFile(path, "utf8"));
-  const img = await renderPage(pdf, page, tmp);
-  let result: { parser: UnitParser; page?: ModelPage; text?: string };
-  try {
-    const g = await geminiPage(img);
-    usage.geminiPages++; usage.geminiIn += g.usage.in; usage.geminiOut += g.usage.out;
-    result = { parser: "gemini", page: g.page };
-  } catch (error) {
-    if (!(error instanceof RecitationError)) { usage.failed++; throw error; }
-    usage.recitation++;
-    if (!allowDeepseek) return { parser: "none" };
-    const text = await deepseekPage(img);
-    usage.deepseekPages++;
-    result = { parser: "deepseek-ocr", text };
-  }
+  const result = await read();
   await mkdir(dirname(path), { recursive: true });
   await writeFile(path, JSON.stringify(result));
   return result;
@@ -245,16 +184,9 @@ async function pool<T>(items: T[], n: number, fn: (item: T) => Promise<void>): P
   }));
 }
 
-function figureRecord(unit: string, f: NonNullable<ModelPage["figures"]>[number]): FigureRecord | undefined {
-  const description = (f.description ?? "").trim();
-  if (!description) return undefined;
-  const box = Array.isArray(f.box_2d) && f.box_2d.length === 4 && f.box_2d.every((x) => typeof x === "number")
-    ? f.box_2d as [number, number, number, number] : undefined;
-  return { unit, label: (f.label ?? "").trim(), caption: (f.caption ?? "").trim(), description, ...(box ? { box } : {}) };
-}
+interface ParseOptions { ocr: boolean; figures: boolean; force: boolean; lanes?: OcrLanes; laneConcurrency: number; callLog: string }
 
-async function parseOne(row: SourceRow, out: string, cache: string, opts: { ocr: boolean; figures: boolean; deepseek: boolean; force: boolean }, usage: Usage)
-  : Promise<Record<string, unknown>> {
+async function parseOne(row: SourceRow, out: string, cache: string, opts: ParseOptions, usage: Usage): Promise<Record<string, unknown>> {
   const bytes = await readFile(row.file);
   const hex = createHash("sha256").update(bytes).digest("hex");
   const objectId = `sha256:${hex}`;
@@ -270,27 +202,50 @@ async function parseOne(row: SourceRow, out: string, cache: string, opts: { ocr:
     const { stdout } = await run("pdftotext", ["-enc", "UTF-8", row.file, "-"], { maxBuffer: 512 * 1024 * 1024 });
     const pages = splitPdfText(stdout);
     pages.forEach((text, i) => units.push({ unit: unitName("p", i + 1), sourcePage: i + 1, parser: pageNeedsOcr(text) ? "none" : "pdftotext", text: text.trim() }));
-    const tmp = await mkdtemp(join(tmpdir(), "page-render-"));
-    try {
-      const ocrPages = opts.ocr ? units.filter((u) => u.parser === "none").map((u) => u.sourcePage!) : [];
-      const figPages = opts.figures ? (await figureCandidatePages(row.file, pages.length)).filter((p) => !ocrPages.includes(p)) : [];
-      await pool([...ocrPages.map((p) => ({ p, ocr: true })), ...figPages.map((p) => ({ p, ocr: false }))], 8, async ({ p, ocr }) => {
-        const unit = units[p - 1];
-        if (!unit) return;
-        let r: Awaited<ReturnType<typeof cachedModelPage>>;
-        try { r = await cachedModelPage(join(cache, "model-pages"), hex, p, row.file, tmp, usage, opts.deepseek && ocr); }
-        catch { return; }
-        if (ocr) {
-          const text = (r.page?.markdown ?? r.text ?? "").trim();
-          if (!pageNeedsOcr(text)) { unit.text = text; unit.parser = r.parser; }
-        }
-        for (const f of r.page?.figures ?? []) {
-          const rec = figureRecord(unit.unit, f);
-          if (rec) figures.push(rec);
-        }
-      });
-    } finally {
-      await rm(tmp, { recursive: true, force: true });
+    const lanes = opts.lanes;
+    if (lanes) {
+      const tmp = await mkdtemp(join(tmpdir(), "page-render-"));
+      try {
+        const ocrPages = opts.ocr ? units.filter((u) => u.parser === "none").map((u) => u.sourcePage!) : [];
+        const figPages = opts.figures && lanes.visionUrl
+          ? [...new Set([...await figurePages(row.file, pages.length),
+            ...units.filter((u) => u.parser === "pdftotext" && hasFigureCaption(u.text)).map((u) => u.sourcePage!)])].sort((a, b) => a - b)
+          : [];
+        const jobs = [...ocrPages.map((p) => ({ p, kind: "ocr" as const })), ...figPages.map((p) => ({ p, kind: "figures" as const }))];
+        await pool(jobs, opts.laneConcurrency, async ({ p, kind }) => {
+          const unit = units[p - 1];
+          if (!unit) return;
+          let r: PageCache;
+          try {
+            r = await lanePage(join(cache, "lane-pages"), hex, p, kind, async () => {
+              const img = await renderPage(row.file, p, tmp);
+              const tag = `${hex.slice(0, 12)}:${p}:${kind}`;
+              if (kind === "ocr") {
+                const o = await ocrPage(img, tag, lanes);
+                return { ocr: { text: o.text, parser: o.parser, ...(o.escalated ? { escalated: o.escalated } : {}) }, calls: o.calls };
+              }
+              const f = await describeFigures(img, unit.unit, tag, lanes);
+              return { figures: f.figures, calls: [f.call] };
+            });
+          } catch (error) {
+            usage.failed++;
+            await appendFile(opts.callLog, JSON.stringify({ object: objectId, page: p, kind, error: (error as Error).message.slice(0, 160) }) + "\n");
+            return;
+          }
+          await appendFile(opts.callLog, JSON.stringify({ object: objectId, page: p, kind, calls: r.calls }) + "\n");
+          usage.refusals += r.calls.filter((c) => c.refusal).length;
+          if (r.ocr) {
+            usage.ocrPages++;
+            if (r.ocr.parser === "deepseek-ocr") usage.deepseekPages++;
+            if (r.ocr.parser === "vision") usage.visionPages++;
+            if (r.ocr.escalated) usage.escalated[r.ocr.escalated] = (usage.escalated[r.ocr.escalated] ?? 0) + 1;
+            if (r.ocr.text.trim()) { unit.text = r.ocr.text; unit.parser = r.ocr.parser; }
+          }
+          if (r.figures) { usage.figurePages++; usage.figures += r.figures.length; figures.push(...r.figures); }
+        });
+      } finally {
+        await rm(tmp, { recursive: true, force: true });
+      }
     }
   } else {
     const text = new TextDecoder().decode(bytes);
@@ -318,19 +273,29 @@ async function commandParse(args: Args): Promise<void> {
   const out = resolve(need(args, "out"));
   const cache = resolve(typeof args.cache === "string" ? args.cache : join(out, ".cache"));
   const rows = (await loadSources(args)).slice(0, typeof args.limit === "string" ? Number(args.limit) : undefined);
-  const usage: Usage = { geminiPages: 0, geminiIn: 0, geminiOut: 0, recitation: 0, deepseekPages: 0, failed: 0 };
-  const opts = { ocr: !args["no-ocr"], figures: !args["no-figures"], deepseek: Boolean(process.env.OLLAMA_URL), force: Boolean(args.force) };
+  const usage: Usage = { ocrPages: 0, deepseekPages: 0, visionPages: 0, escalated: {}, figurePages: 0, figures: 0, refusals: 0, failed: 0 };
+  const ollamaUrl = process.env.OLLAMA_URL;
+  const visionUrl = process.env.VISION_URL;
+  const visionModel = process.env.VISION_MODEL;
+  const lanes: OcrLanes | undefined = ollamaUrl ? { ollamaUrl, ...(visionUrl ? { visionUrl } : {}), ...(visionModel ? { visionModel } : {}) } : undefined;
+  if (!lanes && !args["no-ocr"]) throw new Error("OLLAMA_URL is not set (DeepSeek-OCR); pass --no-ocr to use text layers only");
+  await mkdir(out, { recursive: true });
+  const opts: ParseOptions = {
+    ocr: !args["no-ocr"], figures: !args["no-figures"], force: Boolean(args.force), ...(lanes ? { lanes } : {}),
+    laneConcurrency: Number(args["lane-concurrency"] ?? 2), callLog: join(out, "lane-calls.jsonl"),
+  };
   const results: Array<Record<string, unknown>> = [];
   let done = 0;
-  await pool(rows, Number(args.concurrency ?? 4), async (row) => {
+  await pool(rows, Number(args.concurrency ?? 2), async (row) => {
     try { results.push(await parseOne(row, out, cache, opts, usage)); }
     catch (error) { results.push({ uri: row.uri, error: (error as Error).message.slice(0, 200) }); }
-    if (++done % 25 === 0) console.error(`[parse] ${done}/${rows.length} gemini=${usage.geminiPages} recitation=${usage.recitation} deepseek=${usage.deepseekPages}`);
+    if (++done % 25 === 0) {
+      console.error(`[parse] ${done}/${rows.length} ocr=${usage.ocrPages} vision=${usage.visionPages} figures=${usage.figures} refusals=${usage.refusals} failed=${usage.failed}`);
+    }
   });
   results.sort((a, b) => String(a.uri).localeCompare(String(b.uri)));
   await writeFile(join(out, "sources.jsonl"), results.map((r) => JSON.stringify(r)).join("\n") + "\n");
-  const estUsd = usage.geminiIn / 1e6 * 0.10 + usage.geminiOut / 1e6 * 0.40;
-  console.log(JSON.stringify({ sources: rows.length, errors: results.filter((r) => r.error).length, ...usage, geminiEstUsd: Math.round(estUsd * 100) / 100 }));
+  console.log(JSON.stringify({ sources: rows.length, errors: results.filter((r) => r.error).length, ...usage }));
 }
 
 // ---------- upload ----------
@@ -476,10 +441,11 @@ async function commandAssemble(args: Args): Promise<void> {
 // ---------- main ----------
 
 const HELP = `usage:
-  bun scripts/library-pages.ts parse    --sources <tsv|list of gs:// URIs> --originals <dir> --out <dir> [--cache <dir>] [--no-ocr] [--no-figures] [--concurrency 4] [--limit N] [--force]
+  bun scripts/library-pages.ts parse    --sources <tsv|list of gs:// URIs> --originals <dir> --out <dir> [--cache <dir>] [--no-ocr] [--no-figures] [--concurrency 2] [--lane-concurrency 2] [--limit N] [--force]
   bun scripts/library-pages.ts upload   --out <dir> --bucket <bucket> --prefix <library prefix>
   bun scripts/library-pages.ts assemble --out <dir> --tree <dir> [--manifest master.json]
-env: GEMINI_API_KEY (scan pages and figures), OLLAMA_URL (DeepSeek-OCR fallback), EXPERT_AGENTS_DOMAIN_EXPERT_GOOGLE_ACCESS_TOKEN or gcloud ADC (GCS)`;
+env: OLLAMA_URL (DeepSeek-OCR), VISION_URL and VISION_MODEL (vision lane: escalation and figures),
+     EXPERT_AGENTS_DOMAIN_EXPERT_GOOGLE_ACCESS_TOKEN or gcloud ADC (GCS)`;
 
 export async function main(argv: string[]): Promise<void> {
   const { command, args } = parseArgs(argv);

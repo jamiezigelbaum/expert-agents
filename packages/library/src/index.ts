@@ -12,3 +12,4 @@ export * from "./update.ts";
 export * from "./validation.ts";
 export * from "./agent-repo.ts";
 export * from "./page-units.ts";
+export * from "./page-ocr.ts";

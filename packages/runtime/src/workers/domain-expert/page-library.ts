@@ -2,7 +2,7 @@
 // page-addressed units the parse-once lane assembles.
 //
 //   catalog     books in the library, optionally filtered by author/title
-//   search      hybrid keyword + vector search with reranking (GBrain serve)
+//   search      hybrid keyword + vector search with reranking (page-index.ts)
 //   grep        case-insensitive regex over the full text, optionally one book
 //   read        one unit (a PDF page or a ~1,200-word section)
 //   read_range  consecutive units of one book, at most 25 per call
@@ -40,7 +40,7 @@ export class PageLibraryError extends Error {
 export interface PageLibraryConfig {
   /** Absolute path of the assembled tree (catalog.json + books/). */
   root: string;
-  /** GBrain source id the tree was imported under. */
+  /** Search index source id the tree was imported under. */
   sourceId: string;
   /** Buckets the originals may be read from for view_page. */
   originalBuckets: readonly string[];
@@ -287,63 +287,5 @@ async function renderWithPdftoppm(pdf: Uint8Array, page: number): Promise<Uint8A
     throw new PageLibraryError('page_library_render_failed', 'The page could not be rendered.', 502);
   } finally {
     await rm(dir, { recursive: true, force: true });
-  }
-}
-
-/**
- * A minimal MCP client for `gbrain serve --http`: initialize once, then call
- * its `query` tool (hybrid search + rerank). The bearer token is sent as a
- * header and never included in errors.
- */
-export class GbrainSearchClient {
-  private session?: string;
-
-  constructor(private readonly url: string, private readonly token: string, private readonly fetchImpl: typeof fetch = fetch) {}
-
-  private async rpc(body: Record<string, unknown>): Promise<Record<string, unknown> | undefined> {
-    const headers: Record<string, string> = {
-      'Content-Type': 'application/json', Accept: 'application/json, text/event-stream', Authorization: `Bearer ${this.token}`,
-    };
-    if (this.session) headers['mcp-session-id'] = this.session;
-    let res: Response;
-    try {
-      res = await this.fetchImpl(this.url, { method: 'POST', headers, body: JSON.stringify(body), signal: AbortSignal.timeout(60_000) });
-    } catch {
-      this.session = undefined;
-      throw new PageLibraryError('page_search_unavailable', 'The search service is not reachable.', 503);
-    }
-    if (!res.ok && res.status !== 202) throw new PageLibraryError('page_search_unavailable', `The search service answered ${res.status}.`, 502);
-    const sid = res.headers.get('mcp-session-id');
-    if (sid) this.session = sid;
-    const text = await res.text();
-    if (!text.trim()) return undefined;
-    const payload = (res.headers.get('content-type') ?? '').includes('text/event-stream')
-      ? text.split('\n').filter((l) => l.startsWith('data:')).map((l) => l.slice(5).trim()).filter(Boolean).at(-1) ?? '{}'
-      : text;
-    return JSON.parse(payload) as Record<string, unknown>;
-  }
-
-  private async ensureSession(): Promise<void> {
-    if (this.session !== undefined) return;
-    await this.rpc({ jsonrpc: '2.0', id: 0, method: 'initialize', params: { protocolVersion: '2025-03-26', capabilities: {}, clientInfo: { name: 'expert-agents-page-library', version: '1' } } });
-    this.session ??= '';
-    await this.rpc({ jsonrpc: '2.0', method: 'notifications/initialized' });
-  }
-
-  async search(query: string, k: number, sourceId: string): Promise<PageSearchHit[]> {
-    await this.ensureSession();
-    const r = await this.rpc({ jsonrpc: '2.0', id: Date.now(), method: 'tools/call', params: { name: 'query', arguments: { query, limit: k, source_id: sourceId } } });
-    const result = r?.result as { content?: Array<{ type: string; text?: string }>; isError?: boolean } | undefined;
-    if (!result || result.isError) throw new PageLibraryError('page_search_failed', 'The search service could not run the query.', 502);
-    const text = result.content?.find((c) => c.type === 'text')?.text ?? '[]';
-    let rows: unknown;
-    try { rows = JSON.parse(text); } catch { throw new PageLibraryError('page_search_failed', 'The search service returned an unreadable result.', 502); }
-    if (!Array.isArray(rows) && typeof (rows as { error?: unknown }).error === 'string') {
-      throw new PageLibraryError('page_search_failed', `The search service refused the query (${String((rows as { code?: unknown }).code ?? (rows as { error: string }).error).slice(0, 60)}).`, 502);
-    }
-    const list = Array.isArray(rows) ? rows : (rows as { results?: unknown[] }).results ?? [];
-    return (list as Array<Record<string, unknown>>)
-      .filter((x) => typeof x.slug === 'string')
-      .map((x) => ({ slug: x.slug as string, text: String(x.chunk_text ?? ''), ...(typeof x.score === 'number' ? { score: x.score } : {}) }));
   }
 }

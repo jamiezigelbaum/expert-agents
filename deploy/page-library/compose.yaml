@@ -1,14 +1,15 @@
-# The page library's search engine: Postgres + pgvector and `gbrain serve`.
-# Both bind to loopback only; the worker on the same host is the only client.
-# Secrets come from page-library.env (not in Git; see page-library.env.example).
+# The page library's search index: Postgres 17 with pgvector, bound to
+# loopback. The worker (packages/runtime/.../page-index.ts) and the operator
+# CLI (scripts/page-index.ts) are its only clients. The password comes from
+# page-library.env (not in Git; see page-library.env.example).
 name: page-library
 services:
   postgres:
     image: pgvector/pgvector:0.8.1-pg17
     restart: unless-stopped
     environment:
-      POSTGRES_USER: gbrain
-      POSTGRES_DB: gbrain
+      POSTGRES_USER: pages
+      POSTGRES_DB: pages
       POSTGRES_PASSWORD: ${PAGE_LIBRARY_PG_PASSWORD:?set in page-library.env}
     volumes:
       - pgdata:/var/lib/postgresql/data
@@ -16,30 +17,8 @@ services:
       - "127.0.0.1:5442:5432"
     command: ["postgres", "-c", "shared_buffers=2GB", "-c", "maintenance_work_mem=1GB", "-c", "max_connections=100"]
     healthcheck:
-      test: ["CMD", "pg_isready", "-U", "gbrain"]
+      test: ["CMD", "pg_isready", "-U", "pages"]
       interval: 5s
       retries: 10
-  gbrain:
-    build:
-      context: .
-      dockerfile: Dockerfile.gbrain
-    image: expert-agents/gbrain:51e7ba9
-    restart: unless-stopped
-    depends_on:
-      postgres: { condition: service_healthy }
-    env_file: page-library.env
-    environment:
-      GBRAIN_DATABASE_URL: postgresql://gbrain:${PAGE_LIBRARY_PG_PASSWORD}@postgres:5432/gbrain
-      GBRAIN_POOL_SIZE: "8"
-    volumes:
-      - gbrain-home:/var/lib/gbrain
-      # The assembled tree, read-only: GBrain can never rewrite the units it imports.
-      - ${PAGE_LIBRARY_TREE:?set in page-library.env}:/library:ro
-    # Listens on all container interfaces so the port mapping works; the host
-    # side is published on loopback only.
-    command: ["serve", "--http", "--port", "3131", "--bind", "0.0.0.0"]
-    ports:
-      - "127.0.0.1:3131:3131"
 volumes:
   pgdata:
-  gbrain-home:

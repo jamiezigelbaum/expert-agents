@@ -68,8 +68,10 @@ export interface AgentRoutingEntry {
   disclosure?: AgentDisclosureConfig;
   /**
    * Optional. The page library (docs/page-library.md): an assembled tree of
-   * page-addressed units on the worker host and the GBrain search service it
-   * was imported into. Absent, the domain_library tool refuses for this domain.
+   * page-addressed units on the worker host and the source id it was imported
+   * under in the page search index (the index's database URL and Voyage key
+   * are worker secrets, not routing). Absent, the domain_library tool refuses
+   * for this domain.
    */
   pageLibrary?: AgentPageLibraryConfig;
 }
@@ -77,10 +79,8 @@ export interface AgentRoutingEntry {
 export interface AgentPageLibraryConfig {
   /** Absolute path of the assembled tree (catalog.json + books/). */
   root: string;
-  /** GBrain source id the tree was imported under. */
+  /** Search index source id the tree was imported under. */
   sourceId: string;
-  /** `gbrain serve --http` MCP endpoint; loopback or https only. */
-  searchUrl: string;
 }
 
 export type AgentRoutingConfig = Readonly<Record<string, Readonly<AgentRoutingEntry>>>;
@@ -204,18 +204,12 @@ function validateRoutingEntry(domainId: string, value: unknown): AgentRoutingEnt
 
 function validatePageLibrary(value: unknown): AgentPageLibraryConfig {
   const entry = requireRecord(value, 'pageLibrary must be an object');
-  requireExactKeys(entry, ['root', 'sourceId', 'searchUrl'], 'pageLibrary');
+  requireExactKeys(entry, ['root', 'sourceId'], 'pageLibrary');
   const root = requireNonEmptyString(entry.root, 'pageLibrary root');
   if (!root.startsWith('/') || root.split('/').includes('..')) throw new AgentRoutingConfigError('pageLibrary root must be an absolute path');
   const sourceId = requireNonEmptyString(entry.sourceId, 'pageLibrary sourceId');
   if (!/^[a-z0-9][a-z0-9-]{0,63}$/.test(sourceId)) throw new AgentRoutingConfigError('pageLibrary sourceId is invalid');
-  const searchUrl = requireNonEmptyString(entry.searchUrl, 'pageLibrary searchUrl');
-  let url: URL;
-  try { url = new URL(searchUrl); } catch { throw new AgentRoutingConfigError('pageLibrary searchUrl is not a URL'); }
-  const loopback = url.protocol === 'http:' && ['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname);
-  if (!loopback && url.protocol !== 'https:') throw new AgentRoutingConfigError('pageLibrary searchUrl must be https or loopback http');
-  if (url.username || url.password) throw new AgentRoutingConfigError('pageLibrary searchUrl must not carry credentials');
-  return Object.freeze({ root, sourceId, searchUrl });
+  return Object.freeze({ root, sourceId });
 }
 
 function validateServingCorpora(value: unknown): string[] {

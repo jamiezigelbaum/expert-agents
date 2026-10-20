@@ -19,7 +19,7 @@ export const SECTION_TARGET_WORDS = 1200;
 /** A PDF page whose text layer has fewer characters than this needs OCR. */
 export const OCR_MIN_CHARS = 80;
 
-export type UnitParser = 'pdftotext' | 'gemini' | 'deepseek-ocr' | 'text' | 'none';
+export type UnitParser = 'pdftotext' | 'deepseek-ocr' | 'vision' | 'text' | 'none';
 
 export interface PageUnit {
   /** `p0001` (PDF page, 1-based physical page) or `s0001` (text section). */

@@ -33,14 +33,14 @@ describe('agent routing config', () => {
 
   test('accepts a page library block and refuses unsafe ones', () => {
     const base = { library: { bucket: 'fixture-bucket', prefix: 'v1' }, targetCorpusDisplayName: 'history-primary' };
-    const pageLibrary = { root: '/var/lib/page-library/history/tree', sourceId: 'history', searchUrl: 'http://127.0.0.1:3131/mcp' };
+    const pageLibrary = { root: '/var/lib/page-library/history/tree', sourceId: 'history' };
     expect(validateAgentRoutingConfig({ history: { ...base, pageLibrary } }).history!.pageLibrary).toEqual(pageLibrary);
     for (const bad of [
       { ...pageLibrary, root: 'relative/tree' },
       { ...pageLibrary, root: '/var/lib/../etc' },
       { ...pageLibrary, sourceId: 'Has Spaces' },
-      { ...pageLibrary, searchUrl: 'http://search.example.invalid/mcp' },
-      { ...pageLibrary, searchUrl: 'https://user:pass@search.example.invalid/mcp' },
+      // The index's database URL is a secret; routing never carries it.
+      { ...pageLibrary, databaseUrl: 'postgres://user:pass@127.0.0.1/pages' },
       { ...pageLibrary, extra: true },
     ]) {
       expect(() => validateAgentRoutingConfig({ history: { ...base, pageLibrary: bad } })).toThrow(AgentRoutingConfigError);

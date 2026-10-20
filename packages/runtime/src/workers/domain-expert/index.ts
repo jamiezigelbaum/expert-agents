@@ -111,7 +111,8 @@ import {
 } from '../../core/disclosure.ts';
 import { completePassageSentences, completionSourceObject, SourceTextCache } from './passage-completion.ts';
 import { LibraryReader, LibraryReadError, parseLibraryReadParams } from './library-reader.ts';
-import { GbrainSearchClient, PageLibrary, PageLibraryError, parsePageLibraryParams, type PageLibraryDependencies } from './page-library.ts';
+import { PageIndex, voyageClient } from './page-index.ts';
+import { PageLibrary, PageLibraryError, parsePageLibraryParams, type PageLibraryDependencies } from './page-library.ts';
 
 export const DOMAIN_EXPERT_NOTION_CREDENTIAL_GUIDANCE = `notion_import requires EXPERT_AGENTS_DOMAIN_EXPERT_NOTION_TOKEN. Configure it as documented in ${DOMAIN_EXPERT_ENV_EXAMPLE}.`;
 
@@ -261,9 +262,11 @@ export interface DomainExpertWorkerOptions {
   summarizeBin?: string;
   summarizeExtract?: ReferenceExtractor;
   basePath?: string;
-  /** Bearer token for the page library's search service; defaults to EXPERT_AGENTS_DOMAIN_EXPERT_PAGE_SEARCH_TOKEN. */
-  pageSearchToken?: string;
-  /** Test seam: replaces the GBrain search client. */
+  /** Postgres URL of the page library's search index; defaults to EXPERT_AGENTS_DOMAIN_EXPERT_PAGE_INDEX_DATABASE_URL. */
+  pageIndexDatabaseUrl?: string;
+  /** Voyage API key for page search embeddings and reranking; defaults to EXPERT_AGENTS_DOMAIN_EXPERT_VOYAGE_API_KEY. */
+  voyageApiKey?: string;
+  /** Test seam: replaces the page index search. */
   pageSearch?: PageLibraryDependencies['search'];
 }
 
@@ -772,7 +775,9 @@ export class DomainExpertService {
   private google: GoogleRuntimeClient;
   private libraryReader: LibraryReader;
   private pageLibraries = new Map<string, PageLibrary>();
-  private pageSearchToken: string | undefined;
+  private pageIndexDatabaseUrl: string | undefined;
+  private voyageApiKey: string | undefined;
+  private pageIndex: PageIndex | undefined;
   private pageSearch: PageLibraryDependencies['search'] | undefined;
   private annas: DomainExpertAnnasConfig;
   private annasBooksRoot: string;
@@ -834,7 +839,8 @@ export class DomainExpertService {
       download: (bucket, name, maxBytes, timeoutMs) => this.google.downloadLibraryObject(bucket, name, maxBytes, timeoutMs),
       list: (bucket, prefix, timeoutMs) => this.google.listLibraryObjectNames(bucket, prefix, timeoutMs),
     });
-    this.pageSearchToken = options.pageSearchToken ?? process.env.EXPERT_AGENTS_DOMAIN_EXPERT_PAGE_SEARCH_TOKEN;
+    this.pageIndexDatabaseUrl = options.pageIndexDatabaseUrl ?? process.env.EXPERT_AGENTS_DOMAIN_EXPERT_PAGE_INDEX_DATABASE_URL;
+    this.voyageApiKey = options.voyageApiKey ?? process.env.EXPERT_AGENTS_DOMAIN_EXPERT_VOYAGE_API_KEY;
     this.pageSearch = options.pageSearch;
     this.annas = options.annas ?? {};
     this.annasBooksRoot = options.annas?.booksRoot ?? DEFAULT_ANNAS_BOOKS_ROOT;
@@ -1072,13 +1078,22 @@ export class DomainExpertService {
       if (route.disclosure) throw new PageLibraryError('page_library_not_disclosable', 'This deployment serves under a disclosure policy; the page library is not available.', 403);
       if (!route.pageLibrary) throw new PageLibraryError('page_library_not_configured', 'This domain has no page library.', 404);
       const config = route.pageLibrary;
-      const key = `${manifest.domain_id}\u0000${config.root}\u0000${config.sourceId}\u0000${config.searchUrl}`;
+      const key = `${manifest.domain_id}\u0000${config.root}\u0000${config.sourceId}`;
       let library = this.pageLibraries.get(key);
       if (!library) {
         const search = this.pageSearch ?? (() => {
-          if (!this.pageSearchToken) throw new PageLibraryError('page_search_not_configured', 'The page search token is not configured.', 503);
-          const client = new GbrainSearchClient(config.searchUrl, this.pageSearchToken);
-          return (query: string, k: number, sourceId: string) => client.search(query, k, sourceId);
+          if (!this.pageIndexDatabaseUrl || !this.voyageApiKey) {
+            throw new PageLibraryError('page_search_not_configured', 'The page search index is not configured.', 503);
+          }
+          this.pageIndex ??= new PageIndex(this.pageIndexDatabaseUrl, voyageClient(this.voyageApiKey));
+          const index = this.pageIndex;
+          return async (query: string, k: number, sourceId: string) => {
+            try { return await index.search(sourceId, query, k); }
+            catch (error) {
+              if (error instanceof PageLibraryError) throw error;
+              throw new PageLibraryError('page_search_unavailable', 'The page search index could not run the query.', 503);
+            }
+          };
         })();
         library = new PageLibrary(
           { root: config.root, sourceId: config.sourceId, originalBuckets: [route.library, ...(route.readOnlySourceRoots ?? [])].map((r) => r.bucket) },

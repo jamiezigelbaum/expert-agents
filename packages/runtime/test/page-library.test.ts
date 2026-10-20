@@ -4,7 +4,6 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { renderUnitMarkdown } from '@expert-agents/library';
 import {
-  GbrainSearchClient,
   PageLibrary,
   PageLibraryError,
   parsePageLibraryParams,
@@ -98,38 +97,5 @@ describe('page library tools', () => {
     expect(downloads.at(-1)).toBe('library-bucket/v2/objects/sample.pdf');
     expect(r.image).toEqual({ mime_type: 'image/jpeg', data: Buffer.from([0xff, 0xd8, 12]).toString('base64') });
     await expect(library().viewPage('books/other-text-bbbbbb/s0001')).rejects.toThrow(PageLibraryError);
-  });
-});
-
-describe('GBrain search client', () => {
-  test('initializes an MCP session, then calls query with the source id, reading SSE responses', async () => {
-    const calls: Array<{ body: Record<string, unknown>; headers: Record<string, string> }> = [];
-    const fetchImpl = (async (_url: string, init: RequestInit) => {
-      const body = JSON.parse(String(init.body));
-      calls.push({ body, headers: init.headers as Record<string, string> });
-      if (body.method === 'initialize') return new Response('{"jsonrpc":"2.0","id":0,"result":{}}', { headers: { 'mcp-session-id': 's1', 'content-type': 'application/json' } });
-      if (body.method === 'notifications/initialized') return new Response('', { status: 202 });
-      const rows = [{ slug: 'books/a-aaaaaa/p0001', chunk_text: 'hit', score: 0.5 }];
-      return new Response(`event: message\ndata: ${JSON.stringify({ jsonrpc: '2.0', id: body.id, result: { content: [{ type: 'text', text: JSON.stringify(rows) }] } })}\n\n`,
-        { headers: { 'content-type': 'text/event-stream' } });
-    }) as unknown as typeof fetch;
-    const client = new GbrainSearchClient('http://127.0.0.1:3131/mcp', 'secret-token', fetchImpl);
-    expect(await client.search('q', 7, 'research')).toEqual([{ slug: 'books/a-aaaaaa/p0001', text: 'hit', score: 0.5 }]);
-    expect(calls.map((c) => c.body.method)).toEqual(['initialize', 'notifications/initialized', 'tools/call']);
-    expect(calls[2]!.headers['mcp-session-id']).toBe('s1');
-    expect(calls[2]!.body.params).toEqual({ name: 'query', arguments: { query: 'q', limit: 7, source_id: 'research' } });
-  });
-
-  test('a refused query is an error, never an empty result', async () => {
-    const refusal = JSON.stringify({ jsonrpc: '2.0', id: 1, result: { content: [{ type: 'text', text: JSON.stringify({ error: 'permission_denied', code: 'permission_denied' }) }] } });
-    const client = new GbrainSearchClient('http://127.0.0.1:3131/mcp', 't', (async () => new Response(refusal, { headers: { 'content-type': 'application/json' } })) as unknown as typeof fetch);
-    await expect(client.search('q', 1, 'r')).rejects.toThrow('permission_denied');
-  });
-
-  test('a failed call names no secret', async () => {
-    const client = new GbrainSearchClient('http://127.0.0.1:3131/mcp', 'secret-token', (async () => new Response('no', { status: 401 })) as unknown as typeof fetch);
-    const error = await client.search('q', 1, 'r').catch((e) => e as Error);
-    expect(error).toBeInstanceOf(PageLibraryError);
-    expect(String((error as Error).message)).not.toContain('secret-token');
   });
 });
