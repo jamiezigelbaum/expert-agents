@@ -48,8 +48,9 @@ describe("page units", () => {
     expect(partOf("bailey---esoteric-healing-2009-part-2-of-4.pdf")).toEqual({ base: "bailey---esoteric-healing-2009", part: 2, of: 4 });
     expect(partOf("ferguson---civilization-2011--part1of3.pdf")?.part).toBe(1);
     expect(partOf("plain-book.pdf")).toBeUndefined();
-    const units = offsetUnits([{ unit: "p0001", sourcePage: 1, parser: "pdftotext", text: "a" }], 200);
-    expect(units[0]).toMatchObject({ unit: "p0201", sourcePage: 1 });
+    const units = offsetUnits([{ unit: "p0001", sourcePage: 1, parser: "pdftotext", text: "a" }, { unit: "s0003", parser: "text", text: "b" }], 200);
+    expect(units[0]).toMatchObject({ unit: "p0201", sourcePage: 1, sourceUnit: "p0001" });
+    expect(units[1]).toMatchObject({ unit: "s0203", sourceUnit: "s0003" });
   });
 
   test("book ids are readable and edition-safe; slugs parse strictly", () => {

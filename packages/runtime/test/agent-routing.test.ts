@@ -31,6 +31,22 @@ describe('agent routing config', () => {
     )).toEqual({ history: { domainId: 'history', ...value.history } });
   });
 
+  test('accepts a page library block and refuses unsafe ones', () => {
+    const base = { library: { bucket: 'fixture-bucket', prefix: 'v1' }, targetCorpusDisplayName: 'history-primary' };
+    const pageLibrary = { root: '/var/lib/page-library/history/tree', sourceId: 'history', searchUrl: 'http://127.0.0.1:3131/mcp' };
+    expect(validateAgentRoutingConfig({ history: { ...base, pageLibrary } }).history!.pageLibrary).toEqual(pageLibrary);
+    for (const bad of [
+      { ...pageLibrary, root: 'relative/tree' },
+      { ...pageLibrary, root: '/var/lib/../etc' },
+      { ...pageLibrary, sourceId: 'Has Spaces' },
+      { ...pageLibrary, searchUrl: 'http://search.example.invalid/mcp' },
+      { ...pageLibrary, searchUrl: 'https://user:pass@search.example.invalid/mcp' },
+      { ...pageLibrary, extra: true },
+    ]) {
+      expect(() => validateAgentRoutingConfig({ history: { ...base, pageLibrary: bad } })).toThrow(AgentRoutingConfigError);
+    }
+  });
+
   test('accepts an explicit-corpus requirement alongside the import result sink', () => {
     const route = {
       library: { bucket: 'fixture-bucket', prefix: 'v1' },

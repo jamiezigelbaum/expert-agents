@@ -354,6 +354,11 @@ async function commandUpload(args: Args): Promise<void> {
 
 // ---------- assemble ----------
 
+const ENTITIES: Record<string, string> = { amp: "&", mdash: "—", ndash: "–", quot: '"', apos: "'", rsquo: "’", lsquo: "‘", rdquo: "”", ldquo: "“", nbsp: " " };
+function decodeEntities(s: string): string {
+  return s.replace(/&(#\d+|[a-z]+);/gi, (m, e: string) => e.startsWith("#") ? String.fromCodePoint(Number(e.slice(1))) : ENTITIES[e.toLowerCase()] ?? m);
+}
+
 interface Meta { title: string; creator: string }
 
 function metaFromFilename(uri: string): Meta {
@@ -390,7 +395,7 @@ async function commandAssemble(args: Args): Promise<void> {
     const first = members[0]!;
     const m = master.get(first.objectId);
     const fallback = metaFromFilename(first.uri);
-    const units: Array<PageUnit & { object: string; source: string }> = [];
+    const units: Array<PageUnit & { object: string; source: string; sourceUnit: string }> = [];
     const figures: Array<FigureRecord & { object: string; source: string; sourcePage?: number }> = [];
     let offset = 0;
     let kind: "pages" | "sections" = "pages";
@@ -399,7 +404,7 @@ async function commandAssemble(args: Args): Promise<void> {
       const manifest = JSON.parse(await readFile(join(dir, "manifest.json"), "utf8")) as PageDerivativeManifest;
       kind = manifest.kind;
       const own = (await readFile(join(dir, "units.jsonl"), "utf8")).split("\n").filter(Boolean).map((l) => JSON.parse(l) as PageUnit);
-      const moved = offsetUnits(own, kind === "pages" ? offset : 0);
+      const moved = offsetUnits(own, offset);
       const rename = new Map(own.map((u, i) => [u.unit, moved[i]!]));
       for (const u of moved) units.push({ ...u, object: member.objectId, source: member.uri });
       for (const f of manifest.figures) {
@@ -414,6 +419,7 @@ async function commandAssemble(args: Args): Promise<void> {
       const h1 = /^#\s+(.{3,120})$/m.exec(units[0]?.text ?? "");
       if (h1 && !members[0]!.uri.includes("---")) title = h1[1]!.trim();
     }
+    title = decodeEntities(title);
     const book = bookId(title, first.objectId);
     const bookDir = join(tree, "books", book);
     await mkdir(bookDir, { recursive: true });
@@ -424,7 +430,7 @@ async function commandAssemble(args: Args): Promise<void> {
         title: `${label} — ${kind === "pages" ? `p.${n}` : `§${n}`}${u.heading ? ` (${u.heading})` : ""}`,
         type: kind === "pages" ? "book-page" : "book-section", book, book_title: title, creator, unit: u.unit,
         object: u.object, source: u.source,
-        ...(u.sourcePage ? { source_page: u.sourcePage } : {}), ...(u.heading ? { heading: u.heading } : {}),
+        ...(u.sourcePage ? { source_page: u.sourcePage } : { source_unit: u.sourceUnit }), ...(u.heading ? { heading: u.heading } : {}),
       };
       await writeFile(join(bookDir, `${u.unit}.md`), renderUnitMarkdown(fm, u.text || "(no text on this page)"));
     }

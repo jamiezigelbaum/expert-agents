@@ -147,14 +147,13 @@ export function parseUnitSlug(slug: string): { book: string; unit: string } | un
 }
 
 /**
- * Renumber an object's PDF units into a book's continuous page numbering.
- * Parts of a split PDF are consecutive ranges of the original, so offsetting by
- * the earlier parts' page counts restores the original page numbers.
+ * Renumber an object's units into its book's continuous numbering. Parts of a
+ * split source are consecutive ranges of the original, so offsetting by the
+ * earlier parts' unit counts restores the original page numbers (PDF) or the
+ * original section order (text). `sourceUnit` keeps the part's own name.
  */
-export function offsetUnits(units: readonly PageUnit[], pageOffset: number): PageUnit[] {
-  return units.map((u) => u.unit.startsWith('p')
-    ? { ...u, unit: unitName('p', unitNumber(u.unit) + pageOffset) }
-    : u);
+export function offsetUnits(units: readonly PageUnit[], offset: number): Array<PageUnit & { sourceUnit: string }> {
+  return units.map((u) => ({ ...u, unit: unitName(u.unit[0] as 'p' | 's', unitNumber(u.unit) + offset), sourceUnit: u.unit }));
 }
 
 /** Front matter values are JSON-quoted so any title or heading survives YAML. */
