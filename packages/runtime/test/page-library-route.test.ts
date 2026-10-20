@@ -199,6 +199,9 @@ describe('a page-library domain is seeded for the page library', () => {
         expect(text).toContain('domain_library');
         expect(text).not.toMatch(/domain_ask|rag_corpus|domain_source|corpus/);
       }
+      const card = await readFile(join(root, 'experts/history/templates/source-card.md'), 'utf8');
+      expect(card).toContain('- Book:');
+      expect(card).not.toMatch(/corpus/i);
     } finally { await rm(root, { recursive: true, force: true }); }
   });
 });
