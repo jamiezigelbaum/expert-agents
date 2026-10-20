@@ -8609,7 +8609,7 @@ async function writeWorkspaceSeedFiles(
     [`${rootRel}/references/ingest-log.md`, `# Ingest Log\n\nCreated ${new Date().toISOString()}.\n`],
     [`${rootRel}/references/reading-map.md`, `# ${manifest.display_name} Reading Map\n`],
     [`${rootRel}/references/retrieval-craft.md`, retrievalCraftContent(manifest)],
-    [`${rootRel}/templates/source-card.md`, '# Source Card\n\n- Title:\n- Author:\n- Corpus:\n- Status:\n- Notes:\n'],
+    [`${rootRel}/templates/source-card.md`, `# Source Card\n\n- Title:\n- Author:\n- ${servesPageLibrary(manifest) ? 'Book' : 'Corpus'}:\n- Status:\n- Notes:\n`],
     [`${rootRel}/templates/research-brief.md`, '# Research Brief\n\n## Question\n\n## Evidence\n\n## Answer\n\n## Gaps\n'],
     [`${rootRel}/templates/literature-review.md`, '# Literature Review\n\n## Sources\n\n## Themes\n\n## Disagreements\n'],
     [`${rootRel}/templates/disagreement-map.md`, '# Disagreement Map\n\n## Claims\n\n## Tradeoffs\n\n## Open Questions\n'],
