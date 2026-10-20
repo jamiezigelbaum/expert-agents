@@ -29,6 +29,8 @@ function recordingWriter() {
     },
     async embedPending() { return { embedded: imports.at(-1)?.units.length ?? 0, tokens: 10 }; },
     async pendingEmbeddings() { return 0; },
+    async catalog() { return []; },
+    async replaceBooks() { return {}; },
   };
   return { imports, writer };
 }

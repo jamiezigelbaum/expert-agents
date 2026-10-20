@@ -23,7 +23,7 @@ describe("@expert-agents/library package", () => {
       "resolveArchivePath", "xhtmlToMarkdown",
       "PdfSplitError", "pdfPageLimitSetting", "pdfPartStem", "pdfTextLayer", "planPdfParts", "qpdfPageCount", "splitPdf", "stripPdfPartSuffix",
       "bookId", "offsetUnits", "pageDerivativePrefix", "pageNeedsOcr", "parseUnitSlug", "partOf", "renderUnitMarkdown",
-      "sectionText", "slugify", "splitPdfText", "unitBody", "unitName", "unitNumber", "unitSlug",
+      "sectionText", "slugify", "splitPdfText", "unitBody", "unitFrontmatter", "unitName", "unitNumber", "unitSlug",
       "deepLane", "describeFigures", "escalatePage", "figurePagesFromImageList", "hasFigureCaption", "looksLikeRefusal", "ocrEscalationReason", "ocrPage",
       "parseFigureReply", "readPage", "stripGrounding", "visionCall",
       "derivativeManifest", "emptyParseUsage", "isEpub", "isPdf", "parseObject", "pool", "sha256Hex", "upsertCatalog", "writeBook", "writeParsedBook",

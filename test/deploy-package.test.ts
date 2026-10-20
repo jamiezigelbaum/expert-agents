@@ -20,6 +20,7 @@ describe('deploy package', () => {
       'deploy/README.md',
       'deploy/systemd/domain-expert.env.example',
       'deploy/systemd/expert-agents-domain-expert.service',
+      'packages/runtime/dist/page-index.js',
       'packages/runtime/dist/server.js',
     ];
 
@@ -45,6 +46,8 @@ describe('deploy package', () => {
     await rm(join(repositoryRoot, 'packages/library'), { recursive: true, force: true });
     const packagedWorker = await import(`${pathToFileURL(join(outputRoot, 'packages/runtime/dist/server.js')).href}?smoke=1`);
     expect(packagedWorker.fixtureMarker).toBe('workspace-library-bundled');
+    const packagedCli = await import(`${pathToFileURL(join(outputRoot, 'packages/runtime/dist/page-index.js')).href}?smoke=1`);
+    expect(packagedCli.cliMarker).toBe('workspace-library-bundled');
   }, 30_000);
 });
 
@@ -60,6 +63,8 @@ async function createFixture(): Promise<string> {
     join(root, 'packages/runtime/src/workers/domain-expert/server.ts'),
     "export { fixtureMarker } from '@expert-agents/library';\n",
   );
+  await mkdir(join(root, 'scripts'), { recursive: true });
+  await writeFile(join(root, 'scripts/page-index.ts'), "export { fixtureMarker as cliMarker } from '@expert-agents/library';\n");
   await writeFile(
     join(root, 'packages/library/package.json'),
     '{"name":"@expert-agents/library","type":"module","exports":"./src/index.ts"}\n',

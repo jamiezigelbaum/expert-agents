@@ -11,8 +11,9 @@
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "bun test test",
-    "build": "bun build ./src/index.ts --outfile ./dist/index.js --target bun --packages external && bun build ./src/workers/domain-expert/server.ts --outfile ./dist/server.js --target bun --packages external"
+    "test": "bun test ./test/",
+    "build": "bun build ./src/index.ts --outfile ./dist/index.js --target bun --packages external && bun build ./src/workers/domain-expert/server.ts --outfile ./dist/server.js --target bun --packages external",
+    "test:db": "bun test ./test-db/"
   },
   "dependencies": {
     "@expert-agents/library": "workspace:*"

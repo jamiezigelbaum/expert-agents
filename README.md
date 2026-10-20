@@ -147,7 +147,7 @@ and their page library — from `EXPERT_AGENTS_DOMAIN_EXPERT_AGENTS_JSON`
   "history": {
     "displayName": "History Expert",
     "library": { "bucket": "<library-bucket>", "prefix": "<library-prefix>" },
-    "pageLibrary": { "root": "/var/lib/expert-agents/page-library/history", "sourceId": "history" }
+    "pageLibrary": { "sourceId": "history" }
   }
 }
 ```

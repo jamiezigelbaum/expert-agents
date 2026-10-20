@@ -31,8 +31,10 @@ configuration and credential process. Repository delivery does not enable them.
 - Bun 1.3+ and a supported OpenClaw CLI on a POSIX host, both with absolute executable paths.
 - An authenticated Expert Agents worker with the page library configured: the
   page index (`EXPERT_AGENTS_DOMAIN_EXPERT_PAGE_INDEX_DATABASE_URL` and its
-  writer URL), `VOYAGE_API_KEY`, the OCR lanes, and the page-library root
-  (`EXPERT_AGENTS_DOMAIN_EXPERT_PAGE_LIBRARY_ROOT`). The GCS library bucket
+  writer URL), `VOYAGE_API_KEY` and the OCR lanes. A new agent's library lives
+  in that database under its domain id (set
+  `EXPERT_AGENTS_DOMAIN_EXPERT_PAGE_LIBRARY_ROOT` only to keep trees on local
+  disk instead). The GCS library bucket
   already exists; the factory registers a per-agent prefix, where originals
   land, not cloud billing/IAM or a new bucket. No Vertex corpus is created.
   The worker's workspace root (`EXPERT_AGENTS_DOMAIN_EXPERT_ROOTS_JSON`) must be

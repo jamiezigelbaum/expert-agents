@@ -1,8 +1,25 @@
-# The page library's search index: Postgres 17 with pgvector, bound to
-# loopback. The worker (packages/runtime/.../page-index.ts) and the operator
-# CLI (scripts/page-index.ts) are its only clients. The password comes from
-# page-library.env (not in Git; see page-library.env.example).
-name: page-library
+# One page library: Postgres 17 with pgvector, and (profile `worker`) the
+# domain expert worker that serves it. The same file runs on any Linux host
+# with Docker; nothing in it names a host. docs/page-library.md section 5.
+#
+#   docker compose --env-file page-library.env up -d postgres          database only
+#   docker compose --env-file page-library.env --profile worker up -d  database + worker
+#
+# The database is the library: catalog, units, front matter and search rows.
+# The worker keeps no library files, so moving the library is a dump and a
+# restore (docs/page-library.md, "Moving a library"). A second library that
+# must never be reachable from the first (a private shelf) is a second
+# project from this same file, with its own env file, database and
+# credentials: `docker compose -p <name> --env-file <name>.env ...`.
+#
+# Roles: `pages` owns the schema; `page_reader` (SELECT) is the worker's
+# serving login and `page_writer` (row writes, no DDL) its ingest login. The
+# roles are created on a fresh volume (initdb/10-roles.sh); `migrate` creates
+# or updates the tables and grants both roles on every start.
+#
+# Secrets come from the env file (not in Git; page-library.env.example).
+# Passwords are hex so they need no escaping inside the URLs below.
+name: ${PAGE_LIBRARY_PROJECT:-page-library}
 services:
   postgres:
     image: pgvector/pgvector:0.8.1-pg17
@@ -11,14 +28,63 @@ services:
       POSTGRES_USER: pages
       POSTGRES_DB: pages
       POSTGRES_PASSWORD: ${PAGE_LIBRARY_PG_PASSWORD:?set in page-library.env}
+      PAGE_READER_PASSWORD: ${PAGE_READER_PASSWORD:-}
+      PAGE_WRITER_PASSWORD: ${PAGE_WRITER_PASSWORD:-}
     volumes:
       - pgdata:/var/lib/postgresql/data
+      - ./initdb:/docker-entrypoint-initdb.d:ro
+    # Loopback by default. Ingest on another host reaches it through a
+    # private network or an SSH tunnel, never an open port.
     ports:
-      - "127.0.0.1:5442:5432"
-    command: ["postgres", "-c", "shared_buffers=2GB", "-c", "maintenance_work_mem=1GB", "-c", "max_connections=100"]
+      - "${PAGE_LIBRARY_PG_BIND:-127.0.0.1:5442}:5432"
+    command: ["postgres", "-c", "shared_buffers=${PAGE_LIBRARY_PG_SHARED_BUFFERS:-2GB}", "-c", "maintenance_work_mem=1GB", "-c", "max_connections=100"]
     healthcheck:
       test: ["CMD", "pg_isready", "-U", "pages"]
       interval: 5s
       retries: 10
+
+  migrate:
+    profiles: ["worker"]
+    image: ${EXPERT_AGENTS_IMAGE:-expert-agents-domain-expert:local}
+    build: { context: ../.. }
+    restart: "no"
+    depends_on:
+      postgres: { condition: service_healthy }
+    environment:
+      PAGE_INDEX_DATABASE_URL: postgres://pages:${PAGE_LIBRARY_PG_PASSWORD}@postgres:5432/pages
+    command: ["bun", "/opt/expert-agents/current/packages/runtime/dist/page-index.js", "migrate", "--reader", "page_reader", "--writer", "page_writer"]
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+
+  worker:
+    profiles: ["worker"]
+    image: ${EXPERT_AGENTS_IMAGE:-expert-agents-domain-expert:local}
+    build: { context: ../.. }
+    restart: unless-stopped
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+    # Routing, the bearer, Google and Voyage credentials and the OCR router:
+    # see worker.env.example. The library's database URLs are set here.
+    env_file: [ "${PAGE_LIBRARY_WORKER_ENV:-worker.env}" ]
+    environment:
+      # Inside the container's own namespace; the published port below is the boundary.
+      EXPERT_AGENTS_DOMAIN_EXPERT_HOST: 0.0.0.0
+      EXPERT_AGENTS_DOMAIN_EXPERT_PAGE_INDEX_DATABASE_URL: postgres://page_reader:${PAGE_READER_PASSWORD:?set in page-library.env}@postgres:5432/pages
+      EXPERT_AGENTS_DOMAIN_EXPERT_PAGE_INDEX_WRITER_DATABASE_URL: postgres://page_writer:${PAGE_WRITER_PASSWORD:?set in page-library.env}@postgres:5432/pages
+    volumes:
+      # Ingest jobs and their staging trees, factory registrations: resumable state, not the library.
+      - workerdata:/var/lib/expert-agents/domain-expert
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,mode=1777
+    # Loopback by default. A consumer on another host (an agent on a cloud VM)
+    # reaches it over a private network address or a tunnel, with the bearer.
+    ports:
+      - "${PAGE_LIBRARY_WORKER_BIND:-127.0.0.1:8041}:8040"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+
 volumes:
   pgdata:
+  workerdata:

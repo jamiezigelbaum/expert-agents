@@ -120,6 +120,19 @@ describe('page-library registrations', () => {
     } finally { await rm(dir, { recursive: true, force: true }); }
   });
 
+  test('by default a registered library lives in the database, keyed by the domain id', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'page-route-reg-'));
+    try {
+      const store = new AgentRegistrationStore(dir, validateAgentRoutingConfig({}), registrationLibrary);
+      const library = { bucket: 'neutral-library', prefix: 'factory/history' };
+      const { routes } = store.register('history', { library, pageLibrary: {} }, false);
+      expect(routes.history!.pageLibrary).toEqual({ sourceId: 'history' });
+      // A second database-backed registration is not mistaken for the same library.
+      expect(store.register('geography', { library: { bucket: 'neutral-library', prefix: 'factory/geography' }, pageLibrary: {} }, false).routes.geography!.pageLibrary)
+        .toEqual({ sourceId: 'geography' });
+    } finally { await rm(dir, { recursive: true, force: true }); }
+  });
+
   test('a page library already assigned to a deployment route conflicts', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'page-route-reg-'));
     try {
@@ -228,8 +241,8 @@ describe('health reports page-library readiness', () => {
       const health = await healthOf(worker);
       expect(health.page_library.configured).toEqual({ index: true, writer: false, ocr_lane: true, vision_lane: false });
       expect(health.page_library.domains).toEqual([
-        { domain_id: 'history', source_id: 'history', catalog: 'ready', books: 1, index: { status: 'ready', units: 2, chunks: 2, pending_embeddings: 1 }, disclosure: false },
-        { domain_id: 'fresh', source_id: 'fresh', catalog: 'empty', books: 0, index: { status: 'ready', units: 0, chunks: 0, pending_embeddings: 0 }, disclosure: false },
+        { domain_id: 'history', source_id: 'history', store: 'tree', catalog: 'ready', books: 1, index: { status: 'ready', units: 2, chunks: 2, pending_embeddings: 1 }, disclosure: false },
+        { domain_id: 'fresh', source_id: 'fresh', store: 'tree', catalog: 'empty', books: 0, index: { status: 'ready', units: 0, chunks: 0, pending_embeddings: 0 }, disclosure: false },
       ]);
       expect(health.page_library.status).toBe('degraded');
       expect(health.page_library.issues.map((issue: { code: string }) => issue.code).sort())

@@ -164,6 +164,20 @@ export function renderUnitMarkdown(frontmatter: Record<string, string | number>,
   return `---\n${head}\n---\n\n${body.trim()}\n`;
 }
 
+/** The front matter of a unit Markdown file (values as renderUnitMarkdown wrote them). */
+export function unitFrontmatter(markdown: string): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  if (!markdown.startsWith('---\n')) return out;
+  const end = markdown.indexOf('\n---\n', 4);
+  for (const line of markdown.slice(4, end < 0 ? 0 : end).split('\n')) {
+    const i = line.indexOf(':');
+    if (i < 1) continue;
+    const raw = line.slice(i + 1).trim();
+    try { out[line.slice(0, i).trim()] = JSON.parse(raw); } catch { out[line.slice(0, i).trim()] = raw; }
+  }
+  return out;
+}
+
 /** The body of a unit Markdown file, without its front matter. */
 export function unitBody(markdown: string): string {
   if (!markdown.startsWith('---\n')) return markdown.trim();

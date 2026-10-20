@@ -1,10 +1,14 @@
-import { PageIndex, readTreeUnits, voyageClient } from "../packages/runtime/src/workers/domain-expert/page-index.ts";
+import { PageIndex, readTreeCatalog, readTreeUnits, voyageClient } from "../packages/runtime/src/workers/domain-expert/page-index.ts";
 
 /**
  * Operator CLI for the page library's search engine (docs/page-library.md).
  *
- *   migrate                                      create tables and indexes
- *   import  --source <id> --tree <dir> [--whole-units]  make the index match the tree (idempotent)
+ *   migrate [--reader <role>] [--writer <role>]  create tables and indexes; grant the serving
+ *                                                role read and the ingest role write
+ *   import  --source <id> --tree <dir> [--books a,b] [--whole-units]
+ *                                                make the library match the tree (idempotent):
+ *                                                units, front matter and catalog; with --books,
+ *                                                only those books, the rest of the library untouched
  *   embed   --source <id> [--max-tokens N]       embed chunks without a vector
  *   search  --source <id> --query <text> [--k 10]
  *
@@ -30,12 +34,21 @@ export async function main(argv: string[]): Promise<void> {
   try {
     if (command === "migrate") {
       await index.migrate();
-      console.log(JSON.stringify({ migrated: true }));
+      const reader = flag(rest, "reader"), writer = flag(rest, "writer");
+      await index.grant({ ...(reader ? { reader } : {}), ...(writer ? { writer } : {}) });
+      console.log(JSON.stringify({ migrated: true, ...(reader ? { reader } : {}), ...(writer ? { writer } : {}) }));
     } else if (command === "import") {
-      const units = await readTreeUnits(need(rest, "tree"));
+      const tree = need(rest, "tree"), source = need(rest, "source");
+      const books = flag(rest, "books")?.split(",").filter(Boolean);
+      const units = await readTreeUnits(tree, books);
+      const catalog = await readTreeCatalog(tree, books);
+      // The catalog is what readers list; a tree without one would empty the library's.
+      if (units.length && !catalog.length) throw new Error("the tree has units but no catalog.json entries for them");
       const t = Date.now();
-      const r = await index.importUnits(need(rest, "source"), units, { chunk: !rest.includes("--whole-units") });
-      console.log(JSON.stringify({ ...r, pendingEmbeddings: await index.pendingEmbeddings(need(rest, "source")), seconds: Math.round((Date.now() - t) / 1000) }));
+      const r = await index.importUnits(source, units, { chunk: !rest.includes("--whole-units"), ...(books ? { books } : {}) });
+      // Units first, then the catalog that lists them.
+      const c = await index.replaceBooks(source, catalog, books ? { books } : {});
+      console.log(JSON.stringify({ ...r, catalog: c, pendingEmbeddings: await index.pendingEmbeddings(source), seconds: Math.round((Date.now() - t) / 1000) }));
     } else if (command === "embed") {
       if (!process.env.VOYAGE_API_KEY) throw new Error("VOYAGE_API_KEY is not set");
       const max = flag(rest, "max-tokens");
@@ -49,7 +62,7 @@ export async function main(argv: string[]): Promise<void> {
       const hits = await index.search(need(rest, "source"), need(rest, "query"), Number(flag(rest, "k") ?? 10));
       for (const h of hits) console.log(`${h.score?.toFixed(3)}  ${h.slug}  ${h.text.slice(0, 100).replace(/\s+/g, " ")}`);
     } else {
-      console.log("usage: bun scripts/page-index.ts migrate | import --source <id> --tree <dir> | embed --source <id> [--max-tokens N] | search --source <id> --query <text> [--k 10]");
+      console.log("usage: bun scripts/page-index.ts migrate [--reader <role>] [--writer <role>] | import --source <id> --tree <dir> [--books a,b] | embed --source <id> [--max-tokens N] | search --source <id> --query <text> [--k 10]");
     }
   } finally {
     await index.close();

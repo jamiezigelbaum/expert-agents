@@ -101,8 +101,14 @@ reranked by Voyage.
   typical page) is one chunk; a longer one is cut into ~380-word windows that
   overlap by 60 words. One vector per long section missed passages buried
   inside it; hits and citations are still whole units.
+- **The database is the library.** Each unit row also keeps its front matter
+  (`meta`: the original and its page, which `view_page` renders), and
+  `page_books` holds one catalog entry per book. A worker needs nothing on
+  disk to serve a library, and any host can fill it (section 5).
 - **Import is idempotent.** It updates only units whose text changed and
   deletes units whose file is gone, so a second run leaves the index unchanged.
+  A unit whose text is unchanged keeps its chunks; only its front matter is
+  refreshed.
 - **Embeddings:** Voyage `voyage-4`, 1024 dimensions, one vector per chunk
   (title plus text). Vectors are also kept by text hash, so text that comes
   back unchanged, including under another source, is never paid for twice.
@@ -120,19 +126,25 @@ reranked by Voyage.
     for 44%.
   - Vector arm: nearest neighbours over HNSW.
 
-`deploy/page-library/compose.yaml` runs Postgres 17 with pgvector on loopback.
-`scripts/page-index.ts` is the operator CLI:
+`scripts/page-index.ts` is the operator CLI (`bun run library:index`; the
+deploy package and image carry it as `packages/runtime/dist/page-index.js`):
 
 ```sh
-docker compose --env-file page-library.env up -d postgres
-bun scripts/page-index.ts migrate
-bun scripts/page-index.ts import --source <domain> --tree <tree>
-bun scripts/page-index.ts embed  --source <domain>
-bun scripts/page-index.ts search --source <domain> --query "…"
+bun scripts/page-index.ts migrate [--reader page_reader] [--writer page_writer]
+bun scripts/page-index.ts import --source <id> --tree <tree> [--books a,b]
+bun scripts/page-index.ts embed  --source <id>
+bun scripts/page-index.ts search --source <id> --query "…"
 ```
 
-It reads `PAGE_INDEX_DATABASE_URL` and `VOYAGE_API_KEY` from the environment
-and never prints them.
+- `migrate` creates or updates the tables and grants the serving role read
+  and the ingest role row writes (never schema changes). Run it after every
+  upgrade: a table added since the roles were made is granted too.
+- `import` makes the library match the tree: units, front matter and the
+  catalog. With `--books`, only those books are compared and replaced; every
+  other book is left alone. A tree with units but no catalog is refused.
+
+It reads `PAGE_INDEX_DATABASE_URL` (the owner login for `migrate`, the writer
+for the rest) and `VOYAGE_API_KEY` from the environment and never prints them.
 
 ## 3. Tools: `domain_library`
 
@@ -140,12 +152,25 @@ The worker answers `POST /v1/domain` with `{"tool": "domain_library", ...}`.
 The domain's route must declare:
 
 ```json
-"pageLibrary": { "root": "/abs/path/to/tree", "sourceId": "<domain>" }
+"pageLibrary": { "sourceId": "<library id>" }
 ```
 
-The worker reads the index's credentials from
-`EXPERT_AGENTS_DOMAIN_EXPERT_PAGE_INDEX_DATABASE_URL` and
-`EXPERT_AGENTS_DOMAIN_EXPERT_VOYAGE_API_KEY`.
+The library is then read from the database under that id. A route that adds
+`"root": "/abs/path/to/tree"` serves an assembled tree from local disk instead
+(the original layout; the search rows still come from the database). New
+registrations are database-backed unless the operator sets
+`EXPERT_AGENTS_DOMAIN_EXPERT_PAGE_LIBRARY_ROOT`.
+
+Several routes may name the same `sourceId`: one library, many agents, each
+route with its own disclosure (an owner agent unbounded, a public one under
+bounds). The worker reads the library with
+`EXPERT_AGENTS_DOMAIN_EXPERT_PAGE_INDEX_DATABASE_URL` (a read-only login) and
+`EXPERT_AGENTS_DOMAIN_EXPERT_VOYAGE_API_KEY`. Books another host ingests
+appear within a minute; keyword statistics are re-read every five minutes.
+
+`grep` runs in Postgres for a database library: each line is matched the
+way JavaScript would (`^`/`$` per line, `\b` a word boundary), and a pattern
+Postgres cannot read is scanned unfiltered instead of refused.
 
 | action | parameters | returns |
 |---|---|---|
@@ -201,9 +226,11 @@ the same name). It runs the same parse code as the operator CLI
 - **Per source:** page units, local OCR, figure descriptions, then the book's
   unit files are written into the domain's tree and its catalog entry is
   replaced. Re-ingesting an original replaces its earlier book, even under a
-  new title.
+  new title. For a database library the tree is a staging tree under the
+  job's state, removed when the job ends.
 - **Per job:** the job's books are imported into the index (only those books
-  are compared, so the rest of the source is untouched) and embedded.
+  are compared, so the rest of the source is untouched), then, for a database
+  library, their catalog entries; then embedded.
 - **Background and observable.** Jobs run one at a time. Each job's state is a
   JSON file under the worker's data directory, rewritten as it moves. A job
   interrupted by a restart resumes, and lane results are cached per page.
@@ -223,6 +250,76 @@ The worker needs, besides the search settings in section 3:
 
 The operator CLIs are `bun run library:pages` (parse, upload, assemble a
 whole library) and `bun run library:index` (migrate, import, embed, search).
+
+## 5. Hosting: one library, any host
+
+`deploy/page-library/compose.yaml` runs a library and its worker from the
+same image on any Linux host with Docker; nothing in it names a host.
+`scripts/page-library-smoke.sh` (CI job `page-library-compose`) proves it
+from nothing.
+
+```sh
+cd deploy/page-library
+cp page-library.env.example page-library.env   # fill with generated hex passwords
+cp worker.env.example worker.env               # routes, bearer, Voyage, Google, OCR router
+docker compose --env-file page-library.env --profile worker up -d --build
+```
+
+- `postgres` creates the `page_reader` and `page_writer` logins on a fresh
+  volume; `migrate` (one-shot) creates the tables and grants them; `worker`
+  serves with `page_reader` and ingests with `page_writer`. The owner login
+  never reaches the worker.
+- Both ports bind loopback by default (`PAGE_LIBRARY_PG_BIND`,
+  `PAGE_LIBRARY_WORKER_BIND`). An agent on another host reaches the worker
+  over a private network address or a tunnel, with the bearer; never publish
+  either port openly.
+- **Ingest from another host.** A machine with the OCR models (the parse
+  lane) parses and assembles locally, then writes into the library over a
+  tunnel to the database port with the writer login:
+
+  ```sh
+  bun run library:pages parse … && bun run library:pages assemble --tree <tree> …
+  PAGE_INDEX_DATABASE_URL=postgres://page_writer:…@127.0.0.1:<tunnel>/pages \
+    bun run library:index import --source <id> --tree <tree> --books <new books>
+  PAGE_INDEX_DATABASE_URL=… VOYAGE_API_KEY=… bun run library:index embed --source <id>
+  ```
+
+  Serving workers see the new books within a minute; nothing restarts.
+- **A private shelf is a second library.** Run a second project from the same
+  file (`PAGE_LIBRARY_PROJECT=<name>`, its own env files, ports and
+  passwords). Its worker holds only its own database's logins, so no route of
+  the public worker, misconfigured or not, can reach a private book: the
+  public worker has no credential for that database. Same code, same deploy
+  command, different database.
+
+### Moving a library
+
+The library is the database; the worker's volume holds only resumable ingest
+state. To move a library to another host:
+
+1. On the new host, stand up the compose project as above (`postgres` only):
+   `docker compose --env-file page-library.env up -d postgres`.
+2. Copy the data, schema and all:
+
+   ```sh
+   docker compose -p <old project> exec -T postgres pg_dump -U pages -Fc pages > library.dump
+   docker compose -p <new project> exec -T postgres pg_restore -U pages -d pages --clean --if-exists --no-owner < library.dump
+   ```
+
+   The roles are per cluster, not in the dump: the new host made its own on
+   its fresh volume, and `migrate` (next step) grants them.
+3. `docker compose --env-file page-library.env --profile worker up -d`; check
+   `/v1/health` reports each domain `store: database`, `catalog: ready` and the
+   same `books` and index counts as the old host.
+4. Point consumers at the new worker address, then stop the old project.
+
+Re-importing from originals is the fallback when no dump is at hand: parse
+and assemble from the library bucket (`bun run library:pages`), `import` each
+source id, then `embed`. Vectors are paid for again, so prefer the dump.
+
+A library still served from a tree (`root` set) moves into the database the
+same way: `import` the tree (catalog included), check `catalog` and a `read`
+through a test route without `root`, then drop `root` from the route.
 
 ## Evaluation
 

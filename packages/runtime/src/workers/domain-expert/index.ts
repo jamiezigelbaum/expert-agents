@@ -114,9 +114,10 @@ import {
 } from '../../core/disclosure.ts';
 import { completePassageSentences, completionSourceObject, SourceTextCache } from './passage-completion.ts';
 import { LibraryReader, LibraryReadError, parseLibraryReadParams, type LibraryReadRoute } from './library-reader.ts';
-import { PageIndex, voyageClient } from './page-index.ts';
+import { PageIndex, voyageClient, type VoyageClient } from './page-index.ts';
 import { PageDisclosureRefusal, runDisclosedPageLibrary } from './page-disclosure.ts';
 import { PageLibrary, PageLibraryError, parsePageLibraryParams, type PageLibraryDependencies } from './page-library.ts';
+import { DatabasePageStore, TreePageStore, type PageStore } from './page-store.ts';
 import { PageIngestError, PageIngestQueue, type IngestSourceInput, type PageIndexWriter } from './page-ingest.ts';
 
 export const DOMAIN_EXPERT_NOTION_CREDENTIAL_GUIDANCE = `notion_import requires EXPERT_AGENTS_DOMAIN_EXPERT_NOTION_TOKEN. Configure it as documented in ${DOMAIN_EXPERT_ENV_EXAMPLE}.`;
@@ -273,10 +274,14 @@ export interface DomainExpertWorkerOptions {
   pageIndexDatabaseUrl?: string;
   /** Voyage API key for page search embeddings and reranking; defaults to EXPERT_AGENTS_DOMAIN_EXPERT_VOYAGE_API_KEY. */
   voyageApiKey?: string;
+  /** Test seam: the fetch Voyage embedding and rerank calls go through. */
+  voyageFetch?: typeof fetch;
   /** Test seam: replaces the page index search. */
   pageSearch?: PageLibraryDependencies['search'];
   /** Test seam: replaces the page index's per-source status in health. */
   pageIndexStatus?: (sourceId: string) => Promise<{ units: number; chunks: number; pending_embeddings: number }>;
+  /** Test seam: the store of a page library kept in the database (a route without `root`). */
+  pageStore?: (sourceId: string) => PageStore;
   /**
    * Postgres URL library_ingest writes the index with; defaults to
    * EXPERT_AGENTS_DOMAIN_EXPERT_PAGE_INDEX_WRITER_DATABASE_URL. Separate from the
@@ -805,6 +810,8 @@ export class DomainExpertService {
   private pageIndex: PageIndex | undefined;
   private pageSearch: PageLibraryDependencies['search'] | undefined;
   private pageIndexStatus: ((sourceId: string) => Promise<{ units: number; chunks: number; pending_embeddings: number }>) | undefined;
+  private pageStoreOverride: ((sourceId: string) => PageStore) | undefined;
+  private voyageFetch: typeof fetch | undefined;
   private pageIngest!: PageIngestQueue;
   private annas: DomainExpertAnnasConfig;
   private annasBooksRoot: string;
@@ -870,6 +877,8 @@ export class DomainExpertService {
     this.voyageApiKey = options.voyageApiKey ?? process.env.EXPERT_AGENTS_DOMAIN_EXPERT_VOYAGE_API_KEY;
     this.pageSearch = options.pageSearch;
     this.pageIndexStatus = options.pageIndexStatus;
+    this.pageStoreOverride = options.pageStore;
+    this.voyageFetch = options.voyageFetch;
     this.annas = options.annas ?? {};
     this.annasBooksRoot = options.annas?.booksRoot ?? DEFAULT_ANNAS_BOOKS_ROOT;
     this.annasMaxDownloadBytes = normalizePositiveInteger(options.annas?.maxDownloadBytes, DEFAULT_ANNAS_ARCHIVE_MAX_DOWNLOAD_BYTES);
@@ -966,7 +975,7 @@ export class DomainExpertService {
     if (!configured.vision_lane) issues.push({ code: 'vision_not_configured', message: 'The deep vision profile is off: hard pages keep their OCR reading and figures stay undescribed; both are listed.' });
     const statusOf = this.pageIndexStatus ?? (this.pageIndexDatabaseUrl && this.voyageApiKey
       ? (sourceId: string) => {
-        this.pageIndex ??= new PageIndex(this.pageIndexDatabaseUrl!, voyageClient(this.voyageApiKey!));
+        this.pageIndex ??= new PageIndex(this.pageIndexDatabaseUrl!, this.voyage());
         return this.pageIndex.sourceStatus(sourceId);
       }
       : undefined);
@@ -976,11 +985,10 @@ export class DomainExpertService {
       let catalog: 'ready' | 'empty' | 'unreadable' = 'empty';
       let books = 0;
       try {
-        const parsed = JSON.parse(await readFile(join(config.root, 'catalog.json'), 'utf8')) as { books?: unknown[] };
-        books = Array.isArray(parsed.books) ? parsed.books.length : 0;
+        books = (await withTimeout(this.pageStoreFor(config).catalog(), PAGE_INDEX_HEALTH_TIMEOUT_MS)).length;
         catalog = books > 0 ? 'ready' : 'empty';
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') catalog = 'unreadable';
+      } catch {
+        catalog = 'unreadable';
       }
       if (catalog === 'unreadable') issues.push({ code: 'page_library_unavailable', domain_id: domainId, message: 'The page library catalog is not readable.' });
       let indexStatus: Record<string, unknown> = { status: 'not_configured' };
@@ -995,7 +1003,7 @@ export class DomainExpertService {
           issues.push({ code: 'page_search_unavailable', domain_id: domainId, message: 'The page index did not answer.' });
         }
       }
-      domains.push({ domain_id: domainId, source_id: config.sourceId, catalog, books, index: indexStatus, disclosure: Boolean(route.disclosure) });
+      domains.push({ domain_id: domainId, source_id: config.sourceId, store: config.root ? 'tree' : 'database', catalog, books, index: indexStatus, disclosure: Boolean(route.disclosure) });
     }
     return { status: issues.length ? 'degraded' : 'ready', configured, domains, ...(issues.length ? { issues } : {}) };
   }
@@ -1169,14 +1177,14 @@ export class DomainExpertService {
       const route = this.agentRouting[manifest.domain_id]!;
       if (!route.pageLibrary) throw new PageLibraryError('page_library_not_configured', 'This domain has no page library.', 404);
       const config = route.pageLibrary;
-      const key = `${manifest.domain_id}\u0000${config.root}\u0000${config.sourceId}`;
+      const key = `${manifest.domain_id}\u0000${config.root ?? ''}\u0000${config.sourceId}`;
       let library = this.pageLibraries.get(key);
       if (!library) {
         const search = this.pageSearch ?? (() => {
           if (!this.pageIndexDatabaseUrl || !this.voyageApiKey) {
             throw new PageLibraryError('page_search_not_configured', 'The page search index is not configured.', 503);
           }
-          this.pageIndex ??= new PageIndex(this.pageIndexDatabaseUrl, voyageClient(this.voyageApiKey));
+          this.pageIndex ??= new PageIndex(this.pageIndexDatabaseUrl, this.voyage());
           const index = this.pageIndex;
           return async (query: string, k: number, sourceId: string) => {
             try { return await index.search(sourceId, query, k); }
@@ -1188,8 +1196,8 @@ export class DomainExpertService {
         })();
         library = new PageLibrary(
           // The domain's acquisition directory holds originals library_ingest stored for it.
-          { root: config.root, sourceId: config.sourceId, originalBuckets: [...new Set([...pageLibraryOriginalBuckets(route), ...(this.acquisitionDirectory(manifest.domain_id) ? [this.acquisitionDirectory(manifest.domain_id)!.bucket] : [])])] },
-          { search, download: (bucket, name, maxBytes, timeoutMs) => this.google.downloadLibraryObject(bucket, name, maxBytes, timeoutMs) },
+          { sourceId: config.sourceId, originalBuckets: [...new Set([...pageLibraryOriginalBuckets(route), ...(this.acquisitionDirectory(manifest.domain_id) ? [this.acquisitionDirectory(manifest.domain_id)!.bucket] : [])])] },
+          { search, store: this.pageStoreFor(config), download: (bucket, name, maxBytes, timeoutMs) => this.google.downloadLibraryObject(bucket, name, maxBytes, timeoutMs) },
         );
         this.pageLibraries.set(key, library);
       }
@@ -1211,6 +1219,24 @@ export class DomainExpertService {
     }
   }
 
+  private voyage(): VoyageClient {
+    return voyageClient(this.voyageApiKey!, this.voyageFetch ? { fetch: this.voyageFetch } : {});
+  }
+
+  /**
+   * Where a route's catalog and units are read: its tree when it names a root, else the page
+   * library database through the serving (read-only) URL.
+   */
+  private pageStoreFor(config: { root?: string; sourceId: string }): PageStore {
+    if (config.root) return new TreePageStore(config.root);
+    if (this.pageStoreOverride) return this.pageStoreOverride(config.sourceId);
+    if (!this.pageIndexDatabaseUrl || !this.voyageApiKey) {
+      throw new PageLibraryError('page_search_not_configured', 'The page library database is not configured.', 503);
+    }
+    this.pageIndex ??= new PageIndex(this.pageIndexDatabaseUrl, this.voyage());
+    return new DatabasePageStore(this.pageIndex.sql, config.sourceId);
+  }
+
   private createPageIngest(options: DomainExpertWorkerOptions): PageIngestQueue {
     const lanesConfig = {
       routerUrl: options.ocrLanes?.routerUrl ?? (process.env.EXPERT_AGENTS_DOMAIN_EXPERT_OCR_ROUTER_URL?.trim() || undefined),
@@ -1228,8 +1254,11 @@ export class DomainExpertService {
       writer: () => {
         if (writer) return writer;
         if (!writerUrl || !this.voyageApiKey) throw new PageIngestError('page_ingest_writer_not_configured', 'The page index writer is not configured.', 503);
-        const index = new PageIndex(writerUrl, voyageClient(this.voyageApiKey), { maxConnections: 4 });
-        writer = { importUnits: (s, u, o) => index.importUnits(s, u, o), embedPending: (s) => index.embedPending(s), pendingEmbeddings: (s) => index.pendingEmbeddings(s) };
+        const index = new PageIndex(writerUrl, this.voyage(), { maxConnections: 4 });
+        writer = {
+          importUnits: (s, u, o) => index.importUnits(s, u, o), embedPending: (s) => index.embedPending(s), pendingEmbeddings: (s) => index.pendingEmbeddings(s),
+          catalog: (s) => index.catalog(s), replaceBooks: (s, e, o) => index.replaceBooks(s, e, o),
+        };
         return writer;
       },
       changed: (domainId) => {
