@@ -151,8 +151,22 @@ The worker reads the index's credentials from
 | `view_page` | `slug` | the JPEG of that PDF page, rendered from the original |
 
 Slugs are `books/<book>/<unit>`. Every hit carries a citation label
-(`Author, Title, p.N` or `section N`). The tool refuses a domain with a
-disclosure policy, as `domain_read` does.
+(`Author, Title, p.N` or `section N`).
+
+Under a disclosure policy (the route's `disclosure` block,
+[`AGENT_REPO_CONTRACT.md`](./AGENT_REPO_CONTRACT.md)) the tool serves the same
+bounds `domain_ask` does, with a book as the source: `session_id` is required;
+every passage is cut to `maxQuoteChars`; each response carries at most
+`maxQuotesPerSource` passages per book (`read_range` returns that many units
+and resumes from the next); a session may see at most
+`maxSourceCoveragePerSession` of a book, measured against the book's real
+extent (the characters of its page or section units), and crossing it refuses
+the response rather than trimming it. `view_page` charges its page's full text
+because an image cannot be cut. Books in `excludedSources` (by catalog title or
+original `gs://` URI) are absent from `catalog`, dropped from `search` and
+`grep`, and refused by name (`disclosure_source_excluded`). A library whose
+`sourceId` is declared `derived` or `excluded` is refused. Ingest stays with the
+owner deployment.
 
 The OpenClaw plugin registers it as the gateway tool `domain_library`; a
 `view_page` image reaches the model as an image block, not base64 text. The

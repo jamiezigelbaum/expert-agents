@@ -69,8 +69,13 @@ export interface PageLibraryParams {
 
 interface CatalogBook {
   book: string; title: string; creator: string; kind: 'pages' | 'sections'; units: number;
-  first_unit: string; last_unit: string; figures: number;
+  first_unit: string; last_unit: string; figures: number; sources?: string[];
 }
+
+/** One unit's worth of text with its address and citation label. */
+export interface PageExcerpt { slug: string; cite: string; text: string }
+
+export interface PageBookInfo { book: string; title: string; creator: string; sources: string[]; chars: number }
 
 const FIELDS: Record<PageLibraryAction, string[]> = {
   catalog: ['query'],
@@ -86,7 +91,7 @@ export function parsePageLibraryParams(value: Record<string, unknown>): PageLibr
   if (typeof action !== 'string' || !(PAGE_LIBRARY_ACTIONS as readonly string[]).includes(action)) {
     throw new PageLibraryError('invalid_request', `action must be one of ${PAGE_LIBRARY_ACTIONS.join(', ')}.`);
   }
-  const allowed = ['action', 'domain_id', ...FIELDS[action as PageLibraryAction]];
+  const allowed = ['action', 'domain_id', 'session_id', ...FIELDS[action as PageLibraryAction]];
   const extra = Object.keys(value).filter((k) => !allowed.includes(k));
   if (extra.length) throw new PageLibraryError('invalid_request', `unexpected fields for ${action}: ${extra.join(', ')}`);
   const str = (k: string, required: boolean, max = 500) => {
@@ -114,6 +119,7 @@ export function parsePageLibraryParams(value: Record<string, unknown>): PageLibr
 
 export class PageLibrary {
   private catalogCache?: { books: CatalogBook[]; byBook: Map<string, CatalogBook> };
+  private readonly extentCache = new Map<string, PageBookInfo>();
 
   constructor(private readonly config: PageLibraryConfig, private readonly deps: PageLibraryDependencies) {
     if (!config.root || resolve(config.root) !== config.root) throw new PageLibraryError('page_library_misconfigured', 'The page library root must be an absolute path.', 500);
@@ -216,37 +222,76 @@ export class PageLibrary {
   }
 
   async read(slug: string): Promise<Record<string, unknown>> {
-    const f = await this.unitFile(slug);
-    const unit = f.unit.replace(/^fig-(p\d+)-\d+$/, '$1');
-    const page = unit === f.unit ? f : await this.unitFile(`books/${f.book}/${unit}`);
-    const text = unitBody(page.markdown);
-    return { slug: `books/${f.book}/${unit}`, cite: await this.cite(f.book, unit), text: text.slice(0, READ_MAX_CHARS), truncated: text.length > READ_MAX_CHARS };
+    const { slug: page, cite, text } = await this.unitText(slug);
+    return { slug: page, cite, text: text.slice(0, READ_MAX_CHARS), truncated: text.length > READ_MAX_CHARS };
   }
 
   async readRange(book: string, fromUnit: string, toUnit: string): Promise<Record<string, unknown>> {
+    const range = await this.rangeParts(book, fromUnit, toUnit);
+    return {
+      units: range.parts.map((p) => p.slug),
+      text: range.parts.map((p) => `[${p.slug} | ${p.cite}]\n${p.text}`).join('\n\n'),
+      ...(range.next_unit ? { next_unit: range.next_unit } : {}),
+      note: `at most ${RANGE_MAX_UNITS} units or ${RANGE_MAX_CHARS} characters per call; continue from next_unit`,
+    };
+  }
+
+  /** The units read_range returns, one entry per unit, and the unit to continue from. */
+  async rangeParts(book: string, fromUnit: string, toUnit: string): Promise<{ parts: PageExcerpt[]; next_unit?: string }> {
     const b = await this.requireBook(book);
     let from: number, to: number;
     try { from = unitNumber(fromUnit); to = unitNumber(toUnit); } catch { throw new PageLibraryError('invalid_request', 'from_unit and to_unit must be unit names like p0012 or s0003.'); }
     const kind = b.kind === 'pages' ? 'p' : 's';
     if (fromUnit[0] !== kind || toUnit[0] !== kind || to < from) throw new PageLibraryError('invalid_request', `this book's units are ${b.first_unit}–${b.last_unit}.`);
     const last = Math.min(to, from + RANGE_MAX_UNITS - 1, unitNumber(b.last_unit));
-    const parts: string[] = [];
-    const units: string[] = [];
+    const parts: PageExcerpt[] = [];
     let chars = 0;
     for (let n = from; n <= last; n++) {
       const unit = unitName(kind, n);
       const path = join(this.config.root, 'books', book, `${unit}.md`);
       if (!existsSync(path)) break;
-      const piece = `[books/${book}/${unit} | ${await this.cite(book, unit)}]\n${unitBody(await readFile(path, 'utf8'))}`;
-      if (chars + piece.length > RANGE_MAX_CHARS && units.length) break;
-      parts.push(piece); units.push(`books/${book}/${unit}`); chars += piece.length;
+      const slug = `books/${book}/${unit}`;
+      const cite = await this.cite(book, unit);
+      const text = unitBody(await readFile(path, 'utf8'));
+      const size = slug.length + cite.length + text.length + 4;
+      if (chars + size > RANGE_MAX_CHARS && parts.length) break;
+      parts.push({ slug, cite, text }); chars += size;
     }
-    const nextN = from + units.length;
-    return {
-      units, text: parts.join('\n\n'),
-      ...(nextN <= Math.min(to, unitNumber(b.last_unit)) ? { next_unit: unitName(kind, nextN) } : {}),
-      note: `at most ${RANGE_MAX_UNITS} units or ${RANGE_MAX_CHARS} characters per call; continue from next_unit`,
-    };
+    const nextN = from + parts.length;
+    return { parts, ...(nextN <= Math.min(to, unitNumber(b.last_unit)) ? { next_unit: unitName(kind, nextN) } : {}) };
+  }
+
+  /** The full text of the page or section a slug addresses (a figure slug addresses its page). */
+  async unitText(slug: string): Promise<PageExcerpt> {
+    const f = await this.unitFile(slug);
+    const unit = f.unit.replace(/^fig-(p\d+)-\d+$/, '$1');
+    const page = unit === f.unit ? f : await this.unitFile(`books/${f.book}/${unit}`);
+    return { slug: `books/${f.book}/${unit}`, cite: await this.cite(f.book, unit), text: unitBody(page.markdown) };
+  }
+
+  /**
+   * What disclosure needs to know about one book: its catalog identity, the
+   * originals it was built from, and its real extent — the characters of its
+   * page or section units, figure descriptions excluded.
+   */
+  async bookInfo(book: string): Promise<PageBookInfo> {
+    const cached = this.extentCache.get(book);
+    if (cached) return cached;
+    const identity = await this.bookIdentity(book);
+    const dir = join(this.config.root, 'books', book);
+    let chars = 0;
+    let files: string[] = [];
+    try { files = (await readdir(dir)).filter((f) => /^[ps]\d+\.md$/.test(f)); } catch { /* an empty book has no extent */ }
+    for (const f of files) chars += unitBody(await readFile(join(dir, f), 'utf8')).length;
+    const info: PageBookInfo = { ...identity, chars };
+    this.extentCache.set(book, info);
+    return info;
+  }
+
+  /** A book's catalog identity and originals, without reading its units. */
+  async bookIdentity(book: string): Promise<Omit<PageBookInfo, 'chars'>> {
+    const b = await this.requireBook(book);
+    return { book, title: b.title, creator: b.creator, sources: Array.isArray(b.sources) ? b.sources.filter((s) => typeof s === 'string') : [] };
   }
 
   async viewPage(slug: string): Promise<Record<string, unknown>> {

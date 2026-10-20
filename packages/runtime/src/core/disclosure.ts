@@ -94,6 +94,7 @@ export const DISCLOSURE_REFUSAL_CODES = {
   noDisclosableCorpus: 'disclosure_no_disclosable_corpus',
   sessionRequired: 'disclosure_session_required',
   sourceCoverageExhausted: 'disclosure_source_coverage_exhausted',
+  sourceExcluded: 'disclosure_source_excluded',
 } as const;
 
 export type DisclosureRefusalCode =
@@ -134,6 +135,12 @@ const REFUSALS: Readonly<Record<DisclosureRefusalCode, DisclosureRefusal>> = Obj
     status: 403,
     message: 'Answering would cross the cumulative per-source disclosure bound for this session.',
     remediation: 'Narrow the question or begin a new session; bulk and sequential reconstruction of a source is refused rather than trimmed.',
+  }),
+  [DISCLOSURE_REFUSAL_CODES.sourceExcluded]: Object.freeze({
+    code: DISCLOSURE_REFUSAL_CODES.sourceExcluded,
+    status: 403,
+    message: 'This deployment does not serve the requested source.',
+    remediation: 'Ask about a source this deployment serves.',
   }),
 });
 
@@ -311,6 +318,12 @@ export interface DisclosureExcerptCandidate {
    * allowance (see `sourceSessionBudgetChars`).
    */
   sourceChars?: number;
+  /**
+   * The excerpt cannot be cut, such as the image of a page. It is charged at
+   * its full text length against the session budget and counts as one quote,
+   * but `maxQuoteChars` does not truncate it.
+   */
+  indivisible?: boolean;
 }
 
 export type DisclosureWithholdReason = 'uncitable' | 'quotes_per_source' | 'source_excluded';
@@ -416,7 +429,7 @@ export function discloseExcerpts(
       continue;
     }
     quotesPerSource.set(sourceKey, used + 1);
-    const text = boundedExcerpt(candidate.text, bounds.maxQuoteChars);
+    const text = candidate.indivisible ? candidate.text : boundedExcerpt(candidate.text, bounds.maxQuoteChars);
     const truncated = text.length < candidate.text.length;
     decisions.push({ kind: 'disclosed', text, chars: text.length, truncated });
     excerptsDisclosed += 1;
