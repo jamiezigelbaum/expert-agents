@@ -206,7 +206,9 @@ A served deployment declares its posture in its routing entry
 declared, the worker refuses to reach a `derived` or `excluded` corpus before
 any retrieval executes, bounds every excerpt it returns from a `full` corpus,
 withholds any excerpt it cannot attribute, and refuses rather than trims once a
-session has crossed the cumulative per-source bound. Holdings listing stays
+session has crossed the cumulative per-source bound. The page library
+(`domain_library`) applies the same bounds per book, with the library's
+`sourceId` as its corpus id ([`page-library.md`](./page-library.md)). Holdings listing stays
 permitted and truthful for a disclosed corpus: an agent that can say what it has
 read is more useful and more honest.
 

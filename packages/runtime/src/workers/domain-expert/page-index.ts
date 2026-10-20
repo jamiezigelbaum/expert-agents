@@ -276,6 +276,15 @@ export class PageIndex {
     for (const key of [...this.docFreq.keys()]) if (key.startsWith(`${source}\0`)) this.docFreq.delete(key);
   }
 
+  /** What the index holds for one source: units, chunks, and chunks still without a vector. */
+  async sourceStatus(source: string): Promise<{ units: number; chunks: number; pending_embeddings: number }> {
+    const [r] = await this.sql`
+      SELECT count(DISTINCT slug)::int AS units, count(*)::int AS chunks,
+             (count(*) FILTER (WHERE embedding IS NULL))::int AS pending
+      FROM page_chunks WHERE source = ${source}` as Array<{ units: number; chunks: number; pending: number }>;
+    return { units: r?.units ?? 0, chunks: r?.chunks ?? 0, pending_embeddings: r?.pending ?? 0 };
+  }
+
   async pendingEmbeddings(source: string): Promise<number> {
     const [r] = await this.sql`SELECT count(*)::int AS n FROM page_chunks WHERE source = ${source} AND embedding IS NULL` as Array<{ n: number }>;
     return r?.n ?? 0;

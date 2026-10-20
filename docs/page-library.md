@@ -1,7 +1,7 @@
 # Page library
 
-The page library is the expert-agent library design chosen by the
-2026-10-20 retrieval test. It has three pieces:
+The page library is every expert's library (owner decision 2026-10-20, after
+that day's retrieval test). It has three pieces:
 
 - a parse-once lane that turns every original into page-addressed units, read
   locally so that no page can be refused;
@@ -9,10 +9,10 @@ The page library is the expert-agent library design chosen by the
 - a six-tool belt that lets the agent search, verify, read whole ranges and
   look at pages.
 
-It runs next to the Vertex RAG Engine path. Nothing here changes
-`domain_ask`, `domain_read` or the Vertex corpora. A domain switches to it by
-declaring a `pageLibrary` route (section 3); any deletion of the Vertex import
-path is a separate, owner-approved change.
+New experts get one from the factory. A domain still on a Vertex corpus
+switches by declaring a `pageLibrary` route (section 3); the Vertex path
+(`domain_ask`, `domain_read`, `rag_corpus`) stays only until those domains have
+moved, then is deleted.
 
 ## 1. Parse once: page-addressed units
 
@@ -151,8 +151,22 @@ The worker reads the index's credentials from
 | `view_page` | `slug` | the JPEG of that PDF page, rendered from the original |
 
 Slugs are `books/<book>/<unit>`. Every hit carries a citation label
-(`Author, Title, p.N` or `section N`). The tool refuses a domain with a
-disclosure policy, as `domain_read` does.
+(`Author, Title, p.N` or `section N`).
+
+Under a disclosure policy (the route's `disclosure` block,
+[`AGENT_REPO_CONTRACT.md`](./AGENT_REPO_CONTRACT.md)) the tool serves the same
+bounds `domain_ask` does, with a book as the source: `session_id` is required;
+every passage is cut to `maxQuoteChars`; each response carries at most
+`maxQuotesPerSource` passages per book (`read_range` returns that many units
+and resumes from the next); a session may see at most
+`maxSourceCoveragePerSession` of a book, measured against the book's real
+extent (the characters of its page or section units), and crossing it refuses
+the response rather than trimming it. `view_page` charges its page's full text
+because an image cannot be cut. Books in `excludedSources` (by catalog title or
+original `gs://` URI) are absent from `catalog`, dropped from `search` and
+`grep`, and refused by name (`disclosure_source_excluded`). A library whose
+`sourceId` is declared `derived` or `excluded` is refused. Ingest stays with the
+owner deployment.
 
 The OpenClaw plugin registers it as the gateway tool `domain_library`; a
 `view_page` image reaches the model as an image block, not base64 text. The
@@ -206,8 +220,8 @@ whole library) and `bun run library:index` (migrate, import, embed, search).
 ## Evaluation
 
 Eval sets and receipts live in each agent's own repository, never here. The
-shadow is scored on the same questions as Vertex. Each passage is scored
-three ways:
+page library was scored on the same questions as Vertex. Each passage is
+scored three ways:
 - the repo rule (`scripts/retrieval-eval.ts`): source match plus ordered-word
   quote coverage;
 - a source-blind quote rule;

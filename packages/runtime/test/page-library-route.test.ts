@@ -202,3 +202,50 @@ describe('a page-library domain is seeded for the page library', () => {
     } finally { await rm(root, { recursive: true, force: true }); }
   });
 });
+
+async function healthOf(worker: { fetch(request: Request): Promise<Response> }): Promise<Record<string, any>> {
+  return await (await worker.fetch(new Request('http://worker.test/v1/health'))).json() as Record<string, any>;
+}
+
+describe('health reports page-library readiness', () => {
+  test('per domain: its catalog, what the index holds, and the ingest lanes', async () => {
+    const empty = await mkdtemp(join(tmpdir(), 'page-route-health-'));
+    try {
+      const worker = createDomainExpertWorker({
+        dataDir, gcpProject: 'neutral-project',
+        agentRouting: validateAgentRoutingConfig({
+          history: { pageLibrary: { root: tree, sourceId: 'history', originalBuckets: ['originals-bucket'] } },
+          fresh: { pageLibrary: { root: join(empty, 'fresh'), sourceId: 'fresh', originalBuckets: ['originals-bucket'] } },
+        }),
+        pageSearch: async () => [],
+        pageIndexStatus: async (sourceId) => sourceId === 'history' ? { units: 2, chunks: 2, pending_embeddings: 1 } : { units: 0, chunks: 0, pending_embeddings: 0 },
+        ocrLanes: { ollamaUrl: 'http://ollama.invalid' },
+        google: { accessToken: 'synthetic-token', fetchImpl: (async () => { throw new Error('no network'); }) as unknown as typeof fetch },
+      });
+      const health = await healthOf(worker);
+      expect(health.page_library.configured).toEqual({ index: true, writer: false, ocr_lane: true, vision_lane: false });
+      expect(health.page_library.domains).toEqual([
+        { domain_id: 'history', source_id: 'history', catalog: 'ready', books: 1, index: { status: 'ready', units: 2, chunks: 2, pending_embeddings: 1 }, disclosure: false },
+        { domain_id: 'fresh', source_id: 'fresh', catalog: 'empty', books: 0, index: { status: 'ready', units: 0, chunks: 0, pending_embeddings: 0 }, disclosure: false },
+      ]);
+      expect(health.page_library.status).toBe('degraded');
+      expect(health.page_library.issues.map((issue: { code: string }) => issue.code).sort())
+        .toEqual(['page_embeddings_pending', 'page_ingest_writer_not_configured', 'vision_not_configured']);
+    } finally { await rm(empty, { recursive: true, force: true }); }
+  });
+
+  test('an index that does not answer is reported unreachable, and no route means not configured', async () => {
+    const worker = createDomainExpertWorker({
+      dataDir, gcpProject: 'neutral-project',
+      agentRouting: validateAgentRoutingConfig({ history: { pageLibrary: { root: tree, sourceId: 'history', originalBuckets: ['originals-bucket'] } } }),
+      pageSearch: async () => [],
+      pageIndexStatus: async () => { throw new Error('connection refused'); },
+      google: { accessToken: 'synthetic-token', fetchImpl: (async () => { throw new Error('no network'); }) as unknown as typeof fetch },
+    });
+    const health = await healthOf(worker);
+    expect(health.page_library.domains[0].index).toEqual({ status: 'unreachable' });
+    expect(health.page_library.issues.map((issue: { code: string }) => issue.code)).toContain('page_search_unavailable');
+    const none = createDomainExpertWorker({ dataDir, gcpProject: 'neutral-project', agentRouting: validateAgentRoutingConfig({}) });
+    expect((await healthOf(none)).page_library.status).toBe('not_configured');
+  });
+});

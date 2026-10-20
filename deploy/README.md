@@ -116,13 +116,17 @@ requests; a non-loopback bind will refuse to start without it. Enable only the
 external integrations the deployment uses.
 
 `EXPERT_AGENTS_DOMAIN_EXPERT_AGENTS_JSON` is **REQUIRED for live domain
-serving**. It is the domain-keyed routing manifest for the worker: every entry
-declares one shared-library bucket/prefix and one target Vertex corpus, with
-optional display name, agent-owned scope-manifest path, and retrieval overrides.
+serving**. It is the domain-keyed routing manifest for the worker. Every expert
+reads a page library ([`page-library.md`](../docs/page-library.md)): an entry
+declares a `pageLibrary` (the tree's absolute `root` and its index `sourceId`)
+and the library bucket/prefix its originals live in. A legacy entry declares a
+target Vertex corpus instead, with optional scope-manifest path and retrieval
+overrides; those go when the Vertex machinery is removed. Registrations made
+through `domain_agent register` (the factory) are page-library entries.
 The value may be strict inline JSON or `@` followed by an absolute JSON-file
 path. If the `@` form is used, provision that file separately with
 `root:expert-agents 0640` access and do not place credentials in it. For
-example, a governance domain mapped to its corpus display name has this shape:
+example, a governance domain served from its page library has this shape:
 
 ```json
 {
@@ -132,10 +136,23 @@ example, a governance domain mapped to its corpus display name has this shape:
       "bucket": "<shared-library-bucket>",
       "prefix": "<shared-library-prefix>"
     },
-    "targetCorpusDisplayName": "governance-docs"
+    "pageLibrary": {
+      "root": "/var/lib/expert-agents/page-library/governance",
+      "sourceId": "governance"
+    }
   }
 }
 ```
+
+A page-library domain also needs the page index and its writer
+(`EXPERT_AGENTS_DOMAIN_EXPERT_PAGE_INDEX_DATABASE_URL`,
+`EXPERT_AGENTS_DOMAIN_EXPERT_PAGE_INDEX_WRITER_DATABASE_URL`,
+`EXPERT_AGENTS_DOMAIN_EXPERT_VOYAGE_API_KEY`) and the local OCR lanes
+(`EXPERT_AGENTS_DOMAIN_EXPERT_OLLAMA_URL`, `EXPERT_AGENTS_DOMAIN_EXPERT_VISION_URL`).
+The index's Postgres runs from `deploy/page-library/compose.yaml`; give the
+serving URL a SELECT-only role and the writer URL a role that may insert and
+delete. The tree directory must be writable by the service account, since
+`library_ingest` writes each book into it.
 
 The worker does not generate buckets, prefixes, or corpora for missing domain
 entries. Offline status and dry-run planning remain available and report the
@@ -202,7 +219,13 @@ directory, preventing `summarize` from discovering a caller-project `.env` and
 reloading provider keys that the environment filter removed. The existing
 credential environment filter remains in force.
 
-`annas_archive_import` with `ingest: true` uploads only what Vertex RAG can
+For a page-library domain, `annas_archive_import` with `ingest: true` stores
+the original in the domain's library and queues a `library_ingest` job (PDF,
+EPUB, Markdown or text; other formats are refused with
+`page_ingest_format_unsupported`). The rest of this section is the legacy
+Vertex path, pending its removal.
+
+For a legacy corpus domain, `annas_archive_import` with `ingest: true` uploads only what Vertex RAG can
 parse (PDF, text, Markdown, HTML). An EPUB is converted to Markdown in-process
 (no dependency) and uploaded as `book-imports/<domain>/<surname - main title
 (year)>.md` (first author's surname, title without subtitle or edition notes;
@@ -503,8 +526,12 @@ curl --fail --silent --show-error \
 ```
 
 Both the boot-proof line and a successful `GET /v1/health` are required before
-the deployment is considered ready. A live Google-backed deployment must also
-report `configured.google: true` and `configuration_status.google: "ready"`.
+the deployment is considered ready. With page-library domains, health must also
+report `page_library.status: "ready"`: every domain's catalog readable, its
+index reachable with no chunks pending embedding, the index writer configured,
+and both OCR lanes set. `page_library.issues` names anything missing. A
+deployment that still serves a legacy Vertex corpus must also report
+`configured.google: true` and `configuration_status.google: "ready"`.
 
 ## Stop or disable
 

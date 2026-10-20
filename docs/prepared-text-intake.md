@@ -1,5 +1,9 @@
 # Reviewed text intake
 
+> **Legacy.** This describes the Vertex RAG path, which only domains not yet on
+> the [page library](page-library.md) still use. It is deleted after their
+> cutover (owner decision 2026-10-20). New experts read a page library.
+
 Use the explicit prepared mode for a reviewed UTF-8 text artifact already held outside the repository:
 
 ```sh

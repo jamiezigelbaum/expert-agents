@@ -115,6 +115,7 @@ import {
 import { completePassageSentences, completionSourceObject, SourceTextCache } from './passage-completion.ts';
 import { LibraryReader, LibraryReadError, parseLibraryReadParams, type LibraryReadRoute } from './library-reader.ts';
 import { PageIndex, voyageClient } from './page-index.ts';
+import { PageDisclosureRefusal, runDisclosedPageLibrary } from './page-disclosure.ts';
 import { PageLibrary, PageLibraryError, parsePageLibraryParams, type PageLibraryDependencies } from './page-library.ts';
 import { PageIngestError, PageIngestQueue, type IngestSourceInput, type PageIndexWriter } from './page-ingest.ts';
 
@@ -274,6 +275,8 @@ export interface DomainExpertWorkerOptions {
   voyageApiKey?: string;
   /** Test seam: replaces the page index search. */
   pageSearch?: PageLibraryDependencies['search'];
+  /** Test seam: replaces the page index's per-source status in health. */
+  pageIndexStatus?: (sourceId: string) => Promise<{ units: number; chunks: number; pending_embeddings: number }>;
   /**
    * Postgres URL library_ingest writes the index with; defaults to
    * EXPERT_AGENTS_DOMAIN_EXPERT_PAGE_INDEX_WRITER_DATABASE_URL. Separate from the
@@ -800,6 +803,7 @@ export class DomainExpertService {
   private voyageApiKey: string | undefined;
   private pageIndex: PageIndex | undefined;
   private pageSearch: PageLibraryDependencies['search'] | undefined;
+  private pageIndexStatus: ((sourceId: string) => Promise<{ units: number; chunks: number; pending_embeddings: number }>) | undefined;
   private pageIngest!: PageIngestQueue;
   private annas: DomainExpertAnnasConfig;
   private annasBooksRoot: string;
@@ -864,6 +868,7 @@ export class DomainExpertService {
     this.pageIndexDatabaseUrl = options.pageIndexDatabaseUrl ?? process.env.EXPERT_AGENTS_DOMAIN_EXPERT_PAGE_INDEX_DATABASE_URL;
     this.voyageApiKey = options.voyageApiKey ?? process.env.EXPERT_AGENTS_DOMAIN_EXPERT_VOYAGE_API_KEY;
     this.pageSearch = options.pageSearch;
+    this.pageIndexStatus = options.pageIndexStatus;
     this.annas = options.annas ?? {};
     this.annasBooksRoot = options.annas?.booksRoot ?? DEFAULT_ANNAS_BOOKS_ROOT;
     this.annasMaxDownloadBytes = normalizePositiveInteger(options.annas?.maxDownloadBytes, DEFAULT_ANNAS_ARCHIVE_MAX_DOWNLOAD_BYTES);
@@ -922,6 +927,7 @@ export class DomainExpertService {
         summarize: Bun.which(this.summarizeBin) !== null,
       },
       pdf_import: this.pdfImportStatus(),
+      page_library: await this.pageLibraryStatus(),
       configuration_status: {
         google: googleStatus,
         google_credentials: credentialStatus,
@@ -934,6 +940,63 @@ export class DomainExpertService {
       })),
       policy: domainPolicy(),
     };
+  }
+
+  /**
+   * Whether each page-library domain can serve and ingest: its tree's catalog,
+   * what the search index holds for it, and the lanes ingest reads pages with.
+   * One bounded count per domain; nothing is searched or embedded.
+   */
+  private async pageLibraryStatus(): Promise<Record<string, unknown>> {
+    const routes = Object.entries(this.agentRouting).filter(([, route]) => route.pageLibrary);
+    const lanes = this.pageIngest.lanes();
+    const index = Boolean(this.pageSearch || (this.pageIndexDatabaseUrl && this.voyageApiKey));
+    const configured = {
+      index,
+      writer: this.pageIngestWriterConfigured(),
+      ocr_lane: lanes.deepseek_ocr,
+      vision_lane: lanes.vision,
+    };
+    if (routes.length === 0) return { status: 'not_configured', domains: [], configured };
+    const issues: Array<{ code: string; domain_id?: string; message: string }> = [];
+    if (!index) issues.push({ code: 'page_search_not_configured', message: 'The page index URL or the Voyage key is not set: domain_library search fails.' });
+    if (!configured.writer) issues.push({ code: 'page_ingest_writer_not_configured', message: 'The index writer URL is not set: library_ingest cannot start.' });
+    if (!configured.ocr_lane) issues.push({ code: 'ocr_not_configured', message: 'No Ollama lane: pages without a text layer are listed as failed.' });
+    if (!configured.vision_lane) issues.push({ code: 'vision_not_configured', message: 'No vision lane: figures stay undescribed and are listed.' });
+    const statusOf = this.pageIndexStatus ?? (this.pageIndexDatabaseUrl && this.voyageApiKey
+      ? (sourceId: string) => {
+        this.pageIndex ??= new PageIndex(this.pageIndexDatabaseUrl!, voyageClient(this.voyageApiKey!));
+        return this.pageIndex.sourceStatus(sourceId);
+      }
+      : undefined);
+    const domains = [];
+    for (const [domainId, route] of routes) {
+      const config = route.pageLibrary!;
+      let catalog: 'ready' | 'empty' | 'unreadable' = 'empty';
+      let books = 0;
+      try {
+        const parsed = JSON.parse(await readFile(join(config.root, 'catalog.json'), 'utf8')) as { books?: unknown[] };
+        books = Array.isArray(parsed.books) ? parsed.books.length : 0;
+        catalog = books > 0 ? 'ready' : 'empty';
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') catalog = 'unreadable';
+      }
+      if (catalog === 'unreadable') issues.push({ code: 'page_library_unavailable', domain_id: domainId, message: 'The page library catalog is not readable.' });
+      let indexStatus: Record<string, unknown> = { status: 'not_configured' };
+      if (statusOf) {
+        try {
+          const counts = await withTimeout(statusOf(config.sourceId), PAGE_INDEX_HEALTH_TIMEOUT_MS);
+          indexStatus = { status: 'ready', ...counts };
+          if (counts.pending_embeddings > 0) issues.push({ code: 'page_embeddings_pending', domain_id: domainId, message: `${counts.pending_embeddings} chunks have no vector yet: semantic search misses them until they are embedded.` });
+          if (books > 0 && counts.units === 0) issues.push({ code: 'page_index_empty', domain_id: domainId, message: 'The catalog lists books but the index holds none of them: search finds nothing.' });
+        } catch {
+          indexStatus = { status: 'unreachable' };
+          issues.push({ code: 'page_search_unavailable', domain_id: domainId, message: 'The page index did not answer.' });
+        }
+      }
+      domains.push({ domain_id: domainId, source_id: config.sourceId, catalog, books, index: indexStatus, disclosure: Boolean(route.disclosure) });
+    }
+    return { status: issues.length ? 'degraded' : 'ready', configured, domains, ...(issues.length ? { issues } : {}) };
   }
 
   // How this worker imports PDFs, so a host missing qpdf or pdftotext shows up
@@ -1093,8 +1156,9 @@ export class DomainExpertService {
 
   /**
    * The page library tool belt (docs/page-library.md). Refused for a domain
-   * without a pageLibrary route block and for any route with a disclosure
-   * policy.
+   * without a pageLibrary route block. A route with a disclosure policy serves
+   * it under the domain_ask bounds, per book and per session
+   * (page-disclosure.ts).
    */
   private async domainLibrary(params: Record<string, unknown>): Promise<unknown> {
     try {
@@ -1102,7 +1166,6 @@ export class DomainExpertService {
       const manifest = this.manifest(optionalStringField(params.domain_id, 'domainId').domainId);
       requireConfiguredAgent(manifest, 'domain_library');
       const route = this.agentRouting[manifest.domain_id]!;
-      if (route.disclosure) throw new PageLibraryError('page_library_not_disclosable', 'This deployment serves under a disclosure policy; the page library is not available.', 403);
       if (!route.pageLibrary) throw new PageLibraryError('page_library_not_configured', 'This domain has no page library.', 404);
       const config = route.pageLibrary;
       const key = `${manifest.domain_id}\u0000${config.root}\u0000${config.sourceId}`;
@@ -1129,8 +1192,19 @@ export class DomainExpertService {
         );
         this.pageLibraries.set(key, library);
       }
-      return { kind: 'domain_library_result', domain_id: manifest.domain_id, action: parsed.action, ...await library.run(parsed), policy: domainPolicy() };
+      const policy = this.disclosurePolicyFor(manifest.domain_id);
+      const body = policy
+        ? await runDisclosedPageLibrary(
+          library,
+          parsed,
+          policy,
+          this.disclosureSessions.ledgerFor(`${manifest.domain_id}\u0000${requireDisclosureSessionId(typeof params.session_id === 'string' ? params.session_id : undefined)}`),
+          config.sourceId,
+        )
+        : await library.run(parsed);
+      return { kind: 'domain_library_result', domain_id: manifest.domain_id, action: parsed.action, ...body, policy: domainPolicy() };
     } catch (error) {
+      if (error instanceof PageDisclosureRefusal) throw disclosureErrorFrom(error.refusal);
       if (error instanceof PageLibraryError) throw new DomainExpertWorkerError(error.status, error.code, error.message);
       throw error;
     }
@@ -9245,6 +9319,16 @@ function allowedStageImportExtensions(includeMedia: boolean): Set<string> {
 
 const PAGE_INGEST_EXTENSIONS = new Set(['.pdf', '.epub', '.md', '.markdown', '.txt']);
 const PAGE_INGEST_MAX_BYTES = 300_000_000;
+// Health counts each page-library source's index rows; an index that does not answer in this long is unreachable.
+const PAGE_INDEX_HEALTH_TIMEOUT_MS = 3_000;
+
+function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  return Promise.race([
+    promise,
+    new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error('timeout')), ms); }),
+  ]).finally(() => clearTimeout(timer));
+}
 
 function maxStageFileBytes(path: string): number {
   if (extname(path).toLowerCase() === '.pdf') return PDF_PROCESSING_MAX_BYTES;
