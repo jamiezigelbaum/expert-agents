@@ -74,7 +74,7 @@ describe('Voyage client', () => {
     expect(await v.embed(['a', 'b'], 'query')).toEqual({ vectors: [[1], [2]], tokens: 7 });
     expect(bodies[0]).toMatchObject({ model: 'voyage-4', input_type: 'query', output_dimension: 1024 });
     expect(await v.rerank('q', ['x', 'y'], 1)).toEqual({ order: [{ index: 1, score: 0.9 }], tokens: 3 });
-    expect(bodies[1]).toMatchObject({ model: 'rerank-3', top_k: 1 });
+    expect(bodies[1]).toMatchObject({ model: 'rerank-2.5', top_k: 1 });
   });
 
   test('a refused call is an error that names no key', async () => {

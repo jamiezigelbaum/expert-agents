@@ -12,8 +12,8 @@
 //            back unchanged is never paid for twice.
 //   search   two arms over one source's chunks: full text scored by the IDF
 //            of the query's content words (ORed, never an AND of a sentence), and
-//            nearest vectors. Each arm keeps a unit's best chunk; `rerank-3`
-//            orders the vector arm's top 100 and the keyword arm's top 50 by
+//            nearest vectors. Each arm keeps a unit's best chunk; `rerank-2.5`
+//            orders the vector arm's top 200 and the keyword arm's top 50 by
 //            that chunk.
 //            Hits are units, so citations stay page- and section-addressed.
 //
@@ -28,7 +28,7 @@ import { PageLibraryError, type PageSearchHit } from './page-library.ts';
 
 export const PAGE_INDEX_EMBED_MODEL = 'voyage-4';
 export const PAGE_INDEX_DIMENSIONS = 1024;
-export const PAGE_INDEX_RERANK_MODEL = 'rerank-3';
+export const PAGE_INDEX_RERANK_MODEL = 'rerank-2.5';
 export const RRF_K = 60;
 export const CHUNK_WORDS = 380;
 export const CHUNK_OVERLAP_WORDS = 60;
@@ -36,8 +36,8 @@ export const CHUNK_OVERLAP_WORDS = 60;
 const CHUNK_SPLIT_WORDS = 480;
 const ARM_LIMIT = 100;
 const ARM_CHUNKS = 400;
-// The rerank pool is the vector arm's top 100 and the keyword arm's top 50, deduplicated.
-const VECTOR_POOL = 100;
+// The rerank pool is the vector arm's top 200 and the keyword arm's top 50, deduplicated.
+const VECTOR_POOL = 200;
 const KEYWORD_POOL = 50;
 // Query words in more than this share of the source's chunks carry no signal for the keyword arm.
 const KEYWORD_MAX_DF_SHARE = 0.2;
@@ -347,9 +347,9 @@ export class PageIndex {
   async search(source: string, query: string, k: number): Promise<PageSearchHit[]> {
     const q = query.trim();
     if (!q) return [];
-    const [keyword, embedded] = await Promise.all([this.keywordArm(source, q), this.voyage.embed([q], 'query')]);
+    const [keyword, embedded] = await Promise.all([this.keywordArm(source, q, KEYWORD_POOL), this.voyage.embed([q], 'query')]);
     this.tokens.embed += embedded.tokens;
-    const vector = await this.vectorArm(source, embedded.vectors[0]!);
+    const vector = await this.vectorArm(source, embedded.vectors[0]!, VECTOR_POOL);
     const pooled = new Set([...vector.slice(0, VECTOR_POOL), ...keyword.slice(0, KEYWORD_POOL)].map((h) => h.slug));
     const fused = reciprocalRankFusion([keyword.map((h) => h.slug), vector.map((h) => h.slug)]).filter((f) => pooled.has(f.slug));
     if (!fused.length) return [];

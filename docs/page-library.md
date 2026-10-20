@@ -101,8 +101,10 @@ reranked by Voyage.
   (title plus text). Vectors are also kept by text hash, so text that comes
   back unchanged, including under another source, is never paid for twice.
 - **Search** runs two arms over the chunks, each keeping a unit's best chunk.
-  Voyage `rerank-3` orders the vector arm's top 100 and the keyword arm's top
-  50 (deduplicated) by that best chunk.
+  Voyage `rerank-2.5` orders the vector arm's top 200 and the keyword arm's
+  top 50 (deduplicated) by that best chunk. Blending the arms' ranks into the
+  rerank score only lowered accuracy on the golden set; `rerank-2.5` edged
+  `rerank-3` on conceptual questions.
   - Keyword arm: the query's content words **ORed** (a sentence query is not
     an AND of every word, the failure that made GBrain's keyword arm useless
     on whole questions), each chunk scored by the summed IDF of the words it
