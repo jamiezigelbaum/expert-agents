@@ -114,6 +114,7 @@ import {
 import { completePassageSentences, completionSourceObject, SourceTextCache } from './passage-completion.ts';
 import { LibraryReader, LibraryReadError, parseLibraryReadParams, type LibraryReadRoute } from './library-reader.ts';
 import { PageIndex, voyageClient } from './page-index.ts';
+import { PageDisclosureRefusal, runDisclosedPageLibrary } from './page-disclosure.ts';
 import { PageLibrary, PageLibraryError, parsePageLibraryParams, type PageLibraryDependencies } from './page-library.ts';
 import { PageIngestError, PageIngestQueue, type IngestSourceInput, type PageIndexWriter } from './page-ingest.ts';
 
@@ -1092,8 +1093,9 @@ export class DomainExpertService {
 
   /**
    * The page library tool belt (docs/page-library.md). Refused for a domain
-   * without a pageLibrary route block and for any route with a disclosure
-   * policy.
+   * without a pageLibrary route block. A route with a disclosure policy serves
+   * it under the domain_ask bounds, per book and per session
+   * (page-disclosure.ts).
    */
   private async domainLibrary(params: Record<string, unknown>): Promise<unknown> {
     try {
@@ -1101,7 +1103,6 @@ export class DomainExpertService {
       const manifest = this.manifest(optionalStringField(params.domain_id, 'domainId').domainId);
       requireConfiguredAgent(manifest, 'domain_library');
       const route = this.agentRouting[manifest.domain_id]!;
-      if (route.disclosure) throw new PageLibraryError('page_library_not_disclosable', 'This deployment serves under a disclosure policy; the page library is not available.', 403);
       if (!route.pageLibrary) throw new PageLibraryError('page_library_not_configured', 'This domain has no page library.', 404);
       const config = route.pageLibrary;
       const key = `${manifest.domain_id}\u0000${config.root}\u0000${config.sourceId}`;
@@ -1128,8 +1129,19 @@ export class DomainExpertService {
         );
         this.pageLibraries.set(key, library);
       }
-      return { kind: 'domain_library_result', domain_id: manifest.domain_id, action: parsed.action, ...await library.run(parsed), policy: domainPolicy() };
+      const policy = this.disclosurePolicyFor(manifest.domain_id);
+      const body = policy
+        ? await runDisclosedPageLibrary(
+          library,
+          parsed,
+          policy,
+          this.disclosureSessions.ledgerFor(`${manifest.domain_id}\u0000${requireDisclosureSessionId(typeof params.session_id === 'string' ? params.session_id : undefined)}`),
+          config.sourceId,
+        )
+        : await library.run(parsed);
+      return { kind: 'domain_library_result', domain_id: manifest.domain_id, action: parsed.action, ...body, policy: domainPolicy() };
     } catch (error) {
+      if (error instanceof PageDisclosureRefusal) throw disclosureErrorFrom(error.refusal);
       if (error instanceof PageLibraryError) throw new DomainExpertWorkerError(error.status, error.code, error.message);
       throw error;
     }
