@@ -141,6 +141,7 @@ describe('schema 2 execution and metrics', () => {
     const fetchImpl: RetrievalEvalFetch = async (url, init = {}) => {
       if (url.endsWith('/v1/health')) return jsonResponse({ healthy: true });
       const body = JSON.parse(String(init.body));
+      if (body.tool === 'domain_library') return jsonResponse({ error: { code: 'page_library_not_configured' } }, 404);
       bodies.push(body);
       return jsonResponse(body.params.output === 'passages' ? passagesBody() : answerBody());
     };
@@ -164,6 +165,7 @@ describe('schema 2 execution and metrics', () => {
     let answerRequests = 0;
     const fetchImpl: RetrievalEvalFetch = async (url, init = {}) => {
       if (url.endsWith('/v1/health')) return jsonResponse({ healthy: true });
+      if (JSON.parse(String(init.body)).tool === 'domain_library') return jsonResponse({ error: { code: 'page_library_not_configured' } }, 404);
       if (JSON.parse(String(init.body)).params.output !== 'passages') answerRequests += 1;
       return jsonResponse(passagesBody());
     };
@@ -176,6 +178,29 @@ describe('schema 2 execution and metrics', () => {
     expect(answerRequests).toBe(0);
     expect(execution.mode).toBe('passages');
     expect(execution.questions.every((question) => question.answer === undefined)).toBeTrue();
+  });
+
+  test('a page-library domain is read through domain_library search, and only in passages mode', async () => {
+    const bodies: Array<{ tool: string; params: Record<string, unknown> }> = [];
+    const original = `gs://neutral/v2/book-imports/neutral-history/originals/${OBJECT_ID_A.slice('sha256:'.length)}.pdf`;
+    const fetchImpl: RetrievalEvalFetch = async (url, init = {}) => {
+      if (url.endsWith('/v1/health')) return jsonResponse({ healthy: true });
+      const body = JSON.parse(String(init.body));
+      bodies.push(body);
+      if (body.params.action === 'catalog') return jsonResponse({ books: [], total: 0, complete: true });
+      return jsonResponse({ results: [{ slug: 'books/neutral-book/p0012', cite: 'A. Author, Neutral Book, p.12', source_uri: original, text: `Before it: ${QUOTE_A} After it.` }] });
+    };
+    const set = validSetV2();
+    set.questions = [questionA()];
+    set.thresholds = { minPassageRecallAt: { k: 1, min: 1 } };
+    await expect(executeRetrievalEvalV2(set, { worker: { baseUrl: 'https://worker.test' }, fetchImpl, mode: 'both', nowMs: () => 0 }))
+      .rejects.toThrow('passages mode');
+    bodies.length = 0;
+    const execution = await executeRetrievalEvalV2(set, { worker: { baseUrl: 'https://worker.test' }, fetchImpl, mode: 'passages', nowMs: () => 0 });
+    expect(bodies.map((body) => body.tool)).toEqual(['domain_library', 'domain_library']);
+    expect(bodies[1]!.params).toMatchObject({ action: 'search', query: questionA().question });
+    const metrics = computeRetrievalEvalQuestionMetricsV2(execution.questions[0]!);
+    expect(metrics.passages).toMatchObject({ first_object_hit_rank: 1, first_passage_hit_rank: 1 });
   });
 
   test('computes object and passage hits at each cut-off with first-hit ranks', () => {

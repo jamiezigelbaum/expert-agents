@@ -104,12 +104,14 @@ describe('retrieval eval execution and metrics', () => {
       nowMs: () => clockValues.shift()!,
     });
 
-    expect(calls).toHaveLength(2);
+    // Health, the page-library probe (answered here with no catalog), then the question.
+    expect(calls).toHaveLength(3);
     expect(calls[0]).toEqual({
       url: 'https://worker.test/runtime/v1/health',
       authorization: 'Bearer synthetic-token',
     });
-    expect(calls[1]!.body).toEqual({
+    expect(calls[1]!.body).toEqual({ tool: 'domain_library', params: { domain_id: 'neutral-history', action: 'catalog' } });
+    expect(calls[2]!.body).toEqual({
       tool: 'domain_ask',
       params: {
         domain_id: 'neutral-history',

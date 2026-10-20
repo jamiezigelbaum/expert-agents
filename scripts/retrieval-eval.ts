@@ -251,6 +251,12 @@ export async function executeRetrievalEval(
   const fetchImpl = options.fetchImpl ?? fetch;
   const nowMs = options.nowMs ?? Date.now;
   await assertWorkerHealthy(worker, fetchImpl);
+  if (await readsPageLibrary(evalSet.domainId, worker, fetchImpl)) {
+    throw new Error(
+      `Retrieval eval: ${evalSet.domainId} reads a page library, which the worker does not answer from. `
+      + 'Use a schema-2 eval set in passages mode; answers are evaluated through the agent.',
+    );
+  }
 
   const questions: RetrievalEvalQuestionExecution[] = [];
   for (const question of evalSet.questions) {
@@ -553,21 +559,28 @@ async function postDomainAsk(
   fetchImpl: RetrievalEvalFetch,
   nowMs: () => number,
 ): Promise<DomainAskRawResult> {
+  return postWorkerTool('domain_ask', {
+    domain_id: domainId,
+    question: question.question,
+    ...(output === undefined ? {} : { output }),
+    ...(question.corpora === undefined ? {} : { corpora: question.corpora }),
+  }, worker, fetchImpl, nowMs);
+}
+
+async function postWorkerTool(
+  tool: string,
+  params: Record<string, unknown>,
+  worker: RetrievalEvalWorkerTarget,
+  fetchImpl: RetrievalEvalFetch,
+  nowMs: () => number,
+): Promise<DomainAskRawResult> {
   const startedAt = nowMs();
   let response: Response;
   try {
     response = await fetchImpl(`${worker.baseUrl}/v1/domain`, {
       method: 'POST',
       headers: requestHeaders(worker.token, true),
-      body: JSON.stringify({
-        tool: 'domain_ask',
-        params: {
-          domain_id: domainId,
-          question: question.question,
-          ...(output === undefined ? {} : { output }),
-          ...(question.corpora === undefined ? {} : { corpora: question.corpora }),
-        },
-      }),
+      body: JSON.stringify({ tool, params }),
     });
   } catch {
     return { kind: 'error', error: 'unreachable', latency_ms: elapsedMs(startedAt, nowMs()) };
@@ -1177,13 +1190,27 @@ export async function executeRetrievalEvalV2(
   const nowMs = options.nowMs ?? Date.now;
   const mode = options.mode ?? evalSet.mode;
   await assertWorkerHealthy(worker, fetchImpl);
+  const pageLibrary = await readsPageLibrary(evalSet.domainId, worker, fetchImpl);
+  if (pageLibrary && mode !== 'passages') {
+    throw new Error(
+      `Retrieval eval: ${evalSet.domainId} reads a page library, which the worker does not answer from. `
+      + 'Run it in passages mode (--mode passages); answers are evaluated through the agent.',
+    );
+  }
 
   const questions: RetrievalEvalQuestionExecutionV2[] = [];
   for (const question of evalSet.questions) {
     const execution: RetrievalEvalQuestionExecutionV2 = { question };
     if (mode !== 'answer') {
-      const raw = await postDomainAsk(evalSet.domainId, question, 'passages', worker, fetchImpl, nowMs);
-      execution.passages = raw.kind === 'error' ? raw : passagesResult(raw);
+      if (pageLibrary) {
+        const raw = await postWorkerTool('domain_library', {
+          domain_id: evalSet.domainId, action: 'search', query: question.question, k: PAGE_SEARCH_EVAL_K,
+        }, worker, fetchImpl, nowMs);
+        execution.passages = raw.kind === 'error' ? raw : pageSearchResult(raw);
+      } else {
+        const raw = await postDomainAsk(evalSet.domainId, question, 'passages', worker, fetchImpl, nowMs);
+        execution.passages = raw.kind === 'error' ? raw : passagesResult(raw);
+      }
     }
     if (mode !== 'passages') {
       const raw = await postDomainAsk(evalSet.domainId, question, undefined, worker, fetchImpl, nowMs);
@@ -1192,6 +1219,38 @@ export async function executeRetrievalEvalV2(
     questions.push(execution);
   }
   return { mode, questions };
+}
+
+/** The most hits one page-library search returns, so recall is measured at every cut-off up to 20. */
+const PAGE_SEARCH_EVAL_K = 25;
+
+/**
+ * Whether the domain's route reads a page library: only a catalog answer says so. Any refusal
+ * (page_library_not_configured, or a worker without domain_library) leaves it on domain_ask.
+ */
+async function readsPageLibrary(
+  domainId: string,
+  worker: RetrievalEvalWorkerTarget,
+  fetchImpl: RetrievalEvalFetch,
+): Promise<boolean> {
+  const raw = await postWorkerTool('domain_library', { domain_id: domainId, action: 'catalog' }, worker, fetchImpl, Date.now);
+  return raw.kind === 'body' && Array.isArray(asRecord(raw.body)?.books);
+}
+
+/** Page-library search hits as passages: each names its book's stored original, as domain_ask passages do. */
+function pageSearchResult(raw: Extract<DomainAskRawResult, { kind: 'body' }>): RetrievalEvalPassagesResult {
+  const results = asRecord(raw.body)?.results;
+  const passages: RetrievalEvalPassage[] = [];
+  if (Array.isArray(results)) {
+    for (const item of results) {
+      const hit = asRecord(item);
+      if (typeof hit?.slug !== 'string' || typeof hit.text !== 'string') { passages.length = 0; break; }
+      passages.push({ source_uri: typeof hit.source_uri === 'string' ? hit.source_uri : hit.slug, text: hit.text });
+    }
+  }
+  return Array.isArray(results) && passages.length === results.length
+    ? { kind: 'response', latency_ms: raw.latency_ms, passages: { kind: 'domain_passages', status: passages.length ? 'retrieved' : 'no_results', passages, retrieved_context_count: passages.length } }
+    : { kind: 'error', error: 'invalid_response', latency_ms: raw.latency_ms, http_status: raw.http_status };
 }
 
 function passagesResult(raw: Extract<DomainAskRawResult, { kind: 'body' }>): RetrievalEvalPassagesResult {
