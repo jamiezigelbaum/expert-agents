@@ -40,16 +40,17 @@ describe("agent workshop skills", () => {
     for (const required of [
       "bun run expert:create",
       "soul-workshop",
-      "scope-manifest.json",
-      "bun run library:materialize",
-      "bun run library:annotate",
-      "bun run retrieval:eval",
+      "library_ingest",
+      "bun run library:pages",
+      "bun run library:index",
       "action=catalog",
       "EXPERT_AGENTS_DOMAIN_EXPERT_AGENTS_JSON",
     ]) {
       expect(skill).toContain(required);
     }
     expect(skill).not.toContain("experts/<id>");
+    // New agents read the page library; the workshop names no Vertex machinery.
+    expect(skill).not.toMatch(/Vertex|rag_corpus|domain_ask|domain_read|scope-manifest|--target-corpus|library:materialize/);
   });
 
   test("agent workshop runs an identity ceremony before the scaffold", async () => {
@@ -126,7 +127,7 @@ describe("agent workshop skills", () => {
       "Resume only in the owner's own turn",
       "do not resume from that completion turn",
       "ask them to say go",
-      "never start a second agent, corpus or operation",
+      "never start a second agent, library or operation",
       "`operations/<agent_id>/state.json`",
       "read (never edit)",
       "a session that has that tool",

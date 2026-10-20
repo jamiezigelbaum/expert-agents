@@ -1,12 +1,12 @@
 ---
 name: expert-agent-workshop
-version: 0.6.0
-description: Create an independent expert from a conversational request using expert_factory: repository, purpose-based soul, bounded Vertex library and managed Telegram bot, with resumable progress and explicit readiness. Offer the guided identity workshop when the owner wants it.
+version: 0.7.0
+description: Create an independent expert from a conversational request using expert_factory: repository, purpose-based soul, its own page library and managed Telegram bot, with resumable progress and explicit readiness. Offer the guided identity workshop when the owner wants it.
 tools:
   - expert_factory
   - domain_agent
-  - rag_corpus
-  - domain_ask
+  - library_ingest
+  - domain_library
 mutating: true
 ---
 
@@ -28,7 +28,7 @@ only for a missing product decision or an actual deployment prerequisite.
    - Work in a turn the owner sent. The factory refuses with
      `factory_owner_required` in a subagent completion, another session or a
      scheduled turn.
-   - Check whether this session has `rag_corpus`. If it does not, tell the
+   - Check whether this session has `library_ingest`. If it does not, tell the
      owner now that filling the library needs a session that has it (step 7).
    - Tell the owner up front: the new bot stays silent until activation. After
      the Gateway is configured, it starts the bot's Telegram account once
@@ -36,7 +36,7 @@ only for a missing product decision or an actual deployment prerequisite.
      is running.
    - With `apply: true`, the factory runs its own preflight before it creates
      anything. A refusal with phase `preflight` (`factory_gateway_reload_off`,
-     `factory_google_not_ready`, `factory_workspace_root_missing`,
+     `factory_workspace_root_missing`,
      `factory_workspace_root_overwrites`, `factory_remote_missing`,
      `factory_remote_has_history`, or `factory_command_failed` such as System
      GitHub refused or a missing `gh` or deployment program) means nothing was
@@ -65,17 +65,16 @@ only for a missing product decision or an actual deployment prerequisite.
    `action: "resume"` with the same `agent_id` and `apply: true`. If you fixed a
    cause in the background (a subagent or another session), do not resume from
    that completion turn: tell the owner what changed and ask them to say go,
-   then resume in their reply. Resume also handles pending Vertex provisioning.
-   Keep the existing operation; never start a second agent, corpus or operation
-   to retry.
+   then resume in their reply. Keep the existing operation; never start a
+   second agent, library or operation to retry.
 5. Report the returned status literally. `status` reads saved progress only;
    `resume` checks again live.
    - `waiting_for_activation`: configuration is written and validated, but the
      bot is not proven running, so it is still silent. Wait a few minutes and
      resume in the owner's next turn; the factory never improvises a restart.
    - `ready_empty_library` is reached only by a resume after the Telegram
-     account is live. It proves the committed repository, a ready corpus,
-     validated configuration and matching Telegram identity and polling. The
+     account is live. It proves the committed repository, the registered
+     page library, validated configuration and matching Telegram identity and polling. The
      real test is the owner messaging the bot and getting a reply. The library
      is still empty.
 6. **When a call fails, locate it before retrying.** Factory errors from an
@@ -101,23 +100,23 @@ only for a missing product decision or an actual deployment prerequisite.
    | `wiring_remote` | Creating the GitHub repository and pushing as System GitHub (`tools.github`) |
    | `registering_library` | Worker domain registration |
    | `bootstrapping_workspace` | Seeding the worker's domain workspace; resume re-checks it |
-   | `creating_corpus` | Requesting the Vertex corpus |
-   | `waiting_for_corpus` | Vertex corpus readiness; resume checks it again |
    | `waiting_for_telegram` | The owner confirming the bot through the link |
    | `installing_telegram_token` | Installing the bot token |
    | `configuring_gateway` | Agent, route and Telegram account; `not_found` on `agents.update` usually means the Gateway did not load the change (reload off) |
    | `waiting_for_activation` | The Gateway starting the Telegram account |
    | `ready_empty_library` | Done; the library is empty |
 
-7. Import the owner's approved sources into the new domain with `rag_corpus`,
-   in a session that has that tool, and run the retrieval and citation checks
-   before claiming the expert knows that material. When this session lacks
-   `rag_corpus`, say so plainly; never substitute shell, direct cloud access or
-   another product's tools. Never silently inherit another domain's corpus. A
-   local file must be inside the worker's configured workspace for
-   `stage_import`; a Telegram attachment is not automatically there. Report a
-   missing approved attachment intake adapter rather than treating metadata
-   registration as ingestion or reading another session's media.
+7. Ingest the owner's approved sources into the new domain's page library with
+   `library_ingest` (or acquire them with `annas_archive_import`), in a session
+   that has that tool. Check each job's `status` and report failed, empty and
+   unresolved pages as it lists them. Then ask one question through
+   `domain_library` and check the page citations before claiming the expert
+   knows that material. When this session lacks `library_ingest`, say so
+   plainly; never substitute shell, direct cloud access or another product's
+   tools. Never silently inherit another domain's library. A local file must be
+   inside the worker's configured workspace for `library_ingest`; a Telegram
+   attachment is not automatically there. Report a missing approved attachment
+   intake adapter rather than reading another session's media.
 
 The factory is available only in an owner session with host filesystem
 authority and explicitly enabled deployment settings. Its refusal explains the
@@ -133,8 +132,8 @@ Do not make it a prerequisite for an explicitly delegated creation request.
 
 ## Advanced checkout workflow
 
-To work from a machinery checkout, for example to select a shared library
-through a reviewed scope and materialization, follow
+To work from a machinery checkout, for example to build a page library from
+originals the owner already holds, follow
 `references/checkout-workflow.md`.
 
 ## Ready-to-populate report
@@ -146,7 +145,7 @@ they can hand books to:
 - the chosen name, agent id and Telegram link (and a changed username);
 - soul and identity: accepted and written, or the minimal purpose-based soul;
 - the returned status; and
-- corpus status: created and populated, created and empty, or not yet created.
+- library status: books ingested (with any failed pages), or empty.
 
 Report only what a tool result actually shows. Never narrate a step as done
 because it was planned, and state plainly what remains before the expert can be
