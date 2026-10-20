@@ -66,6 +66,21 @@ export interface AgentRoutingEntry {
    * existed keeps behaving exactly as it did.
    */
   disclosure?: AgentDisclosureConfig;
+  /**
+   * Optional. The page library (docs/page-library.md): an assembled tree of
+   * page-addressed units on the worker host and the source id it was imported
+   * under in the page search index (the index's database URL and Voyage key
+   * are worker secrets, not routing). Absent, the domain_library tool refuses
+   * for this domain.
+   */
+  pageLibrary?: AgentPageLibraryConfig;
+}
+
+export interface AgentPageLibraryConfig {
+  /** Absolute path of the assembled tree (catalog.json + books/). */
+  root: string;
+  /** Search index source id the tree was imported under. */
+  sourceId: string;
 }
 
 export type AgentRoutingConfig = Readonly<Record<string, Readonly<AgentRoutingEntry>>>;
@@ -122,7 +137,7 @@ function validateRoutingEntry(domainId: string, value: unknown): AgentRoutingEnt
   const entry = requireRecord(value, 'an entry must be an object');
   requireExactKeys(
     entry,
-    ['displayName', 'library', 'readOnlySourceRoots', 'targetCorpusDisplayName', 'servingCorpusDisplayNames', 'scopeManifestPath', 'retrieval', 'ingestion', 'disclosure'],
+    ['displayName', 'library', 'readOnlySourceRoots', 'targetCorpusDisplayName', 'servingCorpusDisplayNames', 'scopeManifestPath', 'retrieval', 'ingestion', 'disclosure', 'pageLibrary'],
     'an entry',
   );
   if (!('library' in entry) || !('targetCorpusDisplayName' in entry)) {
@@ -167,6 +182,8 @@ function validateRoutingEntry(domainId: string, value: unknown): AgentRoutingEnt
     }
   }
 
+  const pageLibrary = entry.pageLibrary === undefined ? undefined : validatePageLibrary(entry.pageLibrary);
+
   return {
     domainId,
     ...(displayName ? { displayName } : {}),
@@ -181,7 +198,18 @@ function validateRoutingEntry(domainId: string, value: unknown): AgentRoutingEnt
     ...(retrieval ? { retrieval } : {}),
     ...(ingestion ? { ingestion } : {}),
     ...(disclosure ? { disclosure } : {}),
+    ...(pageLibrary ? { pageLibrary } : {}),
   };
+}
+
+function validatePageLibrary(value: unknown): AgentPageLibraryConfig {
+  const entry = requireRecord(value, 'pageLibrary must be an object');
+  requireExactKeys(entry, ['root', 'sourceId'], 'pageLibrary');
+  const root = requireNonEmptyString(entry.root, 'pageLibrary root');
+  if (!root.startsWith('/') || root.split('/').includes('..')) throw new AgentRoutingConfigError('pageLibrary root must be an absolute path');
+  const sourceId = requireNonEmptyString(entry.sourceId, 'pageLibrary sourceId');
+  if (!/^[a-z0-9][a-z0-9-]{0,63}$/.test(sourceId)) throw new AgentRoutingConfigError('pageLibrary sourceId is invalid');
+  return Object.freeze({ root, sourceId });
 }
 
 function validateServingCorpora(value: unknown): string[] {

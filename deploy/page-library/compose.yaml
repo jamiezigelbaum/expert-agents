@@ -1,0 +1,24 @@
+# The page library's search index: Postgres 17 with pgvector, bound to
+# loopback. The worker (packages/runtime/.../page-index.ts) and the operator
+# CLI (scripts/page-index.ts) are its only clients. The password comes from
+# page-library.env (not in Git; see page-library.env.example).
+name: page-library
+services:
+  postgres:
+    image: pgvector/pgvector:0.8.1-pg17
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: pages
+      POSTGRES_DB: pages
+      POSTGRES_PASSWORD: ${PAGE_LIBRARY_PG_PASSWORD:?set in page-library.env}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:5442:5432"
+    command: ["postgres", "-c", "shared_buffers=2GB", "-c", "maintenance_work_mem=1GB", "-c", "max_connections=100"]
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "pages"]
+      interval: 5s
+      retries: 10
+volumes:
+  pgdata:

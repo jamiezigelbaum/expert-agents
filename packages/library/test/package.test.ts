@@ -22,15 +22,21 @@ describe("@expert-agents/library package", () => {
       "EbookConversionError", "convertEpubToMarkdown", "decodeXmlEntities", "plainTextToMarkdown",
       "resolveArchivePath", "xhtmlToMarkdown",
       "PdfSplitError", "pdfPageLimitSetting", "pdfPartStem", "pdfTextLayer", "planPdfParts", "qpdfPageCount", "splitPdf", "stripPdfPartSuffix",
+      "bookId", "offsetUnits", "pageDerivativePrefix", "pageNeedsOcr", "parseUnitSlug", "partOf", "renderUnitMarkdown",
+      "sectionText", "slugify", "splitPdfText", "unitBody", "unitName", "unitNumber", "unitSlug",
+      "describeFigures", "escalatePage", "figurePagesFromImageList", "hasFigureCaption", "looksLikeRefusal", "ocrEscalationReason", "ocrPage",
+      "parseFigureReply", "readPage", "stripGrounding", "visionCall",
     ] as const;
     const numbers = [
       "EXTRACTION_MAX_OUTPUT_BYTES", "EXTRACTION_TIMEOUT_MS", "LIBRARY_SCHEMA_VERSION",
       "MATERIALIZATION_LEDGER_SCHEMA_VERSION", "RAG_CHUNK_OVERLAP", "RAG_CHUNK_TOKENS",
       "RECONCILIATION_PLAN_SCHEMA_VERSION", "SCOPE_SCHEMA_VERSION", "LLM_PARSER_MAX_PDF_PAGES",
+      "OCR_MIN_CHARS", "PAGE_UNITS_SCHEMA_VERSION", "SECTION_TARGET_WORDS", "DENSE_PAGE_JPEG_BYTES",
     ] as const;
     const strings = [
       "AGENT_REPO_GITIGNORE", "DEFAULT_RAG_PARSER_MODEL", "EXTRACTION_METHOD",
       "RAG_PARSER_DEFAULT_VALUE", "SUMMARIZE_BINARY", "SUMMARIZE_INSTALL_COMMAND", "PDF_SPLIT_PAGES_ENV", "DEFAULT_QPDF_BIN",
+      "DEEPSEEK_OCR_MODEL", "DEEPSEEK_OCR_PROMPT", "VISION_LANE_MODEL",
     ] as const;
 
     expect(Object.keys(library).sort()).toEqual([...functions, ...numbers, ...strings,
