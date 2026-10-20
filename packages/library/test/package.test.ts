@@ -24,7 +24,7 @@ describe("@expert-agents/library package", () => {
       "PdfSplitError", "pdfPageLimitSetting", "pdfPartStem", "pdfTextLayer", "planPdfParts", "qpdfPageCount", "splitPdf", "stripPdfPartSuffix",
       "bookId", "offsetUnits", "pageDerivativePrefix", "pageNeedsOcr", "parseUnitSlug", "partOf", "renderUnitMarkdown",
       "sectionText", "slugify", "splitPdfText", "unitBody", "unitName", "unitNumber", "unitSlug",
-      "describeFigures", "escalatePage", "figurePagesFromImageList", "hasFigureCaption", "looksLikeRefusal", "ocrEscalationReason", "ocrPage",
+      "deepLane", "describeFigures", "escalatePage", "figurePagesFromImageList", "hasFigureCaption", "looksLikeRefusal", "ocrEscalationReason", "ocrPage",
       "parseFigureReply", "readPage", "stripGrounding", "visionCall",
       "derivativeManifest", "emptyParseUsage", "isEpub", "isPdf", "parseObject", "pool", "sha256Hex", "upsertCatalog", "writeBook", "writeParsedBook",
     ] as const;
@@ -37,7 +37,7 @@ describe("@expert-agents/library package", () => {
     const strings = [
       "AGENT_REPO_GITIGNORE", "DEFAULT_RAG_PARSER_MODEL", "EXTRACTION_METHOD",
       "RAG_PARSER_DEFAULT_VALUE", "SUMMARIZE_BINARY", "SUMMARIZE_INSTALL_COMMAND", "PDF_SPLIT_PAGES_ENV", "DEFAULT_QPDF_BIN",
-      "DEEPSEEK_OCR_MODEL", "DEEPSEEK_OCR_PROMPT", "VISION_LANE_MODEL", "LANE_CACHE",
+      "OCR_PROFILE", "DEEP_PROFILE", "DEEPSEEK_OCR_PROMPT", "LANE_CACHE",
     ] as const;
 
     expect(Object.keys(library).sort()).toEqual([...functions, ...numbers, ...strings,

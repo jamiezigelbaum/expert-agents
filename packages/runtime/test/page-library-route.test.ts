@@ -222,7 +222,7 @@ describe('health reports page-library readiness', () => {
         }),
         pageSearch: async () => [],
         pageIndexStatus: async (sourceId) => sourceId === 'history' ? { units: 2, chunks: 2, pending_embeddings: 1 } : { units: 0, chunks: 0, pending_embeddings: 0 },
-        ocrLanes: { ollamaUrl: 'http://ollama.invalid' },
+        ocrLanes: { routerUrl: 'http://router.invalid/v1', deep: false },
         google: { accessToken: 'synthetic-token', fetchImpl: (async () => { throw new Error('no network'); }) as unknown as typeof fetch },
       });
       const health = await healthOf(worker);

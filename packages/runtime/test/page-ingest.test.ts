@@ -14,10 +14,10 @@ let workspace: string;
 const scanText = 'Chapter Two. A scanned page read by the local OCR lane, with more than enough words and letters to stand on its own as the text of the page.';
 const figureReply = JSON.stringify({ figures: [{ label: 'Figure 1', caption: 'The four quadrants of the map.', description: 'A square divided into four labelled quadrants.' }] });
 
-const ocrFetch = (async (url: string, init: RequestInit) => {
-  if (String(url).endsWith('/api/generate')) return Response.json({ response: scanText, done_reason: 'stop' });
-  void init;
-  return Response.json({ choices: [{ finish_reason: 'stop', message: { content: figureReply } }] });
+// The model router: the OCR profile reads scans, the deep profile describes figures.
+const ocrFetch = (async (_url: string, init: RequestInit) => {
+  const profile = JSON.parse(String(init.body)).model;
+  return Response.json({ choices: [{ finish_reason: 'stop', message: { content: profile === 'delphi/vision-quality' ? scanText : figureReply } }] });
 }) as unknown as typeof fetch;
 
 function recordingWriter() {
@@ -69,7 +69,7 @@ function worker(options: { writer?: PageIndexWriter; uploads?: string[]; downloa
     } }),
     annas: { importGcsPrefix: 'gs://neutral-acquisitions/imports/', ...(options.annas ?? {}) },
     ...(options.acquisitionFetch ? { fetchImpl: options.acquisitionFetch } : {}),
-    ocrLanes: { ollamaUrl: 'http://ollama.invalid', visionUrl: 'http://vision.invalid/v1', fetch: ocrFetch },
+    ocrLanes: { routerUrl: 'http://router.invalid/v1', fetch: ocrFetch },
     ...(options.writer ? { pageIndexWriter: options.writer } : {}),
     pageSearch: async () => [],
     google: { accessToken: 'synthetic-token', fetchImpl },

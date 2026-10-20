@@ -149,7 +149,8 @@ A page-library domain also needs the page index and its writer
 (`EXPERT_AGENTS_DOMAIN_EXPERT_PAGE_INDEX_DATABASE_URL`,
 `EXPERT_AGENTS_DOMAIN_EXPERT_PAGE_INDEX_WRITER_DATABASE_URL`,
 `EXPERT_AGENTS_DOMAIN_EXPERT_VOYAGE_API_KEY`) and the local OCR lanes
-(`EXPERT_AGENTS_DOMAIN_EXPERT_OLLAMA_URL`, `EXPERT_AGENTS_DOMAIN_EXPERT_VISION_URL`).
+(`EXPERT_AGENTS_DOMAIN_EXPERT_OCR_ROUTER_URL`, a local model router named by
+profile, never by model).
 The index's Postgres runs from `deploy/page-library/compose.yaml`; give the
 serving URL a SELECT-only role and the writer URL a role that may insert and
 delete (`SELECT, INSERT, UPDATE, DELETE` on `page_units`, `page_chunks` and
