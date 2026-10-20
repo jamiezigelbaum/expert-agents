@@ -369,6 +369,25 @@ function metaFromFilename(uri: string): Meta {
   return { creator: words(creator), title: words(title).replace(/\s(19|20)\d\d$/, "") || words(stem) };
 }
 
+const SMALL_WORDS = new Set(["a", "an", "and", "as", "at", "but", "by", "for", "in", "of", "on", "or", "the", "to", "vs", "via", "with"]);
+// File names are lower case; a name that already has capitals is left alone.
+function titleCase(s: string): string {
+  if (s !== s.toLowerCase()) return s;
+  return s.split(" ").map((w, i) => i > 0 && SMALL_WORDS.has(w) ? w : w.replace(/(^|[.(-])([a-z])/g, (_, p: string, c: string) => p + c.toUpperCase())).join(" ");
+}
+
+// Display names only: the book id keeps its own derivation so ids stay stable
+// across metadata fixes. An arXiv-style file name ("1209.1179v1") titles the
+// book by its first line instead.
+function displayMeta(title: string, creator: string, fromManifest: boolean, firstText: string): Meta {
+  if (fromManifest) return { title, creator };
+  if (/^\d{4}\.\d{4,5}(v\d+)?$/.test(title)) {
+    const line = firstText.split("\n").map((l) => l.replace(/^#+\s*/, "").trim()).find((l) => l.length >= 10);
+    if (line && line.length <= 160) title = line;
+  }
+  return { title: titleCase(title), creator: titleCase(creator) };
+}
+
 async function commandAssemble(args: Args): Promise<void> {
   const out = resolve(need(args, "out"));
   const tree = resolve(need(args, "tree"));
@@ -414,13 +433,14 @@ async function commandAssemble(args: Args): Promise<void> {
       offset += own.length;
     }
     let title = (m?.title ?? fallback.title).replace(/\s*[([]?part\s+\d+\s+of\s+\d+[)\]]?\s*$/i, "").trim() || fallback.title;
-    const creator = m?.creator ?? fallback.creator;
+    let creator = m?.creator ?? fallback.creator;
     if (!m?.title && kind === "sections") {
       const h1 = /^#\s+(.{3,120})$/m.exec(units[0]?.text ?? "");
       if (h1 && !members[0]!.uri.includes("---")) title = h1[1]!.trim();
     }
     title = decodeEntities(title);
     const book = bookId(title, first.objectId);
+    ({ title, creator } = displayMeta(title, creator, Boolean(m?.title), units[0]?.text ?? ""));
     const bookDir = join(tree, "books", book);
     await mkdir(bookDir, { recursive: true });
     const label = creator ? `${creator}, ${title}` : title;

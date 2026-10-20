@@ -119,8 +119,7 @@ things the agent instructions need:
 
 ## Evaluation
 
-Eval sets and receipts live in each agent's repository (for Guru,
-`guru-deva/library/`), never here. The shadow is scored on the same questions
+Eval sets and receipts live in each agent's own repository, never here. The shadow is scored on the same questions
 as Vertex. Each passage is scored three ways:
 - the repo rule (`scripts/retrieval-eval.ts`): source match plus ordered-word
   quote coverage;
