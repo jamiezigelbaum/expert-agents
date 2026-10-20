@@ -7,6 +7,16 @@ import { OperationError } from './operation-error.ts';
 import { writeExclusiveDurably } from './durable-file.ts';
 
 export const REGISTRATION_LIBRARY_ENV = 'EXPERT_AGENTS_DOMAIN_EXPERT_REGISTRATION_LIBRARY_JSON';
+/** Directory holding each page-library domain's assembled tree, one subdirectory per domain. */
+export const PAGE_LIBRARY_ROOT_ENV = 'EXPERT_AGENTS_DOMAIN_EXPERT_PAGE_LIBRARY_ROOT';
+export const DEFAULT_PAGE_LIBRARY_ROOT = '/var/lib/expert-agents/page-library';
+
+export function pageLibraryRootFromEnv(env: Record<string, string | undefined> = process.env): string {
+  const raw = env[PAGE_LIBRARY_ROOT_ENV]?.trim();
+  if (!raw) return DEFAULT_PAGE_LIBRARY_ROOT;
+  if (!raw.startsWith('/') || raw.split('/').includes('..')) throw new OperationError('invalid_page_library_root', `${PAGE_LIBRARY_ROOT_ENV} must be an absolute path.`);
+  return raw.replace(/\/+$/, '') || '/';
+}
 
 export function registrationLibraryFromEnv(env: Record<string, string | undefined> = process.env): LibraryLocationConfig | undefined {
   const raw = env[REGISTRATION_LIBRARY_ENV];
@@ -18,7 +28,8 @@ export function registrationLibraryFromEnv(env: Record<string, string | undefine
 /** Only an operator-configured library subtree can become a new runtime route. */
 export class AgentRegistrationStore {
   private readonly directory: string;
-  constructor(dataDir: string, private readonly base: AgentRoutingConfig, private readonly allowed?: LibraryLocationConfig) {
+  constructor(dataDir: string, private readonly base: AgentRoutingConfig, private readonly allowed?: LibraryLocationConfig,
+    private readonly pageLibraryRoot: string = DEFAULT_PAGE_LIBRARY_ROOT) {
     this.directory = join(dataDir, 'agent-registrations');
   }
 
@@ -36,7 +47,7 @@ export class AgentRegistrationStore {
         const route = this.validate(domain, value);
         // Deployments can withdraw registration authority or replace it with
         // explicit environment routing; persisted data cannot override either.
-        if (!this.base[domain] && this.withinLibrary(route[domain]!.library)) registered[domain] = route[domain]!;
+        if (!this.base[domain] && this.withinLibrary(route[domain]!.library!)) registered[domain] = route[domain]!;
       }
       return Object.freeze({ ...registered, ...this.base });
     } catch { throw new OperationError('agent_registration_store_invalid', 'The persisted agent registration store could not be validated.'); }
@@ -45,17 +56,22 @@ export class AgentRegistrationStore {
   register(domain: string, value: unknown, dryRun: boolean): { routes: AgentRoutingConfig; existing: boolean } {
     if (!this.allowed) throw new OperationError('agent_registration_disabled', 'Agent registration requires an operator-configured registration library.');
     const candidate = this.validate(domain, value);
-    if (!this.withinLibrary(candidate[domain]!.library)) throw new OperationError('agent_registration_library_denied', 'The requested library is outside the configured registration library.');
+    const route = candidate[domain]!;
+    if (!this.withinLibrary(route.library!)) throw new OperationError('agent_registration_library_denied', 'The requested library is outside the configured registration library.');
     if (this.base[domain]) throw new OperationError('agent_registration_conflict', 'The domain is already configured by the deployment.');
     const routes = this.routes();
-    if (Object.entries(routes).some(([id, route]) => id !== domain && route.targetCorpusDisplayName === candidate[domain]!.targetCorpusDisplayName)) {
+    if (route.targetCorpusDisplayName && Object.entries(routes).some(([id, other]) => id !== domain && other.targetCorpusDisplayName === route.targetCorpusDisplayName)) {
       throw new OperationError('agent_registration_conflict', 'The corpus name is already assigned to another agent.');
     }
+    if (route.pageLibrary && Object.entries(routes).some(([id, other]) => id !== domain
+      && (other.pageLibrary?.sourceId === route.pageLibrary!.sourceId || other.pageLibrary?.root === route.pageLibrary!.root))) {
+      throw new OperationError('agent_registration_conflict', 'The page library is already assigned to another agent.');
+    }
     const existing = routes[domain];
-    if (existing && canonicalJson(existing) !== canonicalJson(candidate[domain])) throw new OperationError('agent_registration_conflict', 'The domain is registered with different settings.');
-    if (!dryRun && !existing) {
+    if (existing && canonicalJson(existing) !== canonicalJson(route)) throw new OperationError('agent_registration_conflict', 'The domain is registered with different settings.');
+    if (!dryRun && !existing && route.targetCorpusDisplayName) {
       const reservations = join(this.directory, 'corpus-reservations');
-      const nameHash = createHash('sha256').update(candidate[domain]!.targetCorpusDisplayName).digest('hex');
+      const nameHash = createHash('sha256').update(route.targetCorpusDisplayName).digest('hex');
       const reservationPath = join(reservations, `${nameHash}.json`);
       // Keep reservation identity compatible with records written before the
       // computed client-receipt default. It is not an owner-selected setting.
@@ -70,6 +86,8 @@ export class AgentRegistrationStore {
         if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
         if (readFileSync(reservationPath, 'utf8') !== reservation) throw new OperationError('agent_registration_conflict', 'The corpus name has already been reserved for another registration.');
       }
+    }
+    if (!dryRun && !existing) {
       try {
         // Exclusive creation prevents a second worker from overwriting a
         // concurrent registration. A partial write fails closed on reload.
@@ -85,19 +103,37 @@ export class AgentRegistrationStore {
   }
 
   private validate(domain: string, value: unknown): AgentRoutingConfig {
-    if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).some(key => !['displayName', 'library', 'targetCorpusDisplayName'].includes(key))) {
+    if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).some(key => !['displayName', 'library', 'targetCorpusDisplayName', 'pageLibrary'].includes(key))) {
       throw new OperationError('invalid_agent_registration', 'Agent registration contains unsupported settings.');
+    }
+    const record = value as Record<string, unknown>;
+    if (record.library === undefined) throw new OperationError('invalid_agent_registration', 'A registration names the library subtree that holds its originals.');
+    // A registrant chooses only to have a page library; its tree directory
+    // and index source are the operator's, derived from the domain id, so a
+    // registration can never point the worker at another path or source.
+    let pageLibrary: { root: string; sourceId: string } | undefined;
+    if (record.pageLibrary !== undefined) {
+      const requested = record.pageLibrary;
+      if (!requested || typeof requested !== 'object' || Array.isArray(requested)
+        || Object.keys(requested).some(key => key !== 'sourceId')
+        || ((requested as Record<string, unknown>).sourceId !== undefined && (requested as Record<string, unknown>).sourceId !== domain)) {
+        throw new OperationError('invalid_agent_registration', 'A registration page library is {} or {"sourceId": <domain>}.');
+      }
+      pageLibrary = { root: `${this.pageLibraryRoot}/${domain}`, sourceId: domain };
     }
     // Runtime corpus lookup also accepts numeric ids and resource names. A
     // factory registration must name a new display-name identity, never one
     // of those alternative lookup spellings for an existing corpus.
-    const target = (value as Record<string, unknown>).targetCorpusDisplayName;
-    if (typeof target !== 'string' || target.length > 128 || !/^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$/.test(target)) {
+    const target = record.targetCorpusDisplayName;
+    if (target === undefined && !pageLibrary) {
+      throw new OperationError('invalid_agent_registration', 'A registration needs a page library or a corpus name.');
+    }
+    if (target !== undefined && (typeof target !== 'string' || target.length > 128 || !/^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$/.test(target))) {
       throw new OperationError('invalid_agent_registration', 'A registration corpus name must be a lowercase name beginning with a letter and containing only letters, digits, and single hyphens.');
     }
     // Applied equally to new requests and old persisted registrations, while
     // the strict input shape above prevents callers from choosing sink policy.
-    try { return validateAgentRoutingConfig({ [domain]: { ...value, ingestion: { importResultSink: 'client' } } }); }
+    try { return validateAgentRoutingConfig({ [domain]: { ...record, ...(pageLibrary ? { pageLibrary } : {}), ingestion: { importResultSink: 'client' } } }); }
     catch { throw new OperationError('invalid_agent_registration', 'Agent registration settings are invalid.'); }
   }
 

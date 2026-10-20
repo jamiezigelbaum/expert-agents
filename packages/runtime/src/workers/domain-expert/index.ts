@@ -36,6 +36,7 @@ import {
   planRagCorpus,
   configuredCorpusId,
   requireConfiguredAgent,
+  requireVertexAgent,
   resolveTargetCorpus,
 } from '../../core/domain-expert.ts';
 import type {
@@ -49,7 +50,7 @@ import type {
   RagCorpusParams,
 } from '../../core/domain-expert.ts';
 import { vertexImportOperationCandidate, vertexImportSubmissionReceipt } from '../../core/vertex-import-submission.ts';
-import { AgentRegistrationStore, registrationLibraryFromEnv } from '../../core/agent-registration.ts';
+import { AgentRegistrationStore, pageLibraryRootFromEnv, registrationLibraryFromEnv } from '../../core/agent-registration.ts';
 import { replaceDurably, writeExclusiveDurably } from '../../core/durable-file.ts';
 import { loadRetrievalPreferenceFile } from '../../core/retrieval-preference-file.ts';
 import { OperationError } from '../../core/operation-error.ts';
@@ -94,6 +95,7 @@ import {
   type AgentRoutingConfig,
   type AgentRoutingEntry,
   type ExplicitCorpusOperation,
+  pageLibraryOriginalBuckets,
 } from '../../core/agent-routing.ts';
 import {
   DISCLOSURE_REFUSAL_CODES,
@@ -110,7 +112,7 @@ import {
   type DisclosureSummary,
 } from '../../core/disclosure.ts';
 import { completePassageSentences, completionSourceObject, SourceTextCache } from './passage-completion.ts';
-import { LibraryReader, LibraryReadError, parseLibraryReadParams } from './library-reader.ts';
+import { LibraryReader, LibraryReadError, parseLibraryReadParams, type LibraryReadRoute } from './library-reader.ts';
 import { PageIndex, voyageClient } from './page-index.ts';
 import { PageLibrary, PageLibraryError, parsePageLibraryParams, type PageLibraryDependencies } from './page-library.ts';
 
@@ -262,6 +264,8 @@ export interface DomainExpertWorkerOptions {
   summarizeBin?: string;
   summarizeExtract?: ReferenceExtractor;
   basePath?: string;
+  /** Directory of registered domains' page-library trees; defaults to EXPERT_AGENTS_DOMAIN_EXPERT_PAGE_LIBRARY_ROOT. */
+  pageLibraryRoot?: string;
   /** Postgres URL of the page library's search index; defaults to EXPERT_AGENTS_DOMAIN_EXPERT_PAGE_INDEX_DATABASE_URL. */
   pageIndexDatabaseUrl?: string;
   /** Voyage API key for page search embeddings and reranking; defaults to EXPERT_AGENTS_DOMAIN_EXPERT_VOYAGE_API_KEY. */
@@ -862,7 +866,7 @@ export class DomainExpertService {
     this.dataDir = options.dataDir ?? join(tmpdir(), `expert-agents-domain-expert-${currentUid()}`);
     ensurePrivateDataDirectory(this.dataDir);
     this.registrationLibrary = options.registrationLibrary ?? registrationLibraryFromEnv();
-    this.registrations = new AgentRegistrationStore(this.dataDir, this.agentRouting, this.registrationLibrary);
+    this.registrations = new AgentRegistrationStore(this.dataDir, this.agentRouting, this.registrationLibrary, options.pageLibraryRoot ?? pageLibraryRootFromEnv());
     this.agentRouting = this.registrations.routes();
     this.resolveHostImpl = options.resolveHostImpl ?? defaultResolveHost;
     // Only a configured path is forwarded: an unset value leaves summarize to
@@ -957,7 +961,7 @@ export class DomainExpertService {
   // roots and the registration library count, including the domain's own library.
   private acquisitionDirectoryConflicts(uri: string): boolean {
     const locations = [
-      ...Object.values(this.agentRouting).flatMap((route) => [route.library, ...(route.readOnlySourceRoots ?? [])]),
+      ...Object.values(this.agentRouting).flatMap((route) => [...(route.library ? [route.library] : []), ...(route.readOnlySourceRoots ?? [])]),
       ...(this.registrationLibrary ? [this.registrationLibrary] : []),
     ];
     return locations.some((location) => gcsPrefixesCover([uri], `gs://${location.bucket}/${location.prefix}`));
@@ -976,13 +980,15 @@ export class DomainExpertService {
 
   // The route direct reading uses: the configured route plus the domain's acquisition directory
   // as a read-only source root, when its library does not already contain it.
-  private readableRoute(domainId: string): Readonly<AgentRoutingEntry> {
+  private readableRoute(domainId: string): LibraryReadRoute {
     const route = this.agentRouting[domainId]!;
+    if (!route.library || !route.targetCorpusDisplayName) throw new LibraryReadError('vertex_not_configured', 'domain_read reads a Vertex library; this domain is served from the page library (domain_library).', 404);
+    const vertexRoute = { ...route, library: route.library, targetCorpusDisplayName: route.targetCorpusDisplayName };
     const acquisitions = this.acquisitionDirectory(domainId);
     const roots = [route.library, ...(route.readOnlySourceRoots ?? [])];
     if (!acquisitions || gcsPrefixesCover(roots.map((root) => `gs://${root.bucket}/${root.prefix}`), acquisitions.uri)
-      || this.acquisitionDirectoryConflicts(acquisitions.uri)) return route;
-    return { ...route, readOnlySourceRoots: [...(route.readOnlySourceRoots ?? []), { bucket: acquisitions.bucket, prefix: acquisitions.prefix }] };
+      || this.acquisitionDirectoryConflicts(acquisitions.uri)) return vertexRoute;
+    return { ...vertexRoute, readOnlySourceRoots: [...(route.readOnlySourceRoots ?? []), { bucket: acquisitions.bucket, prefix: acquisitions.prefix }] };
   }
 
   /**
@@ -1096,7 +1102,7 @@ export class DomainExpertService {
           };
         })();
         library = new PageLibrary(
-          { root: config.root, sourceId: config.sourceId, originalBuckets: [route.library, ...(route.readOnlySourceRoots ?? [])].map((r) => r.bucket) },
+          { root: config.root, sourceId: config.sourceId, originalBuckets: pageLibraryOriginalBuckets(route) },
           { search, download: (bucket, name, maxBytes, timeoutMs) => this.google.downloadLibraryObject(bucket, name, maxBytes, timeoutMs) },
         );
         this.pageLibraries.set(key, library);
@@ -1112,7 +1118,7 @@ export class DomainExpertService {
     try {
       const parsed = parseLibraryReadParams(params);
       const manifest = this.manifest(optionalStringField(params.domain_id, 'domainId').domainId);
-      requireConfiguredAgent(manifest, 'domain_read');
+      requireVertexAgent(manifest, 'domain_read');
       const route = this.readableRoute(manifest.domain_id);
       const result = await this.libraryReader.run(route, parsed, async (name) => {
         const requested = parseRagFileResourceName(name)!;
@@ -1154,10 +1160,11 @@ export class DomainExpertService {
       const registration = {
         ...(params.displayName ? { displayName: params.displayName } : {}),
         library: params.library,
-        targetCorpusDisplayName: params.targetCorpusDisplayName,
+        ...(params.targetCorpusDisplayName !== undefined ? { targetCorpusDisplayName: params.targetCorpusDisplayName } : {}),
+        ...(params.pageLibrary !== undefined ? { pageLibrary: params.pageLibrary } : {}),
       };
       const preview = this.registrations.register(domainId, registration, true);
-      if (!dryRun && !preview.existing) {
+      if (!dryRun && !preview.existing && params.targetCorpusDisplayName !== undefined) {
         const corpora = await this.google.listRagCorpora({ project: this.gcpProject, location: this.manifest(domainId).rag_location });
         if (corpora.some(corpus => corpus.displayName === params.targetCorpusDisplayName?.trim())) {
           throw new OperationError('agent_registration_conflict', 'The requested corpus name already exists and cannot be adopted by a new registration.');
@@ -1547,7 +1554,7 @@ export class DomainExpertService {
       stageStartedAt = now;
     };
     const manifest = this.manifest(params.domainId);
-    requireConfiguredAgent(manifest, 'domain_ask');
+    requireVertexAgent(manifest, 'domain_ask');
     const plan = planDomainAsk(params, manifest);
     requireGoogleProject(manifest.gcp_project);
     const question = requireString(params.question, 'question');
@@ -2088,7 +2095,7 @@ export class DomainExpertService {
     registryPath: string,
     registryRelativePath: string,
   ): Promise<Record<string, unknown>> {
-    requireConfiguredAgent(manifest, 'domain_source');
+    requireVertexAgent(manifest, 'domain_source');
     requireGoogleProject(manifest.gcp_project);
     const sha256 = requireString(params.sha256, 'sha256');
     const corpusTarget = resolveTargetCorpus(params.corpusId, manifest);
@@ -2218,7 +2225,7 @@ export class DomainExpertService {
 
   private async ensureRagCorpus(params: RagCorpusParams): Promise<unknown> {
     const manifest = this.manifest(params.domainId);
-    requireConfiguredAgent(manifest, 'rag_corpus ensure');
+    requireVertexAgent(manifest, 'rag_corpus ensure');
     const corpusId = params.corpusId ?? defaultCorpusId(manifest);
     if (!this.configuredCorpusIds(manifest).includes(corpusId)) throw corpusNotConfiguredForDomainError(manifest, corpusId);
     this.assertCorpusDisclosable(manifest.domain_id, corpusId);
@@ -2340,7 +2347,7 @@ export class DomainExpertService {
     if (!manifest.routing.configured && dryRun) {
       return planRagCorpus({ ...params, dryRun: true }, manifest);
     }
-    if (!dryRun) requireConfiguredAgent(manifest, 'rag_corpus');
+    if (!dryRun) requireVertexAgent(manifest, 'rag_corpus');
     if (!dryRun || params.action === 'list_files') requireGoogleProject(manifest.gcp_project);
     if (params.action === 'stage_import') {
       return this.stageRagImport(params, dryRun);
@@ -2353,7 +2360,7 @@ export class DomainExpertService {
     }
     const plan = planRagCorpus({ ...params, dryRun: true }, manifest);
     if (dryRun && params.action !== 'list_files') return plan;
-    requireConfiguredAgent(manifest, 'rag_corpus');
+    requireVertexAgent(manifest, 'rag_corpus');
     const corpusId = params.corpusId ?? defaultCorpusId(manifest);
     assertReviewedLiveRagImport(manifest, params, dryRun);
     if (params.action === 'create') {
@@ -7861,6 +7868,8 @@ function safeSystemErrorCode(error: unknown): string | undefined {
 function operationErrorStatus(error: OperationError): number {
   if (error.code === 'domain_expert_policy_violation') return 403;
   if (error.code === 'agent_not_configured') return 503;
+  if (error.code === 'vertex_not_configured') return 404;
+  if (error.code === 'invalid_page_library_root') return 500;
   if (error.code === 'invalid_params') return 400;
   if (error.code === 'invalid_agent_registration') return 400;
   if (error.code === 'agent_registration_conflict') return 409;
@@ -8132,6 +8141,13 @@ function parseDomainExpertRequest(request: Request): Promise<DomainExpertRequest
   });
 }
 
+// The wire spells the registration's page library snake_case; the store validates the result.
+function wirePageLibrary(value: unknown): unknown {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return value;
+  const { source_id: sourceId, ...rest } = value as Record<string, unknown>;
+  return { ...rest, ...(sourceId !== undefined ? { sourceId } : {}) };
+}
+
 function parseDomainAgentParams(params: Record<string, unknown>): DomainAgentParams {
   return {
     action: parseDomainAgentAction(params.action),
@@ -8140,6 +8156,7 @@ function parseDomainAgentParams(params: Record<string, unknown>): DomainAgentPar
     ...optionalBooleanField(params.dry_run, 'dryRun'),
     ...(params.library !== undefined ? { library: params.library } : {}),
     ...optionalStringField(params.target_corpus_display_name, 'targetCorpusDisplayName'),
+    ...(params.page_library !== undefined ? { pageLibrary: wirePageLibrary(params.page_library) } : {}),
     ...optionalStringField(params.approval_id, 'approvalId'),
   };
 }
@@ -9098,7 +9115,7 @@ function extractRagCorpusResourceName(value: unknown): string | undefined {
 }
 
 function defaultCorpusId(manifest: ReturnType<typeof domainManifest>): string {
-  requireConfiguredAgent(manifest, 'rag_corpus');
+  requireVertexAgent(manifest, 'rag_corpus');
   return configuredCorpusId(manifest)!;
 }
 

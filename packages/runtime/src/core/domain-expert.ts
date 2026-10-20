@@ -102,6 +102,7 @@ export interface DomainManifest {
     source_env: typeof AGENT_ROUTING_ENV_VAR;
     library?: { bucket: string; prefix: string; uri: string };
     target_corpus_display_name?: string;
+    page_library?: { source_id: string };
     scope_manifest_path?: string;
   };
   rag_backend: 'gemini_enterprise_rag_engine';
@@ -142,6 +143,8 @@ export interface DomainAgentParams {
   dryRun?: boolean;
   library?: unknown;
   targetCorpusDisplayName?: string;
+  /** Register with a page library: {} (the tree and index source follow from the domain id). */
+  pageLibrary?: unknown;
   approvalId?: string;
 }
 
@@ -331,7 +334,7 @@ export function domainManifest(
     || (domainId === DEFAULT_DOMAIN_ID ? DEFAULT_DISPLAY_NAME : `${titleCase(domainId)} Researcher`);
   const workspaceRelativePath = `experts/${domainId}`;
   const resourceName = title.replace(/\s+(Researcher|Expert)$/i, '').trim() || titleCase(domainId);
-  const libraryUri = routing ? `gs://${routing.library.bucket}/${routing.library.prefix}` : undefined;
+  const libraryUri = routing?.library ? `gs://${routing.library.bucket}/${routing.library.prefix}` : undefined;
   const ragParserModel = resolveRagParserModel(env.EXPERT_AGENTS_DOMAIN_EXPERT_RAG_PARSER_MODEL);
   return {
     domain_id: domainId,
@@ -348,13 +351,14 @@ export function domainManifest(
       ? {
           configured: true,
           source_env: AGENT_ROUTING_ENV_VAR,
-          library: { ...routing.library, uri: libraryUri! },
-          target_corpus_display_name: routing.targetCorpusDisplayName,
+          ...(routing.library ? { library: { ...routing.library, uri: libraryUri! } } : {}),
+          ...(routing.targetCorpusDisplayName ? { target_corpus_display_name: routing.targetCorpusDisplayName } : {}),
+          ...(routing.pageLibrary ? { page_library: { source_id: routing.pageLibrary.sourceId } } : {}),
           ...(routing.scopeManifestPath ? { scope_manifest_path: routing.scopeManifestPath } : {}),
         }
       : { configured: false, source_env: AGENT_ROUTING_ENV_VAR },
     rag_backend: RAG_BACKEND,
-    corpora: routing
+    corpora: routing?.targetCorpusDisplayName
       ? (routing.servingCorpusDisplayNames ?? [routing.targetCorpusDisplayName])
         .map((id) => ({ id, description: 'Configured materialized library view' }))
       : [],
@@ -1055,6 +1059,21 @@ export function requireConfiguredAgent(manifest: DomainManifest, toolName: strin
     'agent_not_configured',
     `${toolName} live cloud execution requires an agent entry in ${AGENT_ROUTING_ENV_VAR} for domain "${manifest.domain_id}".`,
     `Configure ${AGENT_ROUTING_ENV_VAR} for this domain before retrying.`,
+  );
+}
+
+/**
+ * The Vertex tools (domain_ask, domain_read, domain_source, rag_corpus) need
+ * a corpus and a library location. A page-library-only route has neither and
+ * is refused here instead of failing deeper with an undefined corpus.
+ */
+export function requireVertexAgent(manifest: DomainManifest, toolName: string): void {
+  requireConfiguredAgent(manifest, toolName);
+  if (manifest.routing.target_corpus_display_name && manifest.routing.library) return;
+  throw new OperationError(
+    'vertex_not_configured',
+    `${toolName} needs a Vertex corpus, and domain "${manifest.domain_id}" is served from the page library.`,
+    manifest.routing.page_library ? 'Use domain_library for this domain.' : `Configure a corpus for this domain in ${AGENT_ROUTING_ENV_VAR}.`,
   );
 }
 

@@ -10,7 +10,7 @@ import {
 import { validateAgentRoutingConfig } from '../src/core/agent-routing.ts';
 import { domainManifest } from '../src/core/domain-expert.ts';
 import { createDomainExpertWorker } from '../src/workers/domain-expert/index.ts';
-import { LibraryReader, parseLibraryReadParams, LIBRARY_READ_MAX_BYTES } from '../src/workers/domain-expert/library-reader.ts';
+import { LibraryReader, parseLibraryReadParams, LIBRARY_READ_MAX_BYTES, type LibraryReadRoute } from '../src/workers/domain-expert/library-reader.ts';
 
 const directories: string[] = [];
 afterEach(() => { for (const directory of directories.splice(0)) rmSync(directory, { recursive: true, force: true }); });
@@ -81,7 +81,7 @@ describe('direct library reading', () => {
     } });
     const params = { action: 'read' as const, rag_file_name: 'projects/fixture/locations/us-central1/ragCorpora/1/ragFiles/2' };
     const resolver = async () => ({ uri: 'gs://prior-library/staged/research/source.md' });
-    expect(await reader.run(routes.research!, params, resolver)).toMatchObject({ text: 'Prior source text.' });
+    expect(await reader.run(routes.research! as LibraryReadRoute, params, resolver)).toMatchObject({ text: 'Prior source text.' });
     expect(calls).toContain('prior-library/staged/research/source.md');
     calls.length = 0;
     await expect(reader.run(f.route, params, resolver)).rejects.toMatchObject({ code: 'library_source_not_available' });

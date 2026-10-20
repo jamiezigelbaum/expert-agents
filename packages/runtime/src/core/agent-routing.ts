@@ -47,10 +47,15 @@ export interface AgentRoutingIngestionConfig {
 export interface AgentRoutingEntry {
   domainId: string;
   displayName?: string;
-  library: LibraryLocationConfig;
+  /**
+   * Where the domain's originals live. Required for a Vertex route; optional
+   * for a page-library route, whose originals buckets pageLibrary names.
+   */
+  library?: LibraryLocationConfig;
   /** Existing source locations usable only for authorized RAG-file reads, never ingestion. */
   readOnlySourceRoots?: LibraryLocationConfig[];
-  targetCorpusDisplayName: string;
+  /** The Vertex corpus. Required unless the route declares pageLibrary. */
+  targetCorpusDisplayName?: string;
   /**
    * Optional. The corpora domain_ask searches, in order. Absent, it searches
    * only targetCorpusDisplayName. A library that outgrows one corpus is split
@@ -81,6 +86,11 @@ export interface AgentPageLibraryConfig {
   root: string;
   /** Search index source id the tree was imported under. */
   sourceId: string;
+  /**
+   * Buckets view_page may render originals from. Absent, the route's library
+   * and read-only source roots; a route without either must list them here.
+   */
+  originalBuckets?: string[];
 }
 
 export type AgentRoutingConfig = Readonly<Record<string, Readonly<AgentRoutingEntry>>>;
@@ -140,15 +150,19 @@ function validateRoutingEntry(domainId: string, value: unknown): AgentRoutingEnt
     ['displayName', 'library', 'readOnlySourceRoots', 'targetCorpusDisplayName', 'servingCorpusDisplayNames', 'scopeManifestPath', 'retrieval', 'ingestion', 'disclosure', 'pageLibrary'],
     'an entry',
   );
-  if (!('library' in entry) || !('targetCorpusDisplayName' in entry)) {
+  // A page-library route needs neither a Vertex corpus nor a library
+  // location; every other route needs both.
+  if (entry.pageLibrary === undefined && (!('library' in entry) || !('targetCorpusDisplayName' in entry))) {
     throw new AgentRoutingConfigError('an entry is missing a required field');
   }
 
-  let library: LibraryLocationConfig;
-  try {
-    library = validateLibraryLocationConfig(entry.library);
-  } catch {
-    throw new AgentRoutingConfigError('an entry has an invalid library location');
+  let library: LibraryLocationConfig | undefined;
+  if (entry.library !== undefined) {
+    try {
+      library = validateLibraryLocationConfig(entry.library);
+    } catch {
+      throw new AgentRoutingConfigError('an entry has an invalid library location');
+    }
   }
 
   const displayName = optionalNonEmptyString(entry.displayName, 'an entry displayName');
@@ -165,6 +179,10 @@ function validateRoutingEntry(domainId: string, value: unknown): AgentRoutingEnt
     Object.freeze(readOnlySourceRoots);
   }
   const scopeManifestPath = optionalNonEmptyString(entry.scopeManifestPath, 'an entry scopeManifestPath');
+  const targetCorpusDisplayName = optionalNonEmptyString(entry.targetCorpusDisplayName, 'an entry targetCorpusDisplayName');
+  if (servingCorpusOrVertexOnly(entry) && targetCorpusDisplayName === undefined) {
+    throw new AgentRoutingConfigError('an entry with Vertex retrieval settings needs targetCorpusDisplayName');
+  }
   const servingCorpusDisplayNames = entry.servingCorpusDisplayNames === undefined
     ? undefined
     : validateServingCorpora(entry.servingCorpusDisplayNames);
@@ -183,16 +201,16 @@ function validateRoutingEntry(domainId: string, value: unknown): AgentRoutingEnt
   }
 
   const pageLibrary = entry.pageLibrary === undefined ? undefined : validatePageLibrary(entry.pageLibrary);
+  if (pageLibrary && !pageLibrary.originalBuckets && !library && !readOnlySourceRoots) {
+    throw new AgentRoutingConfigError('pageLibrary needs originalBuckets when the entry has no library');
+  }
 
   return {
     domainId,
     ...(displayName ? { displayName } : {}),
-    library,
+    ...(library ? { library } : {}),
     ...(readOnlySourceRoots ? { readOnlySourceRoots } : {}),
-    targetCorpusDisplayName: requireNonEmptyString(
-      entry.targetCorpusDisplayName,
-      'an entry targetCorpusDisplayName',
-    ),
+    ...(targetCorpusDisplayName ? { targetCorpusDisplayName } : {}),
     ...(servingCorpusDisplayNames ? { servingCorpusDisplayNames } : {}),
     ...(scopeManifestPath ? { scopeManifestPath } : {}),
     ...(retrieval ? { retrieval } : {}),
@@ -204,12 +222,31 @@ function validateRoutingEntry(domainId: string, value: unknown): AgentRoutingEnt
 
 function validatePageLibrary(value: unknown): AgentPageLibraryConfig {
   const entry = requireRecord(value, 'pageLibrary must be an object');
-  requireExactKeys(entry, ['root', 'sourceId'], 'pageLibrary');
+  requireExactKeys(entry, ['root', 'sourceId', 'originalBuckets'], 'pageLibrary');
   const root = requireNonEmptyString(entry.root, 'pageLibrary root');
   if (!root.startsWith('/') || root.split('/').includes('..')) throw new AgentRoutingConfigError('pageLibrary root must be an absolute path');
   const sourceId = requireNonEmptyString(entry.sourceId, 'pageLibrary sourceId');
   if (!/^[a-z0-9][a-z0-9-]{0,63}$/.test(sourceId)) throw new AgentRoutingConfigError('pageLibrary sourceId is invalid');
-  return Object.freeze({ root, sourceId });
+  let originalBuckets: string[] | undefined;
+  if (entry.originalBuckets !== undefined) {
+    if (!Array.isArray(entry.originalBuckets) || entry.originalBuckets.length < 1 || entry.originalBuckets.length > 16
+      || entry.originalBuckets.some((b) => typeof b !== 'string' || !/^[a-z0-9][a-z0-9._-]{1,221}[a-z0-9]$/.test(b))) {
+      throw new AgentRoutingConfigError('pageLibrary originalBuckets must list 1 to 16 bucket names');
+    }
+    originalBuckets = Object.freeze([...new Set(entry.originalBuckets as string[])]) as string[];
+  }
+  return Object.freeze({ root, sourceId, ...(originalBuckets ? { originalBuckets } : {}) });
+}
+
+/** The buckets view_page may read originals from: explicit, else the route's library locations. */
+export function pageLibraryOriginalBuckets(route: Pick<AgentRoutingEntry, 'library' | 'readOnlySourceRoots' | 'pageLibrary'>): string[] {
+  if (route.pageLibrary?.originalBuckets) return [...route.pageLibrary.originalBuckets];
+  return [...new Set([...(route.library ? [route.library] : []), ...(route.readOnlySourceRoots ?? [])].map((r) => r.bucket))];
+}
+
+// Settings that only mean something for a Vertex corpus.
+function servingCorpusOrVertexOnly(entry: Record<string, unknown>): boolean {
+  return entry.servingCorpusDisplayNames !== undefined || entry.scopeManifestPath !== undefined || entry.retrieval !== undefined;
 }
 
 function validateServingCorpora(value: unknown): string[] {

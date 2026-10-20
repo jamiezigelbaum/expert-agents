@@ -56,7 +56,13 @@ export const researchToolSchemas: Record<DomainExpertTool, ToolParameterSchema> 
       properties: { bucket: text('GCS bucket name without gs://.'), prefix: text('Non-root object prefix inside that bucket.') },
       required: ['bucket', 'prefix'], additionalProperties: false,
     },
-    target_corpus_display_name: text('Required for register: the stable display name of this expert\'s Vertex corpus.'),
+    target_corpus_display_name: text('Register only, legacy Vertex agents: the stable display name of this expert\'s Vertex corpus. Omit it for a page-library agent.'),
+    page_library: {
+      type: 'object',
+      description: 'Register: {} gives the expert a page library (the default for new experts). The worker derives its tree and index source from domain_id.',
+      properties: { source_id: text('Optional; must equal domain_id.') },
+      additionalProperties: false,
+    },
     approval_id: approvalId,
   }, ['action']),
 
