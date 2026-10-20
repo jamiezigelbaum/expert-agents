@@ -4,6 +4,7 @@ version: 0.1.0
 description: Answer any question about what a library book, paper, talk, or author says — domain_ask first, with your domain_id, before web search, memory, or any other lane. Also covers bounded source intake, corpus operations, and reviewable document collaboration for a configured expert.
 tools:
   - domain_ask
+  - domain_library
   - domain_read
   - domain_source
   - rag_corpus
@@ -22,6 +23,17 @@ before any web search, memory search, or another product's source tools.
 Repository and code search tools cannot see the library; reaching for one on
 a library question is always the wrong tool, not a fallback. If retrieval
 errors, report the error verbatim and stop — there is no fallback lane.
+
+When the domain has a page library, `domain_library` replaces `domain_ask`
+and `domain_read` for library questions. Run `search` with several short,
+focused queries from different angles; `read` or `read_range` around the hits
+before answering, since neighbouring pages often hold the answer; `grep` to
+verify an exact quote or find every occurrence of a term; `catalog` to find
+books by author or title; `view_page` to see figures, tables and diagrams.
+Cite the citation label each result carries. When the searches find
+nothing relevant, say the library does not hold it. If it answers
+`page_library_not_configured`, this domain has no page library: use
+`domain_ask`.
 
 For a complete bibliography, chapter, exact passage, or sequential reading of a
 known book, use `domain_read` directly instead of relevance search. This is the

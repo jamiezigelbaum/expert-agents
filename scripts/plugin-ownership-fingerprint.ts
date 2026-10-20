@@ -9,6 +9,7 @@ const GATEWAY_TOOLS = {
   domain_agent: true,
   domain_ask: true,
   domain_read: true,
+  domain_library: true,
   domain_source: true,
   rag_corpus: true,
   domain_doc: true,

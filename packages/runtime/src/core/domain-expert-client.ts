@@ -7,6 +7,7 @@ export type DomainExpertTool =
   | 'domain_agent'
   | 'domain_ask'
   | 'domain_read'
+  | 'domain_library'
   | 'domain_source'
   | 'rag_corpus'
   | 'domain_doc'

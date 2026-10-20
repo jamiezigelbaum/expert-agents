@@ -31,6 +31,7 @@ describe('Expert Agents OpenClaw plugin', () => {
     expect(names).toEqual([
       'domain_agent',
       'domain_ask',
+      'domain_library',
       'domain_read',
       'domain_source',
       'rag_corpus',
@@ -91,6 +92,41 @@ describe('Expert Agents OpenClaw plugin', () => {
       expect(result.isError).toBeUndefined();
       expect(result.details).toEqual({ status: 'completed', result: serviceResult });
       expect(JSON.parse(result.content[0]!.text)).toEqual(serviceResult);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test('a page image reaches the model as an image block, not as base64 in the text', async () => {
+    const page = {
+      kind: 'domain_library_result',
+      action: 'view_page',
+      slug: 'books/fixture-book/p0003',
+      cite: 'Fixture Book, p. 3',
+      image: { mime_type: 'image/jpeg', data: 'AAEC' },
+      policy: { expert_agents_control_plane_only: true, raw_runtime_secrets_exposed: false },
+    };
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async () => Response.json(page)) as unknown as typeof globalThis.fetch;
+    try {
+      let view: RegisteredTool['execute'] | undefined;
+      plugin.register({
+        pluginConfig: { domainExpert: { enabled: true, baseUrl: 'http://127.0.0.1:8040/v1' } },
+        registerTool: (tool) => {
+          tool = resolveTool(tool);
+          if (tool.name === 'domain_library') view = tool.execute;
+        },
+      });
+      if (!view) throw new Error('The plugin registered no domain_library tool.');
+
+      const result = await view('fixture-view', { action: 'view_page', slug: 'books/fixture-book/p0003' });
+
+      const { image: _image, ...rest } = page;
+      expect(result.content).toEqual([
+        { type: 'text', text: JSON.stringify(rest, null, 2) },
+        { type: 'image', data: 'AAEC', mimeType: 'image/jpeg' },
+      ]);
+      expect(result.details).toEqual({ status: 'completed', result: rest });
     } finally {
       globalThis.fetch = originalFetch;
     }

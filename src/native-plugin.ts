@@ -31,7 +31,8 @@ export interface NativeTool {
 }
 
 interface NativeToolResult {
-  content: Array<{ type: 'text'; text: string }>;
+  // Text first; a page image, when there is one, follows it.
+  content: [{ type: 'text'; text: string }, ...Array<{ type: 'image'; data: string; mimeType: string }>];
   details?: unknown;
   isError?: boolean;
 }
@@ -39,6 +40,7 @@ interface NativeToolResult {
 const definitions: Array<{ name: DomainExpertTool; description: string }> = [
   { name: 'domain_agent', description: 'Plan or inspect an independently managed domain expert.' },
   { name: 'domain_ask', description: 'Answer a question from an approved expert corpus with citations and explicit gaps.' },
+  { name: 'domain_library', description: 'Search, read and view the pages of a domain page library: hybrid search, exact grep, whole pages or sections, page ranges and page images.' },
   { name: 'domain_read', description: 'Open, search within, and sequentially read a selected library source, chapter, or complete bibliography.' },
   { name: 'domain_source', description: 'Plan or perform bounded source-registry lifecycle work for an expert.' },
   { name: 'rag_corpus', description: 'Plan or perform bounded managed-RAG corpus operations.' },
@@ -174,6 +176,16 @@ function configFromPluginConfig(value: unknown): ExpertAgentsConfig {
 }
 
 function resultPayload(result: unknown): NativeToolResult {
+  // A page image (domain_library view_page) goes to the model as an image
+  // block, not as base64 inside the JSON text.
+  const { image, ...rest } = asRecord(result);
+  const picture = asRecord(image);
+  if (typeof picture.data === 'string' && typeof picture.mime_type === 'string') {
+    return {
+      content: [{ type: 'text', text: JSON.stringify(rest, null, 2) }, { type: 'image', data: picture.data, mimeType: picture.mime_type }],
+      details: { status: 'completed', result: rest },
+    };
+  }
   return {
     content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
     details: { status: 'completed', result },
