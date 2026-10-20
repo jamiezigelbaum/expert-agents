@@ -48,12 +48,17 @@ export const EXPERT_LIBRARY_USAGE = `Usage: bun run expert:library -- <command> 
 Worker lane (POST <worker>/v1/domain; --worker <url> or ${WORKER_URL_ENV};
 bearer token from ${WORKER_TOKEN_ENV} or --token-file <path>, never an argument value):
   health
+  library  --domain <id> --action <catalog|search|grep|read|read_range|view_page>
+           [--query <q>] [--k <n>] [--book <id>] [--pattern <re>] [--max-hits <n>] [--slug <books/b/u>]
+           [--from <unit>] [--to <unit>] [--session <id>] [--out <file.jpg>]   (view_page needs --out)
+  library-ingest --domain <id> --action <start|status|list> [--gcs <gs://uri> | --path <workspace-relative>]
+           [--title <t>] [--creator <c>] [--job <id>] [--approval-id <id>] [--apply]   (start is a dry run without --apply)
   ask      --domain <id> "<question>" [--passages] [--corpus <id>]
   read     --domain <id> --action <catalog|open|find|read> [--object <sha256:id> | --rag-file <resource>]
            [--revision <text-hash>] [--query <text>] [--offset <n>] [--end <n>] [--section <n>] [--limit <n>]
   search   --domain <id> --query "<q>" [--author <a>] [--title <t>] [--language <l>] [--top <n>] [--ingest-intent]
   acquire  --domain <id> --md5 <md5> --format <pdf|epub|mobi|azw3|djvu> --title <t> --author <a> [--year <y>]
-           --corpus <id> --copyright-posture <p> --approval-id <id> [--no-ingest] [--dry-run] [--no-wait]
+           [--corpus <id>] --copyright-posture <p> --approval-id <id> [--no-ingest] [--dry-run] [--no-wait]
   source register --domain <id> --kind <book|pdf|epub|google_doc|blog_post|transcript|note|dataset|web_page>
            --title <t> --author <a> --locator <url> [--trust-tier <t>] [--copyright-posture <p>] [--corpus <id>]
   status   --domain <id> [--corpus <id>]
@@ -100,6 +105,8 @@ export interface WorkerCommandOptions {
 export type ExpertLibraryCommand =
   | ({ command: "health" } & WorkerCommandOptions)
   | ({ command: "read"; domainId: string; params: Record<string, unknown> } & WorkerCommandOptions)
+  | ({ command: "library"; domainId: string; params: Record<string, unknown>; out?: string } & WorkerCommandOptions)
+  | ({ command: "library-ingest"; domainId: string; params: Record<string, unknown> } & WorkerCommandOptions)
   | ({
     command: "ask";
     domainId: string;
@@ -125,7 +132,7 @@ export type ExpertLibraryCommand =
     title: string;
     author: string;
     year?: string;
-    corpusId: string;
+    corpusId?: string;
     copyrightPosture: string;
     approvalId: string;
     ingest: boolean;
@@ -316,6 +323,41 @@ export function parseExpertLibraryArguments(argv: string[]): ExpertLibraryComman
       if (action !== "catalog" && Boolean(params.object_id) === Boolean(params.rag_file_name)) throw usage("Exactly one of --object or --rag-file is required for this read action.");
       return { command: "read", domainId: requireFlag(flags, "--domain"), params, ...workerOptions(flags) };
     }
+    case "library": {
+      const flags = parseFlags(rest, { named: [...WORKER_FLAGS, "--domain", "--action", "--query", "--k", "--book", "--pattern", "--max-hits", "--slug", "--from", "--to", "--session", "--out"] });
+      const action = requireFlag(flags, "--action");
+      if (!["catalog", "search", "grep", "read", "read_range", "view_page"].includes(action)) throw usage("Invalid library action.");
+      const params: Record<string, unknown> = { action };
+      for (const [flag, key] of [["--query", "query"], ["--book", "book"], ["--pattern", "pattern"], ["--slug", "slug"], ["--from", "from_unit"], ["--to", "to_unit"], ["--session", "session_id"]] as const) {
+        const value = flags.values.get(flag);
+        if (value !== undefined) params[key] = requireNonEmpty(value, flag);
+      }
+      for (const [flag, key] of [["--k", "k"], ["--max-hits", "max_hits"]] as const) {
+        const value = flags.values.get(flag);
+        if (value === undefined) continue;
+        if (!/^[1-9]\d*$/.test(value)) throw usage(`${flag} must be a positive integer.`);
+        params[key] = Number(value);
+      }
+      if (action === "view_page" && !flags.values.has("--out")) throw usage("view_page writes the page image to --out <file.jpg>.");
+      return { command: "library", domainId: requireFlag(flags, "--domain"), params, ...optionalFlag(flags, "--out", "out"), ...workerOptions(flags) };
+    }
+    case "library-ingest": {
+      const flags = parseFlags(rest, { named: [...WORKER_FLAGS, "--domain", "--action", "--gcs", "--path", "--title", "--creator", "--job", "--approval-id"], boolean: ["--apply"] });
+      const action = requireFlag(flags, "--action");
+      if (!["start", "status", "list"].includes(action)) throw usage("Invalid library-ingest action.");
+      const params: Record<string, unknown> = { action };
+      for (const [flag, key] of [["--gcs", "gcs_uri"], ["--path", "workspace_relative_path"], ["--title", "title"], ["--creator", "creator"], ["--job", "job_id"], ["--approval-id", "approval_id"]] as const) {
+        const value = flags.values.get(flag);
+        if (value !== undefined) params[key] = requireNonEmpty(value, flag);
+      }
+      if (action === "start") {
+        if (Boolean(params.gcs_uri) === Boolean(params.workspace_relative_path)) throw usage("start takes exactly one of --gcs or --path.");
+        params.dry_run = !flags.booleans.has("--apply");
+        if (!params.dry_run && !params.approval_id) throw usage("A live start (--apply) needs --approval-id.");
+      }
+      if (action === "status" && !params.job_id) throw usage("status needs --job.");
+      return { command: "library-ingest", domainId: requireFlag(flags, "--domain"), params, ...workerOptions(flags) };
+    }
     case "search": {
       const flags = parseFlags(rest, {
         named: [...WORKER_FLAGS, "--domain", "--query", "--author", "--title", "--language", "--top"],
@@ -353,7 +395,7 @@ export function parseExpertLibraryArguments(argv: string[]): ExpertLibraryComman
         title: requireFlag(flags, "--title"),
         author: requireFlag(flags, "--author"),
         ...optionalFlag(flags, "--year", "year"),
-        corpusId: requireFlag(flags, "--corpus"),
+        ...optionalFlag(flags, "--corpus", "corpusId"),
         copyrightPosture: requireFlag(flags, "--copyright-posture"),
         approvalId: requireFlag(flags, "--approval-id"),
         ingest: !flags.booleans.has("--no-ingest"),
@@ -513,6 +555,28 @@ async function runWorkerCommand(
   const fetchImpl = dependencies.fetchImpl ?? fetch;
 
   switch (parsed.command) {
+    case "library": {
+      const outcome = await workerPost(target, "domain_library", { domain_id: parsed.domainId, ...parsed.params }, fetchImpl);
+      if (!outcome.ok) return failWorker(outcome, emitter);
+      const body = asRecord(outcome.body);
+      const image = asRecord(body?.image);
+      if (parsed.out !== undefined && typeof image?.data === "string") {
+        // The page image goes to a file; the transcript carries only its size.
+        const bytes = Buffer.from(image.data, "base64");
+        await (dependencies.writeFileImpl ?? writeFile)(parsed.out, bytes);
+        emitter.out(prettyJson({ ...body, image: { mime_type: image.mime_type, bytes: bytes.byteLength, written_to: parsed.out } }));
+        return 0;
+      }
+      emitter.out(prettyJson(outcome.body));
+      return 0;
+    }
+    case "library-ingest": {
+      const outcome = await workerPost(target, "library_ingest", { domain_id: parsed.domainId, ...parsed.params }, fetchImpl);
+      if (!outcome.ok) return failWorker(outcome, emitter);
+      emitter.out(prettyJson(outcome.body));
+      const state = String(asRecord(asRecord(outcome.body)?.job)?.state ?? "");
+      return state === "failed" ? 1 : 0;
+    }
     case "read": {
       const outcome = await workerPost(target, "domain_read", { domain_id: parsed.domainId, ...parsed.params }, fetchImpl);
       if (!outcome.ok) return failWorker(outcome, emitter);
@@ -559,7 +623,7 @@ async function runWorkerCommand(
         title: parsed.title,
         author: parsed.author,
         ...(parsed.year === undefined ? {} : { year: parsed.year }),
-        corpus_id: parsed.corpusId,
+        ...(parsed.corpusId === undefined ? {} : { corpus_id: parsed.corpusId }),
         copyright_posture: parsed.copyrightPosture,
         approval_id: parsed.approvalId,
         ingest: parsed.ingest,

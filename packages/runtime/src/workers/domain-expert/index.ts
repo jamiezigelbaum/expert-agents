@@ -37,6 +37,7 @@ import {
   configuredCorpusId,
   requireConfiguredAgent,
   requireVertexAgent,
+  servesPageLibrary,
   resolveTargetCorpus,
 } from '../../core/domain-expert.ts';
 import type {
@@ -8607,7 +8608,7 @@ async function writeWorkspaceSeedFiles(
     [`${rootRel}/references/source-registry.jsonl`, ''],
     [`${rootRel}/references/ingest-log.md`, `# Ingest Log\n\nCreated ${new Date().toISOString()}.\n`],
     [`${rootRel}/references/reading-map.md`, `# ${manifest.display_name} Reading Map\n`],
-    [`${rootRel}/references/retrieval-craft.md`, retrievalCraftContent()],
+    [`${rootRel}/references/retrieval-craft.md`, retrievalCraftContent(manifest)],
     [`${rootRel}/templates/source-card.md`, '# Source Card\n\n- Title:\n- Author:\n- Corpus:\n- Status:\n- Notes:\n'],
     [`${rootRel}/templates/research-brief.md`, '# Research Brief\n\n## Question\n\n## Evidence\n\n## Answer\n\n## Gaps\n'],
     [`${rootRel}/templates/literature-review.md`, '# Literature Review\n\n## Sources\n\n## Themes\n\n## Disagreements\n'],
@@ -8649,7 +8650,24 @@ async function writeWorkspaceSeedFiles(
   return results;
 }
 
-function retrievalCraftContent(): string {
+function retrievalCraftContent(manifest: ReturnType<typeof domainManifest>): string {
+  if (servesPageLibrary(manifest)) {
+    return [
+      '# Retrieval Craft',
+      '',
+      'Use these practices when you call `domain_library`:',
+      '',
+      '- Start with `catalog` to see which books you hold; name the book (`book`) when you know it.',
+      '- `search` with several short, focused queries from different angles; one topic per query.',
+      "- When results are weak, search again in the source's own vocabulary, or `grep` for the exact term.",
+      '- `read` the unit a hit came from before relying on it, and `read_range` to follow an argument across pages.',
+      '- Use `view_page` for figures, tables and diagrams; the text of a page may not describe them.',
+      '- Cite every claim with the citation label the tool returned. Never cite or imply support from a passage you did not read.',
+      '- When the library is silent, say so and stop; do not answer from memory.',
+      '- When a source you expect keeps missing, tell your owner. Retrieval misses become eval cases: record the miss in `eval/questions.jsonl` so it cannot silently regress.',
+      '',
+    ].join('\n');
+  }
   return [
     '# Retrieval Craft',
     '',
@@ -8681,7 +8699,9 @@ function proposalContent(manifest: ReturnType<typeof domainManifest>): string {
     '',
     '## Workflow',
     '',
-    'Use domain_source for intake, rag_corpus for corpus lifecycle, domain_ask for grounded answers, and domain_doc for Google Docs collaboration.',
+    servesPageLibrary(manifest)
+      ? 'Use library_ingest to add approved sources, domain_library for grounded answers with page citations, and domain_doc for Google Docs collaboration.'
+      : 'Use domain_source for intake, rag_corpus for corpus lifecycle, domain_ask for grounded answers, and domain_doc for Google Docs collaboration.',
     '',
   ].join('\n');
 }

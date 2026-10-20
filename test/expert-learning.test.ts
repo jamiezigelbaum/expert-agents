@@ -49,7 +49,6 @@ async function learningFixture(): Promise<LearningFixture> {
     agentId: AGENT_ID,
     displayName: "Neutral Agent",
     domainId: "neutral-domain",
-    targetCorpusDisplayName: "neutral-corpus",
   });
   const libraryDirectory = join(workspace, "library");
   const engagementRoot = join(await temporaryRoot("expert-engagement-"), "engagements", ENGAGEMENT_ID);

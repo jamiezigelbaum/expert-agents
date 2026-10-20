@@ -7,9 +7,9 @@ prerequisite for an explicitly delegated creation request.
 ## Intake
 
 Confirm the target directory, stable agent and domain IDs, display name, optional
-emoji, corpus display name, recurring jobs, privacy posture, approved library
-location, escalation channel, workspace adapter, and whether managed RAG is
-appropriate. Ask before importing private or copyrighted material, creating
+emoji, recurring jobs, privacy posture, approved library location,
+escalation channel, and workspace adapter. Ask before importing private
+material, creating
 cloud or GitHub resources, or binding a messaging identity.
 
 ## Identity ceremony
@@ -136,7 +136,7 @@ when the repository exists.
 ## Assembly order
 
 Brain dump → names → avatar → messaging identity → `expert:create` →
-`soul-workshop` → library and corpus wiring → the ready-to-populate report.
+`soul-workshop` → page library wiring → the ready-to-populate report.
 Each step consumes the previous one's output, so a step taken early is a step
 taken on a guess.
 

@@ -45,9 +45,8 @@ export function validateAgentManifest(value: unknown): AgentManifest {
     "agentId",
     "displayName",
     "domainId",
-    "targetCorpusDisplayName",
   ];
-  const allowed = new Set([...required, "emoji", "avatar", "serving"]);
+  const allowed = new Set([...required, "targetCorpusDisplayName", "emoji", "avatar", "serving"]);
   if (required.some((key) => !Object.hasOwn(record, key))) {
     throw new AgentRepoValidationError("agent manifest is missing a required field");
   }
@@ -61,10 +60,9 @@ export function validateAgentManifest(value: unknown): AgentManifest {
   const agentId = requireStableId(record.agentId, "agent manifest agent id");
   const domainId = requireStableId(record.domainId, "agent manifest domain id");
   const displayName = requireSingleLineString(record.displayName, "agent manifest display name");
-  const targetCorpusDisplayName = requireSingleLineString(
-    record.targetCorpusDisplayName,
-    "agent manifest target corpus display name",
-  );
+  const targetCorpusDisplayName = record.targetCorpusDisplayName === undefined
+    ? undefined
+    : requireSingleLineString(record.targetCorpusDisplayName, "agent manifest target corpus display name");
   const emoji = record.emoji === undefined
     ? undefined
     : requireSingleLineString(record.emoji, "agent manifest emoji");
@@ -78,7 +76,7 @@ export function validateAgentManifest(value: unknown): AgentManifest {
     agentId,
     displayName,
     domainId,
-    targetCorpusDisplayName,
+    ...(targetCorpusDisplayName === undefined ? {} : { targetCorpusDisplayName }),
     ...(emoji === undefined ? {} : { emoji }),
     ...(avatar === undefined ? {} : { avatar }),
     ...(serving === undefined ? {} : { serving }),
@@ -276,7 +274,6 @@ export function requireScaffoldOptions(value: {
   agentId: unknown;
   displayName: unknown;
   domainId: unknown;
-  targetCorpusDisplayName: unknown;
   emoji?: unknown;
   avatar?: unknown;
 }): Omit<AgentManifest, "schemaVersion"> {
@@ -285,11 +282,10 @@ export function requireScaffoldOptions(value: {
     agentId: value.agentId,
     displayName: value.displayName,
     domainId: value.domainId,
-    targetCorpusDisplayName: value.targetCorpusDisplayName,
     ...(value.emoji === undefined ? {} : { emoji: value.emoji }),
     ...(value.avatar === undefined ? {} : { avatar: value.avatar }),
   });
-  for (const field of [manifest.displayName, manifest.targetCorpusDisplayName, manifest.emoji]) {
+  for (const field of [manifest.displayName, manifest.emoji]) {
     if (field?.includes("{{") || field?.includes("}}")) {
       throw new AgentRepoValidationError("scaffold input contains template syntax");
     }

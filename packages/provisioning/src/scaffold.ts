@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { mkdir, readdir, stat, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
-import { SCOPE_SCHEMA_VERSION, canonicalJson, type ScopeManifest } from "../../library/src/index.ts";
+import { canonicalJson } from "../../library/src/index.ts";
 import type { RetrievalEvalSet } from "../../../scripts/retrieval-eval.ts";
 import agentsTemplate from "../templates/AGENTS.md" with { type: "text" };
 import heartbeatTemplate from "../templates/HEARTBEAT.md" with { type: "text" };
@@ -81,13 +81,6 @@ export async function scaffoldExpert(
           },
         }),
   });
-  const scopeManifest: ScopeManifest = {
-    agentId: manifest.agentId,
-    schemaVersion: SCOPE_SCHEMA_VERSION,
-    selection: { objectIds: [] },
-    targetCorpusDisplayName: manifest.targetCorpusDisplayName,
-    masterRevision: 0,
-  };
   const evalSet: RetrievalEvalSet = {
     schemaVersion: 1,
     domainId: manifest.domainId,
@@ -107,7 +100,6 @@ export async function scaffoldExpert(
     agentId: manifest.agentId,
     displayName: manifest.displayName,
     domainId: manifest.domainId,
-    targetCorpusDisplayName: manifest.targetCorpusDisplayName,
     emojiLine: manifest.emoji === undefined ? "" : `- Emoji: ${manifest.emoji}`,
     issueTracker: options.issueTracker === undefined
       ? ISSUE_TRACKER_PLACEHOLDER
@@ -118,7 +110,6 @@ export async function scaffoldExpert(
     ["agent.json", canonicalJson(manifest)],
     ["binding.json", canonicalJson(binding)],
     ["library/eval-questions.json", canonicalJson(evalSet)],
-    ["library/scope-manifest.json", canonicalJson(scopeManifest)],
     ["references/.gitkeep", ""],
     ...MARKDOWN_TEMPLATES.map(([path, template]) => [path, renderTemplate(template, substitutions)] as const),
   ]);
@@ -145,7 +136,7 @@ export async function scaffoldExpert(
       }))
       .sort((left, right) => compareStrings(left.path, right.path)),
   };
-  return { targetDir, manifest, binding, scopeManifest, evalSet, receipt };
+  return { targetDir, manifest, binding, evalSet, receipt };
 }
 
 export function serializeCreationReceipt(receipt: ExpertCreationReceipt): string {
