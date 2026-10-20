@@ -17,6 +17,8 @@ PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=read-only
 ReadWritePaths=/var/lib/expert-agents/domain-expert
+# library_ingest writes page-library trees here ("-": a host without one still boots).
+ReadWritePaths=-/var/lib/expert-agents/page-library
 
 [Install]
 WantedBy=multi-user.target

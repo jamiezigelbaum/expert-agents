@@ -47,6 +47,7 @@ sudo useradd --system --home-dir /var/lib/expert-agents --shell /usr/sbin/nologi
 sudo install -d -m 0755 -o root -g root /opt/expert-agents
 sudo install -d -m 0755 -o expert-agents -g expert-agents /opt/expert-agents/releases
 sudo install -d -m 0750 -o expert-agents -g expert-agents /var/lib/expert-agents/domain-expert
+sudo install -d -m 0755 -o expert-agents -g expert-agents /var/lib/expert-agents/page-library
 sudo install -d -m 0750 -o root -g expert-agents /etc/expert-agents
 ```
 
@@ -151,8 +152,10 @@ A page-library domain also needs the page index and its writer
 (`EXPERT_AGENTS_DOMAIN_EXPERT_OLLAMA_URL`, `EXPERT_AGENTS_DOMAIN_EXPERT_VISION_URL`).
 The index's Postgres runs from `deploy/page-library/compose.yaml`; give the
 serving URL a SELECT-only role and the writer URL a role that may insert and
-delete. The tree directory must be writable by the service account, since
-`library_ingest` writes each book into it.
+delete (`SELECT, INSERT, UPDATE, DELETE` on `page_units`, `page_chunks` and
+`page_embeddings`). `library_ingest` writes each book into the domain's tree
+under `/var/lib/expert-agents/page-library`, which the unit opens for writing
+and the service account must own.
 
 The worker does not generate buckets, prefixes, or corpora for missing domain
 entries. Offline status and dry-run planning remain available and report the
