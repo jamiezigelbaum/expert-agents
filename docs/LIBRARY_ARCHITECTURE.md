@@ -1,5 +1,9 @@
 # Shared library architecture
 
+> **Legacy.** This describes the Vertex RAG path, which only domains not yet on
+> the [page library](page-library.md) still use. It is deleted after their
+> cutover (owner decision 2026-10-20). New experts read a page library.
+
 ## Owner ruling and boundary
 
 Expert Agents has one shared knowledge library. All acquired canonical bytes
