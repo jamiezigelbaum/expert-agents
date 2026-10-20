@@ -1,30 +1,38 @@
 // Local page OCR for the page library: nothing on this path can refuse a page.
 //
 //   1. the PDF text layer (pdftotext, in the caller);
-//   2. DeepSeek-OCR through Ollama, with its native "Free OCR." prompt;
-//   3. a vision-language lane (an OpenAI-compatible chat endpoint, e.g.
-//      Delphi's `delphi/vision-deep`) for pages DeepSeek reads badly: empty,
-//      looping, garbled or table pages.
+//   2. DeepSeek-OCR, with its native "Free OCR." prompt, through the OCR
+//      profile of a local model router (Delphi's `delphi/vision-quality`);
+//   3. the router's deep vision profile (`delphi/vision-deep`) for pages
+//      DeepSeek reads badly: empty, looping, garbled or table pages.
 //
-// Figure descriptions use the same vision lane. Every call records its finish
-// reason, and a reply that reads as a refusal is logged and never used as text.
+// Figure descriptions use the deep profile too. Both are OpenAI-compatible chat
+// calls that name a profile, never a model: the router picks the backing model.
+// Every call records its finish reason, and a reply that reads as a refusal is
+// logged and never used as text.
 
 import { OCR_MIN_CHARS, type FigureRecord } from './page-units.ts';
 
-export const DEEPSEEK_OCR_MODEL = 'deepseek-ocr:latest';
+/** The router profile for normal page OCR; DeepSeek-OCR backs it. */
+export const OCR_PROFILE = 'delphi/vision-quality';
+/** The router profile for hard pages and figures. */
+export const DEEP_PROFILE = 'delphi/vision-deep';
 // "Convert the document to markdown." returns empty or grounding-only output
 // on many scan pages; the native prompt reads them.
 export const DEEPSEEK_OCR_PROMPT = '<image>\nFree OCR.';
-export const VISION_LANE_MODEL = 'delphi/vision-deep';
 
 export interface OcrLanes {
-  /** Ollama base URL serving DeepSeek-OCR, e.g. http://127.0.0.1:11434 */
-  ollamaUrl: string;
-  /** OpenAI-compatible base URL (…/v1) serving the vision lane; escalation is off without it. */
-  visionUrl?: string;
-  visionModel?: string;
+  /** OpenAI-compatible base URL (…/v1) of the local model router. */
+  routerUrl: string;
+  /** The deep profile, for escalation and figures; on unless false. */
+  deep?: boolean;
   fetch?: typeof fetch;
   timeoutMs?: number;
+}
+
+/** Whether escalation and figure description run. */
+export function deepLane(lanes: OcrLanes | undefined): boolean {
+  return Boolean(lanes) && lanes!.deep !== false;
 }
 
 export interface LaneCall { lane: 'deepseek-ocr' | 'vision'; finish: string; chars: number; ms: number; refusal?: boolean; error?: string }
@@ -66,44 +74,42 @@ export function stripGrounding(text: string): string {
   return text.replace(/<\|ref\|>.*?<\|\/ref\|><\|det\|>.*?<\|\/det\|>/gs, '').replace(/<\|\/?(ref|det|grounding)\|>/g, '').trim();
 }
 
-async function deepseek(img: Uint8Array, lanes: OcrLanes): Promise<{ text: string; call: LaneCall }> {
-  const t = Date.now();
+/** One chat call to a router profile with one page image. The router queues per profile (one call at a time). */
+async function chat(profile: string, img: Uint8Array, text: string, maxTokens: number, lanes: OcrLanes): Promise<{ text: string; finish: string }> {
   const f = lanes.fetch ?? fetch;
-  const res = await f(`${lanes.ollamaUrl.replace(/\/+$/, '')}/api/generate`, {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ model: DEEPSEEK_OCR_MODEL, prompt: DEEPSEEK_OCR_PROMPT, images: [Buffer.from(img).toString('base64')], stream: false, options: { num_predict: 4096, temperature: 0 } }),
-    signal: AbortSignal.timeout(lanes.timeoutMs ?? 600_000),
-  });
-  if (!res.ok) throw new Error(`DeepSeek-OCR answered ${res.status}`);
-  const r = await res.json() as { response?: string; done_reason?: string };
-  const text = stripGrounding(r.response ?? '');
-  return { text, call: { lane: 'deepseek-ocr', finish: r.done_reason ?? 'unknown', chars: text.length, ms: Date.now() - t, ...(looksLikeRefusal(text) ? { refusal: true } : {}) } };
-}
-
-/** One chat call to the vision lane. `tag` makes each prompt unique (the lane caches prompt prefixes). */
-export async function visionCall(img: Uint8Array, prompt: string, tag: string, lanes: OcrLanes): Promise<{ text: string; call: LaneCall }> {
-  if (!lanes.visionUrl) throw new Error('no vision lane configured');
-  const t = Date.now();
-  const f = lanes.fetch ?? fetch;
-  const res = await f(`${lanes.visionUrl.replace(/\/+$/, '')}/chat/completions`, {
+  const res = await f(`${lanes.routerUrl.replace(/\/+$/, '')}/chat/completions`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      model: lanes.visionModel ?? VISION_LANE_MODEL, temperature: 0, max_tokens: 6000,
+      model: profile, temperature: 0, max_tokens: maxTokens,
       messages: [{ role: 'user', content: [
-        { type: 'text', text: `[${tag}] ${prompt}` },
+        { type: 'text', text },
         { type: 'image_url', image_url: { url: `data:image/jpeg;base64,${Buffer.from(img).toString('base64')}` } },
       ] }],
     }),
     signal: AbortSignal.timeout(lanes.timeoutMs ?? 3_600_000),
-    // The lane queues requests (one at a time, and while memory is short); Bun's own
+    // The router queues requests (one at a time per profile, and while memory is short); Bun's own
     // 300 s idle timeout would cut a queued call off before the signal above.
     timeout: false,
   } as RequestInit);
-  if (!res.ok) throw new Error(`vision lane answered ${res.status}`);
+  if (!res.ok) throw new Error(`${profile} answered ${res.status}`);
   const r = await res.json() as { choices?: Array<{ finish_reason?: string; message?: { content?: string } }> };
   const choice = r.choices?.[0];
-  const text = (choice?.message?.content ?? '').replace(/<think>[\s\S]*?<\/think>/g, '').trim();
-  return { text, call: { lane: 'vision', finish: choice?.finish_reason ?? 'unknown', chars: text.length, ms: Date.now() - t, ...(looksLikeRefusal(text) ? { refusal: true } : {}) } };
+  return { text: (choice?.message?.content ?? '').replace(/<think>[\s\S]*?<\/think>/g, '').trim(), finish: choice?.finish_reason ?? 'unknown' };
+}
+
+async function deepseek(img: Uint8Array, lanes: OcrLanes): Promise<{ text: string; call: LaneCall }> {
+  const t = Date.now();
+  const r = await chat(OCR_PROFILE, img, DEEPSEEK_OCR_PROMPT, 4096, lanes);
+  const text = stripGrounding(r.text);
+  return { text, call: { lane: 'deepseek-ocr', finish: r.finish, chars: text.length, ms: Date.now() - t, ...(looksLikeRefusal(text) ? { refusal: true } : {}) } };
+}
+
+/** One call to the deep profile. `tag` makes each prompt unique (the router caches prompt prefixes). */
+export async function visionCall(img: Uint8Array, prompt: string, tag: string, lanes: OcrLanes): Promise<{ text: string; call: LaneCall }> {
+  if (!deepLane(lanes)) throw new Error('the deep vision profile is off');
+  const t = Date.now();
+  const r = await chat(DEEP_PROFILE, img, `[${tag}] ${prompt}`, 6000, lanes);
+  return { text: r.text, call: { lane: 'vision', finish: r.finish, chars: r.text.length, ms: Date.now() - t, ...(looksLikeRefusal(r.text) ? { refusal: true } : {}) } };
 }
 
 const TRANSCRIBE_PROMPT = 'Transcribe this book page faithfully as Markdown in reading order: headings, running text, footnotes; '
@@ -142,7 +148,7 @@ export async function escalatePage(img: Uint8Array, first: string, tag: string, 
 export async function ocrPage(img: Uint8Array, tag: string, lanes: OcrLanes): Promise<OcrResult> {
   const r = await readPage(img, lanes);
   if (!r.reason) return { text: r.text, parser: r.text ? 'deepseek-ocr' : 'none', calls: r.calls };
-  if (lanes.visionUrl) {
+  if (deepLane(lanes)) {
     const v = await escalatePage(img, r.text, tag, lanes);
     r.calls.push(v.call);
     if (v.text !== undefined) return { text: v.text, parser: 'vision', escalated: r.reason, calls: r.calls };

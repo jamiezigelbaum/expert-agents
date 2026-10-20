@@ -14,16 +14,16 @@ const figureReply = JSON.stringify({ figures: [{ label: 'Figure 1', caption: 'Th
 function lanes(calls: string[], options: { vision?: boolean; failDeepseek?: boolean } = {}): OcrLanes {
   const fetchImpl = (async (url: string, init: RequestInit) => {
     const body = JSON.parse(String(init.body));
-    if (url.endsWith('/api/generate')) {
-      calls.push(`deepseek:${body.prompt}`);
+    if (body.model === 'delphi/vision-quality') {
+      calls.push(`deepseek:${body.messages[0].content[0].text}`);
       if (options.failDeepseek) return new Response('down', { status: 503 });
-      return Response.json({ response: scanText, done_reason: 'stop' });
+      return Response.json({ choices: [{ finish_reason: 'stop', message: { content: scanText } }] });
     }
     const prompt = String(body.messages[0].content[0].text);
     calls.push(prompt.includes('List the figures') ? 'vision:figures' : 'vision:transcribe');
     return Response.json({ choices: [{ finish_reason: 'stop', message: { content: figureReply } }] });
   }) as unknown as typeof fetch;
-  return { ollamaUrl: 'http://ollama.invalid', ...(options.vision === false ? {} : { visionUrl: 'http://vision.invalid/v1' }), fetch: fetchImpl };
+  return { routerUrl: 'http://router.invalid/v1', ...(options.vision === false ? { deep: false } : {}), fetch: fetchImpl };
 }
 
 beforeAll(async () => {

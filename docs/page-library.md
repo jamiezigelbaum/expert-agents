@@ -28,11 +28,12 @@ derivative keyed by the original's SHA-256:
 this order, and no cloud model is on the path:
 
 1. The PDF text layer (`pdftotext`). Most pages need nothing more.
-2. DeepSeek-OCR through Ollama (`OLLAMA_URL`), with its native prompt
+2. DeepSeek-OCR, through the OCR profile (`delphi/vision-quality`) of a local
+   model router (`OCR_ROUTER_URL`, OpenAI-compatible), with its native prompt
    `<image>\nFree OCR.`. The markdown prompt returns empty output on many scan
    pages.
-3. The vision lane (`VISION_URL`, an OpenAI-compatible endpoint such as
-   `delphi/vision-deep`), for pages DeepSeek reads badly:
+3. The router's deep profile (`delphi/vision-deep`), for pages DeepSeek reads
+   badly:
    - a dense page that yields little text;
    - a looping or garbled reading;
    - a table.
@@ -60,9 +61,14 @@ cut at headings and never mid-paragraph.
 
 Lane results are cached per page, so a rerun only reads pages it has not seen.
 A failed call is not cached and is retried by the next run. When both lanes
-share one machine's memory, run the parse twice: first without `VISION_URL`
-(DeepSeek reads every page), then with it once Ollama has unloaded the OCR
-model (only escalations and figures go to the vision lane).
+share one machine's memory, run the parse twice: first with
+`OCR_DEEP_LANE=off` (DeepSeek reads every page), then without it (only
+escalations and figures go to the deep profile).
+
+Calls name a router profile, never a model: the router chooses the backing
+model, queues each profile one call at a time and waits for memory. The router
+listens on loopback on its own host, so a worker elsewhere reaches it through
+a forwarded port.
 
 `upload` writes the derivatives beside the originals in the library bucket. It
 only ever adds objects under `derivatives/`; originals and the master manifest
@@ -211,8 +217,9 @@ the same name). It runs the same parse code as the operator CLI
 The worker needs, besides the search settings in section 3:
 - `EXPERT_AGENTS_DOMAIN_EXPERT_PAGE_INDEX_WRITER_DATABASE_URL`, a role that
   may write (the serving URL can stay read-only);
-- `EXPERT_AGENTS_DOMAIN_EXPERT_OLLAMA_URL` for DeepSeek-OCR;
-- optionally `EXPERT_AGENTS_DOMAIN_EXPERT_VISION_URL` and `_VISION_MODEL`.
+- `EXPERT_AGENTS_DOMAIN_EXPERT_OCR_ROUTER_URL`, the model router (…/v1);
+- optionally `EXPERT_AGENTS_DOMAIN_EXPERT_OCR_DEEP_LANE=off`, to leave hard
+  pages and figures listed instead of sending them to the deep profile.
 
 The operator CLIs are `bun run library:pages` (parse, upload, assemble a
 whole library) and `bun run library:index` (migrate, import, embed, search).

@@ -286,11 +286,12 @@ export interface DomainExpertWorkerOptions {
   /** Test seam: replaces the page index writer. */
   pageIndexWriter?: PageIndexWriter;
   /**
-   * Local OCR lanes for library_ingest: DeepSeek-OCR through Ollama, and the
-   * vision lane (OpenAI-compatible) for escalations and figures. Default from
-   * EXPERT_AGENTS_DOMAIN_EXPERT_OLLAMA_URL, _VISION_URL and _VISION_MODEL.
+   * Local OCR lanes for library_ingest: the model router's OCR profile
+   * (DeepSeek-OCR) and its deep profile for escalations and figures. Default
+   * from EXPERT_AGENTS_DOMAIN_EXPERT_OCR_ROUTER_URL (…/v1); the deep profile is
+   * off when EXPERT_AGENTS_DOMAIN_EXPERT_OCR_DEEP_LANE is "off".
    */
-  ocrLanes?: { ollamaUrl?: string; visionUrl?: string; visionModel?: string; fetch?: typeof fetch };
+  ocrLanes?: { routerUrl?: string; deep?: boolean; fetch?: typeof fetch };
 }
 
 type ResolveHostImpl = (hostname: string) => Promise<string[]>;
@@ -961,8 +962,8 @@ export class DomainExpertService {
     const issues: Array<{ code: string; domain_id?: string; message: string }> = [];
     if (!index) issues.push({ code: 'page_search_not_configured', message: 'The page index URL or the Voyage key is not set: domain_library search fails.' });
     if (!configured.writer) issues.push({ code: 'page_ingest_writer_not_configured', message: 'The index writer URL is not set: library_ingest cannot start.' });
-    if (!configured.ocr_lane) issues.push({ code: 'ocr_not_configured', message: 'No Ollama lane: pages without a text layer are listed as failed.' });
-    if (!configured.vision_lane) issues.push({ code: 'vision_not_configured', message: 'No vision lane: figures stay undescribed and are listed.' });
+    if (!configured.ocr_lane) issues.push({ code: 'ocr_not_configured', message: 'No OCR lane (EXPERT_AGENTS_DOMAIN_EXPERT_OCR_ROUTER_URL): pages without a text layer are listed as failed.' });
+    if (!configured.vision_lane) issues.push({ code: 'vision_not_configured', message: 'The deep vision profile is off: hard pages keep their OCR reading and figures stay undescribed; both are listed.' });
     const statusOf = this.pageIndexStatus ?? (this.pageIndexDatabaseUrl && this.voyageApiKey
       ? (sourceId: string) => {
         this.pageIndex ??= new PageIndex(this.pageIndexDatabaseUrl!, voyageClient(this.voyageApiKey!));
@@ -1212,18 +1213,16 @@ export class DomainExpertService {
 
   private createPageIngest(options: DomainExpertWorkerOptions): PageIngestQueue {
     const lanesConfig = {
-      ollamaUrl: options.ocrLanes?.ollamaUrl ?? process.env.EXPERT_AGENTS_DOMAIN_EXPERT_OLLAMA_URL?.trim(),
-      visionUrl: options.ocrLanes?.visionUrl ?? process.env.EXPERT_AGENTS_DOMAIN_EXPERT_VISION_URL?.trim(),
-      visionModel: options.ocrLanes?.visionModel ?? process.env.EXPERT_AGENTS_DOMAIN_EXPERT_VISION_MODEL?.trim(),
+      routerUrl: options.ocrLanes?.routerUrl ?? (process.env.EXPERT_AGENTS_DOMAIN_EXPERT_OCR_ROUTER_URL?.trim() || undefined),
+      deep: options.ocrLanes?.deep ?? process.env.EXPERT_AGENTS_DOMAIN_EXPERT_OCR_DEEP_LANE?.trim() !== 'off',
     };
     const writerUrl = options.pageIndexWriterDatabaseUrl ?? process.env.EXPERT_AGENTS_DOMAIN_EXPERT_PAGE_INDEX_WRITER_DATABASE_URL;
     let writer: PageIndexWriter | undefined = options.pageIndexWriter;
     const queue = new PageIngestQueue({
       stateDir: join(this.dataDir, 'page-ingest'),
-      ...(lanesConfig.ollamaUrl ? { lanes: {
-        ollamaUrl: lanesConfig.ollamaUrl,
-        ...(lanesConfig.visionUrl ? { visionUrl: lanesConfig.visionUrl } : {}),
-        ...(lanesConfig.visionModel ? { visionModel: lanesConfig.visionModel } : {}),
+      ...(lanesConfig.routerUrl ? { lanes: {
+        routerUrl: lanesConfig.routerUrl,
+        deep: lanesConfig.deep,
         ...(options.ocrLanes?.fetch ? { fetch: options.ocrLanes.fetch } : {}),
       } } : {}),
       writer: () => {

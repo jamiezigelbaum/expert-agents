@@ -22,7 +22,7 @@ import { existsSync } from 'node:fs';
 import { mkdir, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import {
-  emptyParseUsage, parseObject, upsertCatalog, writeParsedBook,
+  deepLane, emptyParseUsage, parseObject, upsertCatalog, writeParsedBook,
   type CatalogEntry, type OcrLanes, type ParseFailure,
 } from '@expert-agents/library';
 import { readTreeUnits, type ImportResult, type PageIndexUnit } from './page-index.ts';
@@ -112,7 +112,7 @@ export class PageIngestQueue {
 
   /** The lanes this worker reads pages with, for status and dry runs. */
   lanes(): { deepseek_ocr: boolean; vision: boolean } {
-    return { deepseek_ocr: Boolean(this.options.lanes), vision: Boolean(this.options.lanes?.visionUrl) };
+    return { deepseek_ocr: Boolean(this.options.lanes), vision: deepLane(this.options.lanes) };
   }
 
   /** A directory the caller may place owned copies of originals in before enqueueing. */

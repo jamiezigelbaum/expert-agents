@@ -3,8 +3,8 @@
 //
 // A PDF becomes one unit per physical page. Each page is read locally:
 //   1. the text layer (pdftotext);
-//   2. DeepSeek-OCR through Ollama, for a page without one;
-//   3. the vision lane, for a page DeepSeek read badly.
+//   2. DeepSeek-OCR through the model router's OCR profile, for a page without one;
+//   3. the router's deep profile, for a page DeepSeek read badly.
 // Figures are found on every page (an embedded image smaller than the page,
 // or a Figure/Table caption line) and described by the vision lane.
 // Text, Markdown and EPUB become sections of about 1,200 words.
@@ -22,7 +22,7 @@ import { dirname, join } from 'node:path';
 import { promisify } from 'node:util';
 import { convertEpubToMarkdown } from './ebook-text.ts';
 import {
-  describeFigures, escalatePage, figurePagesFromImageList, hasFigureCaption, readPage,
+  deepLane, describeFigures, escalatePage, figurePagesFromImageList, hasFigureCaption, readPage,
   type LaneCall, type OcrLanes,
 } from './page-ocr.ts';
 import {
@@ -167,10 +167,10 @@ export async function parseObject(file: string, opts: ParseObjectOptions): Promi
       ...units.filter((u) => u.parser === 'pdftotext' && hasFigureCaption(u.text)).map((u) => u.sourcePage!)])].sort((a, b) => a - b)
     : [];
   // A missing lane is reported per page, never skipped quietly.
-  if (!lanes) for (const p of ocrPages) failures.push({ page: p, kind: 'ocr', error: 'ocr_not_configured: no DeepSeek-OCR lane (OLLAMA_URL)' });
-  if (!lanes?.visionUrl) undescribedFigurePages.push(...figPages);
+  if (!lanes) for (const p of ocrPages) failures.push({ page: p, kind: 'ocr', error: 'ocr_not_configured: no OCR lane (the model router is not configured)' });
+  if (!deepLane(lanes)) undescribedFigurePages.push(...figPages);
   const jobs = lanes
-    ? [...ocrPages.map((p) => ({ p, kind: 'ocr' as const })), ...(lanes.visionUrl ? figPages : []).map((p) => ({ p, kind: 'figures' as const }))]
+    ? [...ocrPages.map((p) => ({ p, kind: 'ocr' as const })), ...(deepLane(lanes) ? figPages : []).map((p) => ({ p, kind: 'figures' as const }))]
     : [];
   let done = 0;
   opts.onProgress?.(0, jobs.length);
@@ -199,7 +199,7 @@ export async function parseObject(file: string, opts: ParseObjectOptions): Promi
           });
           const first = r.ocr;
           if (first?.escalated) {
-            if (lanes.visionUrl) {
+            if (deepLane(lanes)) {
               try {
                 const v = await lanePage(opts.cacheDir, hex, p, 'vision', async () => {
                   const e = await escalatePage(await renderPage(file, p, tmp), first.text, `${hex.slice(0, 12)}:${p}:vision`, lanes);

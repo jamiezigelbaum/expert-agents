@@ -38,9 +38,9 @@ import {
  *             read and what the search index imports (from a copy).
  *
  * PDF pages use the text layer (pdftotext). A page without one is rendered and
- * read locally: DeepSeek-OCR through Ollama (OLLAMA_URL), then the vision lane
- * (VISION_URL, an OpenAI-compatible endpoint such as `delphi/vision-deep`) for
- * pages DeepSeek reads badly. No cloud model is on this path, so no page can
+ * read locally through the model router (OCR_ROUTER_URL): DeepSeek-OCR on its
+ * OCR profile, then its deep profile (`delphi/vision-deep`) for pages DeepSeek
+ * reads badly. No cloud model is on this path, so no page can
  * be refused. Every page holding an embedded image that is not a whole-page
  * scan gets figure descriptions from the vision lane. Lane results are cached
  * per page, so a rerun reads only pages it has not seen; every call's finish
@@ -173,11 +173,9 @@ async function commandParse(args: Args): Promise<void> {
   const cache = resolve(typeof args.cache === "string" ? args.cache : join(out, ".cache"));
   const rows = (await loadSources(args)).slice(0, typeof args.limit === "string" ? Number(args.limit) : undefined);
   const usage = emptyParseUsage();
-  const ollamaUrl = process.env.OLLAMA_URL;
-  const visionUrl = process.env.VISION_URL;
-  const visionModel = process.env.VISION_MODEL;
-  const lanes: OcrLanes | undefined = ollamaUrl ? { ollamaUrl, ...(visionUrl ? { visionUrl } : {}), ...(visionModel ? { visionModel } : {}) } : undefined;
-  if (!lanes && !args["no-ocr"]) throw new Error("OLLAMA_URL is not set (DeepSeek-OCR); pass --no-ocr to use text layers only");
+  const routerUrl = process.env.OCR_ROUTER_URL;
+  const lanes: OcrLanes | undefined = routerUrl ? { routerUrl, deep: process.env.OCR_DEEP_LANE !== "off" } : undefined;
+  if (!lanes && !args["no-ocr"]) throw new Error("OCR_ROUTER_URL is not set (the model router, …/v1); pass --no-ocr to use text layers only");
   await mkdir(out, { recursive: true });
   const opts: ParseOptions = {
     ocr: !args["no-ocr"], figures: !args["no-figures"], force: Boolean(args.force), ...(lanes ? { lanes } : {}),
@@ -322,7 +320,7 @@ const HELP = `usage:
   bun scripts/library-pages.ts parse    --sources <tsv|list of gs:// URIs> --originals <dir> --out <dir> [--cache <dir>] [--no-ocr] [--no-figures] [--concurrency 2] [--lane-concurrency 2] [--limit N] [--force]
   bun scripts/library-pages.ts upload   --out <dir> --bucket <bucket> --prefix <library prefix>
   bun scripts/library-pages.ts assemble --out <dir> --tree <dir> [--manifest master.json]
-env: OLLAMA_URL (DeepSeek-OCR), VISION_URL and VISION_MODEL (vision lane: escalation and figures),
+env: OCR_ROUTER_URL (the model router, …/v1: DeepSeek-OCR and the deep profile), OCR_DEEP_LANE=off (no escalation or figures),
      EXPERT_AGENTS_DOMAIN_EXPERT_GOOGLE_ACCESS_TOKEN or gcloud ADC (GCS)`;
 
 export async function main(argv: string[]): Promise<void> {

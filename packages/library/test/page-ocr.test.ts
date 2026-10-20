@@ -15,16 +15,19 @@ import {
 const prose = 'The witness is not an object of experience, and the argument of this chapter turns on that point. '.repeat(3);
 
 function lanes(deepseekText: string, visionText: string, calls: string[]) {
+  // The router: one chat endpoint, a profile named in every call, never a model.
   const fetchImpl = (async (url: string, init: RequestInit) => {
+    expect(url).toBe('http://router.invalid/v1/chat/completions');
     const body = JSON.parse(String(init.body));
-    if (url.endsWith('/api/generate')) {
-      calls.push(`deepseek:${body.prompt}`);
-      return Response.json({ response: deepseekText, done_reason: 'stop' });
+    if (body.model === 'delphi/vision-quality') {
+      calls.push(`deepseek:${body.messages[0].content[0].text}`);
+      return Response.json({ choices: [{ finish_reason: 'stop', message: { content: deepseekText } }] });
     }
+    expect(body.model).toBe('delphi/vision-deep');
     calls.push(`vision:${body.model}`);
     return Response.json({ choices: [{ finish_reason: 'stop', message: { content: visionText } }] });
   }) as unknown as typeof fetch;
-  return { ollamaUrl: 'http://ollama.invalid', visionUrl: 'http://vision.invalid/v1', fetch: fetchImpl };
+  return { routerUrl: 'http://router.invalid/v1/', fetch: fetchImpl };
 }
 
 describe('local page OCR', () => {
@@ -52,7 +55,7 @@ describe('local page OCR', () => {
   test('the two steps run apart: a failed vision call is marked, so it can be retried later', async () => {
     const first = await readPage(new Uint8Array(DENSE_PAGE_JPEG_BYTES), lanes('', 'unused', []));
     expect(first).toMatchObject({ text: '', reason: 'empty' });
-    const down = { ollamaUrl: 'http://ollama.invalid', visionUrl: 'http://vision.invalid/v1', fetch: (async () => { throw new Error('The operation timed out.'); }) as unknown as typeof fetch };
+    const down = { routerUrl: 'http://router.invalid/v1', fetch: (async () => { throw new Error('The operation timed out.'); }) as unknown as typeof fetch };
     const e = await escalatePage(new Uint8Array([1]), '', 't', down);
     expect(e.text).toBeUndefined();
     expect(e.call).toMatchObject({ lane: 'vision', finish: 'error', error: 'The operation timed out.' });
