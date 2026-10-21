@@ -10,6 +10,7 @@ import {
   ocrPage,
   parseFigureReply,
   readPage,
+  stripGrounding,
 } from '../src/page-ocr.ts';
 
 const prose = 'The witness is not an object of experience, and the argument of this chapter turns on that point. '.repeat(3);
@@ -60,6 +61,12 @@ describe('local page OCR', () => {
     expect(e.text).toBeUndefined();
     expect(e.call).toMatchObject({ lane: 'vision', finish: 'error', error: 'The operation timed out.' });
     expect((await escalatePage(new Uint8Array([1]), '', 't', lanes('', prose, []))).text).toBe(prose.trim());
+  });
+
+  test('chat-template tokens a served model echoes are not page text', () => {
+    // Seen on 2026-10-21 through the router: the reading began with `<|im_end|>`.
+    expect(stripGrounding('<|im_end|>\n\nChapter Two: The Storm Ledger<|end▁of▁sentence|>')).toBe('Chapter Two: The Storm Ledger');
+    expect(stripGrounding('a | b | c')).toBe('a | b | c');
   });
 
   test('a refusal is logged and never used as page text', async () => {

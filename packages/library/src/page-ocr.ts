@@ -71,7 +71,9 @@ export function ocrEscalationReason(text: string, imageBytes = Number.POSITIVE_I
 }
 
 export function stripGrounding(text: string): string {
-  return text.replace(/<\|ref\|>.*?<\|\/ref\|><\|det\|>.*?<\|\/det\|>/gs, '').replace(/<\|\/?(ref|det|grounding)\|>/g, '').trim();
+  return text.replace(/<\|ref\|>.*?<\|\/ref\|><\|det\|>.*?<\|\/det\|>/gs, '').replace(/<\|\/?(ref|det|grounding)\|>/g, '')
+    // Chat-template control tokens (`<|im_end|>`, `<|end▁of▁sentence|>`) a served model can echo; never page text.
+    .replace(/<\|[^|<>\s]{1,40}\|>/gu, '').trim();
 }
 
 /** One chat call to a router profile with one page image. The router queues per profile (one call at a time). */
