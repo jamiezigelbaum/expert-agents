@@ -286,6 +286,7 @@ export function derivativeManifest(parsed: ParsedObject, sourceUri: string): Pag
     units: parsed.units.map(({ text, ...u }) => ({ ...u, chars: text.length })),
     figures: parsed.figures,
     emptyUnits: parsed.emptyUnits,
+    ...(parsed.declared ? { declared: parsed.declared } : {}),
   };
 }
 
