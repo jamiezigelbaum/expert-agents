@@ -826,10 +826,11 @@ function visualStyle(domainId: string): DomainVisualStyle {
   };
 }
 
-export function domainPolicy(): Record<string, unknown> {
+/** The policy stamp on every result. `backend` names what answered: the Vertex engine, or the page library. */
+export function domainPolicy(backend: typeof RAG_BACKEND | 'page_library' = RAG_BACKEND): Record<string, unknown> {
   return {
     expert_agents_control_plane_only: true,
-    backend: RAG_BACKEND,
+    backend,
     host_source_contracts_unchanged: true,
     per_question_answer_logic_in_runtime: false,
     raw_runtime_secrets_exposed: false,

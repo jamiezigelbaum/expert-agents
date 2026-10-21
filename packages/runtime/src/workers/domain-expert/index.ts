@@ -1211,7 +1211,7 @@ export class DomainExpertService {
           config.sourceId,
         )
         : await library.run(parsed);
-      return { kind: 'domain_library_result', domain_id: manifest.domain_id, action: parsed.action, ...body, policy: domainPolicy() };
+      return { kind: 'domain_library_result', domain_id: manifest.domain_id, action: parsed.action, ...body, policy: domainPolicy('page_library') };
     } catch (error) {
       if (error instanceof PageDisclosureRefusal) throw disclosureErrorFrom(error.refusal);
       if (error instanceof PageLibraryError) throw new DomainExpertWorkerError(error.status, error.code, error.message);
@@ -1291,7 +1291,7 @@ export class DomainExpertService {
     const route = this.agentRouting[manifest.domain_id]!;
     if (!route.pageLibrary) throw new DomainExpertWorkerError(404, 'page_library_not_configured', 'This domain has no page library.');
     if (route.disclosure) throw new DomainExpertWorkerError(403, 'page_ingest_not_disclosable', 'This deployment serves under a disclosure policy; ingest into its library from the owner deployment.');
-    const result = (body: Record<string, unknown>) => ({ kind: 'library_ingest_result', domain_id: manifest.domain_id, action, ...body, policy: domainPolicy() });
+    const result = (body: Record<string, unknown>) => ({ kind: 'library_ingest_result', domain_id: manifest.domain_id, action, ...body, policy: domainPolicy('page_library') });
     try {
       if (action === 'status') return result({ job: await this.pageIngest.get(manifest.domain_id, requireString(params.job_id, 'job_id')) });
       if (action === 'list') return result({ jobs: await this.pageIngest.list(manifest.domain_id) });

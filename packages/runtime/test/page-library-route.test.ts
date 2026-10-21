@@ -75,6 +75,8 @@ describe('page-library-only routes', () => {
     const search = await call('domain_library', { action: 'search', query: 'page' });
     expect(search.status).toBe(200);
     expect(search.body.results[0].cite).toBe('A. Author, Sample Book, p.1');
+    // The policy stamp names the page library, so a caller can tell which lane answered.
+    expect(search.body.policy.backend).toBe('page_library');
 
     for (const [tool, params] of [
       ['domain_ask', { question: 'What is on page one?' }],
