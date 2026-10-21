@@ -106,6 +106,7 @@ export const researchToolSchemas: Record<DomainExpertTool, ToolParameterSchema> 
   library_ingest: schema('Add sources to the domain page library. start ingests a workspace file or folder (PDF, EPUB, Markdown, text) or a gs:// original in the domain\'s library: each PDF page becomes a unit read locally (text layer, then DeepSeek-OCR, then the vision lane), figures are described, then the book is indexed and embedded. It runs in the background and answers with a job_id; status reports each source per page: parsers used, failed pages, empty pages, unresolved readings and undescribed figures. Nothing is dropped silently. Re-ingesting the same file replaces its book. dry_run (default true) lists what would be ingested; a live start needs approval_id.', {
     domain_id: domainId,
     action: choice(['start', 'status', 'list'], 'start a job, status of one job, or list recent jobs.'),
+    source_id: text('start: which page library receives the book, one of the route\'s source ids. Required when the route reads more than one library; there is no default.'),
     workspace_relative_path: text('start: a file or folder in the worker workspace.'),
     gcs_uri: text('start: a gs:// original inside this domain\'s library or acquisition directory.'),
     title: text('start, one source only: the book title (default: from the file name or EPUB metadata).'),
@@ -194,6 +195,7 @@ export const researchToolSchemas: Record<DomainExpertTool, ToolParameterSchema> 
     md5: text('Expected source MD5 if known.'),
     file_size_bytes: count('Expected artifact byte count if known.', 0),
     ingest: flag('Whether to ingest the acquired artifact into the domain\'s corpus.'),
+    source_id: text('Page-library ingest only: which of the route\'s libraries receives the book. Required when the route reads more than one library.'),
     allow_short_artifact: flag('Explicit exception to the configured minimum book-scale artifact check. Measurement is still performed and recorded.'),
     copyright_posture: text('Required explicit rights/use classification for this acquisition.'),
     approval_id: approvalId,

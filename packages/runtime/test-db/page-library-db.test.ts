@@ -59,7 +59,7 @@ const ocrFetch = (async (_url: string, init: RequestInit) => {
 const library = { bucket: 'neutral-library', prefix: 'factory/shared' };
 const BOUNDS = { maxQuoteChars: 40, maxQuotesPerSource: 1, maxSourceCoveragePerSession: 0.9 };
 
-function worker(db: string, routes: Record<string, unknown>, downloads: string[] = []) {
+function worker(db: string, routes: Record<string, unknown>, downloads: string[] = [], extra: Record<string, unknown> = {}) {
   const pdf = scanAndFigurePdf();
   const fetchImpl = (async (input: RequestInfo | URL) => {
     const url = String(input);
@@ -79,6 +79,7 @@ function worker(db: string, routes: Record<string, unknown>, downloads: string[]
     pageIndexWriterDatabaseUrl: databaseUrl(db),
     voyageApiKey: 'synthetic-key',
     voyageFetch,
+    ...extra,
     google: { accessToken: 'synthetic-token', fetchImpl },
   });
   return async (domainId: string, tool: string, params: Record<string, unknown>) => {
@@ -202,6 +203,57 @@ describe('a page library kept in the database', () => {
     expect((await publicWorker('governance', 'domain_library', { action: 'catalog' })).body.books.map((b: { book: string }) => b.book)).toEqual([book]);
     expect((await publicWorker('governance', 'domain_library', { action: 'grep', pattern: 'Confidential' })).body.hits).toEqual([]);
     expect((await publicWorker('governance', 'domain_library', { action: 'read', slug: 'books/minutes-aaaaaa/s0001' })).body.error.code).toBe('page_library_unknown_book');
+  });
+});
+
+describe('one route reading two databases', () => {
+  const NOTES = 'private-notes';
+  const both = { governance: { library, pageLibrary: { sourceId: SOURCE, also: [{ sourceId: NOTES, database: 'private' }] } } };
+  // The private database is known to the worker only through its named URLs.
+  const named = { pageLibraryDatabaseUrls: { private: databaseUrl(PRIVATE_DB) }, pageLibraryWriterDatabaseUrls: { private: databaseUrl(PRIVATE_DB) } };
+
+  test('reads span both, a single-database route sees only its own, and ingest lands in the database of the named library', async () => {
+    const privateIndex = new PageIndex(databaseUrl(PRIVATE_DB), voyageClient('synthetic-key', { fetch: voyageFetch }));
+    await privateIndex.importUnits(NOTES, [{ slug: 'books/ledger-bbbbbb/s0001', book: 'ledger-bbbbbb', unit: 's0001', title: 'Ledger', body: 'Confidential treasury ledger entries.', meta: {} }]);
+    await privateIndex.replaceBooks(NOTES, [{ book: 'ledger-bbbbbb', title: 'Ledger', creator: '', kind: 'sections', units: 1, first_unit: 's0001', last_unit: 's0001', figures: 0, objects: [], sources: [] }]);
+    await privateIndex.embedPending(NOTES);
+    await privateIndex.close();
+
+    const call = worker(PUBLIC_DB, both, [], named);
+    const books = (await call('governance', 'domain_library', { action: 'catalog' })).body.books.map((b: { book: string }) => b.book);
+    expect(books).toHaveLength(2);
+    expect(books).toContain('ledger-bbbbbb');
+    expect((await call('governance', 'domain_library', { action: 'read', slug: 'books/ledger-bbbbbb/s0001' })).body.text).toBe('Confidential treasury ledger entries.');
+    const found = await call('governance', 'domain_library', { action: 'search', query: 'confidential treasury ledger' });
+    expect(found.body.results[0].slug).toBe('books/ledger-bbbbbb/s0001');
+    expect((await call('governance', 'domain_library', { action: 'grep', pattern: 'treasury' })).body.hits.map((h: { slug: string }) => h.slug)).toEqual(['books/ledger-bbbbbb/s0001']);
+    const health = await (await createDomainExpertWorker({
+      dataDir: join(dir, `data-${randomSuffix()}`), gcpProject: 'neutral-project',
+      agentRouting: validateAgentRoutingConfig(both) as AgentRoutingConfig,
+      pageIndexDatabaseUrl: databaseUrl(PUBLIC_DB), ...named, voyageApiKey: 'synthetic-key', voyageFetch,
+      google: { accessToken: 'synthetic-token', fetchImpl: (async () => { throw new Error('no network'); }) as unknown as typeof fetch },
+    }).fetch(new Request('http://worker.test/v1/health'))).json() as Record<string, any>;
+    expect(health.page_library.domains[0].libraries).toEqual([
+      { source_id: SOURCE, database: 'default', catalog: 'ready', books: 1 },
+      { source_id: NOTES, database: 'private', catalog: 'ready', books: 1 },
+    ]);
+
+    // The same route without the named database cannot see the private book.
+    const solo = worker(PUBLIC_DB, { governance: { library, pageLibrary: { sourceId: SOURCE } } }, [], named);
+    expect((await solo('governance', 'domain_library', { action: 'read', slug: 'books/ledger-bbbbbb/s0001' })).body.error.code).toBe('page_library_unknown_book');
+    expect((await solo('governance', 'domain_library', { action: 'grep', pattern: 'treasury' })).body.hits).toEqual([]);
+
+    // Ingest needs a source_id and writes through that library's database.
+    const sql = (db: string) => new SQL({ url: databaseUrl(db), max: 1 });
+    const count = async (db: string, source: string) => { const c = sql(db); try { const [r] = await c`SELECT count(*)::int AS n FROM page_books WHERE source = ${source}` as Array<{ n: number }>; return r!.n; } finally { await c.close(); } };
+    const start = { action: 'start', workspace_relative_path: 'inbox/author---a-sample-book.pdf', dry_run: false, approval_id: 'owner-1' };
+    expect((await call('governance', 'library_ingest', start)).body.error.code).toBe('page_ingest_source_required');
+    const queued = await call('governance', 'library_ingest', { ...start, source_id: NOTES });
+    expect(queued.status).toBe(200);
+    expect((await finished(call, 'governance', queued.body.job.job_id)).state).toBe('done');
+    expect(await count(PRIVATE_DB, NOTES)).toBe(2);
+    expect(await count(PUBLIC_DB, NOTES)).toBe(0);
+    expect(await count(PUBLIC_DB, SOURCE)).toBe(1);
   });
 });
 

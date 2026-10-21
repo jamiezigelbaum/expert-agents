@@ -234,6 +234,8 @@ export interface AnnasArchiveImportParams {
   url?: string;
   format?: AnnasArchiveFormat;
   corpusId?: string;
+  /** Page-library ingest: which of the route's libraries gets the book (required when it reads several). */
+  sourceId?: string;
   title?: string;
   author?: string;
   year?: string;

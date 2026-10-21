@@ -66,7 +66,7 @@ export class AgentRegistrationStore {
       throw new OperationError('agent_registration_conflict', 'The corpus name is already assigned to another agent.');
     }
     if (route.pageLibrary && Object.entries(routes).some(([id, other]) => id !== domain
-      && (other.pageLibrary?.sourceId === route.pageLibrary!.sourceId || (route.pageLibrary!.root !== undefined && other.pageLibrary?.root === route.pageLibrary!.root)))) {
+      && ((other.pageLibrary?.sourceId === route.pageLibrary!.sourceId && other.pageLibrary.database === undefined) || (route.pageLibrary!.root !== undefined && other.pageLibrary?.root === route.pageLibrary!.root)))) {
       throw new OperationError('agent_registration_conflict', 'The page library is already assigned to another agent.');
     }
     const existing = routes[domain];
