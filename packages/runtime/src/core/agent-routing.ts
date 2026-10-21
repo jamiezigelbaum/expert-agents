@@ -91,6 +91,15 @@ export interface AgentPageLibraryConfig {
   /** Library source id: the key of its catalog, units and search rows. */
   sourceId: string;
   /**
+   * The named database `sourceId` lives in (a worker reads it through
+   * EXPERT_AGENTS_DOMAIN_EXPERT_PAGE_LIBRARY_DATABASE_URL_<NAME>). Absent, the
+   * default page-library database. Never together with `root`, and never on a
+   * route with a disclosure policy.
+   */
+  database?: string;
+  /** Further libraries this route reads alongside the primary one (no `root`). */
+  also?: Array<{ sourceId: string; database?: string }>;
+  /**
    * Buckets view_page may render originals from. Absent, the route's library
    * and read-only source roots; a route without either must list them here.
    */
@@ -205,6 +214,10 @@ function validateRoutingEntry(domainId: string, value: unknown): AgentRoutingEnt
   }
 
   const pageLibrary = entry.pageLibrary === undefined ? undefined : validatePageLibrary(entry.pageLibrary);
+  // A private library must never reach a public (disclosed) deployment.
+  if (pageLibrary && disclosure && (pageLibrary.database !== undefined || pageLibrary.also?.some((a) => a.database !== undefined))) {
+    throw new AgentRoutingConfigError('a route served under a disclosure policy cannot read a named (private) page library');
+  }
   if (pageLibrary && !pageLibrary.originalBuckets && !library && !readOnlySourceRoots) {
     throw new AgentRoutingConfigError('pageLibrary needs originalBuckets when the entry has no library');
   }
@@ -226,11 +239,30 @@ function validateRoutingEntry(domainId: string, value: unknown): AgentRoutingEnt
 
 function validatePageLibrary(value: unknown): AgentPageLibraryConfig {
   const entry = requireRecord(value, 'pageLibrary must be an object');
-  requireExactKeys(entry, ['root', 'sourceId', 'originalBuckets'], 'pageLibrary');
+  requireExactKeys(entry, ['root', 'sourceId', 'database', 'also', 'originalBuckets'], 'pageLibrary');
   const root = entry.root === undefined ? undefined : requireNonEmptyString(entry.root, 'pageLibrary root');
   if (root !== undefined && (!root.startsWith('/') || root.split('/').includes('..'))) throw new AgentRoutingConfigError('pageLibrary root must be an absolute path');
   const sourceId = requireNonEmptyString(entry.sourceId, 'pageLibrary sourceId');
   if (!/^[a-z0-9][a-z0-9-]{0,63}$/.test(sourceId)) throw new AgentRoutingConfigError('pageLibrary sourceId is invalid');
+  const database = entry.database === undefined ? undefined : validateDatabaseName(entry.database, 'pageLibrary database');
+  if (root !== undefined && database !== undefined) throw new AgentRoutingConfigError('pageLibrary root cannot be combined with database');
+  let also: Array<{ sourceId: string; database?: string }> | undefined;
+  if (entry.also !== undefined) {
+    if (!Array.isArray(entry.also) || entry.also.length < 1 || entry.also.length > 8) throw new AgentRoutingConfigError('pageLibrary also must list 1 to 8 libraries');
+    const seen = new Set([`${database ?? ''}\u0000${sourceId}`]);
+    also = entry.also.map((item) => {
+      const rec = requireRecord(item, 'a pageLibrary also item must be an object');
+      requireExactKeys(rec, ['sourceId', 'database'], 'a pageLibrary also item');
+      const id = requireNonEmptyString(rec.sourceId, 'a pageLibrary also sourceId');
+      if (!/^[a-z0-9][a-z0-9-]{0,63}$/.test(id)) throw new AgentRoutingConfigError('a pageLibrary also sourceId is invalid');
+      const db = rec.database === undefined ? undefined : validateDatabaseName(rec.database, 'a pageLibrary also database');
+      const key = `${db ?? ''}\u0000${id}`;
+      if (seen.has(key)) throw new AgentRoutingConfigError('pageLibrary lists the same library twice');
+      seen.add(key);
+      return Object.freeze({ sourceId: id, ...(db !== undefined ? { database: db } : {}) });
+    });
+    Object.freeze(also);
+  }
   let originalBuckets: string[] | undefined;
   if (entry.originalBuckets !== undefined) {
     if (!Array.isArray(entry.originalBuckets) || entry.originalBuckets.length < 1 || entry.originalBuckets.length > 16
@@ -239,7 +271,24 @@ function validatePageLibrary(value: unknown): AgentPageLibraryConfig {
     }
     originalBuckets = Object.freeze([...new Set(entry.originalBuckets as string[])]) as string[];
   }
-  return Object.freeze({ ...(root !== undefined ? { root } : {}), sourceId, ...(originalBuckets ? { originalBuckets } : {}) });
+  return Object.freeze({
+    ...(root !== undefined ? { root } : {}), sourceId, ...(database !== undefined ? { database } : {}), ...(also ? { also } : {}),
+    ...(originalBuckets ? { originalBuckets } : {}),
+  });
+}
+
+/** A named page-library database: lowercase slug, so its env var name is unambiguous. */
+export const PAGE_LIBRARY_DATABASE_NAME = /^[a-z0-9][a-z0-9-]{0,31}$/;
+
+function validateDatabaseName(value: unknown, label: string): string {
+  const name = requireNonEmptyString(value, label);
+  if (!PAGE_LIBRARY_DATABASE_NAME.test(name)) throw new AgentRoutingConfigError(`${label} is invalid`);
+  return name;
+}
+
+/** The libraries a route reads, primary first. */
+export function pageLibraryMembers(config: Pick<AgentPageLibraryConfig, 'sourceId' | 'database' | 'also'>): Array<{ sourceId: string; database?: string }> {
+  return [{ sourceId: config.sourceId, ...(config.database !== undefined ? { database: config.database } : {}) }, ...(config.also ?? [])];
 }
 
 /** The buckets view_page may read originals from: explicit, else the route's library locations. */

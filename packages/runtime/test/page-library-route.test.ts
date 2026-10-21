@@ -243,8 +243,8 @@ describe('health reports page-library readiness', () => {
       const health = await healthOf(worker);
       expect(health.page_library.configured).toEqual({ index: true, writer: false, ocr_lane: true, vision_lane: false });
       expect(health.page_library.domains).toEqual([
-        { domain_id: 'history', source_id: 'history', store: 'tree', catalog: 'ready', books: 1, index: { status: 'ready', units: 2, chunks: 2, pending_embeddings: 1 }, disclosure: false },
-        { domain_id: 'fresh', source_id: 'fresh', store: 'tree', catalog: 'empty', books: 0, index: { status: 'ready', units: 0, chunks: 0, pending_embeddings: 0 }, disclosure: false },
+        { domain_id: 'history', source_id: 'history', store: 'tree', catalog: 'ready', books: 1, index: { status: 'ready', units: 2, chunks: 2, pending_embeddings: 1 }, disclosure: false, libraries: [{ source_id: 'history', database: 'default', catalog: 'ready', books: 1 }] },
+        { domain_id: 'fresh', source_id: 'fresh', store: 'tree', catalog: 'empty', books: 0, index: { status: 'ready', units: 0, chunks: 0, pending_embeddings: 0 }, disclosure: false, libraries: [{ source_id: 'fresh', database: 'default', catalog: 'empty', books: 0 }] },
       ]);
       expect(health.page_library.status).toBe('degraded');
       expect(health.page_library.issues.map((issue: { code: string }) => issue.code).sort())

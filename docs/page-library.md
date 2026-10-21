@@ -285,12 +285,45 @@ docker compose --env-file page-library.env --profile worker up -d --build
   ```
 
   Serving workers see the new books within a minute; nothing restarts.
-- **A private shelf is a second library.** Run a second project from the same
-  file (`PAGE_LIBRARY_PROJECT=<name>`, its own env files, ports and
-  passwords). Its worker holds only its own database's logins, so no route of
-  the public worker, misconfigured or not, can reach a private book: the
-  public worker has no credential for that database. Same code, same deploy
-  command, different database.
+- **A private shelf is a second library.** Run a second compose project from
+  the same file (`PAGE_LIBRARY_PROJECT=<name>`, its own env files, ports and
+  passwords) and migrate and import into it by pointing the CLI at its URL
+  (`PAGE_INDEX_DATABASE_URL`, as above). A public worker holds no credential
+  for that database, so no route of it, misconfigured or not, can reach a
+  private book. Same code, same deploy command, different database.
+
+  An agent that reads both (an owner's agent over the public shelves and its
+  private documents) runs on an owner worker that is given the private
+  database by name, only through its environment:
+
+  ```sh
+  EXPERT_AGENTS_DOMAIN_EXPERT_PAGE_LIBRARY_DATABASE_URL_PRIVATE_NOTES=postgres://page_reader:…@…/pages          # serving
+  EXPERT_AGENTS_DOMAIN_EXPERT_PAGE_LIBRARY_WRITER_DATABASE_URL_PRIVATE_NOTES=postgres://page_writer:…@…/pages   # library_ingest
+  ```
+
+  `<NAME>` is the database name upper-cased with `-` as `_` (`private-notes`
+  above; names match `^[a-z0-9][a-z0-9-]{0,31}$`). The route names it:
+
+  ```json
+  { "pageLibrary": { "sourceId": "governance", "also": [{ "sourceId": "governance-private", "database": "private-notes" }] } }
+  ```
+
+  `database` on the primary library, or on any `also` entry (1 to 8, no
+  `root`), picks a named database; absent, the default one. The route reads
+  every library as one: the catalog is their union (a book id two hold
+  belongs to the first), a read goes to the owning library, and search asks
+  each library's index and merges by score. Health lists them under
+  `libraries` (source id, database name, catalog state, book count; never a
+  URL).
+  - **Ingest says where.** On a route with more than one library,
+    `library_ingest start` and `annas_archive_import` with `ingest` need
+    `source_id` (`page_ingest_source_required`; one of the route's source
+    ids), so a private document never lands in a public shelf by omission.
+    The job writes through that library's database writer, and without one
+    fails with `page_ingest_writer_not_configured` before anything is queued.
+  - **Disclosure never meets a private database.** Routing is rejected at
+    load when an entry with a `disclosure` policy names any non-default
+    database.
 
 ### Moving a library
 

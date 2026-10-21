@@ -84,6 +84,8 @@ export interface IngestJob {
   root?: string;
   /** The library is the database; `root` is the job's staging tree. */
   database?: boolean;
+  /** The named database the library lives in; absent, the default one. */
+  database_name?: string;
 }
 
 /** What the queue needs from the search index: the writer side of PageIndex. */
@@ -105,10 +107,10 @@ export interface PageIngestOptions {
   stateDir: string;
   lanes?: OcrLanes;
   laneConcurrency?: number;
-  /** The index writer; throws when it is not configured. */
-  writer: () => PageIndexWriter;
+  /** The index writer of a named database (the default one when absent); throws when it is not configured. */
+  writer: (database?: string) => PageIndexWriter;
   /** Called once a job changed a domain's tree or index, so readers drop caches. */
-  changed?: (domainId: string) => void;
+  changed?: (domainId: string, library: { sourceId: string; database?: string }) => void;
   log?: (record: Record<string, unknown>) => void;
 }
 
@@ -132,10 +134,10 @@ export class PageIngestQueue {
     return dir;
   }
 
-  async enqueue(domainId: string, config: { root?: string; sourceId: string }, inputs: IngestSourceInput[]): Promise<IngestJob> {
+  async enqueue(domainId: string, config: { root?: string; sourceId: string; database?: string }, inputs: IngestSourceInput[]): Promise<IngestJob> {
     if (!inputs.length) throw new PageIngestError('page_ingest_no_sources', 'There is nothing to ingest.');
     // A library in the database needs its writer before anything is parsed.
-    if (!config.root) this.options.writer();
+    if (!config.root) this.options.writer(config.database);
     const now = new Date().toISOString();
     const jobId = randomUUID();
     const job: IngestJob = {
@@ -144,6 +146,7 @@ export class PageIngestQueue {
       sources: inputs.map((s) => ({ name: s.name, uri: s.uri, state: 'queued', ...(s.title ? { title: s.title } : {}), ...(s.creator ? { creator: s.creator } : {}) })),
       inputs,
       ...(config.root ? { root: config.root } : { root: join(this.options.stateDir, domainId, 'staging', jobId), database: true }),
+      ...(config.database !== undefined ? { database_name: config.database } : {}),
     };
     await this.save(job);
     this.pending.push({ domainId, jobId: job.job_id });
@@ -238,7 +241,7 @@ export class PageIngestQueue {
           const entry = await writeParsedBook(root, parsed, input.uri, meta);
           // An earlier ingest of the same original under other display names is replaced, not kept twice.
           const holding = await booksHoldingObject(root, parsed.objectId);
-          if (job.database) holding.push(...(await this.options.writer().catalog(job.source_id)).filter((b) => (b.objects ?? []).includes(parsed.objectId)).map((b) => b.book));
+          if (job.database) holding.push(...(await this.options.writer(job.database_name).catalog(job.source_id)).filter((b) => (b.objects ?? []).includes(parsed.objectId)).map((b) => b.book));
           const stale = [...new Set(holding)].filter((b) => b !== entry.book);
           for (const old of stale) { replaced.add(old); await rm(join(root, 'books', old), { recursive: true, force: true }); }
           // The catalog follows each book, so a restart resumes from what is already written.
@@ -263,7 +266,7 @@ export class PageIngestQueue {
       if (books.length) {
         job.state = 'indexing';
         await this.save(job);
-        const writer = this.options.writer();
+        const writer = this.options.writer(job.database_name);
         const units = await readTreeUnits(root, entries.map((e) => e.book));
         const imported = await writer.importUnits(job.source_id, units, { books });
         // Units first, then the catalog that lists them, so a reader never meets a listed book without pages.
@@ -281,7 +284,7 @@ export class PageIngestQueue {
       job.state = 'failed';
       job.error = (error as Error).message.slice(0, 300);
     } finally {
-      if (changed) this.options.changed?.(job.domain_id);
+      if (changed) this.options.changed?.(job.domain_id, { sourceId: job.source_id, ...(job.database_name !== undefined ? { database: job.database_name } : {}) });
     }
     if (TERMINAL.includes(job.state)) {
       for (const input of inputs) await rm(input.file, { force: true });

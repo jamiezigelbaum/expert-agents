@@ -97,6 +97,7 @@ import {
   type AgentRoutingEntry,
   type ExplicitCorpusOperation,
   pageLibraryOriginalBuckets,
+  pageLibraryMembers,
 } from '../../core/agent-routing.ts';
 import {
   DISCLOSURE_REFUSAL_CODES,
@@ -115,8 +116,9 @@ import {
 import { completePassageSentences, completionSourceObject, SourceTextCache } from './passage-completion.ts';
 import { LibraryReader, LibraryReadError, parseLibraryReadParams, type LibraryReadRoute } from './library-reader.ts';
 import { PageIndex, voyageClient, type VoyageClient } from './page-index.ts';
+import { MultiPageStore, type PageLibraryMember } from './page-libraries.ts';
 import { PageDisclosureRefusal, runDisclosedPageLibrary } from './page-disclosure.ts';
-import { PageLibrary, PageLibraryError, parsePageLibraryParams, type PageLibraryDependencies } from './page-library.ts';
+import { PageLibrary, PageLibraryError, parsePageLibraryParams, type PageSearchHit } from './page-library.ts';
 import { DatabasePageStore, TreePageStore, type PageStore } from './page-store.ts';
 import { PageIngestError, PageIngestQueue, type IngestSourceInput, type PageIndexWriter } from './page-ingest.ts';
 
@@ -276,12 +278,19 @@ export interface DomainExpertWorkerOptions {
   voyageApiKey?: string;
   /** Test seam: the fetch Voyage embedding and rerank calls go through. */
   voyageFetch?: typeof fetch;
-  /** Test seam: replaces the page index search. */
-  pageSearch?: PageLibraryDependencies['search'];
+  /**
+   * Postgres URLs of named page-library databases (route `pageLibrary.database`), by name; a name
+   * missing here falls back to EXPERT_AGENTS_DOMAIN_EXPERT_PAGE_LIBRARY_DATABASE_URL_<NAME>.
+   */
+  pageLibraryDatabaseUrls?: Record<string, string>;
+  /** The same for ingest: ..._PAGE_LIBRARY_WRITER_DATABASE_URL_<NAME>. */
+  pageLibraryWriterDatabaseUrls?: Record<string, string>;
+  /** Test seam: replaces the page index search; `database` names the route library's database. */
+  pageSearch?: (query: string, k: number, sourceId: string, database?: string) => Promise<PageSearchHit[]>;
   /** Test seam: replaces the page index's per-source status in health. */
-  pageIndexStatus?: (sourceId: string) => Promise<{ units: number; chunks: number; pending_embeddings: number }>;
+  pageIndexStatus?: (sourceId: string, database?: string) => Promise<{ units: number; chunks: number; pending_embeddings: number }>;
   /** Test seam: the store of a page library kept in the database (a route without `root`). */
-  pageStore?: (sourceId: string) => PageStore;
+  pageStore?: (sourceId: string, database?: string) => PageStore;
   /**
    * Postgres URL library_ingest writes the index with; defaults to
    * EXPERT_AGENTS_DOMAIN_EXPERT_PAGE_INDEX_WRITER_DATABASE_URL. Separate from the
@@ -290,6 +299,8 @@ export interface DomainExpertWorkerOptions {
   pageIndexWriterDatabaseUrl?: string;
   /** Test seam: replaces the page index writer. */
   pageIndexWriter?: PageIndexWriter;
+  /** Test seam: replaces the writer of named databases, by name. */
+  pageIndexWriters?: Record<string, PageIndexWriter>;
   /**
    * Local OCR lanes for library_ingest: the model router's OCR profile
    * (DeepSeek-OCR) and its deep profile for escalations and figures. Default
@@ -808,9 +819,11 @@ export class DomainExpertService {
   private pageIndexDatabaseUrl: string | undefined;
   private voyageApiKey: string | undefined;
   private pageIndex: PageIndex | undefined;
-  private pageSearch: PageLibraryDependencies['search'] | undefined;
-  private pageIndexStatus: ((sourceId: string) => Promise<{ units: number; chunks: number; pending_embeddings: number }>) | undefined;
-  private pageStoreOverride: ((sourceId: string) => PageStore) | undefined;
+  private namedPageIndexes = new Map<string, PageIndex>();
+  private pageLibraryDatabaseUrls: Record<string, string>;
+  private pageSearch: DomainExpertWorkerOptions['pageSearch'];
+  private pageIndexStatus: DomainExpertWorkerOptions['pageIndexStatus'];
+  private pageStoreOverride: DomainExpertWorkerOptions['pageStore'];
   private voyageFetch: typeof fetch | undefined;
   private pageIngest!: PageIngestQueue;
   private annas: DomainExpertAnnasConfig;
@@ -875,6 +888,7 @@ export class DomainExpertService {
     });
     this.pageIndexDatabaseUrl = options.pageIndexDatabaseUrl ?? process.env.EXPERT_AGENTS_DOMAIN_EXPERT_PAGE_INDEX_DATABASE_URL;
     this.voyageApiKey = options.voyageApiKey ?? process.env.EXPERT_AGENTS_DOMAIN_EXPERT_VOYAGE_API_KEY;
+    this.pageLibraryDatabaseUrls = options.pageLibraryDatabaseUrls ?? {};
     this.pageSearch = options.pageSearch;
     this.pageIndexStatus = options.pageIndexStatus;
     this.pageStoreOverride = options.pageStore;
@@ -973,37 +987,41 @@ export class DomainExpertService {
     if (!configured.writer) issues.push({ code: 'page_ingest_writer_not_configured', message: 'The index writer URL is not set: library_ingest cannot start.' });
     if (!configured.ocr_lane) issues.push({ code: 'ocr_not_configured', message: 'No OCR lane (EXPERT_AGENTS_DOMAIN_EXPERT_OCR_ROUTER_URL): pages without a text layer are listed as failed.' });
     if (!configured.vision_lane) issues.push({ code: 'vision_not_configured', message: 'The deep vision profile is off: hard pages keep their OCR reading and figures stay undescribed; both are listed.' });
-    const statusOf = this.pageIndexStatus ?? (this.pageIndexDatabaseUrl && this.voyageApiKey
-      ? (sourceId: string) => {
-        this.pageIndex ??= new PageIndex(this.pageIndexDatabaseUrl!, this.voyage());
-        return this.pageIndex.sourceStatus(sourceId);
-      }
+    const statusFor = (database?: string) => this.pageIndexStatus ?? (this.voyageApiKey && this.pageIndexUrl(database)
+      ? (sourceId: string, _database?: string) => this.pageIndexFor(database).sourceStatus(sourceId)
       : undefined);
     const domains = [];
     for (const [domainId, route] of routes) {
       const config = route.pageLibrary!;
-      let catalog: 'ready' | 'empty' | 'unreadable' = 'empty';
-      let books = 0;
-      try {
-        books = (await withTimeout(this.pageStoreFor(config).catalog(), PAGE_INDEX_HEALTH_TIMEOUT_MS)).length;
-        catalog = books > 0 ? 'ready' : 'empty';
-      } catch {
-        catalog = 'unreadable';
-      }
-      if (catalog === 'unreadable') issues.push({ code: 'page_library_unavailable', domain_id: domainId, message: 'The page library catalog is not readable.' });
-      let indexStatus: Record<string, unknown> = { status: 'not_configured' };
-      if (statusOf) {
+      const libraries: Array<{ source_id: string; database: string; catalog: 'ready' | 'empty' | 'unreadable'; books: number }> = [];
+      const primary: { catalog: 'ready' | 'empty' | 'unreadable'; books: number; indexStatus: Record<string, unknown> } = { catalog: 'empty', books: 0, indexStatus: { status: 'not_configured' } };
+      for (const [i, member] of pageLibraryMembers(config).entries()) {
+        let catalog: 'ready' | 'empty' | 'unreadable' = 'empty';
+        let books = 0;
         try {
-          const counts = await withTimeout(statusOf(config.sourceId), PAGE_INDEX_HEALTH_TIMEOUT_MS);
-          indexStatus = { status: 'ready', ...counts };
-          if (counts.pending_embeddings > 0) issues.push({ code: 'page_embeddings_pending', domain_id: domainId, message: `${counts.pending_embeddings} chunks have no vector yet: semantic search misses them until they are embedded.` });
-          if (books > 0 && counts.units === 0) issues.push({ code: 'page_index_empty', domain_id: domainId, message: 'The catalog lists books but the index holds none of them: search finds nothing.' });
+          books = (await withTimeout(this.pageStoreFor({ ...(i === 0 && config.root ? { root: config.root } : {}), ...member }).catalog(), PAGE_INDEX_HEALTH_TIMEOUT_MS)).length;
+          catalog = books > 0 ? 'ready' : 'empty';
         } catch {
-          indexStatus = { status: 'unreachable' };
-          issues.push({ code: 'page_search_unavailable', domain_id: domainId, message: 'The page index did not answer.' });
+          catalog = 'unreadable';
         }
+        if (catalog === 'unreadable') issues.push({ code: 'page_library_unavailable', domain_id: domainId, message: 'The page library catalog is not readable.' });
+        let indexStatus: Record<string, unknown> = { status: 'not_configured' };
+        const statusOf = statusFor(member.database);
+        if (statusOf) {
+          try {
+            const counts = await withTimeout(statusOf(member.sourceId, member.database), PAGE_INDEX_HEALTH_TIMEOUT_MS);
+            indexStatus = { status: 'ready', ...counts };
+            if (counts.pending_embeddings > 0) issues.push({ code: 'page_embeddings_pending', domain_id: domainId, message: `${counts.pending_embeddings} chunks have no vector yet: semantic search misses them until they are embedded.` });
+            if (books > 0 && counts.units === 0) issues.push({ code: 'page_index_empty', domain_id: domainId, message: 'The catalog lists books but the index holds none of them: search finds nothing.' });
+          } catch {
+            indexStatus = { status: 'unreachable' };
+            issues.push({ code: 'page_search_unavailable', domain_id: domainId, message: 'The page index did not answer.' });
+          }
+        }
+        libraries.push({ source_id: member.sourceId, database: member.database ?? 'default', catalog, books });
+        if (i === 0) Object.assign(primary, { catalog, books, indexStatus });
       }
-      domains.push({ domain_id: domainId, source_id: config.sourceId, store: config.root ? 'tree' : 'database', catalog, books, index: indexStatus, disclosure: Boolean(route.disclosure) });
+      domains.push({ domain_id: domainId, source_id: config.sourceId, store: config.root ? 'tree' : 'database', catalog: primary.catalog, books: primary.books, index: primary.indexStatus, disclosure: Boolean(route.disclosure), libraries });
     }
     return { status: issues.length ? 'degraded' : 'ready', configured, domains, ...(issues.length ? { issues } : {}) };
   }
@@ -1177,27 +1195,25 @@ export class DomainExpertService {
       const route = this.agentRouting[manifest.domain_id]!;
       if (!route.pageLibrary) throw new PageLibraryError('page_library_not_configured', 'This domain has no page library.', 404);
       const config = route.pageLibrary;
-      const key = `${manifest.domain_id}\u0000${config.root ?? ''}\u0000${config.sourceId}`;
+      const members = pageLibraryMembers(config);
+      const key = `${manifest.domain_id}\u0000${config.root ?? ''}\u0000${members.map((m) => `${m.database ?? ''}:${m.sourceId}`).join(',')}`;
       let library = this.pageLibraries.get(key);
       if (!library) {
-        const search = this.pageSearch ?? (() => {
-          if (!this.pageIndexDatabaseUrl || !this.voyageApiKey) {
-            throw new PageLibraryError('page_search_not_configured', 'The page search index is not configured.', 503);
-          }
-          this.pageIndex ??= new PageIndex(this.pageIndexDatabaseUrl, this.voyage());
-          const index = this.pageIndex;
-          return async (query: string, k: number, sourceId: string) => {
-            try { return await index.search(sourceId, query, k); }
-            catch (error) {
-              if (error instanceof PageLibraryError) throw error;
-              throw new PageLibraryError('page_search_unavailable', 'The page search index could not run the query.', 503);
-            }
-          };
-        })();
+        // One search and one store per library; several are read as one (page-libraries.ts).
+        const parts: PageLibraryMember[] = members.map((m, i) => ({
+          ...m,
+          search: this.pageSearchFor(m.database, m.sourceId),
+          store: this.pageStoreFor({ ...(i === 0 && config.root ? { root: config.root } : {}), ...m }),
+        }));
+        const multi = parts.length > 1 ? new MultiPageStore(parts) : undefined;
         library = new PageLibrary(
           // The domain's acquisition directory holds originals library_ingest stored for it.
           { sourceId: config.sourceId, originalBuckets: [...new Set([...pageLibraryOriginalBuckets(route), ...(this.acquisitionDirectory(manifest.domain_id) ? [this.acquisitionDirectory(manifest.domain_id)!.bucket] : [])])] },
-          { search, store: this.pageStoreFor(config), download: (bucket, name, maxBytes, timeoutMs) => this.google.downloadLibraryObject(bucket, name, maxBytes, timeoutMs) },
+          {
+            search: multi ? (query, k) => multi.search(query, k) : (query, k) => parts[0]!.search(query, k),
+            store: multi ?? parts[0]!.store,
+            download: (bucket, name, maxBytes, timeoutMs) => this.google.downloadLibraryObject(bucket, name, maxBytes, timeoutMs),
+          },
         );
         this.pageLibraries.set(key, library);
       }
@@ -1223,18 +1239,46 @@ export class DomainExpertService {
     return voyageClient(this.voyageApiKey!, this.voyageFetch ? { fetch: this.voyageFetch } : {});
   }
 
-  /**
-   * Where a route's catalog and units are read: its tree when it names a root, else the page
-   * library database through the serving (read-only) URL.
-   */
-  private pageStoreFor(config: { root?: string; sourceId: string }): PageStore {
-    if (config.root) return new TreePageStore(config.root);
-    if (this.pageStoreOverride) return this.pageStoreOverride(config.sourceId);
-    if (!this.pageIndexDatabaseUrl || !this.voyageApiKey) {
-      throw new PageLibraryError('page_search_not_configured', 'The page library database is not configured.', 503);
+  /** The configured Postgres URL of the default or a named page-library database (reader). */
+  private pageIndexUrl(database?: string): string | undefined {
+    if (database === undefined) return this.pageIndexDatabaseUrl;
+    return this.pageLibraryDatabaseUrls[database] ?? (process.env[pageLibraryEnvName('DATABASE_URL', database)] || undefined);
+  }
+
+  /** The search index of the default or a named database, opened on first use and kept. */
+  private pageIndexFor(database?: string): PageIndex {
+    const url = this.pageIndexUrl(database);
+    if (!url || !this.voyageApiKey) throw new PageLibraryError('page_search_not_configured', 'The page library database is not configured.', 503);
+    if (database === undefined) return this.pageIndex ??= new PageIndex(url, this.voyage());
+    let index = this.namedPageIndexes.get(database);
+    if (!index) { index = new PageIndex(url, this.voyage()); this.namedPageIndexes.set(database, index); }
+    return index;
+  }
+
+  private pageSearchFor(database: string | undefined, sourceId: string): (query: string, k: number) => Promise<PageSearchHit[]> {
+    const seam = this.pageSearch;
+    if (seam) return (query, k) => seam(query, k, sourceId, database);
+    if (!this.pageIndexUrl(database) || !this.voyageApiKey) {
+      throw new PageLibraryError('page_search_not_configured', 'The page search index is not configured.', 503);
     }
-    this.pageIndex ??= new PageIndex(this.pageIndexDatabaseUrl, this.voyage());
-    return new DatabasePageStore(this.pageIndex.sql, config.sourceId);
+    const index = this.pageIndexFor(database);
+    return async (query, k) => {
+      try { return await index.search(sourceId, query, k); }
+      catch (error) {
+        if (error instanceof PageLibraryError) throw error;
+        throw new PageLibraryError('page_search_unavailable', 'The page search index could not run the query.', 503);
+      }
+    };
+  }
+
+  /**
+   * Where a library's catalog and units are read: its tree when it names a root, else the page
+   * library database (the default or the named one) through the serving (read-only) URL.
+   */
+  private pageStoreFor(config: { root?: string; sourceId: string; database?: string }): PageStore {
+    if (config.root) return new TreePageStore(config.root);
+    if (this.pageStoreOverride) return this.pageStoreOverride(config.sourceId, config.database);
+    return new DatabasePageStore(this.pageIndexFor(config.database).sql, config.sourceId);
   }
 
   private createPageIngest(options: DomainExpertWorkerOptions): PageIngestQueue {
@@ -1242,8 +1286,12 @@ export class DomainExpertService {
       routerUrl: options.ocrLanes?.routerUrl ?? (process.env.EXPERT_AGENTS_DOMAIN_EXPERT_OCR_ROUTER_URL?.trim() || undefined),
       deep: options.ocrLanes?.deep ?? process.env.EXPERT_AGENTS_DOMAIN_EXPERT_OCR_DEEP_LANE?.trim() !== 'off',
     };
-    const writerUrl = options.pageIndexWriterDatabaseUrl ?? process.env.EXPERT_AGENTS_DOMAIN_EXPERT_PAGE_INDEX_WRITER_DATABASE_URL;
-    let writer: PageIndexWriter | undefined = options.pageIndexWriter;
+    const writerUrlOf = (database?: string): string | undefined => database === undefined
+      ? options.pageIndexWriterDatabaseUrl ?? process.env.EXPERT_AGENTS_DOMAIN_EXPERT_PAGE_INDEX_WRITER_DATABASE_URL
+      : options.pageLibraryWriterDatabaseUrls?.[database] ?? (process.env[pageLibraryEnvName('WRITER_DATABASE_URL', database)] || undefined);
+    // One writer per database, opened on first use; '' is the default database.
+    const writers = new Map<string, PageIndexWriter>();
+    const seamWriter = (database?: string) => database === undefined ? options.pageIndexWriter : options.pageIndexWriters?.[database];
     const queue = new PageIngestQueue({
       stateDir: join(this.dataDir, 'page-ingest'),
       ...(lanesConfig.routerUrl ? { lanes: {
@@ -1251,29 +1299,31 @@ export class DomainExpertService {
         deep: lanesConfig.deep,
         ...(options.ocrLanes?.fetch ? { fetch: options.ocrLanes.fetch } : {}),
       } } : {}),
-      writer: () => {
-        if (writer) return writer;
+      writer: (database) => {
+        const cached = writers.get(database ?? '') ?? seamWriter(database);
+        if (cached) return cached;
+        const writerUrl = writerUrlOf(database);
         if (!writerUrl || !this.voyageApiKey) throw new PageIngestError('page_ingest_writer_not_configured', 'The page index writer is not configured.', 503);
         const index = new PageIndex(writerUrl, this.voyage(), { maxConnections: 4 });
-        writer = {
+        const writer: PageIndexWriter = {
           importUnits: (s, u, o) => index.importUnits(s, u, o), embedPending: (s) => index.embedPending(s), pendingEmbeddings: (s) => index.pendingEmbeddings(s),
           catalog: (s) => index.catalog(s), replaceBooks: (s, e, o) => index.replaceBooks(s, e, o),
         };
+        writers.set(database ?? '', writer);
         return writer;
       },
-      changed: (domainId) => {
+      changed: (domainId, library) => {
         for (const key of [...this.pageLibraries.keys()]) if (key.startsWith(`${domainId}\u0000`)) this.pageLibraries.delete(key);
-        const sourceId = this.agentRouting[domainId]?.pageLibrary?.sourceId;
-        if (sourceId) this.pageIndex?.invalidate(sourceId);
+        (library.database === undefined ? this.pageIndex : this.namedPageIndexes.get(library.database))?.invalidate(library.sourceId);
       },
       log: (record) => console.info(JSON.stringify(record)),
     });
-    this.pageIngestWriterConfigured = () => Boolean(writer || (writerUrl && this.voyageApiKey));
+    this.pageIngestWriterConfigured = (database) => Boolean(writers.get(database ?? '') || seamWriter(database) || (writerUrlOf(database) && this.voyageApiKey));
     void queue.resume().catch((error: unknown) => console.warn(JSON.stringify({ kind: 'page_ingest_resume_failed', error: String(error).slice(0, 200) })));
     return queue;
   }
 
-  private pageIngestWriterConfigured: () => boolean = () => false;
+  private pageIngestWriterConfigured: (database?: string) => boolean = () => false;
 
   /**
    * library_ingest: add workspace files or library originals to a domain's page library
@@ -1281,7 +1331,7 @@ export class DomainExpertService {
    * object keeps its own; a workspace file is stored in the domain's acquisition directory.
    */
   private async libraryIngest(params: Record<string, unknown>): Promise<unknown> {
-    const allowed = ['domain_id', 'action', 'workspace_relative_path', 'gcs_uri', 'title', 'creator', 'job_id', 'dry_run', 'approval_id'];
+    const allowed = ['domain_id', 'action', 'source_id', 'workspace_relative_path', 'gcs_uri', 'title', 'creator', 'job_id', 'dry_run', 'approval_id'];
     const extra = Object.keys(params).filter((key) => !allowed.includes(key));
     if (extra.length) throw new DomainExpertWorkerError(400, 'invalid_params', `library_ingest does not take: ${extra.join(', ')}.`);
     const action = params.action;
@@ -1300,6 +1350,8 @@ export class DomainExpertService {
       throw error;
     }
 
+    // Which library the job writes: required when the route reads several, so nothing lands in one by omission.
+    const target = this.pageIngestTarget(manifest.domain_id, params.source_id === undefined ? undefined : requireString(params.source_id, 'source_id'));
     const workspacePath = params.workspace_relative_path === undefined ? undefined : requireString(params.workspace_relative_path, 'workspace_relative_path');
     const gcsUri = params.gcs_uri === undefined ? undefined : requireString(params.gcs_uri, 'gcs_uri');
     if (Boolean(workspacePath) === Boolean(gcsUri)) throw new DomainExpertWorkerError(400, 'invalid_params', 'start takes exactly one of workspace_relative_path or gcs_uri.');
@@ -1340,15 +1392,37 @@ export class DomainExpertService {
       sources: candidates.map((c) => ({ name: c.name, ...(c.bytes ? { bytes: c.bytes } : {}), ...(c.uri ? { gcs_uri: c.uri } : {}) })),
       skipped,
       lanes: this.pageIngest.lanes(),
-      index_writer_configured: this.pageIngestWriterConfigured(),
+      ...(this.agentRouting[manifest.domain_id]!.pageLibrary!.also ? { source_id: target.sourceId } : {}),
+      index_writer_configured: this.pageIngestWriterConfigured(target.database),
     };
     if (dryRun) return result({ status: 'dry_run', ...plan });
     requireApprovalId(typeof params.approval_id === 'string' ? params.approval_id : undefined, 'library_ingest start');
-    if (!this.pageIngestWriterConfigured()) throw new DomainExpertWorkerError(503, 'page_ingest_writer_not_configured', 'The page index writer is not configured.');
+    if (!this.pageIngestWriterConfigured(target.database)) throw new DomainExpertWorkerError(503, 'page_ingest_writer_not_configured', 'The page index writer is not configured.');
     const job = await this.enqueuePageIngest(manifest, candidates.map((c) => ({
       name: c.name, read: c.read, ...(c.uri ? { uri: c.uri } : {}), ...(title ? { title } : {}), ...(creator ? { creator } : {}),
-    })));
+    })), target);
     return result({ status: 'queued', job, lanes: plan.lanes, skipped });
+  }
+
+  /**
+   * The library an ingest writes: the route's only one, or the one `sourceId` names among
+   * several (then it is required). A route reading a named database writes through that
+   * database's writer.
+   */
+  private pageIngestTarget(domainId: string, sourceId: string | undefined): { root?: string; sourceId: string; database?: string } {
+    const config = this.agentRouting[domainId]?.pageLibrary;
+    if (!config) throw new DomainExpertWorkerError(404, 'page_library_not_configured', 'This domain has no page library.');
+    const members = pageLibraryMembers(config);
+    if (members.length > 1 && sourceId === undefined) {
+      throw new DomainExpertWorkerError(400, 'page_ingest_source_required', `This route reads ${members.length} page libraries; name the one to write with source_id: ${[...new Set(members.map((m) => m.sourceId))].join(', ')}.`);
+    }
+    const matches = members.map((m, i) => ({ m, i })).filter(({ m }) => sourceId === undefined || m.sourceId === sourceId);
+    if (!matches.length) {
+      throw new DomainExpertWorkerError(400, 'page_ingest_source_unknown', `source_id is not one of this route's libraries: ${[...new Set(members.map((m) => m.sourceId))].join(', ')}.`);
+    }
+    if (matches.length > 1) throw new DomainExpertWorkerError(400, 'page_ingest_source_ambiguous', 'More than one of this route\'s libraries has that source_id; give each library its own source id to ingest into it.');
+    const { m, i } = matches[0]!;
+    return { ...(i === 0 && config.root ? { root: config.root } : {}), ...m };
   }
 
   /**
@@ -1359,10 +1433,11 @@ export class DomainExpertService {
   private async enqueuePageIngest(
     manifest: ReturnType<typeof domainManifest>,
     sources: Array<{ name: string; read: () => Promise<Uint8Array>; uri?: string; title?: string; creator?: string }>,
+    target: { root?: string; sourceId: string; database?: string },
   ): Promise<unknown> {
     const route = this.agentRouting[manifest.domain_id]!;
     if (!route.pageLibrary) throw new DomainExpertWorkerError(404, 'page_library_not_configured', 'This domain has no page library.');
-    if (!this.pageIngestWriterConfigured()) throw new DomainExpertWorkerError(503, 'page_ingest_writer_not_configured', 'The page index writer is not configured.');
+    if (!this.pageIngestWriterConfigured(target.database)) throw new DomainExpertWorkerError(503, 'page_ingest_writer_not_configured', 'The page index writer is not configured.');
     const acquisitions = this.acquisitionDirectory(manifest.domain_id);
     if (sources.some((c) => !c.uri) && !acquisitions) {
       throw new DomainExpertWorkerError(503, 'page_ingest_no_original_store', 'No acquisition directory is configured for this domain, so the original has nowhere to be stored for view_page.');
@@ -1390,7 +1465,7 @@ export class DomainExpertService {
       inputs.push({ name: c.name, uri, file, ...(c.title ? { title: c.title } : {}), ...(c.creator ? { creator: c.creator } : {}) });
     }
     try {
-      return await this.pageIngest.enqueue(manifest.domain_id, route.pageLibrary, inputs);
+      return await this.pageIngest.enqueue(manifest.domain_id, target, inputs);
     } catch (error) {
       if (error instanceof PageIngestError) throw new DomainExpertWorkerError(error.status, error.code, error.message);
       throw error;
@@ -1425,7 +1500,7 @@ export class DomainExpertService {
       const name = `${basename(sourcePath).replace(/\.[a-z0-9]{1,5}$/i, '')}.${format}`;
       const job = await this.enqueuePageIngest(manifest, [{
         name, read: async () => bytes, ...(params.title ? { title: params.title } : {}), ...(params.author ? { creator: params.author } : {}),
-      }]) as { job_id: string; state: string };
+      }], this.pageIngestTarget(manifest.domain_id, params.sourceId)) as { job_id: string; state: string };
       return {
         ragIngest: { status: 'page_ingest_queued', target: 'page_library', job_id: job.job_id, next: 'Check library_ingest status with this job_id.' },
         registry: { status: 'skipped', reason: 'Page-library sources are catalogued by the page library.' },
@@ -4903,6 +4978,8 @@ export class DomainExpertService {
     const dryRun = params.dryRun ?? true;
     const manifest = this.manifest(params.domainId);
     const toPageLibrary = Boolean(params.ingest && this.agentRouting[manifest.domain_id]?.pageLibrary);
+    // A route reading several libraries must say which one gets the book, before anything is downloaded.
+    if (toPageLibrary) this.pageIngestTarget(manifest.domain_id, params.sourceId);
     // Only a Vertex ingest chooses a corpus; a download-only acquisition is unaffected.
     if (params.ingest && !toPageLibrary) this.requireExplicitCorpus(manifest, 'annas_archive_import', params.corpusId);
     const plan = planAnnasArchiveImport({ ...params, dryRun: true }, manifest);
@@ -8607,6 +8684,7 @@ function parseAnnasArchiveImportParams(params: Record<string, unknown>): AnnasAr
     ...optionalStringField(params.url, 'url'),
     ...optionalAnnasFormat(params.format),
     ...optionalStringField(params.corpus_id, 'corpusId'),
+    ...optionalStringField(params.source_id, 'sourceId'),
     ...optionalStringField(params.title, 'title'),
     ...optionalStringField(params.author, 'author'),
     ...optionalStringField(params.year, 'year'),
@@ -9349,6 +9427,11 @@ const PAGE_INGEST_EXTENSIONS = new Set(['.pdf', '.epub', '.md', '.markdown', '.t
 const PAGE_INGEST_MAX_BYTES = 300_000_000;
 // Health counts each page-library source's index rows; an index that does not answer in this long is unreachable.
 const PAGE_INDEX_HEALTH_TIMEOUT_MS = 3_000;
+
+/** EXPERT_AGENTS_DOMAIN_EXPERT_PAGE_LIBRARY_[WRITER_]DATABASE_URL_<NAME> for a named page-library database. */
+function pageLibraryEnvName(kind: 'DATABASE_URL' | 'WRITER_DATABASE_URL', database: string): string {
+  return `EXPERT_AGENTS_DOMAIN_EXPERT_PAGE_LIBRARY_${kind}_${database.toUpperCase().replace(/-/g, '_')}`;
+}
 
 function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
