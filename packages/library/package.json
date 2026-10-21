@@ -5,7 +5,8 @@
   "license": "MIT",
   "type": "module",
   "exports": {
-    ".": "./src/index.ts"
+    ".": "./src/index.ts",
+    "./web-text": "./src/web-text.ts"
   },
   "scripts": {
     "typecheck": "tsc --noEmit",

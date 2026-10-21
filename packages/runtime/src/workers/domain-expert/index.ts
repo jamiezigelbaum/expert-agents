@@ -90,8 +90,8 @@ import {
   type LibraryLocationConfig,
   MEDIA_EXTENSIONS,
   splitFrontmatter,
-  extractWebMainText,
 } from '@expert-agents/library';
+import { extractWebMainText } from '@expert-agents/library/web-text';
 import { DEFAULT_QPDF_BIN, LLM_PARSER_MAX_PDF_PAGES, pdfPageLimitSetting, pdfPartStem, pdfTextLayer, planPdfParts, qpdfPageCount, splitPdf, stripPdfPartSuffix, type PdfPart, type PdfPartPlan, type PdfTextLayer } from '@expert-agents/library';
 import {
   agentRoutingConfigFromEnv,

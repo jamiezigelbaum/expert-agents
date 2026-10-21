@@ -1,7 +1,9 @@
 // The main text of a web page: Mozilla Readability (the Firefox Reader View
 // extractor) over a linkedom document, then the library's own HTML-to-Markdown
 // converter. Navigation, menus, sidebars and footers are left out. Pure and
-// local: no network, no model.
+// local: no network, no model. Imported as "@expert-agents/library/web-text",
+// never through the package index: these parsers are CommonJS, and a bundle of
+// them carries import.meta.require, which OpenClaw's plugin loader refuses.
 
 import { Readability } from "@mozilla/readability";
 import { parseHTML } from "linkedom";
