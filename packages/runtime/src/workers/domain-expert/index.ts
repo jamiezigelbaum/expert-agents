@@ -9428,9 +9428,15 @@ const PAGE_INGEST_MAX_BYTES = 300_000_000;
 // Health counts each page-library source's index rows; an index that does not answer in this long is unreachable.
 const PAGE_INDEX_HEALTH_TIMEOUT_MS = 3_000;
 
-/** EXPERT_AGENTS_DOMAIN_EXPERT_PAGE_LIBRARY_[WRITER_]DATABASE_URL_<NAME> for a named page-library database. */
-function pageLibraryEnvName(kind: 'DATABASE_URL' | 'WRITER_DATABASE_URL', database: string): string {
-  return `EXPERT_AGENTS_DOMAIN_EXPERT_PAGE_LIBRARY_${kind}_${database.toUpperCase().replace(/-/g, '_')}`;
+// Spelled out whole so the deploy-env test sees each prefix the env example documents.
+const PAGE_LIBRARY_ENV_PREFIX = {
+  DATABASE_URL: 'EXPERT_AGENTS_DOMAIN_EXPERT_PAGE_LIBRARY_DATABASE_URL_',
+  WRITER_DATABASE_URL: 'EXPERT_AGENTS_DOMAIN_EXPERT_PAGE_LIBRARY_WRITER_DATABASE_URL_',
+} as const;
+
+/** The reader or writer URL variable for a named page-library database: the prefix plus <NAME>. */
+function pageLibraryEnvName(kind: keyof typeof PAGE_LIBRARY_ENV_PREFIX, database: string): string {
+  return PAGE_LIBRARY_ENV_PREFIX[kind] + database.toUpperCase().replace(/-/g, '_');
 }
 
 function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
