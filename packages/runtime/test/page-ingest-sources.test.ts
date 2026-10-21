@@ -170,6 +170,19 @@ async function ingest(w: ReturnType<typeof worker>, params: Record<string, unkno
 const fixture = (): Fixture => ({ page: ARTICLE('first'), uploads: [], transcriptions: [] });
 
 describe('library_ingest web pages', () => {
+  test('a fetched page names no creator unless the page declares one', async () => {
+    const fx = fixture();
+    // A title with " - " slugs to "a---b"; that must not be split into creator and title.
+    fx.page = ARTICLE('first').replace('<title>Assemblies of Old</title>', '<title>Assemblies of Old - The Review</title>');
+    const w = worker(fx, { tree: join(dir, 'tree-web-creator'), writer: recordingWriter().writer });
+    const plain = await ingest(w, { urls: ['https://example.org/essays/plain'] });
+    expect(plain.sources[0]).toMatchObject({ state: 'parsed', creator: '' });
+
+    fx.page = fx.page.replace('</head>', '<meta name="author" content="A. Historian"></head>');
+    const signed = await ingest(w, { urls: ['https://example.org/essays/signed'] });
+    expect(signed.sources[0]).toMatchObject({ state: 'parsed', creator: 'A. Historian' });
+  });
+
   test('a page keeps its main text, URL and retrieval date, and re-ingesting the URL replaces its book', async () => {
     const fx = fixture();
     const tree = join(dir, 'tree-web');
@@ -190,6 +203,8 @@ describe('library_ingest web pages', () => {
     expect(read.body.text).toContain('The first assembly met at dawn');
     // Main text only: the extractor drops navigation and footer, and the front matter is metadata, not text.
     expect(read.body.text).not.toContain('retrieved_at');
+    expect(read.body.text).not.toContain('Subscribe');
+    expect(read.body.text).not.toContain('Copyright notice');
     const catalog = await call(w, 'domain_library', { action: 'catalog' });
     expect(catalog.body.books).toEqual([expect.objectContaining({ book: source.book, title: 'Assemblies of Old', source_url: 'https://example.org/essays/assemblies', retrieved_at: source.retrieved_at })]);
 

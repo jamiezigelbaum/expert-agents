@@ -75,7 +75,6 @@ import {
   EbookConversionError,
   convertEpubToMarkdown,
   plainTextToMarkdown,
-  xhtmlToMarkdown,
   normalizeExtractedText,
   parseMasterManifest,
   parseScopeManifest,
@@ -91,6 +90,7 @@ import {
   type LibraryLocationConfig,
   MEDIA_EXTENSIONS,
   splitFrontmatter,
+  extractWebMainText,
 } from '@expert-agents/library';
 import { DEFAULT_QPDF_BIN, LLM_PARSER_MAX_PDF_PAGES, pdfPageLimitSetting, pdfPartStem, pdfTextLayer, planPdfParts, qpdfPageCount, splitPdf, stripPdfPartSuffix, type PdfPart, type PdfPartPlan, type PdfTextLayer } from '@expert-agents/library';
 import {
@@ -1614,7 +1614,7 @@ export class DomainExpertService {
     if (MEDIA_EXTENSIONS.has(ext)) return { ...base, name: file.fileName, file: await write(file.bytes, ext), uri: file.finalUrl };
     if (ext !== '.md' && ext !== '.txt' && ext !== '.markdown') throw new PageIngestError('page_ingest_format_unsupported', `The page library reads web pages, PDF, text, audio and video; this URL is ${ext.slice(1) || 'an unknown type'}.`);
     const t = text(new TextDecoder('utf-8', { fatal: false }).decode(file.bytes));
-    return { ...base, name: file.fileName, file: await write(t.bytes, '.md'), uri: file.finalUrl, ...(t.meta.title ? { title: t.meta.title } : {}), ...(t.meta.channel ? { creator: t.meta.channel } : {}) };
+    return { ...base, name: file.fileName, file: await write(t.bytes, '.md'), uri: file.finalUrl, ...(t.meta.title ? { title: t.meta.title } : {}), ...(t.meta.author || t.meta.channel ? { creator: t.meta.author || t.meta.channel } : {}) };
   }
 
   /** A page-library domain's acquisition goes to its page library, never to a Vertex corpus. */
@@ -12944,12 +12944,14 @@ async function deriveSummarizeExtraction(context: WebImportHandlerContext): Prom
   const extractionInput: SummarizeExtractionInput = youtube
     ? { mode: 'youtube_url', source: context.finalUrl, fetchPerformedBy: SUMMARIZE_BINARY }
     : { mode: 'local_input', source: context.response.bytes, fetchPerformedBy: WEB_IMPORT_WORKER_FETCHER };
-  const extracted = extractionInput.mode === 'youtube_url'
-    ? await runSummarizeExtraction(context.extraction, extractionInput.source)
+  const page = extractionInput.mode === 'youtube_url'
+    ? { text: await runSummarizeExtraction(context.extraction, extractionInput.source) }
     : localHtmlExtraction(extractionInput.source);
+  const extracted = page.text;
   const extractor = extractionInput.mode === 'youtube_url' ? EXTRACTION_METHOD : WEB_IMPORT_LOCAL_HTML_EXTRACTOR;
   const html = utf8(context.response.bytes);
-  const title = extractHtmlTitle(html)
+  const title = page.title
+    || extractHtmlTitle(html)
     || firstMarkdownHeading(extracted)
     || new URL(context.finalUrl).hostname;
   // The extractor usually emits its own leading heading; a second one would
@@ -12960,6 +12962,7 @@ async function deriveSummarizeExtraction(context: WebImportHandlerContext): Prom
     retrieved_at: context.fetchedAt,
     kind,
     title,
+    ...(page.author ? { author: page.author } : {}),
     extractor,
   })}${heading}${extracted}`;
   return {
@@ -12989,13 +12992,15 @@ async function deriveSummarizeExtraction(context: WebImportHandlerContext): Prom
 }
 
 /**
- * A page's bytes are already in this process: the library's own converter turns
- * them into Markdown without a subprocess, a temp file, or a second fetch. An
+ * A page's bytes are already in this process: Readability picks the article
+ * (navigation, menus and footers dropped) and the library's own converter turns
+ * it into Markdown without a subprocess, a temp file, or a second fetch. An
  * empty result is refused with the same code the extractor's own empty answer
  * uses, and the message carries no page content.
  */
-function localHtmlExtraction(bytes: Uint8Array): string {
-  const extracted = normalizeExtractedText(xhtmlToMarkdown(utf8(bytes)).markdown);
+function localHtmlExtraction(bytes: Uint8Array): { text: string; title?: string; author?: string } {
+  const page = extractWebMainText(utf8(bytes));
+  const extracted = normalizeExtractedText(page.markdown);
   if (extracted.length === 0) {
     throw new DomainExpertWorkerError(
       422,
@@ -13003,7 +13008,7 @@ function localHtmlExtraction(bytes: Uint8Array): string {
       `${WEB_IMPORT_LOCAL_HTML_EXTRACTOR} produced no text for this page.`,
     );
   }
-  return extracted;
+  return { text: extracted, ...(page.title ? { title: page.title } : {}), ...(page.author ? { author: page.author } : {}) };
 }
 
 async function runSummarizeExtraction(extraction: ExtractionRuntimeContext, source: string): Promise<string> {

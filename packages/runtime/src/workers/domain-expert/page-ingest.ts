@@ -286,9 +286,11 @@ export class PageIngestQueue {
               if (done === total || done - lastSaved >= 10) { lastSaved = done; void this.save(job); }
             },
           });
+          // A fetched source's file name is a slug of its title, never "creator---title".
+          const named = titleFromName(input.name);
           const meta = {
-            title: input.title ?? parsed.declared?.title ?? titleFromName(input.name).title,
-            creator: input.creator ?? parsed.declared?.creator ?? titleFromName(input.name).creator,
+            title: input.title ?? parsed.declared?.title ?? named.title,
+            creator: input.creator ?? parsed.declared?.creator ?? (input.origin ? '' : named.creator),
           };
           const entry = await writeParsedBook(root, parsed, uri, {
             ...meta, ...(input.origin ? { origin: input.origin } : {}),

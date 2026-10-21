@@ -27,7 +27,7 @@ describe("@expert-agents/library package", () => {
       "deepLane", "describeFigures", "escalatePage", "figurePagesFromImageList", "hasFigureCaption", "looksLikeRefusal", "ocrEscalationReason", "ocrPage",
       "parseFigureReply", "readPage", "stripGrounding", "visionCall",
       "derivativeManifest", "emptyParseUsage", "isEpub", "isPdf", "parseObject", "pool", "sha256Hex", "upsertCatalog", "writeBook", "writeParsedBook",
-      "formatTimecode", "isMediaFile", "splitFrontmatter", "timeRange", "timedSections", "transcribeMedia",
+      "formatTimecode", "isMediaFile", "splitFrontmatter", "timeRange", "timedSections", "transcribeMedia", "extractWebMainText",
     ] as const;
     const numbers = [
       "EXTRACTION_MAX_OUTPUT_BYTES", "EXTRACTION_TIMEOUT_MS", "LIBRARY_SCHEMA_VERSION",

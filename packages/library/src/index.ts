@@ -15,3 +15,4 @@ export * from "./page-units.ts";
 export * from "./page-ocr.ts";
 export * from "./page-parse.ts";
 export * from "./page-media.ts";
+export * from "./web-text.ts";
