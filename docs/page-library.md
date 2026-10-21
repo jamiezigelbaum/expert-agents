@@ -20,8 +20,8 @@ moved, then is deleted.
 derivative keyed by the original's SHA-256:
 
 ```text
-<library prefix>/derivatives/pages/v1/<first two hex>/<64 hex>/units.jsonl
-<library prefix>/derivatives/pages/v1/<first two hex>/<64 hex>/manifest.json
+<library prefix>/derivatives/pages/v2/<first two hex>/<64 hex>/units.jsonl
+<library prefix>/derivatives/pages/v2/<first two hex>/<64 hex>/manifest.json
 ```
 
 **PDFs** become one unit per physical page (`p0001`). Each page is read in

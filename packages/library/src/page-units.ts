@@ -11,7 +11,8 @@
 // scripts/library-pages.ts does the parsing and storage around it.
 
 /** Bumped when the unit format changes; part of the derivative path. */
-export const PAGE_UNITS_SCHEMA_VERSION = 1;
+// 2: transcript units (`transcription`, start/end) and text front matter read as metadata, not text.
+export const PAGE_UNITS_SCHEMA_VERSION = 2;
 
 /** Target section size for text sources, in words. */
 export const SECTION_TARGET_WORDS = 1200;
@@ -57,6 +58,8 @@ export interface PageDerivativeManifest {
   figures: FigureRecord[];
   /** Units still empty after every parser; listed, never silently dropped. */
   emptyUnits: string[];
+  /** Title, author and provenance the source itself declares (EPUB metadata, text front matter). */
+  declared?: { title?: string; creator?: string; sourceUrl?: string; retrievedAt?: string };
 }
 
 export function unitName(kind: 'p' | 's', n: number): string {

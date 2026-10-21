@@ -139,6 +139,7 @@ function worker(fx: Fixture, options: { tree?: string; writer?: PageIndexWriter;
     google: { accessToken: 'synthetic-token', fetchImpl: google },
     resolveHostImpl: async () => ['93.184.216.34'],
     webImportFetchImpl: async (url) => {
+      if (url.pathname.endsWith('.flac')) return new Response(new Blob([silentWav().slice().buffer as ArrayBuffer]), { headers: { 'content-type': 'application/octet-stream' } });
       if (url.pathname.endsWith('.pdf')) return new Response(new Blob([pdf.slice().buffer as ArrayBuffer]), { headers: { 'content-type': 'application/pdf' } });
       return new Response(fx.page, { headers: { 'content-type': 'text/html; charset=utf-8' } });
     },
@@ -293,6 +294,14 @@ describe('library_ingest audio and video', () => {
     // Re-ingesting reuses the cached transcript.
     await ingest(w, { workspace_relative_path: 'talks' });
     expect(fx.transcriptions).toHaveLength(1);
+  });
+
+  test('a direct link to any supported media type is transcribed, not read as a page', async () => {
+    const fx = fixture();
+    const w = worker(fx, { tree: join(dir, 'tree-media-url'), writer: recordingWriter().writer });
+    const job = await ingest(w, { urls: ['https://example.org/audio/hearing.flac'] });
+    expect(job.sources[0]).toMatchObject({ state: 'parsed', parsers: { transcription: job.sources[0].units }, source_url: 'https://example.org/audio/hearing.flac' });
+    expect(fx.transcriptions).toEqual(['delphi/transcription']);
   });
 
   test('without the router, a recording fails with the reason instead of being skipped', async () => {

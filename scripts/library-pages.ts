@@ -30,7 +30,7 @@ import {
  *
  *   parse     every served original → page-addressed units + figure
  *             descriptions, written as a derivative keyed by the original's
- *             SHA-256 (`derivatives/pages/v1/<xx>/<hex>/`), optionally uploaded
+ *             SHA-256 (`derivatives/pages/v2/<xx>/<hex>/`), optionally uploaded
  *             beside the originals in the library bucket.
  *   assemble  derivatives → one Markdown file per unit under books/<book>/,
  *             parts of a split PDF merged back into original page numbers,
@@ -280,10 +280,12 @@ async function commandAssemble(args: Args): Promise<void> {
     const figures: BookFigure[] = [];
     let offset = 0;
     let kind: "pages" | "sections" = "pages";
+    let declared: PageDerivativeManifest["declared"];
     for (const member of members) {
       const dir = join(out, pageDerivativePrefix(member.objectId));
       const manifest = JSON.parse(await readFile(join(dir, "manifest.json"), "utf8")) as PageDerivativeManifest;
       kind = manifest.kind;
+      declared ??= manifest.declared;
       const own = (await readFile(join(dir, "units.jsonl"), "utf8")).split("\n").filter(Boolean).map((l) => JSON.parse(l) as PageUnit);
       const moved = offsetUnits(own, offset);
       const rename = new Map(own.map((u, i) => [u.unit, moved[i]!]));
@@ -294,17 +296,18 @@ async function commandAssemble(args: Args): Promise<void> {
       }
       offset += own.length;
     }
-    let title = (m?.title ?? fallback.title).replace(/\s*[([]?part\s+\d+\s+of\s+\d+[)\]]?\s*$/i, "").trim() || fallback.title;
-    let creator = m?.creator ?? fallback.creator;
-    if (!m?.title && kind === "sections") {
+    let title = (m?.title ?? declared?.title ?? fallback.title).replace(/\s*[([]?part\s+\d+\s+of\s+\d+[)\]]?\s*$/i, "").trim() || fallback.title;
+    let creator = m?.creator ?? declared?.creator ?? fallback.creator;
+    if (!m?.title && !declared?.title && kind === "sections") {
       const h1 = /^#\s+(.{3,120})$/m.exec(units[0]?.text ?? "");
       if (h1 && !members[0]!.uri.includes("---")) title = h1[1]!.trim();
     }
     title = decodeEntities(title);
     const book = bookId(title, first.objectId);
-    ({ title, creator } = displayMeta(title, creator, Boolean(m?.title), units[0]?.text ?? ""));
+    ({ title, creator } = displayMeta(title, creator, Boolean(m?.title ?? declared?.title), units[0]?.text ?? ""));
     catalog.push(await writeBook(tree, {
       book, title, creator, kind, units, figures,
+      ...(declared?.sourceUrl ? { sourceUrl: declared.sourceUrl } : {}), ...(declared?.retrievedAt ? { retrievedAt: declared.retrievedAt } : {}),
       objects: members.map((x) => x.objectId), sources: members.map((x) => x.uri),
     }));
     unitCount += units.length; figureCount += figures.length;

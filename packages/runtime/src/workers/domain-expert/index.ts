@@ -13206,7 +13206,7 @@ async function deriveDirectFile(context: WebImportHandlerContext): Promise<WebIm
   if (!extension) {
     return { files: [] };
   }
-  const isMedia = STAGE_IMPORT_MEDIA_EXTENSIONS.has(extension);
+  const isMedia = STAGE_IMPORT_MEDIA_EXTENSIONS.has(extension) || MEDIA_EXTENSIONS.has(extension);
   if (isMedia && !context.includeMedia) {
     return {
       files: [],
@@ -13249,7 +13249,7 @@ function directFileExtension(url: string, headers: Headers, bytes: Uint8Array): 
   // that arrive as application/octet-stream with a disposition filename.
   if (hasPdfHeader(bytes)) return '.pdf';
   if (pathExtension === '.pdf' || dispositionExtension === '.pdf') return undefined;
-  if (STAGE_IMPORT_ALLOWED_EXTENSIONS.has(pathExtension) || STAGE_IMPORT_MEDIA_EXTENSIONS.has(pathExtension)) {
+  if (STAGE_IMPORT_ALLOWED_EXTENSIONS.has(pathExtension) || STAGE_IMPORT_MEDIA_EXTENSIONS.has(pathExtension) || MEDIA_EXTENSIONS.has(pathExtension)) {
     return pathExtension;
   }
   const contentType = headers.get('content-type')?.split(';', 1)[0]?.trim().toLowerCase();
@@ -13267,6 +13267,12 @@ function directFileExtension(url: string, headers: Headers, bytes: Uint8Array): 
     'audio/ogg': '.ogg',
     'audio/wav': '.wav',
     'audio/wave': '.wav',
+    'audio/x-wav': '.wav',
+    'audio/flac': '.flac',
+    'audio/x-flac': '.flac',
+    'audio/opus': '.opus',
+    'video/x-matroska': '.mkv',
+    'video/x-m4v': '.m4v',
     'video/mp4': '.mp4',
     'video/quicktime': '.mov',
     'video/webm': '.webm',

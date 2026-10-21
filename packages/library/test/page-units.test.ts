@@ -68,7 +68,7 @@ describe("page units", () => {
   });
 
   test("derivatives sit beside the original's content address", () => {
-    expect(pageDerivativePrefix(SHA)).toBe(`derivatives/pages/v1/ab/${"ab".repeat(32)}`);
+    expect(pageDerivativePrefix(SHA)).toBe(`derivatives/pages/v2/ab/${"ab".repeat(32)}`);
     expect(() => pageDerivativePrefix("sha1:abc")).toThrow();
   });
 });
