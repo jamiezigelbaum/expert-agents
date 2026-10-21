@@ -19,6 +19,10 @@ import { PageLibraryError } from './page-library.ts';
 export interface PageCatalogBook {
   book: string; title: string; creator: string; kind: 'pages' | 'sections'; units: number;
   first_unit: string; last_unit: string; figures: number; sources?: string[]; objects?: string[];
+  /** A fetched source (web page, Notion page, Drive file): where it was read from, and when. */
+  origin?: string; source_url?: string; retrieved_at?: string;
+  /** A transcript's section time ranges, cited instead of section numbers. */
+  timecodes?: Record<string, string>;
 }
 
 export interface PageStoreUnit { body: string; meta: Record<string, unknown> }

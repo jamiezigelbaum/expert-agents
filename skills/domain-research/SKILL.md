@@ -72,13 +72,27 @@ asks for it. A refusal there is the policy working; do not work around it.
 
 ## Adding sources
 
-Use `library_ingest` to add approved sources: a workspace file or folder (PDF,
-EPUB, Markdown, text) or a `gs://` original in the domain's library. Run it as
-a dry run first (the default), then start it with the approval id. It runs in
-the background; check `status` and report what it lists — books ingested,
-failed pages, empty pages, unresolved readings and undescribed figures — never
-summarize a job as done before its status says so. Re-ingesting the same file
-replaces its book. Private or unclear material requires owner approval first.
+Use `library_ingest` to add approved sources. A `start` names exactly one of:
+
+- `workspace_relative_path`: a workspace file or folder (PDF, EPUB, Markdown,
+  text, audio, video);
+- `gcs_uri`: a `gs://` original in the domain's library;
+- `urls`: https web pages (the main text is kept with its URL and retrieval
+  date), direct PDF, text, audio or video links, and YouTube videos (captions);
+- `notion`: Notion page or database URLs or ids shared with the worker's
+  integration (a database adds each of its pages);
+- `drive_file_ids`: Drive files or Docs URLs shared with the worker's Google
+  identity (Docs, Slides and Sheets are exported as PDF).
+
+Audio and video are transcribed locally; their sections cite timestamps
+(`00:12:30–00:18:45`) instead of pages. Run it as a dry run first (the
+default), then start it with the approval id. It runs in the background: the
+job fetches what it names, so check `status` and report what it lists — books
+ingested, sources that failed and why, failed pages, empty pages, unresolved
+readings and undescribed figures — never summarize a job as done before its
+status says so. Re-ingesting the same file, URL, Notion page or Drive file
+replaces its book. A failed source is reported, not retried through another
+lane. Private or unclear material requires owner approval first.
 
 If this session does not have `library_ingest`, tell the owner plainly that
 adding sources needs a session that has it; never substitute shell, direct

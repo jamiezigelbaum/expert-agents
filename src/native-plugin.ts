@@ -41,7 +41,7 @@ const definitions: Array<{ name: DomainExpertTool; description: string }> = [
   { name: 'domain_agent', description: 'Plan or inspect an independently managed domain expert.' },
   { name: 'domain_ask', description: 'Answer a question from an approved expert corpus with citations and explicit gaps.' },
   { name: 'domain_library', description: 'Search, read and view the pages of a domain page library: hybrid search, exact grep, whole pages or sections, page ranges and page images.' },
-  { name: 'library_ingest', description: 'Add sources to a domain page library: page units, local OCR and figure descriptions, then indexing. Runs in the background; check status by job id.' },
+  { name: 'library_ingest', description: 'Add sources to a domain page library (files, web pages, Notion, Drive, audio and video): page units, local OCR, local transcription and figure descriptions, then indexing. Runs in the background; check status by job id.' },
   { name: 'domain_read', description: 'Open, search within, and sequentially read a selected library source, chapter, or complete bibliography.' },
   { name: 'domain_source', description: 'Plan or perform bounded source-registry lifecycle work for an expert.' },
   { name: 'rag_corpus', description: 'Plan or perform bounded managed-RAG corpus operations.' },

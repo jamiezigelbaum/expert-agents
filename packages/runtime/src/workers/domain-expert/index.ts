@@ -89,6 +89,8 @@ import {
   type ReferenceExtractor,
   type Sha256Id,
   type LibraryLocationConfig,
+  MEDIA_EXTENSIONS,
+  splitFrontmatter,
 } from '@expert-agents/library';
 import { DEFAULT_QPDF_BIN, LLM_PARSER_MAX_PDF_PAGES, pdfPageLimitSetting, pdfPartStem, pdfTextLayer, planPdfParts, qpdfPageCount, splitPdf, stripPdfPartSuffix, type PdfPart, type PdfPartPlan, type PdfTextLayer } from '@expert-agents/library';
 import {
@@ -120,7 +122,7 @@ import { MultiPageStore, type PageLibraryMember } from './page-libraries.ts';
 import { PageDisclosureRefusal, runDisclosedPageLibrary } from './page-disclosure.ts';
 import { PageLibrary, PageLibraryError, parsePageLibraryParams, type PageSearchHit } from './page-library.ts';
 import { DatabasePageStore, TreePageStore, type PageStore } from './page-store.ts';
-import { PageIngestError, PageIngestQueue, type IngestSourceInput, type PageIndexWriter } from './page-ingest.ts';
+import { PageIngestError, PageIngestQueue, type IngestSourceInput, type IngestSourceRef, type MaterializedSource, type PageIndexWriter } from './page-ingest.ts';
 
 export const DOMAIN_EXPERT_NOTION_CREDENTIAL_GUIDANCE = `notion_import requires EXPERT_AGENTS_DOMAIN_EXPERT_NOTION_TOKEN. Configure it as documented in ${DOMAIN_EXPERT_ENV_EXAMPLE}.`;
 
@@ -1312,6 +1314,7 @@ export class DomainExpertService {
         writers.set(database ?? '', writer);
         return writer;
       },
+      materialize: (domainId, ref, dir) => this.materializeIngestRef(domainId, ref, dir),
       changed: (domainId, library) => {
         for (const key of [...this.pageLibraries.keys()]) if (key.startsWith(`${domainId}\u0000`)) this.pageLibraries.delete(key);
         (library.database === undefined ? this.pageIndex : this.namedPageIndexes.get(library.database))?.invalidate(library.sourceId);
@@ -1331,7 +1334,7 @@ export class DomainExpertService {
    * object keeps its own; a workspace file is stored in the domain's acquisition directory.
    */
   private async libraryIngest(params: Record<string, unknown>): Promise<unknown> {
-    const allowed = ['domain_id', 'action', 'source_id', 'workspace_relative_path', 'gcs_uri', 'title', 'creator', 'job_id', 'dry_run', 'approval_id'];
+    const allowed = ['domain_id', 'action', 'source_id', 'workspace_relative_path', 'gcs_uri', 'urls', 'notion', 'drive_file_ids', 'title', 'creator', 'job_id', 'dry_run', 'approval_id'];
     const extra = Object.keys(params).filter((key) => !allowed.includes(key));
     if (extra.length) throw new DomainExpertWorkerError(400, 'invalid_params', `library_ingest does not take: ${extra.join(', ')}.`);
     const action = params.action;
@@ -1354,11 +1357,37 @@ export class DomainExpertService {
     const target = this.pageIngestTarget(manifest.domain_id, params.source_id === undefined ? undefined : requireString(params.source_id, 'source_id'));
     const workspacePath = params.workspace_relative_path === undefined ? undefined : requireString(params.workspace_relative_path, 'workspace_relative_path');
     const gcsUri = params.gcs_uri === undefined ? undefined : requireString(params.gcs_uri, 'gcs_uri');
-    if (Boolean(workspacePath) === Boolean(gcsUri)) throw new DomainExpertWorkerError(400, 'invalid_params', 'start takes exactly one of workspace_relative_path or gcs_uri.');
+    const given = ['workspace_relative_path', 'gcs_uri', 'urls', 'notion', 'drive_file_ids'].filter((key) => params[key] !== undefined);
+    if (given.length !== 1) throw new DomainExpertWorkerError(400, 'invalid_params', 'start takes exactly one of workspace_relative_path, gcs_uri, urls, notion or drive_file_ids.');
     const title = params.title === undefined ? undefined : requireString(params.title, 'title');
     const creator = params.creator === undefined ? undefined : requireString(params.creator, 'creator');
     const dryRun = params.dry_run === undefined ? true : params.dry_run === true;
     const acquisitions = this.acquisitionDirectory(manifest.domain_id);
+
+    // Web pages, Notion pages and Drive files are fetched by the job itself, so start answers at once.
+    if (!workspacePath && !gcsUri) {
+      const refs = await this.pageIngestRefs(given[0]!, params[given[0]!]);
+      if ((title || creator) && refs.length > 1) throw new DomainExpertWorkerError(400, 'invalid_params', 'title and creator name one source; ingest several without them.');
+      const plan = {
+        sources: refs.map((r) => ({ name: r.name, type: r.ref.type, ...(r.origin ? { origin: r.origin } : {}) })),
+        skipped: [],
+        lanes: this.pageIngest.lanes(),
+        ...(route.pageLibrary.also ? { source_id: target.sourceId } : {}),
+        index_writer_configured: this.pageIngestWriterConfigured(target.database),
+      };
+      if (dryRun) return result({ status: 'dry_run', ...plan });
+      requireApprovalId(typeof params.approval_id === 'string' ? params.approval_id : undefined, 'library_ingest start');
+      if (!this.pageIngestWriterConfigured(target.database)) throw new DomainExpertWorkerError(503, 'page_ingest_writer_not_configured', 'The page index writer is not configured.');
+      try {
+        const job = await this.pageIngest.enqueue(manifest.domain_id, target, refs.map((r) => ({
+          name: r.name, ref: r.ref, ...(r.origin ? { origin: r.origin } : {}), ...(title ? { title } : {}), ...(creator ? { creator } : {}),
+        })));
+        return result({ status: 'queued', job, lanes: plan.lanes, skipped: [] });
+      } catch (error) {
+        if (error instanceof PageIngestError) throw new DomainExpertWorkerError(error.status, error.code, error.message);
+        throw error;
+      }
+    }
 
     type Candidate = { name: string; bytes: number; read: () => Promise<Uint8Array>; uri?: string };
     const candidates: Candidate[] = [];
@@ -1386,7 +1415,7 @@ export class DomainExpertService {
         return bytes;
       } });
     }
-    if (!candidates.length) throw new DomainExpertWorkerError(400, 'page_ingest_no_sources', 'No PDF, EPUB, Markdown or text file was found to ingest.');
+    if (!candidates.length) throw new DomainExpertWorkerError(400, 'page_ingest_no_sources', 'No PDF, EPUB, Markdown, text, audio or video file was found to ingest.');
     if ((title || creator) && candidates.length > 1) throw new DomainExpertWorkerError(400, 'invalid_params', 'title and creator name one source; ingest a folder without them.');
     const plan = {
       sources: candidates.map((c) => ({ name: c.name, ...(c.bytes ? { bytes: c.bytes } : {}), ...(c.uri ? { gcs_uri: c.uri } : {}) })),
@@ -1451,17 +1480,7 @@ export class DomainExpertService {
       const ext = extname(c.name).toLowerCase() || '.bin';
       const file = join(scratch, `${i}-${hex.slice(0, 16)}${ext}`);
       await writeFile(file, bytes, { mode: 0o600 });
-      let uri = c.uri;
-      if (!uri) {
-        const objectName = `${acquisitions!.prefix}/originals/${hex}${ext}`;
-        uri = `gs://${acquisitions!.bucket}/${objectName}`;
-        assertAllowedGcsDestination(uri, manifest.allowed_gcs_prefixes);
-        try { await this.google.uploadGcsObject(acquisitions!.bucket, objectName, bytes, { ifGenerationMatch: '0' }); }
-        catch (error) {
-          // 412: the same content-addressed original is already stored.
-          if (!(error instanceof DomainExpertWorkerError && error.status === 412)) throw error;
-        }
-      }
+      const uri = c.uri ?? await this.storeIngestOriginal(manifest, bytes, ext);
       inputs.push({ name: c.name, uri, file, ...(c.title ? { title: c.title } : {}), ...(c.creator ? { creator: c.creator } : {}) });
     }
     try {
@@ -1470,6 +1489,132 @@ export class DomainExpertService {
       if (error instanceof PageIngestError) throw new DomainExpertWorkerError(error.status, error.code, error.message);
       throw error;
     }
+  }
+
+  /** Store an original in the domain's acquisition directory, content-addressed, where view_page can render it. */
+  private async storeIngestOriginal(manifest: ReturnType<typeof domainManifest>, bytes: Uint8Array, ext: string): Promise<string> {
+    const acquisitions = this.acquisitionDirectory(manifest.domain_id);
+    if (!acquisitions) throw new PageIngestError('page_ingest_no_original_store', 'No acquisition directory is configured for this domain, so the original has nowhere to be stored for view_page.', 503);
+    const hex = createHash('sha256').update(bytes).digest('hex');
+    const objectName = `${acquisitions.prefix}/originals/${hex}${ext}`;
+    const uri = `gs://${acquisitions.bucket}/${objectName}`;
+    assertAllowedGcsDestination(uri, manifest.allowed_gcs_prefixes);
+    try { await this.google.uploadGcsObject(acquisitions.bucket, objectName, bytes, { ifGenerationMatch: '0' }); }
+    catch (error) {
+      // 412: the same content-addressed original is already stored.
+      if (!(error instanceof DomainExpertWorkerError && error.status === 412)) throw error;
+    }
+    return uri;
+  }
+
+  /**
+   * The references a start names, checked before anything is queued: https URLs (web pages,
+   * direct files, media, YouTube), Notion pages or databases (a database becomes one source per
+   * row page), Drive files. Notion URLs go through `notion`: their pages are client-rendered.
+   */
+  private async pageIngestRefs(key: string, value: unknown): Promise<Array<{ name: string; ref: IngestSourceRef; origin?: string }>> {
+    const list = (max: number) => {
+      if (!Array.isArray(value) || value.length < 1 || value.length > max || !value.every((v) => typeof v === 'string' && v.trim())) {
+        throw new DomainExpertWorkerError(400, 'invalid_params', `${key} must be a list of 1 to ${max} strings.`);
+      }
+      return [...new Set((value as string[]).map((v) => v.trim()))];
+    };
+    if (key === 'urls') {
+      return list(PAGE_INGEST_MAX_REFS).map((url) => {
+        let parsed: URL;
+        try { parsed = new URL(url); } catch { throw new DomainExpertWorkerError(400, 'invalid_params', 'urls must be absolute https URLs.'); }
+        if (parsed.protocol !== 'https:') throw new DomainExpertWorkerError(400, 'web_import_https_required', 'urls must be https.');
+        if (isNotionImportUrl(url)) {
+          throw new DomainExpertWorkerError(400, 'notion_requires_api_import', 'Notion pages are client-rendered; pass them in notion instead of urls.', 'Use library_ingest start with notion: [<page or database URL or id>].');
+        }
+        const provenance = webImportProvenanceUrl(url);
+        return { name: provenance, ref: { type: 'url', ref: url }, origin: `url:${provenance}` };
+      });
+    }
+    if (key === 'drive_file_ids') {
+      return list(PAGE_INGEST_MAX_REFS).map((v) => {
+        const id = /\/d\/([A-Za-z0-9_-]{10,})/.exec(v)?.[1] ?? /[?&]id=([A-Za-z0-9_-]{10,})/.exec(v)?.[1] ?? (/^[A-Za-z0-9_-]{10,}$/.test(v) ? v : undefined);
+        if (!id) throw new DomainExpertWorkerError(400, 'invalid_params', 'drive_file_ids must be Drive file ids or Drive/Docs URLs.');
+        return { name: `drive:${id}`, ref: { type: 'drive', ref: id }, origin: `drive:${id}` };
+      });
+    }
+    if (!this.notion.configured()) {
+      throw new DomainExpertWorkerError(503, 'notion_not_configured', DOMAIN_EXPERT_NOTION_CREDENTIAL_GUIDANCE, 'Configure the Notion credential on the worker host.');
+    }
+    const out: Array<{ name: string; ref: IngestSourceRef; origin?: string }> = [];
+    for (const v of list(this.notion.maxObjects())) {
+      const id = notionObjectIdFromUrlOrId(v);
+      const object = await this.notion.inspectObject(id);
+      let pages = [{ objectId: id, title: object.title }];
+      if (object.objectType === 'database') {
+        const rows = await this.notion.listDatabasePages(id);
+        if (rows.skipped > 0) throw new DomainExpertWorkerError(400, 'invalid_params', `The Notion database "${rows.databaseTitle}" has more than ${this.notion.maxObjects()} pages; ingest its pages in smaller sets.`);
+        pages = rows.pages;
+      }
+      for (const page of pages) {
+        if (out.length >= this.notion.maxObjects()) throw new DomainExpertWorkerError(400, 'invalid_params', `notion names more than ${this.notion.maxObjects()} pages; ingest fewer at a time.`);
+        out.push({ name: page.title || page.objectId, ref: { type: 'notion', ref: page.objectId }, origin: `notion:${page.objectId}` });
+      }
+    }
+    return out;
+  }
+
+  /** Fetch one reference for an ingest job: the job's fetch step (page-ingest.ts). */
+  private async materializeIngestRef(domainId: string, ref: IngestSourceRef, dir: string): Promise<MaterializedSource> {
+    const manifest = this.manifest(domainId);
+    const retrievedAt = new Date().toISOString();
+    const write = async (bytes: Uint8Array, ext: string) => {
+      const file = join(dir, `${createHash('sha256').update(bytes).digest('hex').slice(0, 16)}${ext}`);
+      await writeFile(file, bytes, { mode: 0o600 });
+      return file;
+    };
+    // Text is stored without its front matter, so a page fetched again unchanged is the same object.
+    const text = (markdown: string) => {
+      const { meta, body } = splitFrontmatter(markdown);
+      return { meta, bytes: new TextEncoder().encode(body.trim() + '\n') };
+    };
+    if (ref.type === 'notion') {
+      if (!this.notion.configured()) throw new PageIngestError('notion_not_configured', DOMAIN_EXPERT_NOTION_CREDENTIAL_GUIDANCE, 503);
+      const page = await this.notion.fetchPageMarkdown({ id: ref.ref, retrievedAt, blockSeparator: '\n\n' });
+      const { bytes } = text(new TextDecoder().decode(page.bytes));
+      const sourceUrl = page.sourceUrl ?? `https://www.notion.so/${page.objectId}`;
+      return { name: `${safeObjectName(page.title)}.md`, file: await write(bytes, '.md'), uri: sourceUrl, origin: `notion:${page.objectId}`, sourceUrl, retrievedAt, title: page.title };
+    }
+    if (ref.type === 'drive') {
+      const meta = await this.google.driveFile(ref.ref);
+      const exported = DRIVE_EXPORT_AS_PDF.has(meta.mimeType);
+      const ext = exported ? '.pdf' : extname(meta.name).toLowerCase();
+      if (meta.mimeType === 'application/vnd.google-apps.folder') throw new PageIngestError('drive_folder_not_supported', 'This Drive id is a folder; name its files instead.');
+      if (!exported && !PAGE_INGEST_EXTENSIONS.has(ext)) throw new PageIngestError('page_ingest_format_unsupported', `The page library reads PDF, EPUB, Markdown, text, audio and video, and Google Docs, Slides and Sheets; this Drive file is ${meta.mimeType}.`);
+      const bytes = await this.google.driveDownload(ref.ref, exported ? 'application/pdf' : undefined, PAGE_INGEST_MAX_BYTES);
+      const sourceUrl = meta.webViewLink ?? `https://drive.google.com/file/d/${ref.ref}/view`;
+      const title = meta.name.replace(/\.[a-z0-9]{1,5}$/i, '');
+      const base = { name: `${safeObjectName(title)}${ext}`, origin: `drive:${ref.ref}`, sourceUrl, retrievedAt, title };
+      if (ext === '.pdf') return { ...base, file: await write(bytes, ext), uri: await this.storeIngestOriginal(manifest, bytes, ext) };
+      if (ext === '.md' || ext === '.markdown' || ext === '.txt') {
+        const t = text(new TextDecoder('utf-8', { fatal: false }).decode(bytes));
+        return { ...base, file: await write(t.bytes, '.md'), uri: sourceUrl };
+      }
+      return { ...base, file: await write(bytes, ext), uri: sourceUrl };
+    }
+    // A web page: the web_import fetch (https only, public addresses, size and redirect bounds) and extraction.
+    const budget = webImportBudget();
+    const derived = await deriveWebImportFiles({
+      urls: [ref.ref], includeMedia: true, transcriptMode: 'captions', dryRun: false, fetchedAt: retrievedAt,
+      fetch: (url) => guardedWebImportFetch({ url, fetchImpl: this.webImportFetchImpl, resolveHost: this.resolveHostImpl, budget, timeoutMs: this.webImportFetchTimeoutMs }),
+      extraction: this.extractionRuntime(),
+    });
+    const error = derived.errors[0];
+    if (error) throw new PageIngestError(error.code, error.suggestion ? `${error.message} ${error.suggestion}` : error.message);
+    const file = derived.files[0];
+    if (!file) throw new PageIngestError('web_ingest_nothing_extracted', 'Nothing readable was found at this URL.');
+    const ext = extname(file.fileName).toLowerCase();
+    const base = { origin: `url:${file.sourceUrl}`, sourceUrl: file.finalUrl, retrievedAt };
+    if (ext === '.pdf') return { ...base, name: file.fileName, file: await write(file.bytes, ext), uri: await this.storeIngestOriginal(manifest, file.bytes, ext) };
+    if (MEDIA_EXTENSIONS.has(ext)) return { ...base, name: file.fileName, file: await write(file.bytes, ext), uri: file.finalUrl };
+    if (ext !== '.md' && ext !== '.txt' && ext !== '.markdown') throw new PageIngestError('page_ingest_format_unsupported', `The page library reads web pages, PDF, text, audio and video; this URL is ${ext.slice(1) || 'an unknown type'}.`);
+    const t = text(new TextDecoder('utf-8', { fatal: false }).decode(file.bytes));
+    return { ...base, name: file.fileName, file: await write(t.bytes, '.md'), uri: file.finalUrl, ...(t.meta.title ? { title: t.meta.title } : {}), ...(t.meta.channel ? { creator: t.meta.channel } : {}) };
   }
 
   /** A page-library domain's acquisition goes to its page library, never to a Vertex corpus. */
@@ -7165,6 +7310,8 @@ class NotionRuntimeClient {
     sourceUrl?: string;
     retrievedAt: string;
     filePrefix?: string;
+    /** Between top-level blocks; a blank line makes each block its own paragraph. */
+    blockSeparator?: string;
   }): Promise<NotionMarkdownDerivative> {
     const objectId = normalizeNotionObjectId(input.id);
     const page = asRecord(await this.notionJson(`/pages/${objectId}`), 'notion page');
@@ -7181,7 +7328,7 @@ class NotionRuntimeClient {
       ...(parent.parentPageId ? { parentPageId: parent.parentPageId } : {}),
       ...(parent.parentDatabaseId ? { parentDatabaseId: parent.parentDatabaseId } : {}),
       warnings,
-      body: blocks.join('\n').trim(),
+      body: blocks.join(input.blockSeparator ?? '\n').trim(),
     });
     return {
       objectId,
@@ -7977,6 +8124,29 @@ class GoogleRuntimeClient {
       pageToken = typeof body.nextPageToken === 'string' ? body.nextPageToken : undefined;
     } while (pageToken && names.length < 10_000);
     return names;
+  }
+
+  /** A Drive file's name and type; the file must be shared with the worker's Google identity. */
+  async driveFile(fileId: string): Promise<{ id: string; name: string; mimeType: string; webViewLink?: string }> {
+    const r = asRecord(await this.googleJson(`https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}?fields=id,name,mimeType,webViewLink&supportsAllDrives=true`), 'drive file');
+    if (typeof r.name !== 'string' || typeof r.mimeType !== 'string') throw new DomainExpertWorkerError(502, 'drive_file_unreadable', 'Drive did not describe this file.');
+    return { id: fileId, name: r.name, mimeType: r.mimeType, ...(typeof r.webViewLink === 'string' ? { webViewLink: r.webViewLink } : {}) };
+  }
+
+  /** A Drive file's bytes, or a Google Workspace file exported as `exportMime`. */
+  async driveDownload(fileId: string, exportMime: string | undefined, maxBytes: number): Promise<Uint8Array> {
+    const id = encodeURIComponent(fileId);
+    const response = await this.authedFetch(exportMime
+      ? `https://www.googleapis.com/drive/v3/files/${id}/export?mimeType=${encodeURIComponent(exportMime)}`
+      : `https://www.googleapis.com/drive/v3/files/${id}?alt=media&supportsAllDrives=true`, {}, 300_000);
+    if (!response.ok) throw googleError(response, await responseTextOrJson(response));
+    if (Number(response.headers.get('content-length')) > maxBytes) {
+      await response.body?.cancel();
+      throw new DomainExpertWorkerError(413, 'drive_file_too_large', 'The Drive file exceeds the ingest size limit.');
+    }
+    const bytes = new Uint8Array(await response.arrayBuffer());
+    if (bytes.byteLength > maxBytes) throw new DomainExpertWorkerError(413, 'drive_file_too_large', 'The Drive file exceeds the ingest size limit.');
+    return bytes;
   }
 
   async downloadLibraryObject(bucket: string, objectName: string, maxBytes: number, timeoutMs: number): Promise<Uint8Array | null> {
@@ -9423,7 +9593,14 @@ function allowedStageImportExtensions(includeMedia: boolean): Set<string> {
     : new Set(STAGE_IMPORT_ALLOWED_EXTENSIONS);
 }
 
-const PAGE_INGEST_EXTENSIONS = new Set(['.pdf', '.epub', '.md', '.markdown', '.txt']);
+const PAGE_INGEST_EXTENSIONS = new Set(['.pdf', '.epub', '.md', '.markdown', '.txt', ...MEDIA_EXTENSIONS]);
+// URLs or Drive files one start may name.
+const PAGE_INGEST_MAX_REFS = 50;
+// Google Workspace files Drive exports as PDF for the page library: page units, page citations, view_page.
+const DRIVE_EXPORT_AS_PDF = new Set([
+  'application/vnd.google-apps.document', 'application/vnd.google-apps.presentation',
+  'application/vnd.google-apps.spreadsheet', 'application/vnd.google-apps.drawing',
+]);
 const PAGE_INGEST_MAX_BYTES = 300_000_000;
 // Health counts each page-library source's index rows; an index that does not answer in this long is unreachable.
 const PAGE_INDEX_HEALTH_TIMEOUT_MS = 3_000;

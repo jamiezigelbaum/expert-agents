@@ -57,7 +57,17 @@ and a bounding box. Figures inside page scans are reached through
 `view_page`.
 
 **Text and converted ebooks** become sections of about 1,200 words (`s0001`),
-cut at headings and never mid-paragraph.
+cut at headings and never mid-paragraph. A text source's YAML front matter
+(`title`, `author`, `source_url`, `retrieved_at`) is read as its metadata, not
+as text.
+
+**Audio and video** are downmixed to 16 kHz mono (`ffmpeg`) and transcribed by
+the router's transcription profile (`delphi/transcription`, local Whisper; an
+on-demand Delphi lane an operator starts). The transcript becomes sections of
+about 600 words (`s0001`, a few minutes of speech) whose paragraphs open with
+their start time (`[00:12:31]`). Each section keeps its time range, and its
+citation names that range instead of a section number. The transcript is
+cached per recording like a page's lane result.
 
 Lane results are cached per page, so a rerun only reads pages it has not seen.
 A failed call is not cached and is retried by the next run. When both lanes
@@ -214,10 +224,30 @@ the same name). It runs the same parse code as the operator CLI
 
 | action | parameters | returns |
 |---|---|---|
-| `start` | `workspace_relative_path` or `gcs_uri`; `title?`, `creator?` (one source); `dry_run` (default true); `approval_id` | `job_id`, the lanes in use, skipped files |
-| `status` | `job_id` | the job: state, and per source its book, units, parsers used, failed pages, empty pages, unresolved escalations, undescribed figure pages, refusals; then the index counts |
+| `start` | one of `workspace_relative_path`, `gcs_uri`, `urls`, `notion`, `drive_file_ids`; `title?`, `creator?` (one source); `dry_run` (default true); `approval_id` | `job_id`, the lanes in use, skipped files |
+| `status` | `job_id` | the job: state, and per source its book, units, parsers used, failed pages, empty pages, unresolved escalations, undescribed figure pages, refusals, and for a fetched source its URL, origin and retrieval time; then the index counts |
 | `list` | | recent jobs |
 
+- **Sources the job fetches.** These are checked at `start` and fetched by the
+  job itself (state `fetching`), so `start` answers at once:
+  - `urls` (1 to 50, https only, public addresses, the `web_import` size and
+    redirect bounds): a page's main text is extracted locally
+    (`html-to-markdown`); a direct PDF, text, audio or video link is read as
+    that file; a YouTube video gives its captions (the `summarize` extractor,
+    with no credential that could reach a model). The book keeps the URL and
+    retrieval time (`source_url`, `retrieved_at` in its catalog entry and unit
+    front matter). Notion URLs are refused here: their pages are
+    client-rendered.
+  - `notion` (page or database URLs or ids, through
+    `EXPERT_AGENTS_DOMAIN_EXPERT_NOTION_TOKEN`): one page is one book; its
+    top-level blocks are paragraphs, cut into sections at headings. A database
+    is expanded at `start` into one source per row page.
+  - `drive_file_ids` (1 to 50, ids or Drive/Docs URLs, read with the worker's
+    Google identity): Docs, Slides, Sheets and Drawings are exported as PDF
+    (Drive caps an export at 10 MB); other files are read as they are.
+  - A fetched PDF is stored in the acquisition directory like a workspace file,
+    so `view_page` can render it. Text is stored without its front matter, so a
+    page fetched again unchanged is the same object and book.
 - **Where originals live.** A `gcs_uri` must be inside the domain's library,
   read-only roots or acquisition directory, and keeps its own URI. A workspace
   file is stored content-addressed in the domain's acquisition directory
@@ -226,8 +256,10 @@ the same name). It runs the same parse code as the operator CLI
 - **Per source:** page units, local OCR, figure descriptions, then the book's
   unit files are written into the domain's tree and its catalog entry is
   replaced. Re-ingesting an original replaces its earlier book, even under a
-  new title. For a database library the tree is a staging tree under the
-  job's state, removed when the job ends.
+  new title. A fetched source has a stable origin (`url:<URL>`,
+  `notion:<page id>`, `drive:<file id>`): re-ingesting it replaces its earlier
+  book even when the content changed. For a database library the tree is a
+  staging tree under the job's state, removed when the job ends.
 - **Per job:** the job's books are imported into the index (only those books
   are compared, so the rest of the source is untouched), then, for a database
   library, their catalog entries; then embedded.
@@ -236,7 +268,10 @@ the same name). It runs the same parse code as the operator CLI
   interrupted by a restart resumes, and lane results are cached per page.
 - **Nothing silent.** A page whose lane failed, a page without an OCR lane, a
   reading no vision lane re-read and a figure page nobody described are each
-  listed. A job with any failed page ends `done_with_failures`.
+  listed. A source that could not be fetched or transcribed fails with its
+  reason (for example `transcription_lane_unavailable` when Delphi's
+  transcription lane is stopped); there is no other lane to fall back to. A
+  job with any failed page or source ends `done_with_failures`.
 - **Acquisitions.** `annas_archive_import` with `ingest: true` on a domain with
   a page library queues a `library_ingest` job instead of a Vertex import, and
   answers with its `job_id`. The book-scale floor still applies.
@@ -244,7 +279,8 @@ the same name). It runs the same parse code as the operator CLI
 The worker needs, besides the search settings in section 3:
 - `EXPERT_AGENTS_DOMAIN_EXPERT_PAGE_INDEX_WRITER_DATABASE_URL`, a role that
   may write (the serving URL can stay read-only);
-- `EXPERT_AGENTS_DOMAIN_EXPERT_OCR_ROUTER_URL`, the model router (…/v1);
+- `EXPERT_AGENTS_DOMAIN_EXPERT_OCR_ROUTER_URL`, the model router (…/v1), for
+  OCR and transcription; and `ffmpeg` on PATH for audio and video;
 - optionally `EXPERT_AGENTS_DOMAIN_EXPERT_OCR_DEEP_LANE=off`, to leave hard
   pages and figures listed instead of sending them to the deep profile.
 
