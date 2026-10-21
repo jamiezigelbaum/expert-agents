@@ -72,9 +72,14 @@ export function ocrEscalationReason(text: string, imageBytes = Number.POSITIVE_I
 
 export function stripGrounding(text: string): string {
   return text.replace(/<\|ref\|>.*?<\|\/ref\|><\|det\|>.*?<\|\/det\|>/gs, '').replace(/<\|\/?(ref|det|grounding)\|>/g, '')
-    // Chat-template control tokens (`<|im_end|>`, `<|end▁of▁sentence|>`) a served model can echo; never page text.
-    .replace(/<\|[^|<>\s]{1,40}\|>/gu, '').trim();
+    .replace(TEMPLATE_EDGES, '').trim();
 }
+
+// Chat-template control tokens a served model can echo at the start or end of its reply (seen through the
+// router: a reading that began with `<|im_end|>`). Only these, and only at the reply's edges, so a page that
+// prints such a token in its text keeps it.
+const TEMPLATE_TOKEN = '<\\|(?:im_start|im_end|endoftext|eot_id|end|end▁of▁sentence|begin▁of▁sentence)\\|>';
+const TEMPLATE_EDGES = new RegExp(`^(?:\\s*${TEMPLATE_TOKEN})+|(?:${TEMPLATE_TOKEN}\\s*)+$`, 'gu');
 
 /** One chat call to a router profile with one page image. The router queues per profile (one call at a time). */
 async function chat(profile: string, img: Uint8Array, text: string, maxTokens: number, lanes: OcrLanes): Promise<{ text: string; finish: string }> {

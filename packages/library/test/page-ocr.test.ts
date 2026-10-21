@@ -67,6 +67,8 @@ describe('local page OCR', () => {
     // Seen on 2026-10-21 through the router: the reading began with `<|im_end|>`.
     expect(stripGrounding('<|im_end|>\n\nChapter Two: The Storm Ledger<|end▁of▁sentence|>')).toBe('Chapter Two: The Storm Ledger');
     expect(stripGrounding('a | b | c')).toBe('a | b | c');
+    // A page that prints a token keeps it: only known tokens at the reply's edges are dropped.
+    expect(stripGrounding('The template opens with <|user|> and closes with <|im_end|> here.')).toBe('The template opens with <|user|> and closes with <|im_end|> here.');
   });
 
   test('a refusal is logged and never used as page text', async () => {
