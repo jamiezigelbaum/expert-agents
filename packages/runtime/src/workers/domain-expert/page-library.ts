@@ -157,7 +157,8 @@ export class PageLibrary {
   private async cite(book: string, unit: string): Promise<string> {
     const b = (await this.books()).byBook.get(book);
     const page = unit.replace(/^fig-(p\d+)-\d+$/, '$1');
-    const loc = page.startsWith('p') ? `p.${unitNumber(page)}` : `section ${unitNumber(page)}`;
+    const time = b?.timecodes?.[page];
+    const loc = page.startsWith('p') ? `p.${unitNumber(page)}` : typeof time === 'string' ? time : `section ${unitNumber(page)}`;
     return `${b?.creator ? `${b.creator}, ` : ''}${b?.title ?? book}, ${loc}`;
   }
 
@@ -180,7 +181,10 @@ export class PageLibrary {
     const q = query?.toLowerCase();
     const rows = (await this.books()).books.filter((b) => !q || `${b.creator} ${b.title} ${b.book}`.toLowerCase().includes(q));
     return {
-      books: rows.slice(0, 200).map((b) => ({ book: b.book, creator: b.creator, title: b.title, units: b.units, range: `${b.first_unit}–${b.last_unit}`, figures: b.figures })),
+      books: rows.slice(0, 200).map((b) => ({
+        book: b.book, creator: b.creator, title: b.title, units: b.units, range: `${b.first_unit}–${b.last_unit}`, figures: b.figures,
+        ...(b.source_url ? { source_url: b.source_url } : {}), ...(b.retrieved_at ? { retrieved_at: b.retrieved_at } : {}),
+      })),
       total: rows.length,
       complete: rows.length <= 200,
     };

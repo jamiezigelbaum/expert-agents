@@ -19,15 +19,18 @@ export const SECTION_TARGET_WORDS = 1200;
 /** A PDF page whose text layer has fewer characters than this needs OCR. */
 export const OCR_MIN_CHARS = 80;
 
-export type UnitParser = 'pdftotext' | 'deepseek-ocr' | 'vision' | 'text' | 'none';
+export type UnitParser = 'pdftotext' | 'deepseek-ocr' | 'vision' | 'text' | 'transcription' | 'none';
 
 export interface PageUnit {
   /** `p0001` (PDF page, 1-based physical page) or `s0001` (text section). */
   unit: string;
   /** Physical page in the source object, for PDF units. */
   sourcePage?: number;
-  /** Nearest heading, for text sections. */
+  /** Nearest heading, for text sections; the time range, for transcript sections. */
   heading?: string;
+  /** Seconds into the recording, for transcript sections. */
+  start?: number;
+  end?: number;
   parser: UnitParser;
   text: string;
 }
@@ -176,6 +179,25 @@ export function unitFrontmatter(markdown: string): Record<string, unknown> {
     try { out[line.slice(0, i).trim()] = JSON.parse(raw); } catch { out[line.slice(0, i).trim()] = raw; }
   }
   return out;
+}
+
+/**
+ * Leading YAML front matter of a text source (`key: value` lines between `---`
+ * fences), and the body after it. Text without front matter is all body.
+ */
+export function splitFrontmatter(text: string): { meta: Record<string, string>; body: string } {
+  const m = /^\uFEFF?---\r?\n([\s\S]*?)\r?\n---\r?\n?/.exec(text);
+  if (!m) return { meta: {}, body: text };
+  const meta: Record<string, string> = {};
+  for (const line of m[1]!.split(/\r?\n/)) {
+    const i = line.indexOf(':');
+    if (i < 1 || /^\s/.test(line)) continue;
+    const raw = line.slice(i + 1).trim();
+    let value: unknown = raw;
+    if (/^["'[{]/.test(raw)) { try { value = JSON.parse(raw.replace(/^'(.*)'$/, '"$1"')); } catch { value = raw.replace(/^["']|["']$/g, ''); } }
+    if (typeof value === 'string' && value) meta[line.slice(0, i).trim()] = value;
+  }
+  return { meta, body: text.slice(m[0].length) };
 }
 
 /** The body of a unit Markdown file, without its front matter. */

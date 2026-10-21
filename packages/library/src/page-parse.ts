@@ -7,7 +7,10 @@
 //   3. the router's deep profile, for a page DeepSeek read badly.
 // Figures are found on every page (an embedded image smaller than the page,
 // or a Figure/Table caption line) and described by the vision lane.
-// Text, Markdown and EPUB become sections of about 1,200 words.
+// Text, Markdown and EPUB become sections of about 1,200 words; a text
+// source's YAML front matter (title, author, source_url, retrieved_at) is read
+// as its metadata, not as text. Audio and video become time-ranged sections of
+// a local transcript (page-media.ts).
 //
 // Nothing is dropped silently: a page whose lanes failed, a page left empty,
 // an escalation no vision lane resolved and a figure page nobody described
@@ -21,12 +24,13 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { promisify } from 'node:util';
 import { convertEpubToMarkdown } from './ebook-text.ts';
+import { isMediaFile, timeRange, timedSections, transcribeMedia, type Transcript } from './page-media.ts';
 import {
   deepLane, describeFigures, escalatePage, figurePagesFromImageList, hasFigureCaption, readPage,
   type LaneCall, type OcrLanes,
 } from './page-ocr.ts';
 import {
-  PAGE_UNITS_SCHEMA_VERSION, bookId, pageNeedsOcr, renderUnitMarkdown, sectionText, splitPdfText, unitName,
+  PAGE_UNITS_SCHEMA_VERSION, bookId, pageNeedsOcr, renderUnitMarkdown, sectionText, splitFrontmatter, splitPdfText, unitName,
   type FigureRecord, type PageDerivativeManifest, type PageUnit, type UnitParser,
 } from './page-units.ts';
 
@@ -77,11 +81,13 @@ export interface ParsedObject {
   unresolvedEscalations: Array<{ page: number; reason: string }>;
   /** Figure pages without descriptions because no vision lane is configured; reachable by view_page. */
   undescribedFigurePages: number[];
-  /** Title and author an EPUB declares. */
-  declared?: { title?: string; creator?: string };
+  /** Title and author an EPUB or a text source's front matter declares, and where a text source came from. */
+  declared?: { title?: string; creator?: string; sourceUrl?: string; retrievedAt?: string };
+  /** For audio and video: the recording's length and the transcription call. */
+  media?: { duration: number; segments: number; ms: number };
 }
 
-interface PageCache { ocr?: { text: string; parser: UnitParser; escalated?: string }; figures?: FigureRecord[]; calls: LaneCall[] }
+interface PageCache { ocr?: { text: string; parser: UnitParser; escalated?: string }; figures?: FigureRecord[]; transcript?: Transcript; calls: LaneCall[] }
 
 export function sha256Hex(bytes: Uint8Array): string {
   return createHash('sha256').update(bytes).digest('hex');
@@ -115,7 +121,7 @@ async function imageFigurePages(pdf: string, pageCount: number, scanPages: Reado
   return figurePagesFromImageList(list, (p) => sizes.get(p), scanPages);
 }
 
-async function lanePage(cacheDir: string, hex: string, page: number, kind: 'ocr' | 'vision' | 'figures', read: () => Promise<PageCache>): Promise<PageCache> {
+async function lanePage(cacheDir: string, hex: string, page: number, kind: 'ocr' | 'vision' | 'figures' | 'transcript', read: () => Promise<PageCache>): Promise<PageCache> {
   const path = join(cacheDir, LANE_CACHE, hex.slice(0, 2), hex, `${page}-${kind}.json`);
   if (existsSync(path)) return JSON.parse(await readFile(path, 'utf8'));
   const result = await read();
@@ -142,15 +148,38 @@ export async function parseObject(file: string, opts: ParseObjectOptions): Promi
   const failures: ParseFailure[] = [];
   const unresolvedEscalations: Array<{ page: number; reason: string }> = [];
   const undescribedFigurePages: number[] = [];
+  if (!isPdf(bytes) && isMediaFile(file)) {
+    // One transcription per recording, cached like a page's lane result; a failed call is not cached.
+    if (!opts.lanes) throw new Error('transcription_not_configured: no transcription lane (the model router is not configured)');
+    const lanes = opts.lanes;
+    opts.onProgress?.(0, 1);
+    const t = await lanePage(opts.cacheDir, hex, 0, 'transcript', async () => ({ transcript: await transcribeMedia(file, lanes), calls: [] }));
+    const transcript = t.transcript!;
+    await opts.onCall?.({ object: objectId, kind: 'transcript', duration: transcript.duration, segments: transcript.segments.length, ms: transcript.ms });
+    opts.onProgress?.(1, 1);
+    units.push(...timedSections(transcript.segments));
+    return {
+      objectId, kind: 'sections', units, figures, emptyUnits: [], failures, unresolvedEscalations, undescribedFigurePages,
+      media: { duration: transcript.duration, segments: transcript.segments.length, ms: transcript.ms },
+    };
+  }
   if (!isPdf(bytes)) {
     let text: string;
-    let declared: { title?: string; creator?: string } | undefined;
+    let declared: { title?: string; creator?: string; sourceUrl?: string; retrievedAt?: string } | undefined;
     if (isEpub(bytes)) {
       const epub = convertEpubToMarkdown(bytes);
       text = epub.markdown;
       declared = { ...(epub.title ? { title: epub.title } : {}), ...(epub.creator ? { creator: epub.creator } : {}) };
     } else {
-      text = new TextDecoder('utf-8', { fatal: false }).decode(bytes);
+      const { meta, body } = splitFrontmatter(new TextDecoder('utf-8', { fatal: false }).decode(bytes));
+      text = body;
+      const creator = meta.creator ?? meta.author ?? meta.channel;
+      const sourceUrl = meta.source_url ?? meta.url;
+      declared = {
+        ...(meta.title ? { title: meta.title } : {}), ...(creator ? { creator } : {}),
+        ...(sourceUrl ? { sourceUrl } : {}), ...(meta.retrieved_at ? { retrievedAt: meta.retrieved_at } : {}),
+      };
+      if (!Object.keys(declared).length) declared = undefined;
     }
     sectionText(text).forEach((s, i) => units.push({ unit: unitName('s', i + 1), ...(s.heading ? { heading: s.heading } : {}), parser: 'text', text: s.text }));
     return { objectId, kind: 'sections', units, figures, emptyUnits: [], failures, unresolvedEscalations, undescribedFigurePages, ...(declared ? { declared } : {}) };
@@ -266,7 +295,17 @@ export interface BookFigure extends FigureRecord { object: string; source: strin
 export interface CatalogEntry {
   book: string; title: string; creator: string; kind: 'pages' | 'sections'; units: number;
   first_unit: string; last_unit: string; figures: number; objects: string[]; sources: string[];
+  /** The stable identity of a fetched source (`url:…`, `notion:…`, `drive:…`): re-ingesting it replaces this book. */
+  origin?: string;
+  /** Where a fetched source was read from, and when. */
+  source_url?: string;
+  retrieved_at?: string;
+  /** For a transcript: each section's time range, which its citations name instead of a section number. */
+  timecodes?: Record<string, string>;
 }
+
+/** Provenance a book carries beyond its title and author. */
+export interface BookProvenance { origin?: string; sourceUrl?: string; retrievedAt?: string }
 
 /**
  * Write one book's unit files (books/<book>/<unit>.md and fig-<unit>-<n>.md),
@@ -275,7 +314,7 @@ export interface CatalogEntry {
 export async function writeBook(tree: string, book: {
   book: string; title: string; creator: string; kind: 'pages' | 'sections';
   units: BookUnit[]; figures: BookFigure[]; objects: string[]; sources: string[];
-}): Promise<CatalogEntry> {
+} & BookProvenance): Promise<CatalogEntry> {
   const bookDir = join(tree, 'books', book.book);
   await rm(bookDir, { recursive: true, force: true });
   await mkdir(bookDir, { recursive: true });
@@ -283,11 +322,14 @@ export async function writeBook(tree: string, book: {
   const label = creator ? `${creator}, ${title}` : title;
   for (const u of book.units) {
     const n = Number(u.unit.slice(1));
+    const timed = u.start !== undefined && u.end !== undefined;
     const fm: Record<string, string | number> = {
-      title: `${label} — ${kind === 'pages' ? `p.${n}` : `§${n}`}${u.heading ? ` (${u.heading})` : ''}`,
-      type: kind === 'pages' ? 'book-page' : 'book-section', book: book.book, book_title: title, creator, unit: u.unit,
+      title: `${label} — ${timed ? timeRange(u.start!, u.end!) : `${kind === 'pages' ? `p.${n}` : `§${n}`}${u.heading ? ` (${u.heading})` : ''}`}`,
+      type: kind === 'pages' ? 'book-page' : timed ? 'transcript-section' : 'book-section', book: book.book, book_title: title, creator, unit: u.unit,
       object: u.object, source: u.source,
       ...(u.sourcePage ? { source_page: u.sourcePage } : { source_unit: u.sourceUnit ?? u.unit }), ...(u.heading ? { heading: u.heading } : {}),
+      ...(timed ? { start_seconds: Math.round(u.start! * 10) / 10, end_seconds: Math.round(u.end! * 10) / 10 } : {}),
+      ...(book.sourceUrl ? { source_url: book.sourceUrl } : {}), ...(book.retrievedAt ? { retrieved_at: book.retrievedAt } : {}),
     };
     await writeFile(join(bookDir, `${u.unit}.md`), renderUnitMarkdown(fm, u.text || '(no text on this page)'));
   }
@@ -301,15 +343,21 @@ export async function writeBook(tree: string, book: {
       creator, unit: f.unit, object: f.object, source: f.source, ...(f.sourcePage ? { source_page: f.sourcePage } : {}),
     }, body));
   }
+  const timecodes = Object.fromEntries(book.units.filter((u) => u.start !== undefined && u.end !== undefined).map((u) => [u.unit, timeRange(u.start!, u.end!)]));
   return {
     book: book.book, title, creator, kind, units: book.units.length, first_unit: book.units[0]?.unit ?? '',
     last_unit: book.units.at(-1)?.unit ?? '', figures: book.figures.length, objects: book.objects, sources: book.sources,
+    ...(book.origin ? { origin: book.origin } : {}), ...(book.sourceUrl ? { source_url: book.sourceUrl } : {}),
+    ...(book.retrievedAt ? { retrieved_at: book.retrievedAt } : {}), ...(Object.keys(timecodes).length ? { timecodes } : {}),
   };
 }
 
 /** One parsed original as a book: its id, display names and unit files. */
-export async function writeParsedBook(tree: string, parsed: ParsedObject, source: string, meta: { title: string; creator: string }): Promise<CatalogEntry> {
+export async function writeParsedBook(tree: string, parsed: ParsedObject, source: string, meta: { title: string; creator: string } & BookProvenance): Promise<CatalogEntry> {
+  const sourceUrl = meta.sourceUrl ?? parsed.declared?.sourceUrl;
+  const retrievedAt = meta.retrievedAt ?? parsed.declared?.retrievedAt;
   return writeBook(tree, {
+    ...(meta.origin ? { origin: meta.origin } : {}), ...(sourceUrl ? { sourceUrl } : {}), ...(retrievedAt ? { retrievedAt } : {}),
     book: bookId(meta.title, parsed.objectId), title: meta.title, creator: meta.creator, kind: parsed.kind,
     units: parsed.units.map((u) => ({ ...u, object: parsed.objectId, source })),
     figures: parsed.figures.map((f) => ({ ...f, object: parsed.objectId, source, sourcePage: Number(f.unit.slice(1)) })),
