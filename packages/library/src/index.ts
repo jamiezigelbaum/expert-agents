@@ -15,3 +15,5 @@ export * from "./page-units.ts";
 export * from "./page-ocr.ts";
 export * from "./page-parse.ts";
 export * from "./page-media.ts";
+// web-text.ts is its own entry, "@expert-agents/library/web-text": its parser
+// depends on CommonJS modules, which plugin bundles must not carry.

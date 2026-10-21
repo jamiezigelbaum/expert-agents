@@ -5,7 +5,8 @@
   "license": "MIT",
   "type": "module",
   "exports": {
-    ".": "./src/index.ts"
+    ".": "./src/index.ts",
+    "./web-text": "./src/web-text.ts"
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
@@ -15,5 +16,9 @@
   "devDependencies": {
     "@types/bun": "^1.3.14",
     "@types/node": "^22.0.0"
+  },
+  "dependencies": {
+    "@mozilla/readability": "0.6.0",
+    "linkedom": "0.18.13"
   }
 }
