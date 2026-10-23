@@ -310,9 +310,14 @@ export class PageLibrary {
   }
 }
 
-/** A catalog title without its bracketed annotations, e.g. "Politics [PD]" → "Politics". */
+/**
+ * A catalog title without its bracketed annotations, e.g. "Politics [PD]" →
+ * "Politics". A title that is nothing but brackets is kept as it is, so a
+ * citation never falls back to the internal book id.
+ */
 export function readerTitle(title: string | undefined): string {
-  return (title ?? '').replace(/\s*\[[^\]]*\]/g, '').replace(/\s{2,}/g, ' ').trim();
+  const raw = (title ?? '').trim();
+  return raw.replace(/\s*\[[^\]]*\]/g, '').replace(/\s{2,}/g, ' ').trim() || raw;
 }
 
 async function renderWithPdftoppm(pdf: Uint8Array, page: number): Promise<Uint8Array> {

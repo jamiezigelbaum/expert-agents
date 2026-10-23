@@ -8,6 +8,7 @@ import {
   PageLibraryError,
   parsePageLibraryParams,
   type PageSearchHit,
+  readerTitle,
 } from '../src/workers/domain-expert/page-library.ts';
 
 let root: string;
@@ -85,6 +86,7 @@ describe('page library tools', () => {
   test('an unpaginated section cites author and title only, without catalog tags', async () => {
     const r = await library().read('books/other-text-bbbbbb/s0001');
     expect(r.cite).toBe('B. Writer, Other Text (1788)');
+    expect(readerTitle('[Untitled]')).toBe('[Untitled]');
   });
 
   test('read_range reads at most 25 units and says where to continue', async () => {
