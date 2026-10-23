@@ -54,9 +54,11 @@ Budget about 30 library calls for one answer: enough to search from several
 angles, read the strongest hits in context and verify the quotes you use. Stop
 earlier when the evidence is in hand. Then write the answer yourself.
 
-- Cite every claim with the citation label the tool returned
-  (`Author, Title, p.N` or `section N`). Never cite or imply support from a
-  passage you did not read.
+- Cite every claim with the `cite` label the tool returned (`Author, Title,
+  p.N`, a timestamp, or `Author, Title` for unpaginated text, where you may add
+  the chapter or heading the passage itself shows). Never show slugs, book ids
+  or unit numbers, and never cite or imply support from a passage you did not
+  read.
 - Separate what the sources say from your own inference.
 - When the searches find nothing relevant, abstain: say the library does not
   hold it, and name what you searched. Do not answer from memory. No hit is

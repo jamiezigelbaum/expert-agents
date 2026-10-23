@@ -38,7 +38,7 @@ beforeAll(async () => {
   await writeFile(join(other, 's0001.md'), renderUnitMarkdown({ title: 'Other — §1', source: 'gs://elsewhere/x.md' }, 'Section text with the witness.'));
   await writeFile(join(root, 'catalog.json'), JSON.stringify({ books: [
     { book: 'sample-book-aaaaaa', title: 'Sample Book', creator: 'A. Author', kind: 'pages', units: 30, first_unit: 'p0001', last_unit: 'p0030', figures: 1 },
-    { book: 'other-text-bbbbbb', title: 'Other Text', creator: '', kind: 'sections', units: 1, first_unit: 's0001', last_unit: 's0001', figures: 0 },
+    { book: 'other-text-bbbbbb', title: 'Other Text (1788) [PD]', creator: 'B. Writer', kind: 'sections', units: 1, first_unit: 's0001', last_unit: 's0001', figures: 0 },
   ] }));
 });
 
@@ -80,6 +80,11 @@ describe('page library tools', () => {
     expect(r.text).toBe('The Witness is not an object.\nA second line.');
     await expect(library().read('books/sample-book-aaaaaa/p0099')).rejects.toThrow(PageLibraryError);
     await expect(library().read('books/../p0001')).rejects.toThrow(PageLibraryError);
+  });
+
+  test('an unpaginated section cites author and title only, without catalog tags', async () => {
+    const r = await library().read('books/other-text-bbbbbb/s0001');
+    expect(r.cite).toBe('B. Writer, Other Text (1788)');
   });
 
   test('read_range reads at most 25 units and says where to continue', async () => {
