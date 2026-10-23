@@ -13,8 +13,10 @@ description `fig-pNNNN-k`). Use `domain_library`:
   (continue from `next_unit`), `view_page` to look at a figure, table or
   diagram.
 
-Cite every claim with the citation label the tool returns. When the library
-has no evidence, say so rather than answering from memory.
+Cite every claim with the `cite` label the tool returns (author, title and
+page or timestamp). Slugs, book ids and unit numbers are internal addresses;
+never show them to readers. When the library has no evidence, say so rather
+than answering from memory.
 
 Use `library_ingest` to add approved sources (a workspace file or folder, or a
 `gs://` original in your library), then check its `status` and report failed

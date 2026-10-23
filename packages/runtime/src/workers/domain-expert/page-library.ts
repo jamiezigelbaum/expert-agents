@@ -154,12 +154,15 @@ export class PageLibrary {
     return this.catalogCache;
   }
 
+  // The reference a reader is given: author, title and a location the reader
+  // can find in their own copy. Sections are the library's own cuts, so they
+  // name no location; bracketed catalog tags such as [PD] are dropped.
   private async cite(book: string, unit: string): Promise<string> {
     const b = (await this.books()).byBook.get(book);
     const page = unit.replace(/^fig-(p\d+)-\d+$/, '$1');
     const time = b?.timecodes?.[page];
-    const loc = page.startsWith('p') ? `p.${unitNumber(page)}` : typeof time === 'string' ? time : `section ${unitNumber(page)}`;
-    return `${b?.creator ? `${b.creator}, ` : ''}${b?.title ?? book}, ${loc}`;
+    const loc = page.startsWith('p') ? `p.${unitNumber(page)}` : typeof time === 'string' ? time : undefined;
+    return [b?.creator, readerTitle(b?.title) || book, loc].filter(Boolean).join(', ');
   }
 
   private async requireBook(book: string): Promise<CatalogBook> {
@@ -305,6 +308,16 @@ export class PageLibrary {
     const unit = f.unit.replace(/^fig-(p\d+)-\d+$/, '$1');
     return { slug: `books/${f.book}/${unit}`, cite: await this.cite(f.book, unit), image: { mime_type: 'image/jpeg', data: Buffer.from(jpeg).toString('base64') } };
   }
+}
+
+/**
+ * A catalog title without its bracketed annotations, e.g. "Politics [PD]" →
+ * "Politics". A title that is nothing but brackets is kept as it is, so a
+ * citation never falls back to the internal book id.
+ */
+export function readerTitle(title: string | undefined): string {
+  const raw = (title ?? '').trim();
+  return raw.replace(/\s*\[[^\]]*\]/g, '').replace(/\s{2,}/g, ' ').trim() || raw;
 }
 
 async function renderWithPdftoppm(pdf: Uint8Array, page: number): Promise<Uint8Array> {

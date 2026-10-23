@@ -199,7 +199,7 @@ describe('library_ingest web pages', () => {
     expect(source.retrieved_at).toMatch(/^\d{4}-\d\d-\d\dT/);
 
     const read = await call(w, 'domain_library', { action: 'read', slug: `books/${source.book}/s0001` });
-    expect(read.body.cite).toBe('Assemblies of Old, section 1');
+    expect(read.body.cite).toBe('Assemblies of Old');
     expect(read.body.text).toContain('The first assembly met at dawn');
     // Main text only: the extractor drops navigation and footer, and the front matter is metadata, not text.
     expect(read.body.text).not.toContain('retrieved_at');

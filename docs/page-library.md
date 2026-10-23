@@ -191,8 +191,11 @@ Postgres cannot read is scanned unfiltered instead of refused.
 | `read_range` | `book`, `from_unit`, `to_unit` | ≤25 consecutive units, `next_unit` to continue |
 | `view_page` | `slug` | the JPEG of that PDF page, rendered from the original |
 
-Slugs are `books/<book>/<unit>`. Every hit carries a citation label
-(`Author, Title, p.N` or `section N`).
+Slugs are `books/<book>/<unit>`. Every hit carries `cite`, the reference a
+reader is given: `Author, Title, p.N`, a timestamp for audio and video, or
+`Author, Title` for unpaginated text, whose sections are the library's own cuts
+and name no location. Bracketed catalog tags such as `[PD]` are left out.
+Slugs, book ids and unit numbers are internal addresses, never shown to readers.
 
 Under a disclosure policy (the route's `disclosure` block,
 [`AGENT_REPO_CONTRACT.md`](./AGENT_REPO_CONTRACT.md)) the tool serves the same
