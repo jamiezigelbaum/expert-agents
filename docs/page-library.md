@@ -312,6 +312,16 @@ docker compose --env-file page-library.env --profile worker up -d --build
   `PAGE_LIBRARY_WORKER_BIND`). An agent on another host reaches the worker
   over a private network address or a tunnel, with the bearer; never publish
   either port openly.
+- **Scoped client tokens.** A deployment on another host (a public Deva, say)
+  should not hold the owner bearer, which reaches ingest and every route.
+  `EXPERT_AGENTS_DOMAIN_EXPERT_CLIENT_TOKENS_JSON` (JSON or `@/path`) gives
+  each client its own token, stored as a SHA-256 digest, limited to named
+  domains, tools and optionally actions:
+  `{"<client>": {"tokenSha256": "<hex>", "domains": ["<id>"], "tools": ["domain_library"], "actions": ["search"]}}`.
+  A client token reaches only `POST /v1/domain` within its grant (403
+  `client_not_permitted` otherwise, health included). Client tokens alone
+  satisfy the non-loopback bind guard, so a reader-only worker can run with
+  no owner token at all.
 - **Ingest from another host.** A machine with the OCR models (the parse
   lane) parses and assembles locally, then writes into the library over a
   tunnel to the database port with the writer login:
