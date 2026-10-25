@@ -178,6 +178,13 @@ bounds). The worker reads the library with
 `EXPERT_AGENTS_DOMAIN_EXPERT_VOYAGE_API_KEY`. Books another host ingests
 appear within a minute; keyword statistics are re-read every five minutes.
 
+Originals (the PDFs `view_page` renders, and what `library_ingest` stores)
+are addressed as `gs://<bucket>/<name>`. With
+`EXPERT_AGENTS_DOMAIN_EXPERT_LIBRARY_OBJECTS_ROOT` set, the worker keeps them
+on its own disk at `<root>/<bucket>/<name>` and never calls Cloud Storage for
+them; the references stay as they are, so moving a library off Cloud Storage
+is a copy of its buckets into that directory.
+
 `grep` runs in Postgres for a database library: each line is matched the
 way JavaScript would (`^`/`$` per line, `\b` a word boundary), and a pattern
 Postgres cannot read is scanned unfiltered instead of refused.
