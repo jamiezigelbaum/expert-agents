@@ -192,8 +192,6 @@ bun run expert:library -- library --domain climate --action search --query "sea-
 | `domain_library` | The page library: catalog, search, grep, read, read_range and view_page, every result cited. |
 | `library_ingest` | Add sources to the page library and report each page's outcome. |
 | `domain_agent` | Plan or inspect a domain expert's configuration. |
-| `domain_ask`, `domain_read`, `domain_source`, `rag_corpus` | Legacy Vertex tools, for domains not yet on the page library. |
-| `domain_doc` | Read, comment on, or apply an approved edit to a configured document. |
 | `annas_archive_search` | Search book catalogs for candidates without downloading. |
 | `annas_archive_import` | Download and import an explicitly approved item. |
 | `expert_factory` | Create, resume, or check on a new expert. Owner-only and disabled by default. |
@@ -214,7 +212,7 @@ Everything the agent can do, an operator can do from a shell with
 | `library-ingest` | Start, follow or list page-library ingest jobs. |
 | `search` | Find candidate books for a domain. |
 | `acquire` | Download an approved book and queue its ingest. |
-| `ask`, `read`, `source register`, `status`, `ingest` | Legacy Vertex lanes. |
+| `ingest` | Legacy owner lane: stage into the shared GCS library and materialize into a Vertex corpus. |
 
 `bun run library:pages` and `bun run library:index` build and index a whole
 library on the host that holds it ([page library](docs/page-library.md)).
@@ -230,7 +228,7 @@ reference.
 ├── src/                          OpenClaw plugin entry and tool schemas
 ├── packages/
 │   ├── runtime/                  domain-expert worker (HTTP server)
-│   ├── library/                  library model, ingestion, retrieval preferences
+│   ├── library/                  library model, page units, OCR and ingestion
 │   ├── library-materializer/     legacy: plan/execute import into Vertex corpora
 │   └── provisioning/             expert factory and agent-repository scaffolding
 ├── skills/                       OpenClaw operating skills

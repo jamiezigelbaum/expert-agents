@@ -52,7 +52,7 @@ USER.md
 HEARTBEAT.md
 references/
 library/
-  scope-manifest.json (legacy Vertex agents only)
+  scope-manifest.json (optional, legacy materializer lane)
   eval-questions.json
 derived/ (optional)
   <artifact-id>/
@@ -109,10 +109,8 @@ may also load one from a local checkout.
 
 `emoji`, `avatar`, and `serving` are optional; all other fields are required.
 An agent reads its domain's page library ([`page-library.md`](./page-library.md)),
-so it names no corpus. `targetCorpusDisplayName` is accepted only from a legacy
-agent still served from a Vertex corpus, which also keeps
-`library/scope-manifest.json`; both go when the Vertex machinery is removed.
-Unknown fields are rejected. IDs use lowercase letters, digits, dots,
+so it names no corpus. A retired Vertex agent's `targetCorpusDisplayName` is
+still accepted and ignored. Unknown fields are rejected. IDs use lowercase letters, digits, dots,
 underscores, and hyphens, begin and end with a letter or digit, and have at most
 128 characters. Human-facing values must be non-empty, trimmed, single-line
 strings.
@@ -128,8 +126,8 @@ valid.
 
 The manifest is consistent only when:
 
-- for a legacy Vertex agent, `agentId` and `targetCorpusDisplayName` equal
-  `library/scope-manifest.json`'s; and
+- when `library/scope-manifest.json` is present, its `agentId` equals the
+  manifest's; and
 - `domainId` equals `library/eval-questions.json`'s `domainId`.
 
 ## Deployment posture and the serving set
@@ -343,7 +341,7 @@ directory behind:
 repo-relative path, SHA-256, and byte count, sorted by path. Equal tag in,
 byte-identical artifact and receipt out.
 
-Soul lint, retrieval evaluation, and the parity battery are network gates.
+Soul lint and retrieval evaluation are network gates.
 Packaging does not attempt them; it names them as `[MANUAL]` preconditions the
 operator runs, and `SERVING_CHECKLIST.md` repeats them alongside the four
 offline posture steps: read-only `workspace/` mount, no git remote or push
@@ -386,7 +384,7 @@ verification workflow.
 
 ## Library files
 
-A legacy Vertex agent's `library/scope-manifest.json` is an agent-owned
+An optional `library/scope-manifest.json` (the legacy materializer lane) is an agent-owned
 [`ScopeManifest`](./LIBRARY_ARCHITECTURE.md) validated by
 `@expert-agents/library`. It never moves into this machinery repository or the
 shared-library bucket.

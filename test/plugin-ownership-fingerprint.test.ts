@@ -37,16 +37,16 @@ describe('captured response validation', () => {
 
   test('rejects malformed input shapes and duplicate entries', () => {
     expect(() => parseCapturedResponses('{')).toThrow('Invalid captured responses: expected valid JSON.');
-    expect(() => parseCapturedResponses('"domain_ask"')).toThrow(
+    expect(() => parseCapturedResponses('"domain_library"')).toThrow(
       'Invalid captured responses at $: expected an object mapping tool name to response, or an array of { tool, response } entries.',
     );
-    expect(() => parseCapturedResponses(JSON.stringify([{ tool: 'domain_ask' }]))).toThrow(
+    expect(() => parseCapturedResponses(JSON.stringify([{ tool: 'domain_library' }]))).toThrow(
       'Invalid captured responses at $[0].response: expected a captured response body.',
     );
     expect(() => parseCapturedResponses(JSON.stringify([
-      { tool: 'domain_ask', response: ourResponse() },
-      { tool: 'domain_ask', response: ourResponse() },
-    ]))).toThrow('Invalid captured responses at $[1].tool: duplicate entry for "domain_ask".');
+      { tool: 'domain_library', response: ourResponse() },
+      { tool: 'domain_library', response: ourResponse() },
+    ]))).toThrow('Invalid captured responses at $[1].tool: duplicate entry for "domain_library".');
   });
 
   test('accepts the array entry form as an equivalent capture of the same set', () => {
@@ -75,68 +75,68 @@ describe('ownership classification', () => {
     // The 2026-07-30 incident: the cutover looked healthy while the fork on the
     // same gateway answered tool calls our plugin believed it owned.
     const captured = allOurs();
-    captured.set('domain_ask', forkResponse());
+    captured.set('domain_library', forkResponse());
 
     const fingerprint = createOwnershipFingerprint(captured);
 
-    expect(entryFor(fingerprint, 'domain_ask').verdict).toBe('olympus');
-    expect(entryFor(fingerprint, 'domain_ask').reason).toBe('only olympus_control_plane_only is true.');
-    expect(fingerprint.verdict.unowned_tools).toEqual(['domain_ask']);
+    expect(entryFor(fingerprint, 'domain_library').verdict).toBe('olympus');
+    expect(entryFor(fingerprint, 'domain_library').reason).toBe('only olympus_control_plane_only is true.');
+    expect(fingerprint.verdict.unowned_tools).toEqual(['domain_library']);
     expect(pluginOwnershipExitCode(fingerprint)).toBe(1);
-    expect(formatOwnershipReport(fingerprint)).toContain('Not ours: domain_ask');
+    expect(formatOwnershipReport(fingerprint)).toContain('Not ours: domain_library');
   });
 
   test('fails and names a tool with no captured response', () => {
     const captured = allOurs();
-    captured.delete('rag_corpus');
+    captured.delete('library_ingest');
 
     const fingerprint = createOwnershipFingerprint(captured);
 
     expect(fingerprint.tools).toHaveLength(GATEWAY_TOOL_NAMES.length);
-    expect(entryFor(fingerprint, 'rag_corpus')).toEqual({
-      tool: 'rag_corpus',
+    expect(entryFor(fingerprint, 'library_ingest')).toEqual({
+      tool: 'library_ingest',
       verdict: 'missing',
       reason: 'no response was captured for this tool name.',
       stamps: null,
     });
-    expect(fingerprint.verdict.missing_tools).toEqual(['rag_corpus']);
+    expect(fingerprint.verdict.missing_tools).toEqual(['library_ingest']);
     expect(pluginOwnershipExitCode(fingerprint)).toBe(1);
     expect(formatOwnershipReport(fingerprint)).toContain(
-      'Missing: rag_corpus. A tool name with no captured response is a failure, not a pass.',
+      'Missing: library_ingest. A tool name with no captured response is a failure, not a pass.',
     );
   });
 
   test('treats both stamps set as ambiguous rather than as ours', () => {
     const captured = allOurs();
-    captured.set('domain_doc', ourResponse({ olympus_control_plane_only: true }));
+    captured.set('annas_archive_import', ourResponse({ olympus_control_plane_only: true }));
 
     const fingerprint = createOwnershipFingerprint(captured);
 
-    expect(entryFor(fingerprint, 'domain_doc').verdict).toBe('ambiguous');
-    expect(entryFor(fingerprint, 'domain_doc').stamps).toEqual({
+    expect(entryFor(fingerprint, 'annas_archive_import').verdict).toBe('ambiguous');
+    expect(entryFor(fingerprint, 'annas_archive_import').stamps).toEqual({
       expert_agents_control_plane_only: true,
       olympus_control_plane_only: true,
     });
-    expect(fingerprint.verdict.unowned_tools).toEqual(['domain_doc']);
+    expect(fingerprint.verdict.unowned_tools).toEqual(['annas_archive_import']);
     expect(pluginOwnershipExitCode(fingerprint)).toBe(1);
   });
 
   test('treats a response without a policy object as unknown ownership', () => {
     const captured = allOurs();
-    captured.set('domain_source', { kind: 'domain_answer', answer: CORPUS_SENTINEL });
+    captured.set('annas_archive_search', { kind: 'domain_answer', answer: CORPUS_SENTINEL });
     captured.set('domain_agent', 'not-an-object');
 
     const fingerprint = createOwnershipFingerprint(captured);
 
-    expect(entryFor(fingerprint, 'domain_source').verdict).toBe('unknown');
-    expect(entryFor(fingerprint, 'domain_source').reason).toBe('the response carries no policy object.');
+    expect(entryFor(fingerprint, 'annas_archive_search').verdict).toBe('unknown');
+    expect(entryFor(fingerprint, 'annas_archive_search').reason).toBe('the response carries no policy object.');
     expect(entryFor(fingerprint, 'domain_agent').reason).toBe('the captured response is not a JSON object.');
     expect(fingerprint.counts.unknown).toBe(2);
     expect(pluginOwnershipExitCode(fingerprint)).toBe(1);
   });
 
   test('treats a policy object with neither stamp true as unknown ownership', () => {
-    const ownership = classifyToolOwnership('domain_ask', { policy: { raw_runtime_secrets_exposed: false } });
+    const ownership = classifyToolOwnership('domain_library', { policy: { raw_runtime_secrets_exposed: false } });
 
     expect(ownership.verdict).toBe('unknown');
     expect(ownership.reason).toBe('neither control-plane stamp is true.');
@@ -148,7 +148,7 @@ describe('ownership classification', () => {
 
   test('changes the receipt digest when a single tool changes owner', () => {
     const changed = allOurs();
-    changed.set('domain_doc', forkResponse());
+    changed.set('annas_archive_import', forkResponse());
 
     expect(createOwnershipFingerprint(changed).sha256).not.toBe(createOwnershipFingerprint(allOurs()).sha256);
   });
@@ -223,7 +223,7 @@ describe('ownership fingerprint CLI', () => {
       expect(output).not.toContain('sentinel');
       expect(output).not.toContain('citations');
     }
-    expect(human.output).toContain('domain_ask');
+    expect(human.output).toContain('domain_library');
   });
 });
 

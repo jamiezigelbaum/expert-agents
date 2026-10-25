@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { readFile } from "node:fs/promises";
+import { readdir, readFile } from "node:fs/promises";
 
 describe("acquisition skill", () => {
   test("every error code it names is one the worker produces", async () => {
@@ -17,5 +17,14 @@ describe("acquisition skill", () => {
     expect(skill).toContain("Check `library_ingest` with `action: \"status\"`");
     expect(skill).toContain("Never describe a queued or running job as success");
     expect(skill).not.toMatch(/Vertex|rag_corpus|domain_ask|target corpus|parts of at most/);
+  });
+});
+
+describe("skills", () => {
+  test("no skill teaches a retired Vertex tool", async () => {
+    for (const name of await readdir("skills")) {
+      const skill = await readFile(`skills/${name}/SKILL.md`, "utf8").catch(() => "");
+      expect({ name, retired: skill.match(/\b(?:domain_ask|domain_read|domain_source|rag_corpus)\b/g) ?? [] }).toEqual({ name, retired: [] });
+    }
   });
 });

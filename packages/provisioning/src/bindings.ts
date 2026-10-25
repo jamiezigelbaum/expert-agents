@@ -110,7 +110,6 @@ export function createBindingDescriptor(
     ...(binding.telegram === undefined ? {} : { telegram: binding.telegram }),
     routing: {
       domainId: manifest.domainId,
-      ...(manifest.targetCorpusDisplayName === undefined ? {} : { targetCorpusDisplayName: manifest.targetCorpusDisplayName }),
     },
   };
 }

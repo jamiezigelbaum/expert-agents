@@ -65,15 +65,25 @@ describe("agent repository contract", () => {
     });
   });
 
-  test("a legacy corpus agent still needs its scope manifest", async () => {
+  test("a legacy corpus agent no longer needs its scope manifest", async () => {
     const directory = await legacyCorpusFixture();
     expect((await expertStatus(directory)).valid).toBe(true);
     await unlink(join(directory, "library/scope-manifest.json"));
-    expect((await expertStatus(directory)).findings).toContainEqual({
-      file: "library/scope-manifest.json",
-      ruleId: "contract.required",
-      severity: "error",
-    });
+    const report = await expertStatus(directory);
+    expect(report.valid).toBe(true);
+    expect(report.findings.filter((finding) => finding.file === "library/scope-manifest.json")).toEqual([]);
+  });
+
+  test("agent.json still accepts a retired targetCorpusDisplayName but drops it", () => {
+    const value = {
+      schemaVersion: 1,
+      agentId: "neutral-agent",
+      displayName: "Neutral Agent",
+      domainId: "neutral-domain",
+    } as const;
+    const validated = validateAgentManifest({ ...value, targetCorpusDisplayName: "neutral-corpus" });
+    expect(validated).toEqual(value);
+    expect(Object.keys(validated)).not.toContain("targetCorpusDisplayName");
   });
 
   test("rejects agent and scope identity mismatches", async () => {
@@ -91,11 +101,8 @@ describe("agent repository contract", () => {
       ruleId: "consistency.agent_id",
       severity: "error",
     });
-    expect(report.findings).toContainEqual({
-      file: "agent.json",
-      ruleId: "consistency.target_corpus",
-      severity: "error",
-    });
+    // The target corpus is retired: a differing scope corpus is no longer a finding.
+    expect(report.findings.map((finding) => finding.ruleId)).not.toContain("consistency.target_corpus");
   });
 
   test("rejects invalid scope and retrieval eval documents", async () => {
@@ -130,7 +137,6 @@ describe("agent repository contract", () => {
       agentId: "neutral-agent",
       displayName: "Neutral Agent",
       domainId: "neutral-domain",
-      targetCorpusDisplayName: "neutral-corpus",
     } as const;
     expect(validateAgentManifest(value)).toEqual(value);
     expect(() => validateAgentManifest({ ...value, unexpected: true })).toThrow("unknown field");
@@ -143,7 +149,6 @@ describe("agent repository contract", () => {
       agentId: "neutral-agent",
       displayName: "Neutral Agent",
       domainId: "neutral-domain",
-      targetCorpusDisplayName: "neutral-corpus",
     } as const;
     expect(validateAgentManifest(base).avatar).toBeUndefined();
     for (const avatar of ["avatar.png", "references/avatar.webp", "avatar.JPEG"]) {
@@ -157,7 +162,6 @@ describe("agent repository contract", () => {
       agentId: "neutral-agent",
       displayName: "Neutral Agent",
       domainId: "neutral-domain",
-      targetCorpusDisplayName: "neutral-corpus",
     } as const;
     for (const avatar of ["/etc/avatar.png", "~/avatar.png", "../avatar.png", "art/../avatar.png"]) {
       expect(() => validateAgentManifest({ ...base, avatar }))
@@ -178,7 +182,6 @@ describe("agent repository contract", () => {
       agentId: "neutral-agent",
       displayName: "Neutral Agent",
       domainId: "neutral-domain",
-      targetCorpusDisplayName: "neutral-corpus",
     } as const;
     for (const avatar of [
       "memory/avatar.png",

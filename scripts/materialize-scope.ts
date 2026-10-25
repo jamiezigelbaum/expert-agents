@@ -13,7 +13,8 @@ import {
   type MaterializerCandidate,
   type VertexAdapter,
 } from "../packages/library-materializer/src/index.ts";
-import { DEFAULT_QPDF_BIN, PDF_SPLIT_PAGES_ENV, pdfPageLimitSetting, qpdfPageCount, resolveRagParserModel } from "../packages/library/src/index.ts";
+import { DEFAULT_QPDF_BIN, PDF_SPLIT_PAGES_ENV, pdfPageLimitSetting, qpdfPageCount } from "../packages/library/src/index.ts";
+import { resolveRagParserModel } from "../packages/library-materializer/src/rag-ingestion.ts";
 
 const CANDIDATE_DESCRIPTOR = "candidates.json";
 const VERTEX_LOCATION = "us-central1";

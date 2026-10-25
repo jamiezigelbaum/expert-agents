@@ -34,17 +34,18 @@ afterAll(async () => {
 });
 
 describe('page-library-only routes', () => {
-  test('need neither a corpus nor a library location', () => {
+  test('need no library location when the originals buckets are explicit', () => {
     const routes = validateAgentRoutingConfig({ history: { pageLibrary: { root: '/srv/pages/history', sourceId: 'history', originalBuckets: ['originals-bucket'] } } });
     expect(routes.history).toEqual({ domainId: 'history', pageLibrary: { root: '/srv/pages/history', sourceId: 'history', originalBuckets: ['originals-bucket'] } });
     // Without a library, the originals buckets must be explicit.
     expect(() => validateAgentRoutingConfig({ history: { pageLibrary: { root: '/srv/pages/history', sourceId: 'history' } } })).toThrow(AgentRoutingConfigError);
-    // Vertex retrieval settings without a corpus mean nothing.
-    expect(() => validateAgentRoutingConfig({ history: {
+    // A route without a page library is refused: it is the only retrieval lane.
+    expect(() => validateAgentRoutingConfig({ history: { library: { bucket: 'b', prefix: 'p' } } })).toThrow('an entry is missing pageLibrary');
+    // The retired Vertex retrieval settings are accepted and dropped.
+    const retired = validateAgentRoutingConfig({ history: {
       pageLibrary: { root: '/srv/pages/history', sourceId: 'history', originalBuckets: ['originals-bucket'] }, retrieval: { topK: 5 },
-    } })).toThrow(AgentRoutingConfigError);
-    // A Vertex route still needs both fields.
-    expect(() => validateAgentRoutingConfig({ history: { library: { bucket: 'b', prefix: 'p' } } })).toThrow(AgentRoutingConfigError);
+    } });
+    expect(Object.keys(retired.history!)).not.toContain('retrieval');
     expect(() => validateAgentRoutingConfig({ history: { pageLibrary: { root: '/srv/x', sourceId: 'history', originalBuckets: ['Bad Bucket'] } } })).toThrow(AgentRoutingConfigError);
   });
 
@@ -55,10 +56,10 @@ describe('page-library-only routes', () => {
       .toEqual(['only']);
   });
 
-  test('serve domain_library, refuse the Vertex tools, and view only allowlisted originals', async () => {
+  test('serve domain_library, refuse the removed Vertex tools, and view only allowlisted originals', async () => {
     const downloads: string[] = [];
     const worker = createDomainExpertWorker({
-      dataDir, gcpProject: 'neutral-project',
+      dataDir,
       agentRouting: validateAgentRoutingConfig({ history: { pageLibrary: { root: tree, sourceId: 'history', originalBuckets: ['originals-bucket'] } } }),
       pageSearch: async () => [{ slug: 'books/sample-book-aaaaaa/p0001', text: 'Page 1 text.' }],
       google: { accessToken: 'synthetic-token', fetchImpl: (async (input: RequestInfo | URL) => {
@@ -81,11 +82,12 @@ describe('page-library-only routes', () => {
     for (const [tool, params] of [
       ['domain_ask', { question: 'What is on page one?' }],
       ['domain_read', { action: 'catalog' }],
+      ['domain_source', { action: 'list' }],
       ['rag_corpus', { action: 'ensure', dry_run: false, approval_id: 'op-1' }],
     ] as const) {
       const refused = await call(tool, params);
-      expect(refused.status).toBe(404);
-      expect(refused.body.error.code).toBe('vertex_not_configured');
+      expect(refused.status).toBe(400);
+      expect(refused.body.error.code).toBe('invalid_tool');
     }
 
     const foreign = await call('domain_library', { action: 'view_page', slug: 'books/sample-book-aaaaaa/p0002' });
@@ -104,7 +106,7 @@ describe('page-library registrations', () => {
       const library = { bucket: 'neutral-library', prefix: 'factory/history' };
       const { routes } = store.register('history', { displayName: 'History', library, pageLibrary: {} }, false);
       expect(routes.history!.pageLibrary).toEqual({ root: '/srv/pages/history', sourceId: 'history' });
-      expect(routes.history!.targetCorpusDisplayName).toBeUndefined();
+      expect(Object.keys(routes.history!)).not.toContain('targetCorpusDisplayName');
       expect(pageLibraryOriginalBuckets(routes.history!)).toEqual(['neutral-library']);
       // Persisted, reloaded, and idempotent.
       const reloaded = new AgentRegistrationStore(dir, validateAgentRoutingConfig({}), registrationLibrary, '/srv/pages');
@@ -149,7 +151,7 @@ describe('page-library registrations', () => {
     const dir = await mkdtemp(join(tmpdir(), 'page-route-reg-'));
     try {
       const worker = createDomainExpertWorker({
-        dataDir: dir, gcpProject: 'neutral-project', registrationLibrary, pageLibraryRoot: '/srv/pages',
+        dataDir: dir,registrationLibrary, pageLibraryRoot: '/srv/pages',
         agentRouting: validateAgentRoutingConfig({}),
         google: { accessToken: 'synthetic-token', fetchImpl: (async () => { throw new Error('no upstream call expected'); }) as unknown as typeof fetch },
       });
@@ -175,7 +177,7 @@ describe('a page-library domain is seeded for the page library', () => {
     const empty = await mkdtemp(join(tmpdir(), 'page-route-empty-'));
     try {
       const worker = createDomainExpertWorker({
-        dataDir, gcpProject: 'neutral-project',
+        dataDir,
         agentRouting: validateAgentRoutingConfig({ history: { pageLibrary: { root: join(empty, 'history'), sourceId: 'history', originalBuckets: ['originals-bucket'] } } }),
         pageSearch: async () => [],
         google: { accessToken: 'synthetic-token', fetchImpl: (async () => { throw new Error('no network'); }) as unknown as typeof fetch },
@@ -191,7 +193,7 @@ describe('a page-library domain is seeded for the page library', () => {
 
   test('its agent plan scopes the page library tools and no Vertex tool', () => {
     const plan = planDomainAgent({ action: 'status', domainId: 'history' }, domainManifest('history', 'History', { agentRouting: routing })) as Record<string, any>;
-    expect(plan.openclaw_agent.scoped_tools).toEqual(['domain_library', 'library_ingest', 'domain_doc', 'annas_archive_search', 'annas_archive_import', 'expert_agents_workspace']);
+    expect(plan.openclaw_agent.scoped_tools).toEqual(['domain_library', 'library_ingest', 'annas_archive_search', 'annas_archive_import', 'expert_agents_workspace']);
     expect(JSON.stringify(plan.next_steps)).not.toMatch(/RAG|corpora/);
   });
 
@@ -199,7 +201,7 @@ describe('a page-library domain is seeded for the page library', () => {
     const root = await mkdtemp(join(tmpdir(), 'page-route-seed-'));
     try {
       const worker = createDomainExpertWorker({
-        dataDir: root, gcpProject: 'neutral-project', agentRouting: routing,
+        dataDir: root,agentRouting: routing,
         roots: [{ rootId: 'expert_agents_workspace', path: root, maxWriteBytes: 1024 * 1024, allowOverwrite: false }],
         fetchImpl: (async () => { throw new Error('no network'); }) as unknown as typeof fetch,
       });
@@ -230,7 +232,7 @@ describe('health reports page-library readiness', () => {
     const empty = await mkdtemp(join(tmpdir(), 'page-route-health-'));
     try {
       const worker = createDomainExpertWorker({
-        dataDir, gcpProject: 'neutral-project',
+        dataDir,
         agentRouting: validateAgentRoutingConfig({
           history: { pageLibrary: { root: tree, sourceId: 'history', originalBuckets: ['originals-bucket'] } },
           fresh: { pageLibrary: { root: join(empty, 'fresh'), sourceId: 'fresh', originalBuckets: ['originals-bucket'] } },
@@ -254,7 +256,7 @@ describe('health reports page-library readiness', () => {
 
   test('an index that does not answer is reported unreachable, and no route means not configured', async () => {
     const worker = createDomainExpertWorker({
-      dataDir, gcpProject: 'neutral-project',
+      dataDir,
       agentRouting: validateAgentRoutingConfig({ history: { pageLibrary: { root: tree, sourceId: 'history', originalBuckets: ['originals-bucket'] } } }),
       pageSearch: async () => [],
       pageIndexStatus: async () => { throw new Error('connection refused'); },
@@ -263,7 +265,7 @@ describe('health reports page-library readiness', () => {
     const health = await healthOf(worker);
     expect(health.page_library.domains[0].index).toEqual({ status: 'unreachable' });
     expect(health.page_library.issues.map((issue: { code: string }) => issue.code)).toContain('page_search_unavailable');
-    const none = createDomainExpertWorker({ dataDir, gcpProject: 'neutral-project', agentRouting: validateAgentRoutingConfig({}) });
+    const none = createDomainExpertWorker({ dataDir,agentRouting: validateAgentRoutingConfig({}) });
     expect((await healthOf(none)).page_library.status).toBe('not_configured');
   });
 });

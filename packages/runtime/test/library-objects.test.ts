@@ -3,8 +3,7 @@ import { createHash } from 'node:crypto';
 import { mkdtemp, readdir, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { LibraryObjectExistsError, LocalLibraryObjects } from '../src/workers/domain-expert/library-objects.ts';
-import { LibraryReadError } from '../src/workers/domain-expert/library-reader.ts';
+import { LibraryObjectExistsError, LibraryReadError, LocalLibraryObjects } from '../src/workers/domain-expert/library-objects.ts';
 
 // Library objects kept on the worker's own disk: the same bucket-and-name
 // addressing as Cloud Storage, so stored gs:// references keep resolving.

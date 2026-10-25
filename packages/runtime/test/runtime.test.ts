@@ -4,28 +4,18 @@ import { tmpdir } from 'node:os';
 import { extname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { AGENT_REPO_GITIGNORE, serializeScopeManifest } from '@expert-agents/library';
-import {
-  DOMAIN_EXPERT_GOOGLE_CREDENTIAL_GUIDANCE,
-  connectGcpSource,
-  validateServiceAccountKey,
-} from '../src/core/connect-gcp.ts';
 import { DirectHttpDomainExpertTransport, DomainExpertClient } from '../src/core/domain-expert-client.ts';
 import {
-  DOMAIN_ASK_RETRIEVAL_DEFAULTS,
   domainManifest,
   domainPolicy,
   planDomainAgent,
-  planDomainAsk,
-  planDomainSource,
   planAnnasArchiveImport,
-  planRagCorpus,
 } from '../src/core/domain-expert.ts';
 import { OperationError } from '../src/core/operation-error.ts';
 import { validateAgentRoutingConfig } from '../src/core/agent-routing.ts';
 import {
   createDomainExpertWorker as createRawDomainExpertWorker,
   DOMAIN_EXPERT_NOTION_CREDENTIAL_GUIDANCE,
-  domainExpertGoogleConfigFromEnv,
   domainExpertRootsFromEnv,
   type DomainExpertWorkerOptions,
 } from '../src/workers/domain-expert/index.ts';
@@ -50,7 +40,6 @@ describe('independent runtime identity', () => {
     expect(JSON.stringify(manifest)).not.toMatch(/olympus/i);
     expect(manifest).toMatchObject({
       allowed_gcs_prefixes: [],
-      corpora: [],
       routing: { configured: false, source_env: 'EXPERT_AGENTS_DOMAIN_EXPERT_AGENTS_JSON' },
     });
     expect(domainPolicy()).toMatchObject({
@@ -59,48 +48,24 @@ describe('independent runtime identity', () => {
     });
   });
 
-  test('the RAG location is us-central1 unless the environment names another region', () => {
-    expect(domainManifest('history', undefined, { agentRouting: TEST_AGENT_ROUTING, env: {} }).rag_location).toBe('us-central1');
-    expect(domainManifest('history', undefined, {
-      agentRouting: TEST_AGENT_ROUTING,
-      env: { EXPERT_AGENTS_DOMAIN_EXPERT_RAG_LOCATION: 'europe-west4' },
-    }).rag_location).toBe('europe-west4');
-    for (const invalid of ['us', 'US-CENTRAL1', 'projects/x/locations/us-central1', 'us-central1/']) {
-      expect(() => domainManifest('history', undefined, {
-        agentRouting: TEST_AGENT_ROUTING,
-        env: { EXPERT_AGENTS_DOMAIN_EXPERT_RAG_LOCATION: invalid },
-      })).toThrow('EXPERT_AGENTS_DOMAIN_EXPERT_RAG_LOCATION');
-    }
-  });
-
-  test('derives cloud routing and retrieval only from configured agent manifest', () => {
+  test('derives routing and the page library only from the configured agent manifest', () => {
     const manifest = domainManifest('history', undefined, {
       agentRouting: TEST_AGENT_ROUTING,
-      env: { EXPERT_AGENTS_GCP_PROJECT: 'fixture-project' },
+      env: {},
     });
 
     expect(manifest).toMatchObject({
       display_name: 'History Expert',
-      gcp_project: 'fixture-project',
       allowed_gcs_prefixes: ['gs://fixture-shared-library/v1'],
-      corpora: [{ id: 'history-library' }],
       routing: {
         configured: true,
         library: { bucket: 'fixture-shared-library', prefix: 'v1', uri: 'gs://fixture-shared-library/v1' },
-        target_corpus_display_name: 'history-library',
-      },
-      retrieval: {
-        candidate_top_k: 18,
-        synthesis_context_limit: 7,
-        reranker: 'off',
-        multi_query: false,
+        page_library: { source_id: 'history' },
       },
     });
-    expect(planRagCorpus({ action: 'create', domainId: 'history' }, manifest)).toMatchObject({
-      status: 'dry_run_corpus_lifecycle_ready',
-      corpus: { corpus_id: 'history-library', routing_configured: true },
-      allowed_gcs_prefixes: ['gs://fixture-shared-library/v1'],
-    });
+    expect(Object.keys(manifest)).not.toContain('corpora');
+    expect(Object.keys(manifest)).not.toContain('retrieval');
+    expect(Object.keys(manifest.routing)).not.toContain('target_corpus_display_name');
   });
 
   test('refuses unconfigured live cloud operations while preserving a marked dry-run plan', async () => {
@@ -119,7 +84,7 @@ describe('independent runtime identity', () => {
     const liveResponse = await worker.fetch(new Request('http://localhost/v1/domain', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ tool: 'domain_ask', params: { domain_id: 'unconfigured', question: 'Fixture question?' } }),
+      body: JSON.stringify({ tool: 'domain_library', params: { action: 'catalog', domain_id: 'unconfigured' } }),
     }));
     expect(liveResponse.status).toBe(503);
     expect(await liveResponse.json()).toMatchObject({
@@ -132,14 +97,13 @@ describe('independent runtime identity', () => {
     const planResponse = await worker.fetch(new Request('http://localhost/v1/domain', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ tool: 'rag_corpus', params: { action: 'create', domain_id: 'unconfigured', dry_run: true } }),
+      body: JSON.stringify({ tool: 'annas_archive_import', params: { annas_archive_id: 'fixture-book', copyright_posture: 'approved_for_fixture', domain_id: 'unconfigured', dry_run: true } }),
     }));
     expect(planResponse.status).toBe(200);
     expect(await planResponse.json()).toMatchObject({
-      kind: 'rag_corpus_plan',
-      status: 'dry_run_agent_not_configured',
-      corpus: { routing_configured: false },
-      allowed_gcs_prefixes: [],
+      kind: 'annas_archive_import_plan',
+      status: 'dry_run_acquisition_ready',
+      domain: { routing: { configured: false } },
     });
     expect(cloudCalls).toBe(0);
   });
@@ -190,11 +154,7 @@ describe('independent runtime identity', () => {
   });
 });
 
-// The planner used to resolve ingest targets on its own: a dry run reported no
-// target while the identical live request imported into the domain's routing
-// corpus. Planning and execution now share one resolver, so these assert the
-// target the worker would choose.
-describe('ingest target resolution is the same when planning and when executing', () => {
+describe('ingest target planning follows the domain page library', () => {
   const ROUTED_MANIFEST = domainManifest('history', undefined, { agentRouting: TEST_AGENT_ROUTING });
   const UNROUTED_MANIFEST = domainManifest('unrouted', undefined, { agentRouting: TEST_AGENT_ROUTING });
   const ACQUISITION = {
@@ -204,207 +164,25 @@ describe('ingest target resolution is the same when planning and when executing'
     ingest: true,
   };
 
-  test('an explicit corpus_id is planned as the request choice', () => {
-    const plan = planAnnasArchiveImport({ ...ACQUISITION, corpusId: 'named-corpus' }, ROUTED_MANIFEST);
-    expect(plan.rag_ingest).toEqual({
-      status: 'planned',
-      target_corpus_id: 'named-corpus',
-      target_corpus_source: 'request',
-    });
+  test('a domain with a page library plans the page library as the ingest target', () => {
+    expect(planAnnasArchiveImport(ACQUISITION, ROUTED_MANIFEST).rag_ingest)
+      .toEqual({ status: 'planned', target: 'page_library' });
   });
 
-  test('no corpus_id on a configured domain is planned as the routing default', () => {
-    const plan = planAnnasArchiveImport(ACQUISITION, ROUTED_MANIFEST);
-    expect(plan.rag_ingest).toEqual({
-      status: 'planned',
-      target_corpus_id: 'history-library',
-      target_corpus_source: 'domain_default',
-    });
-    expect(ROUTED_MANIFEST.corpora[0]!.id).toBe('history-library');
-  });
-
-  test('no corpus_id and no configured corpus stays the undecidable case', () => {
+  test('a domain without a page library plans the ingest as blocked', () => {
     const plan = planAnnasArchiveImport({ ...ACQUISITION, domainId: 'unrouted' }, UNROUTED_MANIFEST);
-    expect(plan.rag_ingest).toMatchObject({ status: 'needs_corpus_decision' });
-    expect((plan.rag_ingest as Record<string, unknown>).target_corpus_id).toBeUndefined();
+    expect(plan.rag_ingest).toMatchObject({ status: 'blocked' });
+    expect((plan.rag_ingest as Record<string, unknown>).target).toBeUndefined();
   });
 
   test('ingest not requested plans no target at all', () => {
     const plan = planAnnasArchiveImport({ ...ACQUISITION, ingest: false }, ROUTED_MANIFEST);
     expect(plan.rag_ingest).toEqual({ status: 'not_requested' });
   });
-
-  // Same divergence class in the rag_corpus planner: it refused an import the
-  // worker resolves to the routing corpus and runs.
-  test('web_import and notion_import plan the routing corpus rather than refusing', () => {
-    expect(planRagCorpus({ action: 'web_import', domainId: 'history', urls: ['https://example.test/a'] }, ROUTED_MANIFEST))
-      .toMatchObject({ corpus: { corpus_id: 'history-library', web_import: { target_corpus_id: 'history-library' } } });
-    expect(planRagCorpus({ action: 'notion_import', domainId: 'history', pageIds: ['fixture-page'] }, ROUTED_MANIFEST))
-      .toMatchObject({ corpus: { corpus_id: 'history-library', notion_import: { target_corpus_id: 'history-library' } } });
-  });
-
-  test('web_import and notion_import still require corpus_id with no configured corpus', () => {
-    expect(() => planRagCorpus({ action: 'web_import', domainId: 'unrouted', urls: ['https://example.test/a'] }, UNROUTED_MANIFEST))
-      .toThrow(/web_import requires corpus_id/);
-    expect(() => planRagCorpus({ action: 'notion_import', domainId: 'unrouted', pageIds: ['fixture-page'] }, UNROUTED_MANIFEST))
-      .toThrow(/notion_import requires corpus_id/);
-  });
 });
 
 describe('bounded worker and client', () => {
-  test('web_import dry run reports derived metadata without changing workspace bytes', async () => {
-    const fixture = await mkdtemp(join(tmpdir(), 'expert-agents-web-dry-run-'));
-    const dataDir = join(fixture, 'data');
-    const manifest = domainManifest('history', undefined, { env: { EXPERT_AGENTS_GCP_PROJECT: 'fixture-project' } });
-    // The corpus the `history` fixture domain is routed to: a web_import plan
-    // may only target a corpus configured for its domain.
-    const corpusId = 'history-library';
-    const mappingKey = `${manifest.gcp_project}/${manifest.rag_location}/${corpusId}`;
-    try {
-      await mkdir(dataDir, { recursive: true });
-      await writeFile(join(dataDir, 'rag-corpus-mapping.json'), JSON.stringify({
-        version: 1,
-        corpora: {
-          [mappingKey]: {
-            display_name: corpusId,
-            corpus_id: 'corpus-1',
-            resource_name: `projects/${manifest.gcp_project}/locations/${manifest.rag_location}/ragCorpora/corpus-1`,
-            project: manifest.gcp_project,
-            location: manifest.rag_location,
-            updated_at: '2026-07-22T00:00:00.000Z',
-          },
-        },
-      }));
-      const before = await snapshotDirectory(fixture);
-      const worker = createDomainExpertWorker({
-        gcpProject: 'fixture-project',
-        roots: [{ rootId: 'expert_agents_workspace', path: fixture, maxWriteBytes: 1024 * 1024, allowOverwrite: false }],
-        dataDir,
-        resolveHostImpl: async () => ['93.184.216.34'],
-        webImportFetchImpl: async () => new Response(
-          '<html><head><title>Fixture Page</title></head><body><main><p>Grounded fixture text.</p></main></body></html>',
-          { status: 200, headers: { 'content-type': 'text/html' } },
-        ),
-        summarizeBin: '/neutral/bin/summarize',
-        summarizeExtract: async () => ({ exitCode: 0, stdout: 'Grounded fixture text.\n', stderr: '' }),
-      });
-
-      const response = await worker.fetch(new Request('http://localhost/v1/domain', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({
-          tool: 'rag_corpus',
-          params: {
-            action: 'web_import',
-            domain_id: 'history',
-            corpus_id: corpusId,
-            urls: ['https://example.com/article'],
-            batch_id: 'dry-run-fixture',
-            dry_run: true,
-          },
-        }),
-      }));
-
-      expect(response.status).toBe(200);
-      const result = await response.json() as Record<string, any>;
-      expect(result).toMatchObject({
-        kind: 'rag_corpus_web_import_plan',
-        status: 'dry_run_web_import_ready',
-        eligible_file_count: 1,
-        derived_files: [{
-          kind: 'html',
-          workspace_relative_path: 'experts/history/sources/web-imports/dry-run-fixture/fixture-page.md',
-        }],
-      });
-      expect(result.derived_files[0].bytes).toBeGreaterThan(0);
-      expect(result.derived_files[0].sha256).toMatch(/^[a-f0-9]{64}$/);
-      expect(await snapshotDirectory(fixture)).toEqual(before);
-    } finally {
-      await rm(fixture, { recursive: true, force: true });
-    }
-  });
-
-  test('domain plans promise only returned answer fields and registration-only source effects', () => {
-    const askPlan = planDomainAsk({ question: 'What changed?' });
-    expect(askPlan.expected_output).toEqual({ answer: true, citations: true });
-
-    const sourcePlan = planDomainSource({
-      action: 'add',
-      domainId: 'history',
-      url: 'https://example.com/source',
-    });
-    expect(sourcePlan).toMatchObject({
-      status: 'dry_run_source_registration_ready',
-      source_record: { ingest_status: 'not_ingested' },
-      registration_effects: ['append source-registry.jsonl and ingest-log.md'],
-      ingestion: {
-        performed_by_domain_source_add: false,
-        available_via: [
-          'rag_corpus stage_import or import',
-          'rag_corpus web_import',
-          'rag_corpus notion_import',
-          'annas_archive_import',
-        ],
-      },
-    });
-    expect(sourcePlan).not.toHaveProperty('ingest_pipeline');
-  });
-
-  test('domain_ask plan reports the execution defaults from the shared retrieval constants', () => {
-    const executionDefaults = domainExpertGoogleConfigFromEnv({});
-    expect(executionDefaults).toMatchObject({
-      retrievalTopK: DOMAIN_ASK_RETRIEVAL_DEFAULTS.candidateTopK,
-      answerContextLimit: DOMAIN_ASK_RETRIEVAL_DEFAULTS.synthesisContextLimit,
-      reranker: DOMAIN_ASK_RETRIEVAL_DEFAULTS.reranker,
-      multiQuery: DOMAIN_ASK_RETRIEVAL_DEFAULTS.multiQuery,
-    });
-    expect(planDomainAsk({ question: 'What changed?' })).toMatchObject({
-      kind: 'domain_ask_plan',
-      status: 'runtime_execution_available',
-      retrieval: {
-        backend: 'vertex-rag',
-        configuration_required: true,
-        candidate_top_k: DOMAIN_ASK_RETRIEVAL_DEFAULTS.candidateTopK,
-        synthesis_context_limit: DOMAIN_ASK_RETRIEVAL_DEFAULTS.synthesisContextLimit,
-        reranker: {
-          mode: DOMAIN_ASK_RETRIEVAL_DEFAULTS.reranker,
-          model: DOMAIN_ASK_RETRIEVAL_DEFAULTS.rerankerModel,
-        },
-        multi_query: {
-          enabled: DOMAIN_ASK_RETRIEVAL_DEFAULTS.multiQuery,
-          max_queries: DOMAIN_ASK_RETRIEVAL_DEFAULTS.maxQueries,
-        },
-      },
-    });
-  });
-
-  test('domain_ask rejects max_results outside the bounded positive-integer range', async () => {
-    for (const maxResults of [0, -1, 1.5, DOMAIN_ASK_RETRIEVAL_DEFAULTS.maxResultsCap + 1]) {
-      let error: unknown;
-      try {
-        planDomainAsk({ question: 'What changed?', maxResults });
-      } catch (caught) {
-        error = caught;
-      }
-      expect(error).toMatchObject({ code: 'invalid_params' });
-    }
-    expect(() => planDomainAsk({ question: 'What changed?', maxResults: 1 })).not.toThrow();
-    expect(() => planDomainAsk({
-      question: 'What changed?',
-      maxResults: DOMAIN_ASK_RETRIEVAL_DEFAULTS.maxResultsCap,
-    })).not.toThrow();
-
-    const worker = createDomainExpertWorker();
-    const response = await worker.fetch(new Request('http://localhost/v1/domain', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ tool: 'domain_ask', params: { question: 'What changed?', max_results: 0 } }),
-    }));
-    expect(response.status).toBe(400);
-    expect(await response.json()).toMatchObject({ error: { code: 'invalid_params' } });
-  });
-
-  test('domain_agent status inspects workspace files, source records, tombstones, and corpus mappings offline', async () => {
+  test('domain_agent status inspects workspace files and the scope manifest offline', async () => {
     const fixture = await mkdtemp(join(tmpdir(), 'expert-agents-status-'));
     const dataDir = join(fixture, 'data');
     const workspace = join(fixture, 'experts', 'history');
@@ -413,16 +191,6 @@ describe('bounded worker and client', () => {
       await mkdir(join(workspace, 'references'), { recursive: true });
       await mkdir(dataDir, { recursive: true });
       await writeFile(join(workspace, 'PROPOSAL.md'), '# History\n');
-      await writeFile(join(workspace, 'references', 'source-registry.jsonl'), [
-        JSON.stringify({ source_id: 'source-1', ingest_status: 'registered' }),
-        JSON.stringify({ source_id: 'source-1', ingest_status: 'removed', removed: true }),
-        JSON.stringify({ source_id: 'source-2', ingest_status: 'registered' }),
-        '',
-      ].join('\n'));
-      await writeFile(join(dataDir, 'rag-corpus-mapping.json'), JSON.stringify({
-        version: 1,
-        corpora: { first: {}, second: {} },
-      }));
       await writeFile(scopeManifestPath, serializeScopeManifest({
         agentId: 'history',
         schemaVersion: 1,
@@ -441,8 +209,7 @@ describe('bounded worker and client', () => {
           history: {
             displayName: TEST_AGENT_ROUTING.history!.displayName,
             library: TEST_AGENT_ROUTING.history!.library,
-            targetCorpusDisplayName: TEST_AGENT_ROUTING.history!.targetCorpusDisplayName,
-            retrieval: TEST_AGENT_ROUTING.history!.retrieval,
+            pageLibrary: TEST_AGENT_ROUTING.history!.pageLibrary,
             scopeManifestPath,
           },
         }),
@@ -475,8 +242,8 @@ describe('bounded worker and client', () => {
         workspace: {
           relative_path: 'experts/history',
           exists: true,
-          seeded_file_count: 2,
-          seeded_file_total: 12,
+          seeded_file_count: 1,
+          seeded_file_total: 11,
           recommended_recovery: {
             action: 'bootstrap_missing_workspace_seed',
             tool: 'domain_agent',
@@ -487,16 +254,12 @@ describe('bounded worker and client', () => {
             },
           },
         },
-        source_registry: { exists: true, record_count: 3, tombstone_count: 1, malformed_line_count: 0 },
-        corpus_mapping_cache: { exists: true, readable: true, entry_count: 2 },
         scope_manifest: {
           configured: true,
           present: true,
           parseable: true,
           agent_id: 'history',
           selected_object_count: 2,
-          target_corpus_display_name: 'history-library',
-          target_matches_routing: true,
         },
       });
       expect(result.workspace.seeded_files).toContainEqual({
@@ -525,7 +288,7 @@ describe('bounded worker and client', () => {
       }));
       expect(bootstrapResponse.status).toBe(200);
       const bootstrap = await bootstrapResponse.json() as Record<string, any>;
-      expect(bootstrap.files).toHaveLength(12);
+      expect(bootstrap.files).toHaveLength(11);
       expect(bootstrap.files).toContainEqual(expect.objectContaining({
         relative_path: 'experts/history/.gitignore',
         status: 'created',
@@ -545,8 +308,8 @@ describe('bounded worker and client', () => {
         health_issues: [],
         cloud_calls_made: false,
         workspace: {
-          seeded_file_count: 12,
-          seeded_file_total: 12,
+          seeded_file_count: 11,
+          seeded_file_total: 11,
           missing_requirements: [],
         },
       });
@@ -567,8 +330,7 @@ describe('bounded worker and client', () => {
           history: {
             displayName: TEST_AGENT_ROUTING.history!.displayName,
             library: TEST_AGENT_ROUTING.history!.library,
-            targetCorpusDisplayName: TEST_AGENT_ROUTING.history!.targetCorpusDisplayName,
-            retrieval: TEST_AGENT_ROUTING.history!.retrieval,
+            pageLibrary: TEST_AGENT_ROUTING.history!.pageLibrary,
             scopeManifestPath,
           },
         }),
@@ -587,8 +349,6 @@ describe('bounded worker and client', () => {
         health_issues: [
           expect.objectContaining({ code: 'workspace_missing' }),
           expect.objectContaining({ code: 'workspace_seed_incomplete' }),
-          expect.objectContaining({ code: 'source_registry_missing' }),
-          expect.objectContaining({ code: 'corpus_mapping_cache_missing' }),
           expect.objectContaining({ code: 'scope_manifest_unparseable' }),
         ],
       });
@@ -673,10 +433,10 @@ describe('bounded worker and client', () => {
     });
 
     const withDefault = new DomainExpertClient(configured('governance'), transport);
-    await withDefault.run('domain_ask', { question: 'Fixture question' });
-    await withDefault.run('domain_ask', { question: 'Fixture question', domain_id: 'history' });
-    await withDefault.run('domain_ask', { question: 'Fixture question', domain_id: '   ' });
-    await new DomainExpertClient(configured(), transport).run('domain_ask', { question: 'Fixture question' });
+    await withDefault.run('domain_library', { question: 'Fixture question' });
+    await withDefault.run('domain_library', { question: 'Fixture question', domain_id: 'history' });
+    await withDefault.run('domain_library', { question: 'Fixture question', domain_id: '   ' });
+    await new DomainExpertClient(configured(), transport).run('domain_library', { question: 'Fixture question' });
 
     expect(sent).toEqual([
       { question: 'Fixture question', domain_id: 'governance' },
@@ -696,22 +456,6 @@ describe('bounded worker and client', () => {
     expect(authorization).toBeNull();
   });
 });
-
-async function snapshotDirectory(root: string, relativePath = ''): Promise<Array<[string, 'directory' | 'file', string?]>> {
-  const directory = join(root, relativePath);
-  const entries = await readdir(directory, { withFileTypes: true });
-  const snapshot: Array<[string, 'directory' | 'file', string?]> = [];
-  for (const entry of entries.sort((left, right) => left.name.localeCompare(right.name))) {
-    const entryRelativePath = relativePath ? `${relativePath}/${entry.name}` : entry.name;
-    if (entry.isDirectory()) {
-      snapshot.push([entryRelativePath, 'directory']);
-      snapshot.push(...await snapshotDirectory(root, entryRelativePath));
-    } else if (entry.isFile()) {
-      snapshot.push([entryRelativePath, 'file', Buffer.from(await readFile(join(root, entryRelativePath))).toString('base64')]);
-    }
-  }
-  return snapshot;
-}
 
 async function collectTextFiles(directory: string): Promise<string[]> {
   const files: string[] = [];
@@ -757,10 +501,7 @@ describe('configuration boundaries', () => {
     expect(violations).toEqual([]);
 
     const builtSurfaces = JSON.stringify({
-      googleGuidance: DOMAIN_EXPERT_GOOGLE_CREDENTIAL_GUIDANCE,
       notionGuidance: DOMAIN_EXPERT_NOTION_CREDENTIAL_GUIDANCE,
-      askPlan: planDomainAsk({ question: 'Fixture question' }),
-      sourcePlan: planDomainSource({ action: 'add', url: 'https://example.com/source' }),
       acquisitionPlan: planAnnasArchiveImport({
         annasArchiveId: 'fixture-book',
         copyrightPosture: 'approved_for_fixture',
@@ -770,23 +511,10 @@ describe('configuration boundaries', () => {
     expect(builtSurfaces).not.toMatch(NONEXISTENT_CONNECT_COMMAND_PATTERN);
   });
 
-  test('operator credential guidance names real environment fields and no nonexistent connect commands', async () => {
-    expect(DOMAIN_EXPERT_GOOGLE_CREDENTIAL_GUIDANCE).toContain('EXPERT_AGENTS_DOMAIN_EXPERT_GOOGLE_SERVICE_ACCOUNT_JSON');
-    expect(DOMAIN_EXPERT_GOOGLE_CREDENTIAL_GUIDANCE).toContain('EXPERT_AGENTS_DOMAIN_EXPERT_GOOGLE_SERVICE_ACCOUNT_JSON_FILE');
-    expect(DOMAIN_EXPERT_GOOGLE_CREDENTIAL_GUIDANCE).toContain('EXPERT_AGENTS_DOMAIN_EXPERT_GOOGLE_ACCESS_TOKEN');
+  test('operator credential guidance names real environment fields and no nonexistent connect commands', () => {
     expect(DOMAIN_EXPERT_NOTION_CREDENTIAL_GUIDANCE).toContain('EXPERT_AGENTS_DOMAIN_EXPERT_NOTION_TOKEN');
-    for (const guidance of [DOMAIN_EXPERT_GOOGLE_CREDENTIAL_GUIDANCE, DOMAIN_EXPERT_NOTION_CREDENTIAL_GUIDANCE]) {
-      expect(guidance).toContain('deploy/systemd/domain-expert.env.example');
-      expect(guidance).not.toMatch(/expert-agents connect/i);
-    }
-
-    const dryRun = await connectGcpSource({
-      project: 'expert-agents-test1',
-      serviceAccount: 'expert-agents-runtime',
-      dryRun: true,
-      secretStore: { get: () => undefined, set: () => undefined },
-    });
-    expect(JSON.stringify(dryRun)).not.toMatch(/expert-agents connect/i);
+    expect(DOMAIN_EXPERT_NOTION_CREDENTIAL_GUIDANCE).toContain('deploy/systemd/domain-expert.env.example');
+    expect(DOMAIN_EXPERT_NOTION_CREDENTIAL_GUIDANCE).not.toMatch(/expert-agents connect/i);
   });
 
   test('workspace roots parse from the Expert Agents namespace', () => {
@@ -796,47 +524,6 @@ describe('configuration boundaries', () => {
       }),
     });
     expect(roots).toEqual([{ rootId: 'library', path: '/tmp/example-library', maxWriteBytes: 1024, allowOverwrite: false }]);
-  });
-
-  test('GCP dry-run never reads or writes credentials', async () => {
-    let secretCalls = 0;
-    const result = await connectGcpSource({
-      project: 'expert-agents-test1',
-      serviceAccount: 'expert-agents-runtime',
-      dryRun: true,
-      secretStore: {
-        get: () => { secretCalls += 1; return undefined; },
-        set: () => { secretCalls += 1; },
-      },
-    });
-    expect(result.ok).toBe(true);
-    expect(secretCalls).toBe(0);
-    expect(result.messages.join('\n')).not.toMatch(/olympus/i);
-  });
-
-  test('stored GCP credential must carry an https token_uri', () => {
-    const base = {
-      type: 'service_account',
-      project_id: 'expert-agents-test1',
-      client_email: 'runtime@expert-agents-test1.iam.gserviceaccount.com',
-      // Satisfies the validator's "PRIVATE KEY" check without tripping the
-      // repository's high-confidence secret scan on a real PEM header.
-      private_key: 'fixture PRIVATE KEY material',
-    };
-    const email = base.client_email;
-
-    expect(validateServiceAccountKey(JSON.stringify(base), email).token_uri).toBeUndefined();
-    expect(
-      validateServiceAccountKey(JSON.stringify({ ...base, token_uri: 'https://oauth2.example.invalid/token' }), email).token_uri,
-    ).toBe('https://oauth2.example.invalid/token');
-    expect(() => validateServiceAccountKey(
-      JSON.stringify({ ...base, token_uri: 'http://token-sink.example.invalid/token' }),
-      email,
-    )).toThrow(/token_uri must be an https URL/);
-    expect(() => validateServiceAccountKey(
-      JSON.stringify({ ...base, token_uri: 42 }),
-      email,
-    )).toThrow(/token_uri must be an https URL/);
   });
 
   test('disabled client fails explicitly', async () => {

@@ -46,6 +46,7 @@ export function validateAgentManifest(value: unknown): AgentManifest {
     "displayName",
     "domainId",
   ];
+  // A retired Vertex agent's targetCorpusDisplayName is still read, and dropped.
   const allowed = new Set([...required, "targetCorpusDisplayName", "emoji", "avatar", "serving"]);
   if (required.some((key) => !Object.hasOwn(record, key))) {
     throw new AgentRepoValidationError("agent manifest is missing a required field");
@@ -60,9 +61,6 @@ export function validateAgentManifest(value: unknown): AgentManifest {
   const agentId = requireStableId(record.agentId, "agent manifest agent id");
   const domainId = requireStableId(record.domainId, "agent manifest domain id");
   const displayName = requireSingleLineString(record.displayName, "agent manifest display name");
-  const targetCorpusDisplayName = record.targetCorpusDisplayName === undefined
-    ? undefined
-    : requireSingleLineString(record.targetCorpusDisplayName, "agent manifest target corpus display name");
   const emoji = record.emoji === undefined
     ? undefined
     : requireSingleLineString(record.emoji, "agent manifest emoji");
@@ -76,7 +74,6 @@ export function validateAgentManifest(value: unknown): AgentManifest {
     agentId,
     displayName,
     domainId,
-    ...(targetCorpusDisplayName === undefined ? {} : { targetCorpusDisplayName }),
     ...(emoji === undefined ? {} : { emoji }),
     ...(avatar === undefined ? {} : { avatar }),
     ...(serving === undefined ? {} : { serving }),

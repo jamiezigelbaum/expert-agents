@@ -2,29 +2,30 @@ import { describe, expect, test } from 'bun:test';
 import {
   mkdtempSync,
   mkdirSync,
-  readFileSync,
   readdirSync,
   rmSync,
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, sep } from 'node:path';
-import type { ExtractionRequest } from '@expert-agents/library';
+import type { CatalogEntry, ExtractionRequest } from '@expert-agents/library';
+import { validateAgentRoutingConfig } from '../src/core/agent-routing.ts';
 import {
   createDomainExpertWorker,
   type DomainExpertWorkerOptions,
 } from '../src/workers/domain-expert/index.ts';
-import { TEST_AGENT_ROUTING } from './routing-fixture.ts';
+import type { PageIndexWriter } from '../src/workers/domain-expert/page-ingest.ts';
+
+// How library_ingest fetches and extracts a URL: the pinned bytes, the summarize
+// subprocess for media, and what is left behind afterwards.
 
 const PAGE_URL = 'https://example.com/article';
 const YOUTUBE_URL = 'https://www.youtube.com/watch?v=fixture-video';
 const PAGE_BYTES = '<html><head><title>Pinned Fixture</title></head><body>already fetched</body></html>';
-const EXTRACTED_MARKDOWN = '# Extracted fixture\n\nPinned body.\n';
+const EXTRACTED_MARKDOWN = `# Extracted fixture\n\nPinned body. ${Array.from({ length: 120 }, (_, i) => `word${i % 9}`).join(' ')}\n`;
 const TEMP_FILE_PREFIX = '.web-import-extraction-';
-const LOCAL_HTML_EXTRACTOR = 'html-to-markdown';
-const SUMMARIZE_EXTRACTOR = 'summarize --extract --format md';
 
-describe('web_import summarize extraction inputs', () => {
+describe('library_ingest URL extraction inputs', () => {
   test('YouTube URLs run the real extractor with a private writable summarize cache outside the caller home and cwd', async () => {
     const fixture = extractionFixture();
     const priorCwd = process.cwd();
@@ -35,7 +36,7 @@ describe('web_import summarize extraction inputs', () => {
     writeFileSync(join(fixture.base, '.env'), 'OPENAI_API_KEY=sentinel-must-not-load\n');
     writeFileSync(
       extractor,
-      '#!/bin/sh\nif [ -f .env ]; then echo loaded-caller-dotenv >&2; exit 91; fi\ncase "$HOME" in /*) ;; *) echo relative-home >&2; exit 92;; esac\n[ -d "$HOME" ] || exit 93\nmkdir -p "$HOME/.summarize" || exit 94\nprintf cache > "$HOME/.summarize/cache.sqlite" || exit 95\nprintf "# Private cwd extraction\\n\\nNo caller dotenv loaded.\\n"\n',
+      `#!/bin/sh\nif [ -f .env ]; then echo loaded-caller-dotenv >&2; exit 91; fi\ncase "$HOME" in /*) ;; *) echo relative-home >&2; exit 92;; esac\n[ -d "$HOME" ] || exit 93\nmkdir -p "$HOME/.summarize" || exit 94\nprintf cache > "$HOME/.summarize/cache.sqlite" || exit 95\nprintf "# Private cwd extraction\\n\\nNo caller dotenv loaded. ${'filler '.repeat(120)}\\n"\n`,
       { mode: 0o755 },
     );
     try {
@@ -43,20 +44,13 @@ describe('web_import summarize extraction inputs', () => {
       process.env.HOME = inheritedHome;
       const worker = extractionWorker(fixture, { summarizeBin: './relative-summarize', dataDir: 'data' });
 
-      const result = await webImport(worker, YOUTUBE_URL, 'private-cwd-runtime');
+      const job = await ingestUrl(worker, YOUTUBE_URL);
 
-      expect(result).toMatchObject({
-        status: 'dry_run_web_import_ready',
-        url_results: [{
-          handler: 'summarize-extract',
-          file_count: 1,
-          extraction_input_mode: 'youtube_url',
-          extraction_fetch_performed_by: 'summarize',
-          extractor: SUMMARIZE_EXTRACTOR,
-        }],
-      });
-      expect(JSON.stringify(result)).not.toContain('sentinel-must-not-load');
-      expect(JSON.stringify(result)).not.toContain('loaded-caller-dotenv');
+      expect(job.sources[0]).toMatchObject({ state: 'parsed', kind: 'sections' });
+      const read = await call(worker, 'domain_library', { action: 'read', slug: `books/${job.sources[0].book}/s0001` });
+      expect(String(read.body.text)).toContain('No caller dotenv loaded.');
+      expect(JSON.stringify(job)).not.toContain('sentinel-must-not-load');
+      expect(JSON.stringify(job)).not.toContain('loaded-caller-dotenv');
       expect(readdirSync(inheritedHome)).toEqual([]);
       expect(temporaryExtractionDirectories(fixture.dataDir)).toEqual([]);
       expect(temporaryExtractionFiles(fixture.dataDir)).toEqual([]);
@@ -70,7 +64,7 @@ describe('web_import summarize extraction inputs', () => {
 
   test('recognizes an OSF-style octet-stream PDF by magic and disposition without invoking summarize', async () => {
     const fixture = extractionFixture();
-    const pdfBytes = new Uint8Array(18_545_864);
+    const pdfBytes = new Uint8Array(1_000_000);
     pdfBytes.fill(0x20);
     pdfBytes.set(new TextEncoder().encode([
       '%PDF-1.3\n',
@@ -95,25 +89,11 @@ describe('web_import summarize extraction inputs', () => {
         },
       });
 
-      const result = await webImport(worker, 'https://osf.example/download/ev6ry/', 'osf-pdf');
+      await ingestUrl(worker, 'https://osf.example/download/ev6ry/');
 
       expect(extractionCalls).toBe(0);
-      expect(result.source.extractor).toBe('direct-file');
-      expect(result).toMatchObject({
-        status: 'dry_run_web_import_ready',
-        fetch_policy: {
-          max_fetch_bytes: 100_000_000,
-          text_default_max_processing_bytes: 10_000_000,
-          pdf_max_processing_bytes: 100_000_000,
-        },
-        url_results: [{ handler: 'direct-file', file_count: 1 }],
-        derived_files: [{
-          kind: 'file',
-          workspace_relative_path: 'experts/research/sources/web-imports/osf-pdf/paper-v4.pdf',
-          bytes: 18_545_864,
-        }],
-        eligible_files: [{ upload_relative_path: 'paper-v4.pdf', bytes: 18_545_864 }],
-      });
+      // It was taken as a PDF: stored as an original under its content hash.
+      expect(fixture.uploads).toEqual([expect.stringMatching(/\/originals\/[0-9a-f]{64}\.pdf$/)]);
       expect(temporaryExtractionDirectories(fixture.dataDir)).toEqual([]);
     } finally {
       fixture.cleanup();
@@ -122,7 +102,7 @@ describe('web_import summarize extraction inputs', () => {
 
   test('does not trust a PDF filename when the fetched bytes are HTML', async () => {
     const fixture = extractionFixture();
-    const htmlMentioningPdf = '<!doctype html><html><head><title>PDF reference</title></head><body><p>A PDF starts with %PDF-1.7</p></body></html>';
+    const htmlMentioningPdf = `<!doctype html><html><head><title>PDF reference</title></head><body><article><h1>PDF reference</h1><p>A PDF starts with %PDF-1.7</p><p>${'prose '.repeat(150)}</p></article></body></html>`;
     let extractionCalls = 0;
     try {
       const worker = extractionWorker(fixture, {
@@ -139,19 +119,13 @@ describe('web_import summarize extraction inputs', () => {
         },
       });
 
-      const result = await webImport(worker, 'https://example.com/not-a-pdf.pdf', 'false-pdf');
+      const job = await ingestUrl(worker, 'https://example.com/not-a-pdf.pdf');
 
       // The pinned HTML bytes are converted in process: the .pdf filename does
-      // not send them to the subprocess either.
+      // not send them to the subprocess either, and nothing is stored as a PDF.
       expect(extractionCalls).toBe(0);
-      expect(result.source.extractor).toBe('html-to-markdown');
-      expect(result).toMatchObject({
-        url_results: [{
-          handler: 'summarize-extract',
-          extractor: LOCAL_HTML_EXTRACTOR,
-          extraction_input_mode: 'local_input',
-        }],
-      });
+      expect(fixture.uploads).toEqual([]);
+      expect(job.sources[0]).toMatchObject({ state: 'parsed', kind: 'sections', title: 'PDF reference' });
     } finally {
       fixture.cleanup();
     }
@@ -164,6 +138,7 @@ describe('web_import summarize extraction inputs', () => {
       '<style>body { color: red; }</style></head><body>',
       '<h1>Real Heading</h1>',
       '<p>Real body sentence.</p>',
+      `<p>${'filler '.repeat(150)}</p>`,
       '<script>window.tracker = "script-payload-must-not-survive";</script>',
       '<style>.hidden { display: none; }</style>',
       '</body></html>',
@@ -178,30 +153,17 @@ describe('web_import summarize extraction inputs', () => {
         }),
       });
 
-      const result = await webImport(worker, PAGE_URL, 'page-local-conversion', false);
+      const job = await ingestUrl(worker, PAGE_URL);
 
       expect(temporaryExtractionFiles(fixture.dataDir)).toEqual([]);
       expect(temporaryExtractionDirectories(fixture.dataDir)).toEqual([]);
-      expect(result).toMatchObject({
-        url_results: [{
-          handler: 'summarize-extract',
-          extractor: LOCAL_HTML_EXTRACTOR,
-          extraction_input_mode: 'local_input',
-          extraction_fetch_performed_by: 'domain-expert-worker',
-        }],
-      });
-      const staged = readFileSync(join(
-        fixture.workspaceRoot,
-        'experts/research/sources/web-imports/page-local-conversion/converted-fixture.md',
-      ), 'utf8');
-      // The page's own heading and text survive the conversion.
-      expect(staged).toContain('# Real Heading');
+      const [source] = job.sources;
+      expect(source).toMatchObject({ state: 'parsed', title: 'Converted Fixture', kind: 'sections' });
+      const read = await call(worker, 'domain_library', { action: 'read', slug: `books/${source.book}/s0001` });
+      const staged = String(read.body.text);
+      // The page's own text survives the conversion.
       expect(staged).toContain('Real body sentence.');
-      // Honest provenance: this page never reached the summarize subprocess.
-      expect(staged).toContain(`extractor: "${LOCAL_HTML_EXTRACTOR}"`);
-      expect(staged).toContain('kind: "html"');
-      expect(staged).toContain('title: "Converted Fixture"');
-      // Scripts and styles are dropped, not staged.
+      // Scripts and styles are dropped, not stored.
       expect(staged).not.toContain('script-payload-must-not-survive');
       expect(staged).not.toContain('color: red');
       expect(staged).not.toContain('display: none');
@@ -221,7 +183,7 @@ describe('web_import summarize extraction inputs', () => {
         },
       });
 
-      const result = await webImport(worker, YOUTUBE_URL, 'youtube-url-success');
+      const job = await ingestUrl(worker, YOUTUBE_URL);
 
       expect(request?.source).toBe(YOUTUBE_URL);
       expect(request!.env.HOME).toStartWith(`${fixture.dataDir}${sep}.extraction-runtime-`);
@@ -231,13 +193,7 @@ describe('web_import summarize extraction inputs', () => {
       expect(request!.workingDirectory).toStartWith(`${fixture.dataDir}${sep}.extraction-runtime-`);
       expect(temporaryExtractionFiles(fixture.dataDir)).toEqual([]);
       expect(temporaryExtractionDirectories(fixture.dataDir)).toEqual([]);
-      expect(result).toMatchObject({
-        url_results: [{
-          extractor: SUMMARIZE_EXTRACTOR,
-          extraction_input_mode: 'youtube_url',
-          extraction_fetch_performed_by: 'summarize',
-        }],
-      });
+      expect(job.sources[0]).toMatchObject({ state: 'parsed' });
     } finally {
       fixture.cleanup();
     }
@@ -254,22 +210,14 @@ describe('web_import summarize extraction inputs', () => {
         }),
       });
 
-      const result = await webImport(worker, PAGE_URL, 'page-empty');
+      const job = await ingestUrl(worker, PAGE_URL);
 
-      expect(result).toMatchObject({
-        status: 'dry_run_web_import_no_importable_files',
-        eligible_file_count: 0,
-        derived_files: [],
-        errors: [{
-          handler: 'summarize-extract',
-          code: 'summarize_extraction_empty',
-        }],
-      });
-      expect(result.errors[0].message).toContain(LOCAL_HTML_EXTRACTOR);
+      expect(job.state).toBe('done_with_failures');
+      expect(job.sources[0]).toMatchObject({ state: 'failed', error: expect.stringContaining('html-to-markdown produced no text') });
       // The refusal names the converter, not a diagnostic it never had, and
       // repeats none of the page back.
-      expect(result.errors[0].message).not.toContain('no diagnostic output');
-      expect(JSON.stringify(result)).not.toContain('const tracker = 1;');
+      expect(String(job.sources[0].error)).not.toContain('no diagnostic output');
+      expect(JSON.stringify(job)).not.toContain('const tracker = 1;');
       expect(temporaryExtractionFiles(fixture.dataDir)).toEqual([]);
       expect(temporaryExtractionDirectories(fixture.dataDir)).toEqual([]);
     } finally {
@@ -287,22 +235,10 @@ describe('web_import summarize extraction inputs', () => {
         },
       });
 
-      const result = await webImport(worker, YOUTUBE_URL, 'youtube-extraction-failure');
+      const job = await ingestUrl(worker, YOUTUBE_URL);
 
-      expect(result).toMatchObject({
-        status: 'dry_run_web_import_no_importable_files',
-        errors: [{
-          handler: 'summarize-extract',
-          code: 'summarize_extraction_failed',
-          stderr_tail: 'fixture extraction failure\nprivate diagnostic tail',
-        }],
-        url_results: [{
-          handler: 'summarize-extract',
-          file_count: 0,
-          error_count: 1,
-          extractor: SUMMARIZE_EXTRACTOR,
-        }],
-      });
+      expect(job.state).toBe('done_with_failures');
+      expect(job.sources[0]).toMatchObject({ state: 'failed', error: expect.stringContaining('fixture extraction failure') });
       expect(temporaryExtractionFiles(fixture.dataDir)).toEqual([]);
       expect(temporaryExtractionDirectories(fixture.dataDir)).toEqual([]);
     } finally {
@@ -315,6 +251,8 @@ function extractionFixture(): {
   base: string;
   workspaceRoot: string;
   dataDir: string;
+  tree: string;
+  uploads: string[];
   cleanup(): void;
 } {
   const base = mkdtempSync(join(tmpdir(), 'domain-expert-extraction-'));
@@ -325,7 +263,22 @@ function extractionFixture(): {
     base,
     workspaceRoot,
     dataDir,
+    tree: join(base, 'tree'),
+    uploads: [],
     cleanup: () => rmSync(base, { recursive: true, force: true }),
+  };
+}
+
+function recordingWriter(): PageIndexWriter {
+  let books: CatalogEntry[] = [];
+  return {
+    async importUnits(_source, units) {
+      return { units: units.length, inserted: units.length, updated: 0, unchanged: 0, deleted: 0, chunks: units.length, reusedVectors: 0 };
+    },
+    async embedPending() { return { embedded: 0, tokens: 0 }; },
+    async pendingEmbeddings() { return 0; },
+    async catalog() { return books; },
+    async replaceBooks(_source, entries, opts) { books = [...books.filter((b) => !opts.books.includes(b.book)), ...entries]; return {}; },
   };
 }
 
@@ -334,8 +287,10 @@ function extractionWorker(
   overrides: Partial<DomainExpertWorkerOptions>,
 ) {
   return createDomainExpertWorker({
-    agentRouting: TEST_AGENT_ROUTING,
-    gcpProject: 'fixture-project',
+    agentRouting: validateAgentRoutingConfig({ research: {
+      library: { bucket: 'neutral-library', prefix: 'factory/research' },
+      pageLibrary: { root: fixture.tree, sourceId: 'research' },
+    } }),
     roots: [{
       rootId: 'expert_agents_workspace',
       path: fixture.workspaceRoot,
@@ -343,88 +298,56 @@ function extractionWorker(
       allowOverwrite: false,
     }],
     dataDir: fixture.dataDir,
-    google: { accessToken: 'fixture-token', fetchImpl: extractionGoogleFetch },
+    annas: { importGcsPrefix: 'gs://neutral-acquisitions/imports/' },
+    pageIndexWriter: recordingWriter(),
+    pageSearch: async () => [],
+    google: {
+      accessToken: 'fixture-token',
+      fetchImpl: (async (input: string | URL | Request) => {
+        const url = input instanceof Request ? input.url : String(input);
+        if (url.includes('/upload/storage/v1/b/')) {
+          fixture.uploads.push(decodeURIComponent(new URL(url).searchParams.get('name') ?? ''));
+          return Response.json({ name: 'ok', generation: '1' });
+        }
+        return Response.json({ error: `unexpected fixture URL: ${url}` }, { status: 500 });
+      }) as typeof fetch,
+    },
     resolveHostImpl: async () => ['93.184.216.34'],
     webImportFetchImpl: async () => new Response(PAGE_BYTES, {
       status: 200,
       headers: { 'content-type': 'text/html' },
     }),
     summarizeBin: '/fixture/bin/summarize',
-    // The fixture corpus never lists the imported file; keep the listing retries short.
-    annas: { importPollIntervalMs: 1 },
     ...overrides,
   });
 }
 
-const extractionGoogleFetch = (async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
-  const url = input instanceof Request ? input.url : String(input);
-  const method = init?.method ?? (input instanceof Request ? input.method : 'GET');
-  const pathname = new URL(url).pathname;
-  if (pathname.endsWith('/ragCorpora')) {
-    return new Response(JSON.stringify({
-      ragCorpora: [{
-        name: 'projects/fixture-project/locations/us-central1/ragCorpora/1234567890123456789',
-        displayName: 'research-library',
-      }],
-    }), { status: 200, headers: { 'content-type': 'application/json' } });
-  }
-  if (url.includes('/upload/storage/v1/b/')) {
-    return new Response(JSON.stringify({ name: new URL(url).searchParams.get('name') ?? '' }), {
-      status: 200,
-      headers: { 'content-type': 'application/json' },
-    });
-  }
-  // A staged import lists the corpus before it submits, so the fixture answers
-  // an empty list and a completed operation.
-  if (method === 'GET' && pathname.endsWith('/ragFiles')) {
-    return new Response(JSON.stringify({ ragFiles: [] }), {
-      status: 200,
-      headers: { 'content-type': 'application/json' },
-    });
-  }
-  if (method === 'POST' && pathname.endsWith('/ragFiles:import')) {
-    return new Response(JSON.stringify({
-      name: `${pathname.replace(/^\/v1\//, '').replace(/\/ragFiles:import$/, '')}/operations/import-fixture`,
-      done: true,
-      response: { importedRagFilesCount: '1' },
-    }), { status: 200, headers: { 'content-type': 'application/json' } });
-  }
-  if (method === 'GET' && pathname.includes('/operations/')) {
-    return new Response(JSON.stringify({
-      name: pathname.replace(/^\/v1\//, ''),
-      done: true,
-      response: { importedRagFilesCount: '1' },
-    }), { status: 200, headers: { 'content-type': 'application/json' } });
-  }
-  return new Response(JSON.stringify({ error: `unexpected fixture URL: ${url}` }), {
-    status: 500,
-    headers: { 'content-type': 'application/json' },
-  });
-}) as typeof fetch;
-
-async function webImport(
+async function call(
   worker: { fetch(request: Request): Promise<Response> },
-  url: string,
-  batchId: string,
-  dryRun = true,
-): Promise<Record<string, any>> {
+  tool: string,
+  params: Record<string, unknown>,
+): Promise<{ status: number; body: Record<string, any> }> {
   const response = await worker.fetch(new Request('http://worker.test/v1/domain', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({
-      tool: 'rag_corpus',
-      params: {
-        action: 'web_import',
-        corpus_id: '1234567890123456789',
-        urls: [url],
-        batch_id: batchId,
-        dry_run: dryRun,
-      },
-    }),
+    body: JSON.stringify({ tool, params: { domain_id: 'research', ...params } }),
   }));
-  const body = await response.text();
-  if (response.status !== 200) throw new Error(`web_import fixture returned ${response.status}: ${body}`);
-  return JSON.parse(body) as Record<string, any>;
+  return { status: response.status, body: await response.json() as Record<string, any> };
+}
+
+/** Starts a library_ingest job for one URL and waits for it to finish. */
+async function ingestUrl(
+  worker: { fetch(request: Request): Promise<Response> },
+  url: string,
+): Promise<Record<string, any>> {
+  const started = await call(worker, 'library_ingest', { action: 'start', urls: [url], dry_run: false, approval_id: 'owner-1' });
+  if (started.status !== 200) throw new Error(`library_ingest start returned ${started.status}: ${JSON.stringify(started.body)}`);
+  for (let i = 0; i < 400; i++) {
+    const status = await call(worker, 'library_ingest', { action: 'status', job_id: started.body.job.job_id });
+    if (['done', 'done_with_failures', 'failed'].includes(status.body.job?.state)) return status.body.job;
+    await Bun.sleep(25);
+  }
+  throw new Error('ingest job did not finish');
 }
 
 function temporaryExtractionFiles(dataDir: string): string[] {

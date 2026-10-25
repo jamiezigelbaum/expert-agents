@@ -47,7 +47,7 @@ export async function expertStatus(
   const findings: ContractFinding[] = [];
 
   const agentText = await inspectFile(root, "agent.json", fs, items, findings, true);
-  // A legacy Vertex agent's selection; a page-library agent has none.
+  // An optional library selection; a page-library agent needs none.
   const scopeText = await inspectOptionalFile(root, "library/scope-manifest.json", fs, items, findings);
   const evalText = await inspectFile(
     root,
@@ -93,23 +93,11 @@ export async function expertStatus(
     items,
     findings,
   );
-  if (agent?.targetCorpusDisplayName !== undefined && scopeText === undefined
-    && !findings.some((finding) => finding.file === "library/scope-manifest.json")) {
-    // A legacy corpus agent still needs the selection that feeds its corpus.
-    items.push({ path: "library/scope-manifest.json", kind: "file", present: false, parsed: false, valid: false });
-    findings.push({ file: "library/scope-manifest.json", ruleId: "contract.required", severity: "error" });
-  }
-  if (agent !== undefined && scope !== undefined && agent.targetCorpusDisplayName !== undefined) {
+  if (agent !== undefined && scope !== undefined) {
     addConsistencyFinding(
       agent.agentId === scope.agentId,
       "agent.json",
       "consistency.agent_id",
-      findings,
-    );
-    addConsistencyFinding(
-      agent.targetCorpusDisplayName === scope.targetCorpusDisplayName,
-      "agent.json",
-      "consistency.target_corpus",
       findings,
     );
   }

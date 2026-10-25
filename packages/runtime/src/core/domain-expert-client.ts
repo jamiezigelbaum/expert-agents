@@ -5,13 +5,8 @@ import { withWorkerAuthHeader, workerAuthTokenFromConfig } from './worker-auth.t
 
 export type DomainExpertTool =
   | 'domain_agent'
-  | 'domain_ask'
-  | 'domain_read'
   | 'domain_library'
   | 'library_ingest'
-  | 'domain_source'
-  | 'rag_corpus'
-  | 'domain_doc'
   | 'annas_archive_search'
   | 'annas_archive_import';
 
@@ -22,34 +17,16 @@ export interface DomainExpertTransport {
 }
 
 const WORKER_ERROR_MESSAGES: Readonly<Record<string, string>> = Object.freeze({
-  retrieval_preferences_corpus_mismatch: 'The retrieval preference profile does not match the resolved corpus. Retry with retrieval_mode history and report the profile binding.',
-  retrieval_preferences_unavailable: 'The retrieval preference profile could not be validated. Retry with retrieval_mode history and report the profile.',
-  library_read_disclosure_restricted: 'Direct reading is unavailable on a disclosure-bounded deployment. Use domain_ask.',
-  library_read_not_configured: 'Direct reading requires an operator-configured library scope manifest.',
-  library_read_scope_mismatch: 'The library scope does not match the configured corpus.',
-  library_read_busy: 'Direct reading is busy. Retry shortly.',
   library_read_unavailable: 'The source or library state could not be read or validated.',
-  library_source_not_available: 'The source is not available in this library scope.',
-  library_source_too_large: 'The source exceeds the direct-reading size limit.',
-  library_source_format_unsupported: 'The source needs a text, Markdown, HTML, or PDF representation before direct reading.',
-  library_source_integrity_failed: 'The stored source does not match its library identity.',
-  library_source_text_unavailable: 'The source has no readable text. Scanned PDFs require a separately prepared OCR text representation.',
-  library_text_too_large: 'The text exceeds the direct-reading size limit.',
-  library_text_revision_required: 'Use the text_revision from open when selecting or continuing a text range.',
-  library_text_revision_changed: 'The text representation changed. Open the source again before continuing.',
-  library_pdf_reader_unavailable: 'PDF reading requires Poppler pdftotext on the worker host.',
-  library_pdf_extraction_failed: 'PDF text extraction failed or exceeded its size or time limit.',
+  library_source_too_large: 'The source exceeds the worker read size limit.',
   invalid_params: 'The domain expert request parameters are invalid.',
   domain_expert_not_configured: 'The domain expert worker is not configured.',
   annas_archive_not_configured: 'The library acquisition provider is not configured.',
-  gcp_project_not_configured: 'A valid Google Cloud project must be configured for the Vertex library.',
   agent_not_configured: 'The requested agent has no configured library route.',
   agent_registration_disabled: 'Agent registration is disabled by the worker deployment.',
   agent_registration_library_denied: 'The requested library is outside the deployment registration boundary.',
-  agent_registration_conflict: 'The requested agent or corpus name is already in use.',
+  agent_registration_conflict: 'The requested agent or page library is already in use.',
   invalid_agent_registration: 'The agent registration settings are invalid.',
-  rag_corpus_creation_failed: 'Corpus creation failed and requires operator reconciliation.',
-  rag_corpus_ambiguous: 'Multiple corpora have the configured display name.',
   google_generation_empty: 'Google returned no usable text generation.',
   google_generation_incomplete: 'Google did not return a complete text generation.',
   // Worker refusals an agent can act on. Without these a 403 surfaced as a
@@ -57,14 +34,7 @@ const WORKER_ERROR_MESSAGES: Readonly<Record<string, string>> = Object.freeze({
   // as a blocked lane and halted a whole intake batch.
   approval_required: 'This action requires approval_id. Pass the approval reference for the owner request.',
   gcs_destination_not_allowed: 'The storage destination is outside the domain allowlisted prefixes.',
-  gcs_object_name_conflict: 'Different files already occupy this book name and its content-hash variant. Nothing was uploaded; check the edition metadata.',
-  rag_corpus_not_configured_for_domain: 'The requested corpus is not configured for this domain.',
-  rag_corpus_foreign_project: 'The requested corpus belongs to a project not configured for this domain.',
-  rag_corpus_foreign_location: 'The requested corpus is in a location not configured for this domain.',
-  rag_file_foreign_corpus: 'The rag file does not belong to the resolved corpus.',
   annas_archive_url_not_allowed: 'The acquisition URL is not an allowed library endpoint.',
-  drive_import_review_required: 'Drive imports require owner review before ingestion.',
-  vertex_not_configured: 'This domain is served from the page library. Use domain_library to read and library_ingest to add sources.',
   page_library_not_configured: 'This domain has no page library.',
   page_ingest_writer_not_configured: 'The page library index writer is not configured on the worker.',
   page_ingest_no_original_store: 'The worker has no acquisition directory for this domain, so a workspace file cannot be stored for view_page.',
@@ -120,7 +90,7 @@ export class DomainExpertClient {
       throw new OperationError(
         'domain_expert_not_configured',
         'Domain expert worker is disabled.',
-        'Configure the bounded domain expert worker before live Google/Gemini/Docs/Anna actions.',
+        'Configure the bounded domain expert worker before live library or Anna actions.',
       );
     }
   }

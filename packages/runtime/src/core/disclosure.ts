@@ -460,26 +460,6 @@ export function discloseExcerpts(
   };
 }
 
-/**
- * Splits requested corpora into the ones a served deployment may retrieve from
- * and the ones it may not. `derived` sources never reach a served instance and
- * `excluded` corpora are absent entirely; both are decided here, before any
- * retrieval executes.
- */
-export function partitionCorporaByDisclosure(
-  policy: DisclosurePolicy,
-  corpusIds: readonly string[],
-): { disclosable: string[]; withheld: Array<{ corpusId: string; disclosure: DisclosurePosture }> } {
-  const disclosable: string[] = [];
-  const withheld: Array<{ corpusId: string; disclosure: DisclosurePosture }> = [];
-  for (const corpusId of corpusIds) {
-    const posture = policy.postureFor(corpusId);
-    if (posture === 'full') disclosable.push(corpusId);
-    else withheld.push({ corpusId, disclosure: posture });
-  }
-  return { disclosable, withheld };
-}
-
 function boundedExcerpt(text: string, maxChars: number): string {
   if (text.length <= maxChars) return text;
   const sliced = text.slice(0, maxChars);

@@ -28,7 +28,6 @@ function main(): void {
   const worker = createDomainExpertWorker({
     roots,
     agentRouting,
-    gcpProject: process.env.EXPERT_AGENTS_GCP_PROJECT,
     google: domainExpertGoogleConfigFromEnv(process.env),
     annas: domainExpertAnnasConfigFromEnv(process.env),
     notion: domainExpertNotionConfigFromEnv(process.env),
@@ -48,7 +47,7 @@ function main(): void {
   console.log(
     roots.length > 0
       ? `Configured domain expert workspace roots: ${roots.map((root) => root.rootId).join(', ')}.`
-      : 'No workspace roots configured; workspace file tools, domain_source registry writes, and staged imports are disabled until EXPERT_AGENTS_DOMAIN_EXPERT_ROOTS_JSON is set. Serving (domain_ask) is unaffected.',
+      : 'No workspace roots configured; workspace file tools and workspace ingests are disabled until EXPERT_AGENTS_DOMAIN_EXPERT_ROOTS_JSON is set. Serving is unaffected.',
   );
 }
 

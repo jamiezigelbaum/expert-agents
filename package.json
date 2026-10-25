@@ -19,7 +19,6 @@
     "library:pages": "bun scripts/library-pages.ts",
     "library:index": "bun scripts/page-index.ts",
     "worker:domain-expert": "bun packages/runtime/dist/server.js",
-    "parity:battery": "bun scripts/parity-battery.ts",
     "plugin:ownership": "bun scripts/plugin-ownership-fingerprint.ts",
     "retrieval:eval": "bun scripts/retrieval-eval.ts",
     "expert:create": "bun scripts/expert-create.ts",

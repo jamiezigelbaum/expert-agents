@@ -4,7 +4,7 @@ import { DirectHttpDomainExpertTransport } from '../src/core/domain-expert-clien
 const privateText = 'synthetic-token /private/worker/source.txt source holding';
 
 describe('worker client error boundary', () => {
-  test.each(['invalid_params', 'gcp_project_not_configured', 'unknown_code'])('never forwards provider message or remediation for %s', async code => {
+  test.each(['invalid_params', 'page_library_not_configured', 'unknown_code'])('never forwards provider message or remediation for %s', async code => {
     const transport = new DirectHttpDomainExpertTransport(async () => Response.json({
       error: { code, message: privateText, suggestion: privateText, remediation: privateText },
     }, { status: 500 }));

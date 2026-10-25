@@ -1,12 +1,10 @@
 ---
 name: domain-research
-version: 0.2.1
-description: Answer any question about what a library book, paper, talk, or author says — domain_library first, with your domain_id, before web search, memory, or any other lane. Also covers adding approved sources to the page library and reviewable document collaboration for a configured expert.
+version: 0.4.0
+description: Answer any question about what a library book, paper, talk, or author says — domain_library first, with your domain_id, before web search, memory, or any other lane. Also covers adding approved sources to the page library.
 tools:
   - domain_library
   - library_ingest
-  - domain_doc
-  - domain_ask
 mutating: true
 ---
 
@@ -19,12 +17,8 @@ where X and Y disagree, what a report claimed — is a library question: call
 `domain_library` FIRST, with the expert's stable `domain_id` named explicitly,
 before any web search, memory search, or another product's source tools.
 Repository and code search tools cannot see the library; reaching for one on
-a library question is always the wrong tool, not a fallback. An agent whose
-tools include `domain_ask` but not `domain_library` is on a legacy domain:
-call `domain_ask` first instead. If the library errors, report the error
-verbatim and stop — there is no fallback lane. The one exception is
-`page_library_not_configured`: see "Domains not yet on the page library"
-below.
+a library question is always the wrong tool, not a fallback. If the library
+errors, report the error verbatim and stop — there is no fallback lane.
 
 ## Reading the library
 
@@ -82,9 +76,7 @@ Use `library_ingest` to add approved sources. A `start` names exactly one of:
 - `urls`: https web pages (the main text is kept with its URL and retrieval
   date), direct PDF, text, audio or video links, and YouTube videos (captions);
 - `notion`: Notion page or database URLs or ids shared with the worker's
-  integration (a database adds each of its pages);
-- `drive_file_ids`: Drive files or Docs URLs shared with the worker's Google
-  identity (Docs, Slides and Sheets are exported as PDF).
+  integration (a database adds each of its pages).
 
 Audio and video are transcribed locally; their sections cite timestamps
 (`00:12:30–00:18:45`) instead of pages. Run it as a dry run first (the
@@ -92,20 +84,11 @@ default), then start it with the approval id. It runs in the background: the
 job fetches what it names, so check `status` and report what it lists — books
 ingested, sources that failed and why, failed pages, empty pages, unresolved
 readings and undescribed figures — never summarize a job as done before its
-status says so. Re-ingesting the same file, URL, Notion page or Drive file
-replaces its book. A failed source is reported, not retried through another
+status says so. Re-ingesting the same file, URL or Notion page replaces its
+book. A failed source is reported, not retried through another
 lane. Private or unclear material requires owner approval first.
 
 If this session does not have `library_ingest`, tell the owner plainly that
 adding sources needs a session that has it; never substitute shell, direct
 cloud access or another product's tools. Credentials stay inside the
 configured task-scoped adapter.
-
-Use `domain_doc` for comments or visibly marked edits; direct edits require
-approval and must remain reviewable.
-
-## Domains not yet on the page library
-
-If `domain_library` answers `page_library_not_configured`, this domain has not
-moved to the page library yet: answer with `domain_ask` for the same
-`domain_id`, and tell the owner the domain is still on its legacy library.

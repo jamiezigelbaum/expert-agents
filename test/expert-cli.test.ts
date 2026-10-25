@@ -429,10 +429,10 @@ describe("expert release CLI", () => {
   });
 
   test("names every manual precondition it did not run", () => {
-    expect(SERVING_MANUAL_PRECONDITIONS).toHaveLength(3);
+    expect(SERVING_MANUAL_PRECONDITIONS).toHaveLength(2);
     expect(SERVING_MANUAL_PRECONDITIONS.join("\n")).toContain("soul lint");
     expect(SERVING_MANUAL_PRECONDITIONS.join("\n")).toContain("retrieval evaluation");
-    expect(SERVING_MANUAL_PRECONDITIONS.join("\n")).toContain("parity battery");
+    expect(SERVING_MANUAL_PRECONDITIONS.join("\n")).not.toContain("parity battery");
   });
 
   test("refuses a repository whose manifest declares no serving set", async () => {
@@ -538,7 +538,6 @@ describe("expert:release disclosure summary", () => {
     agentId: "neutral-agent",
     displayName: "Neutral Agent",
     domainId: "neutral-domain",
-    targetCorpusDisplayName: "neutral-corpus",
     corpora,
     files: ["SOUL.md"],
   });
@@ -554,24 +553,10 @@ describe("expert:release disclosure summary", () => {
     expect(lines).toMatch(/derived\s+neutral-private/);
   });
 
-  test("warns loudly when no disclosure is declared at all", () => {
+  test("states the page-library posture when no corpus is declared", () => {
     const lines = formatDisclosureSummary(manifest([])).join("\n");
-    expect(lines).toContain("WARNING");
-    expect(lines).toContain("permissive default posture (full)");
-  });
-
-  test("always states the target corpus and the permissive default", () => {
-    for (const corpora of [[], [{ corpusId: "neutral-public", disclosure: "full" as const }]]) {
-      const lines = formatDisclosureSummary(manifest(corpora)).join("\n");
-      expect(lines).toContain("neutral-corpus");
-      expect(lines).toContain("exposed at the permissive default");
-    }
-  });
-
-  test("a page-library agent with no corpus points at its deployment route", () => {
-    const { targetCorpusDisplayName: _omit, ...pageLibrary } = manifest([]);
-    const lines = formatDisclosureSummary(pageLibrary).join("\n");
     expect(lines).toContain("page library");
+    expect(lines).toContain("serves the library in full");
     expect(lines).toContain("disclosure policy");
     expect(lines).not.toContain("undefined");
     expect(lines).not.toContain("WARNING");

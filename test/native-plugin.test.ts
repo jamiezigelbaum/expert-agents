@@ -30,13 +30,8 @@ describe('Expert Agents OpenClaw plugin', () => {
     expect(plugin.id).toBe('expert-agents');
     expect(names).toEqual([
       'domain_agent',
-      'domain_ask',
       'domain_library',
       'library_ingest',
-      'domain_read',
-      'domain_source',
-      'rag_corpus',
-      'domain_doc',
       'annas_archive_search',
       'annas_archive_import',
       'expert_factory',
@@ -49,22 +44,22 @@ describe('Expert Agents OpenClaw plugin', () => {
     // all the way into the request body.
     const bodies = await capturedRequestBodies(
       { domainExpert: { enabled: true, baseUrl: 'http://127.0.0.1:8040/v1', defaultDomainId: 'governance' } },
-      [{ question: 'Fixture question' }, { question: 'Fixture question', domain_id: 'history' }],
+      [{ action: 'search', query: 'Fixture question' }, { action: 'search', query: 'Fixture question', domain_id: 'history' }],
     );
 
     expect(bodies).toEqual([
-      { tool: 'domain_ask', params: { question: 'Fixture question', domain_id: 'governance' } },
-      { tool: 'domain_ask', params: { question: 'Fixture question', domain_id: 'history' } },
+      { tool: 'domain_library', params: { action: 'search', query: 'Fixture question', domain_id: 'governance' } },
+      { tool: 'domain_library', params: { action: 'search', query: 'Fixture question', domain_id: 'history' } },
     ]);
   });
 
   test('an unset default domain id changes nothing about the request', async () => {
     const bodies = await capturedRequestBodies(
       { domainExpert: { enabled: true, baseUrl: 'http://127.0.0.1:8040/v1', defaultDomainId: '   ' } },
-      [{ question: 'Fixture question' }],
+      [{ action: 'search', query: 'Fixture question' }],
     );
 
-    expect(bodies).toEqual([{ tool: 'domain_ask', params: { question: 'Fixture question' } }]);
+    expect(bodies).toEqual([{ tool: 'domain_library', params: { action: 'search', query: 'Fixture question' } }]);
   });
 
   test('reports execution completion separately from a degraded service health result', async () => {
@@ -208,7 +203,7 @@ describe('the plugin turning configured credentials into worker auth', () => {
   test('a literal credential becomes exactly one trimmed Bearer header', async () => {
     const requests = await capturedRequests(
       { domainExpert: { enabled: true, baseUrl: 'http://127.0.0.1:8040/v1', authToken: '  fixture-worker-token  ' } },
-      [{ question: 'Fixture question' }],
+      [{ action: 'search', query: 'Fixture question' }],
     );
 
     expect(requests.map((request) => request.headers.get('authorization'))).toEqual([
@@ -219,7 +214,7 @@ describe('the plugin turning configured credentials into worker auth', () => {
   test('no configured credential sends no authorization header at all', async () => {
     const requests = await capturedRequests(
       { domainExpert: { enabled: true, baseUrl: 'http://127.0.0.1:8040/v1' } },
-      [{ question: 'Fixture question' }],
+      [{ action: 'search', query: 'Fixture question' }],
     );
 
     expect(requests.map((request) => request.headers.get('authorization'))).toEqual([null]);
@@ -285,18 +280,18 @@ describe('the plugin turning configured credentials into worker auth', () => {
         registerTool: (definition) => {
           const tool = typeof definition === 'function'
             ? definition({ getRuntimeConfig: () => runtime }) : definition;
-          if (tool.name === 'domain_ask') ask = tool;
+          if (tool.name === 'domain_library') ask = tool;
         },
       });
-      expect((await ask!.execute('first', { question: 'Fixture?' })).isError).toBeUndefined();
+      expect((await ask!.execute('first', { action: 'search', query: 'Fixture?' })).isError).toBeUndefined();
       runtime = snapshot('fixture-rotated');
-      expect((await ask!.execute('second', { question: 'Fixture?' })).isError).toBeUndefined();
+      expect((await ask!.execute('second', { action: 'search', query: 'Fixture?' })).isError).toBeUndefined();
       runtime = snapshot(ref);
-      const refused = await ask!.execute('third', { question: 'Fixture?' });
+      const refused = await ask!.execute('third', { action: 'search', query: 'Fixture?' });
       expect(refused.isError).toBe(true);
       expect(JSON.stringify(refused)).not.toContain('fixture-rotated');
       runtime = { plugins: { entries: {} } };
-      expect((await ask!.execute('removed', { question: 'Fixture?' })).isError).toBe(true);
+      expect((await ask!.execute('removed', { action: 'search', query: 'Fixture?' })).isError).toBe(true);
       expect(headers).toEqual(['Bearer fixture-first', 'Bearer fixture-rotated']);
     } finally { globalThis.fetch = originalFetch; }
   });
@@ -330,10 +325,10 @@ async function capturedRequests(
       pluginConfig,
       registerTool: (tool) => {
         tool = resolveTool(tool);
-        if (tool.name === 'domain_ask') ask = tool.execute;
+        if (tool.name === 'domain_library') ask = tool.execute;
       },
     });
-    if (!ask) throw new Error('The plugin registered no domain_ask tool.');
+    if (!ask) throw new Error('The plugin registered no domain_library tool.');
     for (const params of calls) {
       expect((await ask('fixture-call', params)).isError).toBeUndefined();
     }

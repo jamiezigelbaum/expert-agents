@@ -16,8 +16,8 @@ import { runMaterializeScopeCli } from "./materialize-scope.ts";
  * both already machinery elsewhere in this repository; this module only
  * orchestrates them and prints what happened.
  *
- * Worker lane: HTTP against a running domain-expert worker (`ask`, `search`,
- * `acquire`, `source register`, `status`, `health`). Owner lane: local Google
+ * Worker lane: HTTP against a running domain-expert worker (`library`,
+ * `library-ingest`, `search`, `acquire`, `health`). Owner lane: local Google
  * ADC (`ingest`: extract → stage → scope → materialize → annotate).
  *
  * Credential rule, same as retrieval-eval: the worker bearer token comes only
@@ -32,7 +32,7 @@ export const GOOGLE_ACCESS_TOKEN_ENV = "EXPERT_AGENTS_DOMAIN_EXPERT_GOOGLE_ACCES
 export const GCP_PROJECT_ENV = "EXPERT_AGENTS_GCP_PROJECT";
 export const GCLOUD_ADC_ARGV = ["gcloud", "auth", "application-default", "print-access-token"] as const;
 
-/** Busy-corpus and quota responses are waited out, never treated as failures. */
+/** Quota responses are waited out, never treated as failures. */
 export const ACQUIRE_RETRY_INITIAL_DELAY_MS = 30_000;
 export const ACQUIRE_RETRY_SECOND_DELAY_MS = 90_000;
 export const ACQUIRE_RETRY_MAX_DELAY_MS = 5 * 60_000;
@@ -53,15 +53,9 @@ bearer token from ${WORKER_TOKEN_ENV} or --token-file <path>, never an argument 
            [--from <unit>] [--to <unit>] [--session <id>] [--out <file.jpg>]   (view_page needs --out)
   library-ingest --domain <id> --action <start|status|list> [--gcs <gs://uri> | --path <workspace-relative>]
            [--title <t>] [--creator <c>] [--job <id>] [--approval-id <id>] [--apply]   (start is a dry run without --apply)
-  ask      --domain <id> "<question>" [--passages] [--corpus <id>]
-  read     --domain <id> --action <catalog|open|find|read> [--object <sha256:id> | --rag-file <resource>]
-           [--revision <text-hash>] [--query <text>] [--offset <n>] [--end <n>] [--section <n>] [--limit <n>]
   search   --domain <id> --query "<q>" [--author <a>] [--title <t>] [--language <l>] [--top <n>] [--ingest-intent]
   acquire  --domain <id> --md5 <md5> --format <pdf|epub|mobi|azw3|djvu> --title <t> --author <a> [--year <y>]
-           [--corpus <id>] --copyright-posture <p> --approval-id <id> [--no-ingest] [--dry-run] [--no-wait]
-  source register --domain <id> --kind <book|pdf|epub|google_doc|blog_post|transcript|note|dataset|web_page>
-           --title <t> --author <a> --locator <url> [--trust-tier <t>] [--copyright-posture <p>] [--corpus <id>]
-  status   --domain <id> [--corpus <id>]
+           --copyright-posture <p> --approval-id <id> [--no-ingest] [--dry-run] [--no-wait]
 
 Owner lane (local Google ADC; ${GCP_PROJECT_ENV} required; token from
 ${GOOGLE_ACCESS_TOKEN_ENV} or \`gcloud auth application-default print-access-token\`):
@@ -70,7 +64,7 @@ ${GOOGLE_ACCESS_TOKEN_ENV} or \`gcloud auth application-default print-access-tok
            [--trust-tier <t>] [--copyright-posture <p>] (<url>|<path>)...
 
 Worker errors are printed verbatim (code + message) and exit 1. acquire retries a busy
-corpus (FAILED_PRECONDITION) or HTTP 429 with backoff (30s, 90s, ... up to 15 minutes)
+quota (RESOURCE_EXHAUSTED) or HTTP 429 with backoff (30s, 90s, ... up to 15 minutes)
 unless --no-wait is given.`;
 
 export type ExpertLibraryErrorCode =
@@ -104,16 +98,8 @@ export interface WorkerCommandOptions {
 
 export type ExpertLibraryCommand =
   | ({ command: "health" } & WorkerCommandOptions)
-  | ({ command: "read"; domainId: string; params: Record<string, unknown> } & WorkerCommandOptions)
   | ({ command: "library"; domainId: string; params: Record<string, unknown>; out?: string } & WorkerCommandOptions)
   | ({ command: "library-ingest"; domainId: string; params: Record<string, unknown> } & WorkerCommandOptions)
-  | ({
-    command: "ask";
-    domainId: string;
-    question: string;
-    passages: boolean;
-    corpusId?: string;
-  } & WorkerCommandOptions)
   | ({
     command: "search";
     domainId: string;
@@ -132,25 +118,12 @@ export type ExpertLibraryCommand =
     title: string;
     author: string;
     year?: string;
-    corpusId?: string;
     copyrightPosture: string;
     approvalId: string;
     ingest: boolean;
     dryRun: boolean;
     wait: boolean;
   } & WorkerCommandOptions)
-  | ({
-    command: "source-register";
-    domainId: string;
-    kind: string;
-    title: string;
-    author: string;
-    locator: string;
-    trustTier?: string;
-    copyrightPosture?: string;
-    corpusId?: string;
-  } & WorkerCommandOptions)
-  | ({ command: "status"; domainId: string; corpusId?: string } & WorkerCommandOptions)
   | {
     command: "ingest";
     scopePath: string;
@@ -289,40 +262,6 @@ export function parseExpertLibraryArguments(argv: string[]): ExpertLibraryComman
       const flags = parseFlags(rest, { named: WORKER_FLAGS });
       return { command: "health", ...workerOptions(flags) };
     }
-    case "ask": {
-      const flags = parseFlags(rest, {
-        named: [...WORKER_FLAGS, "--domain", "--corpus"],
-        boolean: ["--passages"],
-        positional: true,
-      });
-      if (flags.positional.length !== 1) throw usage("ask takes exactly one quoted question.");
-      return {
-        command: "ask",
-        domainId: requireFlag(flags, "--domain"),
-        question: requireNonEmpty(flags.positional[0]!, "question"),
-        passages: flags.booleans.has("--passages"),
-        ...optionalFlag(flags, "--corpus", "corpusId"),
-        ...workerOptions(flags),
-      };
-    }
-    case "read": {
-      const flags = parseFlags(rest, { named: [...WORKER_FLAGS, "--domain", "--action", "--object", "--rag-file", "--revision", "--query", "--offset", "--end", "--section", "--limit"] });
-      const action = requireFlag(flags, "--action");
-      if (!["catalog", "open", "find", "read"].includes(action)) throw usage("Invalid read action.");
-      const params: Record<string, unknown> = { action };
-      for (const [flag, key] of [["--object", "object_id"], ["--rag-file", "rag_file_name"], ["--revision", "text_revision"], ["--query", "query"]]) {
-        const value = flags.values.get(flag!);
-        if (value !== undefined) params[key!] = value;
-      }
-      for (const key of ["offset", "end", "section", "limit"]) {
-        const value = flags.values.get(`--${key}`);
-        if (value === undefined) continue;
-        if (!/^\d+$/.test(value) || !Number.isSafeInteger(Number(value))) throw usage(`--${key} must be a non-negative integer.`);
-        params[key] = Number(value);
-      }
-      if (action !== "catalog" && Boolean(params.object_id) === Boolean(params.rag_file_name)) throw usage("Exactly one of --object or --rag-file is required for this read action.");
-      return { command: "read", domainId: requireFlag(flags, "--domain"), params, ...workerOptions(flags) };
-    }
     case "library": {
       const flags = parseFlags(rest, { named: [...WORKER_FLAGS, "--domain", "--action", "--query", "--k", "--book", "--pattern", "--max-hits", "--slug", "--from", "--to", "--session", "--out"] });
       const action = requireFlag(flags, "--action");
@@ -381,7 +320,7 @@ export function parseExpertLibraryArguments(argv: string[]): ExpertLibraryComman
       const flags = parseFlags(rest, {
         named: [
           ...WORKER_FLAGS, "--domain", "--md5", "--format", "--title", "--author", "--year",
-          "--corpus", "--copyright-posture", "--approval-id",
+          "--copyright-posture", "--approval-id",
         ],
         boolean: ["--no-ingest", "--dry-run", "--no-wait"],
       });
@@ -395,43 +334,11 @@ export function parseExpertLibraryArguments(argv: string[]): ExpertLibraryComman
         title: requireFlag(flags, "--title"),
         author: requireFlag(flags, "--author"),
         ...optionalFlag(flags, "--year", "year"),
-        ...optionalFlag(flags, "--corpus", "corpusId"),
         copyrightPosture: requireFlag(flags, "--copyright-posture"),
         approvalId: requireFlag(flags, "--approval-id"),
         ingest: !flags.booleans.has("--no-ingest"),
         dryRun: flags.booleans.has("--dry-run"),
         wait: !flags.booleans.has("--no-wait"),
-        ...workerOptions(flags),
-      };
-    }
-    case "source": {
-      const [subcommand, ...sourceRest] = rest;
-      if (subcommand !== "register") throw usage("source supports only: source register ...");
-      const flags = parseFlags(sourceRest, {
-        named: [
-          ...WORKER_FLAGS, "--domain", "--kind", "--title", "--author", "--locator",
-          "--trust-tier", "--copyright-posture", "--corpus",
-        ],
-      });
-      return {
-        command: "source-register",
-        domainId: requireFlag(flags, "--domain"),
-        kind: requireFlag(flags, "--kind"),
-        title: requireFlag(flags, "--title"),
-        author: requireFlag(flags, "--author"),
-        locator: requireFlag(flags, "--locator"),
-        ...optionalFlag(flags, "--trust-tier", "trustTier"),
-        ...optionalFlag(flags, "--copyright-posture", "copyrightPosture"),
-        ...optionalFlag(flags, "--corpus", "corpusId"),
-        ...workerOptions(flags),
-      };
-    }
-    case "status": {
-      const flags = parseFlags(rest, { named: [...WORKER_FLAGS, "--domain", "--corpus"] });
-      return {
-        command: "status",
-        domainId: requireFlag(flags, "--domain"),
-        ...optionalFlag(flags, "--corpus", "corpusId"),
         ...workerOptions(flags),
       };
     }
@@ -577,27 +484,10 @@ async function runWorkerCommand(
       const state = String(asRecord(asRecord(outcome.body)?.job)?.state ?? "");
       return state === "failed" ? 1 : 0;
     }
-    case "read": {
-      const outcome = await workerPost(target, "domain_read", { domain_id: parsed.domainId, ...parsed.params }, fetchImpl);
-      if (!outcome.ok) return failWorker(outcome, emitter);
-      emitter.out(prettyJson(outcome.body));
-      return 0;
-    }
     case "health": {
       const outcome = await workerGet(target, "/v1/health", fetchImpl);
       emitter.out(prettyJson(outcome.body));
       if (!outcome.ok) return failWorker(outcome, emitter);
-      return 0;
-    }
-    case "ask": {
-      const outcome = await workerPost(target, "domain_ask", {
-        domain_id: parsed.domainId,
-        question: parsed.question,
-        ...(parsed.passages ? { output: "passages" } : {}),
-        ...(parsed.corpusId === undefined ? {} : { corpus_id: parsed.corpusId }),
-      }, fetchImpl);
-      if (!outcome.ok) return failWorker(outcome, emitter);
-      printAsk(outcome.body, emitter);
       return 0;
     }
     case "search": {
@@ -623,7 +513,6 @@ async function runWorkerCommand(
         title: parsed.title,
         author: parsed.author,
         ...(parsed.year === undefined ? {} : { year: parsed.year }),
-        ...(parsed.corpusId === undefined ? {} : { corpus_id: parsed.corpusId }),
         copyright_posture: parsed.copyrightPosture,
         approval_id: parsed.approvalId,
         ingest: parsed.ingest,
@@ -632,43 +521,6 @@ async function runWorkerCommand(
       const outcome = await acquireWithRetry(target, params, parsed.wait, dependencies, emitter);
       if (!outcome.ok) return failWorker(outcome, emitter);
       return printAcquire(outcome.body, emitter);
-    }
-    case "source-register": {
-      const outcome = await workerPost(target, "domain_source", {
-        action: "add",
-        domain_id: parsed.domainId,
-        kind: parsed.kind,
-        title: parsed.title,
-        author: parsed.author,
-        url: parsed.locator,
-        ...(parsed.trustTier === undefined ? {} : { trust_posture: parsed.trustTier }),
-        ...(parsed.copyrightPosture === undefined ? {} : { copyright_posture: parsed.copyrightPosture }),
-        ...(parsed.corpusId === undefined ? {} : { corpus_id: parsed.corpusId }),
-        dry_run: false,
-      }, fetchImpl);
-      if (!outcome.ok) return failWorker(outcome, emitter);
-      const body = asRecord(outcome.body);
-      const record = asRecord(body?.source_record);
-      emitter.out(`status: ${String(body?.status ?? "unknown")}`);
-      if (record) emitter.out(`source_id: ${String(record.source_id ?? "")}`);
-      emitter.out(prettyJson(record ?? outcome.body));
-      return 0;
-    }
-    case "status": {
-      const outcome = await workerPost(target, "rag_corpus", {
-        action: "status",
-        domain_id: parsed.domainId,
-        ...(parsed.corpusId === undefined ? {} : { corpus_id: parsed.corpusId }),
-      }, fetchImpl);
-      if (!outcome.ok) return failWorker(outcome, emitter);
-      const body = asRecord(outcome.body);
-      const resolved = asRecord(body?.resolved_corpus);
-      if (resolved) {
-        emitter.out(`corpus: ${String(resolved.corpus_id ?? "")} (${String(resolved.resource_name ?? "")})`);
-      }
-      emitter.out(prettyJson(body?.corpus ?? outcome.body));
-      printWarnings(body?.warnings, emitter);
-      return 0;
     }
   }
 }
@@ -776,11 +628,10 @@ function failWorker(outcome: WorkerOutcome, emitter: Emitter): number {
 }
 
 /**
- * The worker serializes Vertex imports per corpus and Anna Archive meters per
- * minute. Both surface as "wait, then try again": HTTP 429, an HTTP error whose
- * text carries FAILED_PRECONDITION / "other operations running", or a 200 whose
- * rag_ingest was blocked by that same condition (the download already landed;
- * the worker re-ingests the existing file on the retry).
+ * Anna Archive meters downloads per minute, which surfaces as "wait, then try
+ * again": HTTP 429, an HTTP error whose text carries RESOURCE_EXHAUSTED, or a
+ * 200 whose rag_ingest was blocked by that same condition (the download already
+ * landed; the worker re-ingests the existing file on the retry).
  */
 export function isBusyWorkerOutcome(outcome: WorkerOutcome): boolean {
   if (outcome.status === 429) return true;
@@ -796,7 +647,7 @@ export function isBusyWorkerOutcome(outcome: WorkerOutcome): boolean {
   collect(body?.error);
   const ragIngest = asRecord(body?.rag_ingest);
   if (ragIngest?.status === "blocked") collect(ragIngest.error);
-  return texts.some((text) => /FAILED_PRECONDITION|other operations? (?:are )?running|RESOURCE_EXHAUSTED/i.test(text));
+  return texts.some((text) => /RESOURCE_EXHAUSTED/i.test(text));
 }
 
 async function acquireWithRetry(
@@ -814,59 +665,19 @@ async function acquireWithRetry(
     const outcome = await workerPost(target, "annas_archive_import", params, fetchImpl);
     if (!isBusyWorkerOutcome(outcome)) return outcome;
     if (!wait) {
-      throw new ExpertLibraryError("worker_busy", `corpus or quota busy (HTTP ${outcome.status}); --no-wait given, not retrying.`);
+      throw new ExpertLibraryError("worker_busy", `quota busy (HTTP ${outcome.status}); --no-wait given, not retrying.`);
     }
     if (waited + delay > ACQUIRE_RETRY_BUDGET_MS) {
       throw new ExpertLibraryError(
         "worker_busy",
-        `corpus or quota still busy after ${Math.round(waited / 1000)}s across ${attempt} attempts; giving up.`,
+        `quota still busy after ${Math.round(waited / 1000)}s across ${attempt} attempts; giving up.`,
       );
     }
-    emitter.err(`corpus or quota busy (HTTP ${outcome.status}); attempt ${attempt}, retrying in ${Math.round(delay / 1000)}s`);
+    emitter.err(`quota busy (HTTP ${outcome.status}); attempt ${attempt}, retrying in ${Math.round(delay / 1000)}s`);
     await sleep(delay);
     waited += delay;
     delay = attempt === 1 ? ACQUIRE_RETRY_SECOND_DELAY_MS : Math.min(delay * 3, ACQUIRE_RETRY_MAX_DELAY_MS);
   }
-}
-
-// Matches the worker's citation header: "<creator> — <title>" when the source
-// is titled, else the stored display name.
-function sourceLabel(source: Record<string, unknown>): string {
-  const title = typeof source.title === "string" && source.title.trim() ? source.title.trim() : "";
-  const creator = typeof source.creator === "string" && source.creator.trim() ? source.creator.trim() : "";
-  if (!title) return String(source.source_display_name ?? "");
-  return creator ? `${creator} — ${title}` : title;
-}
-
-function printAsk(body: unknown, emitter: Emitter): void {
-  const record = asRecord(body);
-  if (record?.kind === "domain_passages" && Array.isArray(record.passages)) {
-    for (const value of record.passages) {
-      const passage = asRecord(value);
-      if (!passage) continue;
-      emitter.out(`[${String(passage.citation_id ?? "")}] ${sourceLabel(passage)}`
-        + ` (${String(passage.corpus_id ?? "")}${passage.score === undefined ? "" : `, score ${String(passage.score)}`})`);
-      emitter.out(`  ${String(passage.source_uri ?? "")}`);
-      emitter.out(indent(String(passage.text ?? "")));
-      emitter.out("");
-    }
-    emitter.out(`${record.passages.length} passage(s)`);
-  } else if (record?.kind === "domain_answer") {
-    emitter.out(`status: ${String(record.status ?? "")}`);
-    emitter.out(String(record.answer ?? ""));
-    if (Array.isArray(record.citations) && record.citations.length > 0) {
-      emitter.out("");
-      emitter.out("citations:");
-      for (const value of record.citations) {
-        const citation = asRecord(value);
-        if (!citation) continue;
-        emitter.out(`  [${String(citation.citation_id ?? "")}] ${sourceLabel(citation)} ${String(citation.source_uri ?? "")}`);
-      }
-    }
-  } else {
-    emitter.out(prettyJson(body));
-  }
-  printWarnings(record?.warnings, emitter);
 }
 
 function printSearch(body: unknown, emitter: Emitter): void {
@@ -915,7 +726,7 @@ function printAcquire(body: unknown, emitter: Emitter): number {
   }
   printWarnings(record?.warnings, emitter);
   const status = String(ragIngest?.status ?? "");
-  if (status === "blocked" || status === "needs_corpus_decision" || status === "import_failed" || status === "import_empty") {
+  if (status === "blocked") {
     return 1;
   }
   if (record?.kind === "annas_archive_import_result" || record?.kind === "annas_archive_import_plan") return 0;

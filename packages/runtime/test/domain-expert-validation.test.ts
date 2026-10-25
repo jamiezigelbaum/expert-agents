@@ -39,23 +39,7 @@ function jsonResponse(value: unknown, status = 200): Response {
   return Response.json(value, { status });
 }
 
-describe('live mutation approval validation', () => {
-  function visualWorker(calls: CapturedCall[] = []) {
-    return createDomainExpertWorker({
-      google: {
-        accessToken: 'fixture-google-token',
-        fetchImpl: (async (input: string | URL | Request, init?: RequestInit) => {
-          const url = input instanceof Request ? input.url : String(input);
-          const method = init?.method ?? (input instanceof Request ? input.method : 'GET');
-          calls.push({ url, method });
-          if (method === 'GET' && url.includes('/documents/')) return jsonResponse({});
-          if (method === 'POST' && url.endsWith(':batchUpdate')) return jsonResponse({ replies: [] });
-          return jsonResponse({ error: `unexpected Google fixture URL: ${url}` }, 500);
-        }) as typeof fetch,
-      },
-    });
-  }
-
+describe('Anna download approval validation', () => {
   function acquisitionFixture(calls: CapturedCall[] = []) {
     const base = mkdtempSync(join(tmpdir(), 'expert-agents-validation-annas-'));
     const booksRoot = join(base, 'books');
@@ -87,22 +71,6 @@ describe('live mutation approval validation', () => {
     { name: 'tab', value: '\t' },
     { name: 'missing', value: undefined },
   ]) {
-    test(`${approval.name} approval id is rejected on Google Docs mutations`, async () => {
-      const calls: CapturedCall[] = [];
-      const response = await postDomainResponse(visualWorker(calls), 'domain_doc', {
-        action: 'visual_insert',
-        document_id: 'fixture-document',
-        text: 'Approved text',
-        range_start: 1,
-        ...(approval.value === undefined ? {} : { approval_id: approval.value }),
-        dry_run: false,
-      });
-
-      expect(response.status).toBe(403);
-      expect(await response.json()).toMatchObject({ error: { code: 'approval_required' } });
-      expect(calls).toHaveLength(0);
-    });
-
     test(`${approval.name} approval id is rejected on Anna downloads`, async () => {
       const calls: CapturedCall[] = [];
       const fixture = acquisitionFixture(calls);
@@ -125,19 +93,7 @@ describe('live mutation approval validation', () => {
     });
   }
 
-  test('a non-empty approval id passes both live mutation gates', async () => {
-    const visualCalls: CapturedCall[] = [];
-    const visualResponse = await postDomainResponse(visualWorker(visualCalls), 'domain_doc', {
-      action: 'visual_insert',
-      document_id: 'fixture-document',
-      text: 'Approved text',
-      range_start: 1,
-      approval_id: 'approval-fixture',
-      dry_run: false,
-    });
-    expect(visualResponse.status).toBe(200);
-    expect(visualCalls.some((call) => call.method === 'POST' && call.url.endsWith(':batchUpdate'))).toBe(true);
-
+  test('a non-empty approval id passes the live download gate', async () => {
     const annasCalls: CapturedCall[] = [];
     const fixture = acquisitionFixture(annasCalls);
     try {
@@ -269,150 +225,4 @@ describe('Anna Archive search limit validation', () => {
       });
     }
   }
-});
-
-describe('RAG delete not-found classification', () => {
-  const corpusResource = 'projects/fixture-project/locations/us-central1/ragCorpora/1234567890123456789';
-  const ragFileName = `${corpusResource}/ragFiles/fixture-file`;
-
-  function deleteWorker(missing: 'file' | 'corpus', calls: CapturedCall[]) {
-    let corpusListCalls = 0;
-    return createDomainExpertWorker({
-      gcpProject: 'fixture-project',
-      google: {
-        accessToken: 'fixture-google-token',
-        fetchImpl: (async (input: string | URL | Request, init?: RequestInit) => {
-          const url = input instanceof Request ? input.url : String(input);
-          const method = init?.method ?? (input instanceof Request ? input.method : 'GET');
-          const path = new URL(url).pathname;
-          calls.push({ url, method });
-          if (method === 'GET' && path.endsWith('/ragCorpora')) {
-            corpusListCalls += 1;
-            return jsonResponse({
-              ragCorpora: missing === 'corpus' && corpusListCalls > 1
-                ? []
-                : [{ name: corpusResource, displayName: 'research-library' }],
-            });
-          }
-          if (method === 'DELETE' && path.includes('/ragFiles/')) {
-            if (missing === 'file') {
-              return jsonResponse({
-                error: {
-                  code: 404,
-                  message: 'RagFile not found',
-                  status: 'NOT_FOUND',
-                  details: [{
-                    '@type': 'type.googleapis.com/google.rpc.ResourceInfo',
-                    resourceType: 'aiplatform.googleapis.com/RagFile',
-                    resourceName: ragFileName,
-                  }],
-                },
-              }, 404);
-            }
-            return jsonResponse({ error: { code: 404, message: 'not found', status: 'NOT_FOUND' } }, 404);
-          }
-          if (method === 'GET' && path.endsWith(`/ragCorpora/${corpusResource.split('/').at(-1)}`)) {
-            return missing === 'corpus'
-              ? jsonResponse({ error: { code: 404, message: 'not found', status: 'NOT_FOUND' } }, 404)
-              : jsonResponse({ name: corpusResource, displayName: 'research-library' });
-          }
-          return jsonResponse({ error: `unexpected Google fixture URL: ${url}` }, 500);
-        }) as typeof fetch,
-      },
-    });
-  }
-
-  test('a missing child file with a live corpus reports file not-found', async () => {
-    const calls: CapturedCall[] = [];
-    const response = await postDomainResponse(deleteWorker('file', calls), 'rag_corpus', {
-      action: 'delete_file',
-      domain_id: 'research',
-      corpus_id: 'research-library',
-      rag_file_name: ragFileName,
-      dry_run: false,
-    });
-
-    expect(response.status).toBe(404);
-    expect(await response.json()).toMatchObject({ error: { code: 'rag_file_not_found' } });
-    expect(calls.filter((call) => call.method === 'DELETE')).toHaveLength(1);
-  });
-
-  test('a missing corpus retains the corpus-level not-found contract', async () => {
-    const calls: CapturedCall[] = [];
-    const response = await postDomainResponse(deleteWorker('corpus', calls), 'rag_corpus', {
-      action: 'delete_file',
-      domain_id: 'research',
-      corpus_id: 'research-library',
-      rag_file_name: ragFileName,
-      dry_run: false,
-    });
-
-    expect(response.status).toBe(404);
-    expect(await response.json()).toMatchObject({ error: { code: 'rag_corpus_not_found' } });
-    expect(calls.some((call) => call.method === 'GET' && call.url.endsWith(`/ragCorpora/${corpusResource.split('/').at(-1)}`))).toBe(true);
-  });
-});
-
-// 2026-10-08: after a worker restart, deleting a rag file named with the
-// project number (as Vertex lists it) was refused as foreign until something
-// listed the corpus first, because number aliases lived only in memory.
-describe('RAG delete accepts the project-number spelling Resource Manager confirms', () => {
-  const corpusResource = 'projects/fixture-project/locations/us-central1/ragCorpora/1234567890123456789';
-  const numberedFile = (projectNumber: string) => `projects/${projectNumber}/locations/us-central1/ragCorpora/1234567890123456789/ragFiles/fixture-file`;
-
-  function numberWorker(calls: CapturedCall[]) {
-    return createDomainExpertWorker({
-      gcpProject: 'fixture-project',
-      google: {
-        accessToken: 'fixture-google-token',
-        fetchImpl: (async (input: string | URL | Request, init?: RequestInit) => {
-          const url = input instanceof Request ? input.url : String(input);
-          const method = init?.method ?? (input instanceof Request ? input.method : 'GET');
-          const path = new URL(url).pathname;
-          calls.push({ url, method });
-          if (url === 'https://cloudresourcemanager.googleapis.com/v1/projects/fixture-project') {
-            return jsonResponse({ projectId: 'fixture-project', projectNumber: '111111111111' });
-          }
-          if (method === 'GET' && path.endsWith('/ragCorpora')) {
-            return jsonResponse({ ragCorpora: [{ name: corpusResource, displayName: 'research-library' }] });
-          }
-          if (method === 'DELETE' && path.includes('/ragFiles/')) {
-            return jsonResponse({ name: `${corpusResource}/operations/delete-1` });
-          }
-          return jsonResponse({ error: `unexpected Google fixture URL: ${url}` }, 500);
-        }) as typeof fetch,
-      },
-    });
-  }
-
-  test('a fresh worker deletes a file named with the confirmed project number, with no listing first', async () => {
-    const calls: CapturedCall[] = [];
-    const response = await postDomainResponse(numberWorker(calls), 'rag_corpus', {
-      action: 'delete_file',
-      domain_id: 'research',
-      corpus_id: 'research-library',
-      rag_file_name: numberedFile('111111111111'),
-      dry_run: false,
-    });
-
-    expect(response.status).toBe(200);
-    expect(await response.json()).toMatchObject({ status: 'delete_file_requested' });
-    expect(calls.filter((call) => call.method === 'DELETE')).toHaveLength(1);
-    expect(calls.some((call) => call.url.endsWith('/ragCorpora/1234567890123456789/ragFiles') && call.method === 'GET')).toBe(false);
-  });
-
-  test('a project number Resource Manager does not confirm is still refused', async () => {
-    const calls: CapturedCall[] = [];
-    const response = await postDomainResponse(numberWorker(calls), 'rag_corpus', {
-      action: 'delete_file',
-      domain_id: 'research',
-      corpus_id: 'research-library',
-      rag_file_name: numberedFile('999999999999'),
-      dry_run: false,
-    });
-
-    expect(response.status).toBe(403);
-    expect(await response.json()).toMatchObject({ error: { code: 'rag_file_foreign_corpus' } });
-    expect(calls.filter((call) => call.method === 'DELETE')).toHaveLength(0);
-  });
 });

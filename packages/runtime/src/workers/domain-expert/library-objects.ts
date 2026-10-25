@@ -2,7 +2,11 @@ import { createHash, randomUUID } from 'node:crypto';
 import { createReadStream } from 'node:fs';
 import { link, mkdir, open, readdir, rename, stat, unlink, writeFile } from 'node:fs/promises';
 import { dirname, join, sep } from 'node:path';
-import { LibraryReadError } from './library-reader.ts';
+
+/** A library object read that failed: its code and HTTP status travel to the caller. */
+export class LibraryReadError extends Error {
+  constructor(readonly code: string, message: string, readonly status = 400) { super(message); }
+}
 
 /**
  * Where the worker keeps library objects: originals, acquisitions, manifests
@@ -117,7 +121,7 @@ export class LocalLibraryObjects implements LibraryObjectStore {
 
   async downloadLibraryObject(bucket: string, objectName: string, maxBytes: number, _timeoutMs?: number): Promise<Uint8Array | null> {
     return this.read(bucket, objectName, maxBytes,
-      () => new LibraryReadError('library_source_too_large', 'The source exceeds the direct-reading size limit.', 413));
+      () => new LibraryReadError('library_source_too_large', 'The source exceeds the worker read size limit.', 413));
   }
 
   async downloadGcsText(bucket: string, objectName: string, maxBytes: number, _timeoutMs?: number): Promise<string | null> {

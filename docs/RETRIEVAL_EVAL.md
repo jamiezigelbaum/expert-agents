@@ -7,6 +7,13 @@ questions, and per-stage timing: what a baseline of the current pipeline and a
 comparison against another retrieval backend need. It is an explicit operator
 workflow: the deployed worker does not run evals automatically.
 
+The worker searches a page library but no longer answers questions (its Vertex
+answer path was removed on 2026-10-25), so the runner executes only a schema-2
+set in passages mode, through `domain_library` search. A schema-1 set, and
+answer or `both` mode, are refused; answers are evaluated through the agent.
+The schema-1 and answer-run sections below describe receipts written before
+then.
+
 Eval questions belong to the individual agent repository, for example
 `<agent-repo>/library/eval-questions.json`. They may contain private domain
 material. Eval-set files and generated receipts are runtime artifacts and must
@@ -128,24 +135,10 @@ As in schema 1, validation errors name schema paths without echoing values.
 
 ## Run the gate
 
-The worker must implement `GET /v1/health` and the `POST /v1/domain`
-`domain_ask` contract. The runner checks health before sending any questions,
-then evaluates questions in file order. All CLI paths are operator-chosen:
-
-```sh
-bun run retrieval:eval -- \
-  --worker https://worker.example.invalid \
-  --questions <agent-repo>/library/eval-questions.json \
-  --receipt <approved-artifact-path>/retrieval-eval.json
-```
-
-For an authenticated worker, inject its bearer token through
-`EXPERT_AGENTS_PARITY_CANDIDATE_TOKEN`. This reuses the candidate-runtime token
-slot because the parity battery and retrieval eval have the same trust class.
-Do not place a token in an argument, eval set, log, or receipt.
-
-For a schema-2 set, `--mode passages|answer|both` overrides the file's mode
-for one run, for example a fast passages-only baseline:
+The worker must implement `GET /v1/health` and `domain_library` over
+`POST /v1/domain`, and the domain must read a page library. The runner checks
+health and the domain's catalog before sending any questions, then searches
+each question in file order. All CLI paths are operator-chosen:
 
 ```sh
 bun run retrieval:eval -- \
@@ -155,12 +148,13 @@ bun run retrieval:eval -- \
   --mode passages
 ```
 
-Passages mode sends `domain_ask` with `output: "passages"`, which runs the
-full retrieval pipeline and skips answer synthesis. Answer mode sends the
-schema-1 request (no `output`). `both` sends the passages request and then
-the answer request for each question, in file order. Thresholds that need a
-mode an override did not run are listed in `verdict.skipped` instead of being
-evaluated. `--mode` is refused for a schema-1 set.
+For an authenticated worker, inject its bearer token through
+`EXPERT_AGENTS_PARITY_CANDIDATE_TOKEN`. Do not place a token in an argument,
+eval set, log, or receipt.
+
+`--mode passages` overrides a file whose mode is `answer` or `both`. Thresholds
+that need answer mode are listed in `verdict.skipped` instead of being
+evaluated.
 
 The command exits with code 0 only when all configured thresholds pass.
 A quality-threshold failure writes the receipt and exits 1. Health, input,
@@ -311,29 +305,6 @@ against the answer summary; `minPassageRecallAt` against
 `passage_recall_at.at_<k>`; `minAbstentionRate` against `abstention_rate`.
 Only configured thresholds appear in `verdict`; `verdict.passed` is their
 conjunction (true when none are configured).
-
-### Worker stage timings
-
-The domain-expert worker returns `timings` on every `domain_ask` response,
-both `domain_passages` and `domain_answer`, and logs one
-`domain_expert_ask_timings` JSON line per ask with the domain id, output,
-query, corpus and selected-context counts, and the timings (never the
-question). Values are wall-clock integer milliseconds:
-
-| Key | Measures |
-| --- | --- |
-| `setup_ms` | agent, preference profile, and corpus resolution |
-| `rewrite_ms` | multi-query reformulation; 0 when multi-query is off |
-| `retrieve_ms` | every corpus x query `retrieveContexts` call, run concurrently |
-| `rerank_ms` | cross-corpus ranking; 0 for one corpus |
-| `fuse_ms` | rank fusion, retrieval preferences, profile-corpus floor |
-| `complete_ms` | sentence completion and the disclosure bound |
-| `cite_ms` | citation source metadata resolution |
-| `synthesize_ms` | answer synthesis; present only on `domain_answer` |
-| `total_ms` | the whole ask, from request handling to response assembly |
-
-The eval keeps only timing keys that are lowercase identifiers with
-non-negative numeric values, so another backend can report its own stages.
 
 ## Receipt safety and custody
 

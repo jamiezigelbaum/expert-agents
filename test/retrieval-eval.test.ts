@@ -10,6 +10,8 @@ import {
   parseRetrievalEvalSet,
   retrievalEvalExitCode,
   runRetrievalEvalCli,
+  serializeRetrievalEvalReceipt,
+  writeRetrievalEvalReceipt,
   type RetrievalEvalFetch,
   type RetrievalEvalQuestionExecution,
   type RetrievalEvalSet,
@@ -83,7 +85,7 @@ describe('retrieval eval set validation', () => {
 });
 
 describe('retrieval eval execution and metrics', () => {
-  test('executes health first and sends domain_ask through injected fetch', async () => {
+  test('a schema-1 eval set checks health, then refuses: the worker no longer answers questions', async () => {
     const calls: Array<{ url: string; authorization: string | null; body?: unknown }> = [];
     const fetchImpl: RetrievalEvalFetch = async (url, init = {}) => {
       const headers = new Headers(init.headers);
@@ -92,33 +94,26 @@ describe('retrieval eval execution and metrics', () => {
         authorization: headers.get('Authorization'),
         ...(init.body ? { body: JSON.parse(String(init.body)) } : {}),
       });
-      return url.endsWith('/v1/health')
-        ? jsonResponse({ healthy: true })
-        : jsonResponse(domainAnswer());
+      return jsonResponse({ healthy: true });
     };
-    const clockValues = [100, 137];
 
-    const execution = await executeRetrievalEval(validEvalSet(), {
+    await expect(executeRetrievalEval(validEvalSet(), {
       worker: { baseUrl: 'https://worker.test/runtime/', token: 'synthetic-token' },
       fetchImpl,
-      nowMs: () => clockValues.shift()!,
-    });
-
-    // Health, the page-library probe (answered here with no catalog), then the question.
-    expect(calls).toHaveLength(3);
-    expect(calls[0]).toEqual({
+    })).rejects.toThrow('a schema-1 eval set scores worker answers, and the worker no longer answers questions');
+    expect(calls).toEqual([{
       url: 'https://worker.test/runtime/v1/health',
       authorization: 'Bearer synthetic-token',
-    });
-    expect(calls[1]!.body).toEqual({ tool: 'domain_library', params: { domain_id: 'neutral-history', action: 'catalog' } });
-    expect(calls[2]!.body).toEqual({
-      tool: 'domain_ask',
-      params: {
-        domain_id: 'neutral-history',
-        question: 'Which neutral source records the event?',
-      },
-    });
-    expect(execution.questions[0]!.result.latency_ms).toBe(37);
+    }]);
+  });
+
+  test('the CLI refuses a schema-1 eval set and writes no receipt', async () => {
+    const fixture = await createCliFixture();
+    await expect(runRetrievalEvalCli(cliArgs(fixture), {
+      fetchImpl: async () => jsonResponse({ healthy: true }),
+      env: {},
+    })).rejects.toThrow('Use a schema-2 eval set in passages mode');
+    await expect(readFile(fixture.receiptPath, 'utf8')).rejects.toThrow();
   });
 
   test('computes expected source hit and one-based first-hit rank from canonical object paths', () => {
@@ -225,39 +220,19 @@ describe('retrieval eval receipt and gate', () => {
     expect(receipt.worker).toBe('https://worker.test');
   });
 
-  test('maps passing and failing threshold verdicts to process exit behavior', async () => {
-    const passing = await createCliFixture();
-    const passingReceipt = await runRetrievalEvalCli(cliArgs(passing), {
-      fetchImpl: createEvalFetch(true),
-      env: {},
-      nowMs: clock([0, 10]),
-    });
-    expect(retrievalEvalExitCode(passingReceipt)).toBe(0);
-
-    const failing = await createCliFixture();
-    const failingReceipt = await runRetrievalEvalCli(cliArgs(failing), {
-      fetchImpl: createEvalFetch(false),
-      env: {},
-      nowMs: clock([0, 10]),
-    });
-    expect(retrievalEvalExitCode(failingReceipt)).toBe(1);
-    expect(await readFile(failing.receiptPath, 'utf8')).toContain('"passed": false');
+  test('maps passing and failing threshold verdicts to process exit behavior', () => {
+    expect(retrievalEvalExitCode(receiptFor(true))).toBe(0);
+    expect(retrievalEvalExitCode(receiptFor(false))).toBe(1);
+    expect(serializeRetrievalEvalReceipt(receiptFor(false))).toContain('"passed": false');
   });
 
   test('fails closed before writing when a bearer token reaches receipt fields', async () => {
     const fixture = await createCliFixture();
     const token = 'synthetic-secret-token';
-    const fetchImpl: RetrievalEvalFetch = async (url) => (
-      url.endsWith('/v1/health')
-        ? jsonResponse({ healthy: true })
-        : jsonResponse(domainAnswer({ status: token }))
-    );
+    const receipt = receiptFor(true, domainAnswer({ status: token }));
 
-    await expect(runRetrievalEvalCli(cliArgs(fixture), {
-      fetchImpl,
-      env: { EXPERT_AGENTS_PARITY_CANDIDATE_TOKEN: token },
-      nowMs: clock([0, 10]),
-    })).rejects.toThrow('Refusing to write retrieval eval receipt because it contains a bearer token.');
+    await expect(writeRetrievalEvalReceipt(fixture.receiptPath, receipt, [token]))
+      .rejects.toThrow('Refusing to write retrieval eval receipt because it contains a bearer token.');
     await expect(readFile(fixture.receiptPath, 'utf8')).rejects.toThrow();
   });
 
@@ -269,38 +244,23 @@ describe('retrieval eval receipt and gate', () => {
     const bearerToken = 'PRIVATE_BEARER_TOKEN_SENTINEL';
     const evalSet = validEvalSet();
     evalSet.questions[0]!.question = privateQuestion;
-    await writeFile(fixture.questionsPath, `${JSON.stringify(evalSet, null, 2)}\n`);
-    const fetchImpl: RetrievalEvalFetch = async (url) => {
-      if (url.endsWith('/v1/health')) return jsonResponse({ healthy: true });
-      return jsonResponse(domainAnswer({
-        answer: privateAnswer,
-        citations: [{
-          ...citation(
-            'neutral:1',
-            `gs://neutral/objects/sha256/aa/${'a'.repeat(64)}.txt`,
-          ),
-          source_display_name: privateDisplayName,
-        }],
-      }));
-    };
-    const dependencies = {
-      fetchImpl,
-      env: { EXPERT_AGENTS_PARITY_CANDIDATE_TOKEN: bearerToken },
-    };
+    const answer = domainAnswer({
+      answer: privateAnswer,
+      citations: [{
+        ...citation('neutral:1', `gs://neutral/objects/sha256/aa/${'a'.repeat(64)}.txt`),
+        source_display_name: privateDisplayName,
+      }],
+    });
+    const build = () => createRetrievalEvalReceipt(
+      { evalSet, bytes: new TextEncoder().encode(`${JSON.stringify(evalSet)}\n`) },
+      { questions: [{ question: evalSet.questions[0]!, result: { kind: 'response', latency_ms: 23, answer: answer as never } }] },
+      'https://worker.test/runtime',
+    );
 
-    const first = await runRetrievalEvalCli(cliArgs(fixture), {
-      ...dependencies,
-      nowMs: clock([100, 123]),
-    });
+    const first = build();
+    await writeRetrievalEvalReceipt(fixture.receiptPath, first, [bearerToken]);
+    await writeRetrievalEvalReceipt(fixture.secondReceiptPath, build(), [bearerToken]);
     const firstBytes = await readFile(fixture.receiptPath, 'utf8');
-    await runRetrievalEvalCli([
-      '--worker', 'https://worker.test/runtime',
-      '--questions', fixture.questionsPath,
-      '--receipt', fixture.secondReceiptPath,
-    ], {
-      ...dependencies,
-      nowMs: clock([100, 123]),
-    });
     const secondBytes = await readFile(fixture.secondReceiptPath, 'utf8');
 
     expect(secondBytes).toBe(firstBytes);
@@ -407,20 +367,19 @@ function cliArgs(fixture: CliFixture): string[] {
   ];
 }
 
-function createEvalFetch(hit: boolean): RetrievalEvalFetch {
-  return async (url) => {
-    if (url.endsWith('/v1/health')) return jsonResponse({ healthy: true });
-    return jsonResponse(domainAnswer({
-      citations: [citation(
-        'neutral:1',
-        hit
-          ? `gs://neutral/objects/sha256/aa/${'a'.repeat(64)}.txt`
-          : `gs://neutral/objects/sha256/cc/${'c'.repeat(64)}.txt`,
-      )],
-    }));
-  };
-}
-
-function clock(values: number[]): () => number {
-  return () => values.shift()!;
+function receiptFor(hit: boolean, override?: Record<string, unknown>) {
+  const evalSet = validEvalSet();
+  const answer = override ?? domainAnswer({
+    citations: [citation(
+      'neutral:1',
+      hit
+        ? `gs://neutral/objects/sha256/aa/${'a'.repeat(64)}.txt`
+        : `gs://neutral/objects/sha256/cc/${'c'.repeat(64)}.txt`,
+    )],
+  });
+  return createRetrievalEvalReceipt(
+    { evalSet, bytes: new TextEncoder().encode(`${JSON.stringify(evalSet)}\n`) },
+    { questions: [questionExecution(answer)] },
+    'https://worker.test/runtime',
+  );
 }

@@ -3,7 +3,7 @@
 //
 // A job takes originals the worker has already placed (a gs:// URI that
 // view_page can render from, plus a local copy to parse), or references it
-// fetches itself (a web page, a Notion page, a Drive file), and, per source:
+// fetches itself (a web page or a Notion page), and, per source:
 //   fetch    a reference only: the worker's materializer turns it into a local
 //            file with its provenance (URL, retrieval time, stable origin);
 //   parse    page units, local OCR (text layer, DeepSeek-OCR, vision lane),
@@ -40,14 +40,14 @@ export type IngestJobState = 'queued' | 'parsing' | 'indexing' | 'embedding' | '
 const TERMINAL: readonly IngestJobState[] = ['done', 'done_with_failures', 'failed'];
 
 /** A source the job fetches itself before parsing it. */
-export interface IngestSourceRef { type: 'url' | 'notion' | 'drive'; ref: string }
+export interface IngestSourceRef { type: 'url' | 'notion'; ref: string }
 
 /** A fetched reference: a local file to parse and where it came from. */
 export interface MaterializedSource {
   name: string;
   file: string;
   uri: string;
-  /** The stable identity of the source (`url:…`, `notion:…`, `drive:…`); re-ingesting it replaces its book. */
+  /** The stable identity of the source (`url:…`, `notion:…`); re-ingesting it replaces its book. */
   origin: string;
   sourceUrl?: string;
   retrievedAt?: string;

@@ -63,7 +63,6 @@ function worker(options: { writer?: PageIndexWriter; uploads?: string[]; downloa
   }) as typeof fetch;
   return createDomainExpertWorker({
     dataDir: join(dir, `data-${Math.random().toString(36).slice(2)}`),
-    gcpProject: 'neutral-project',
     roots: [{ rootId: 'expert_agents_workspace', path: workspace, maxWriteBytes: 20 * 1024 * 1024, allowOverwrite: false }],
     agentRouting: validateAgentRoutingConfig({ history: {
       library: { bucket: 'neutral-library', prefix: 'factory/history' },

@@ -1,6 +1,6 @@
 ---
 name: expert-annas-archive-acquisition
-version: 0.7.0
+version: 0.7.1
 description: Search for candidate books, download owner-named titles immediately, present candidates for selection questions, save approved files through the configured sink, and ingest them into the domain's page library.
 tools:
   - annas_archive_search
@@ -72,9 +72,6 @@ Re-ingesting the same original replaces its book; there is nothing to clean up
 by hand. Report a scale refusal with the measured page count (`scale.pages`)
 and do not substitute another copy without telling the owner.
 
-## Domains not yet on the page library
-
-A domain still served from a legacy corpus reports `rag_ingest` statuses such
-as `imported`, `import_failed`, `import_in_progress` or `blocked` instead of a
-queued page-library job. Report them verbatim: only `imported` means the book
-is in that library.
+A domain with no page library reports `rag_ingest` status `blocked` with
+`page_library_not_configured`: nothing was ingested and the download is kept.
+Report it verbatim.

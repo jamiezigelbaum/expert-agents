@@ -23,8 +23,8 @@ The deployment layout is:
 - Bun exactly `1.3.14`, installed at `/usr/local/bin/bun`. Confirm with
   `/usr/local/bin/bun --version`.
 - `summarize` (`npm i -g @steipete/summarize`) installed system-wide and on the
-  service account's `PATH`, plus the Node runtime it needs. `rag_corpus
-  web_import` uses it for YouTube transcript extraction and fails closed when
+  service account's `PATH`, plus the Node runtime it needs. `library_ingest`
+  uses it for YouTube transcript extraction and fails closed when
   that lane needs it but it is absent. Ordinary HTML pages are converted from
   the worker's already-fetched bytes in process; they do not require summarize. Point
   `EXPERT_AGENTS_DOMAIN_EXPERT_SUMMARIZE_BIN` at the binary if it is installed
@@ -120,10 +120,12 @@ external integrations the deployment uses.
 serving**. It is the domain-keyed routing manifest for the worker. Every expert
 reads a page library ([`page-library.md`](../docs/page-library.md)): an entry
 declares a `pageLibrary` (its `sourceId` in the library database, and a tree `root` only for one served from local disk)
-and the library bucket/prefix its originals live in. A legacy entry declares a
-target Vertex corpus instead, with optional scope-manifest path and retrieval
-overrides; those go when the Vertex machinery is removed. Registrations made
-through `domain_agent register` (the factory) are page-library entries.
+and the library bucket/prefix its originals live in; an entry without a
+`pageLibrary` is refused. The retired Vertex keys `targetCorpusDisplayName`,
+`servingCorpusDisplayNames`, `retrieval` and `ingestion` are still accepted and
+ignored, so an older routing file keeps loading; remove them at leisure.
+Registrations made through `domain_agent register` (the factory) are
+page-library entries.
 The value may be strict inline JSON or `@` followed by an absolute JSON-file
 path. If the `@` form is used, provision that file separately with
 `root:expert-agents 0640` access and do not place credentials in it. For
@@ -161,35 +163,16 @@ route that also names a `root` serves a tree from local disk instead; for
 those, `library_ingest` writes under `/var/lib/expert-agents/page-library`,
 which the unit opens for writing and the service account must own.
 
-The worker does not generate buckets, prefixes, or corpora for missing domain
+The worker does not generate buckets, prefixes, or libraries for missing domain
 entries. Offline status and dry-run planning remain available and report the
 domain as unconfigured; a cloud-touching request is refused with
-`agent_not_configured`. `EXPERT_AGENTS_GCP_PROJECT` is **REQUIRED for live
-deployments** and must name the project hosting the declared target corpora. A
+`agent_not_configured`. The worker needs a Google credential only when library
+originals live in Cloud Storage; with
+`EXPERT_AGENTS_DOMAIN_EXPERT_LIBRARY_OBJECTS_ROOT` set they live on local disk
+and no Google call is made. A
 configured `scopeManifestPath` is read only by `domain_agent status` and the
 read-only `domain_agent catalog` action for configured domains; it remains owned
 by the agent repository and is never copied or mutated by this deployment.
-
-Optional `retrieval.preferenceProfilePath` and `ingestion.importResultSink`
-settings are described in [retrieval preferences](../docs/retrieval-preferences.md).
-
-Optional `ingestion.explicitCorpusRequiredFor` lists acquisition operations
-(`annas_archive_import`, `web_import`) that must name `corpus_id`. Without it,
-an import defaults to the first configured corpus (the first
-`servingCorpusDisplayNames` entry, else `targetCorpusDisplayName`). A domain
-whose first corpus is private and whose public acquisitions belong on separate
-shelves sets it so those imports cannot land in the private corpus by default:
-
-```json
-"ingestion": { "explicitCorpusRequiredFor": ["annas_archive_import", "web_import"] }
-```
-
-A listed operation without `corpus_id` is refused with `corpus_id_required`
-before any fetch, download or staging, including in dry runs. An
-`annas_archive_import` without `ingest: true` chooses no corpus and is not
-affected. A named `corpus_id` is still checked against the domain's corpora.
-Provision profiles as private operator files with `root:expert-agents 0640`
-permissions and atomically replace them when reviewed file IDs change.
 
 `domain_agent status` separates inspection execution from the inspected service
 health. A completed read-only inspection returns `status: "completed"` even
@@ -201,7 +184,7 @@ workspace overwrite is disabled.
 
 ### Ingestion limits and PDF handling
 
-`rag_corpus web_import` accepts one fetched PDF up to exactly 100,000,000 bytes.
+`library_ingest` with `urls` accepts one fetched PDF up to exactly 100,000,000 bytes.
 It recognizes a PDF from its `%PDF-` header in the fetched bytes; URL suffixes,
 `Content-Type`, and `Content-Disposition` supply naming hints but cannot make
 HTML or another payload count as a PDF. This covers download services that
@@ -209,10 +192,7 @@ return a real PDF as `application/octet-stream` with a disposition filename.
 The guarded HTTPS fetch, public-address check, pinned destination addresses,
 redirect cap, timeout, and 100 MiB batch cap still apply.
 
-Text, HTML, Markdown, and the default parser path retain the 10 MB
-(10,000,000-byte) per-file processing and staging limit. `stage_import` applies
-the same 100,000,000-byte limit to `.pdf` files and reports both limits in its
-`file_policy`; skipped files identify `file_size_limit_exceeded`. The worker
+Text, HTML and Markdown keep a 10 MB (10,000,000-byte) per-file limit. The worker
 runs YouTube `summarize` extraction with a temporary private HOME and XDG
 cache/config/data tree
 under `EXPERT_AGENTS_DOMAIN_EXPERT_DATA_DIR`, then removes it after extraction.
@@ -226,248 +206,11 @@ directory, preventing `summarize` from discovering a caller-project `.env` and
 reloading provider keys that the environment filter removed. The existing
 credential environment filter remains in force.
 
-For a page-library domain, `annas_archive_import` with `ingest: true` stores
-the original in the domain's library and queues a `library_ingest` job (PDF,
-EPUB, Markdown or text; other formats are refused with
-`page_ingest_format_unsupported`). The rest of this section is the legacy
-Vertex path, pending its removal.
-
-For a legacy corpus domain, `annas_archive_import` with `ingest: true` uploads only what Vertex RAG can
-parse (PDF, text, Markdown, HTML). An EPUB is converted to Markdown in-process
-(no dependency) and uploaded as `book-imports/<domain>/<surname - main title
-(year)>.md` (first author's surname, title without subtitle or edition notes;
-a different file already at that name gets a `--<content hash>` suffix, never
-an overwrite); a DJVU is converted through `djvutxt` when
-`EXPERT_AGENTS_DOMAIN_EXPERT_ANNAS_DJVUTXT_BIN` (default `djvutxt`, from
-djvulibre) resolves on PATH; MOBI/AZW3 are refused with
-`unsupported_ingest_format` and the download stays on disk. While imports use
-the LLM parser a PDF holds at most
-`EXPERT_AGENTS_DOMAIN_EXPERT_ANNAS_PDF_SPLIT_PAGES` (default 200) pages per
-import ([measured limit](../docs/vertex-rag-limits.md)). A longer PDF is split
-with `qpdf` into `<name>--partNofM.pdf` parts that are imported one at a time
-and coverage-checked (ACTIVE ragFile; text layer read with `pdftotext`); the
-host needs `qpdf` and `pdftotext` (poppler-utils) on PATH, and without `qpdf`,
-or for a file `qpdf` cannot read, such a PDF is refused before upload with
-`pdf_exceeds_parser_page_limit`. A PDF whose pages nothing can count (no
-`qpdf`, or a file `qpdf` cannot read, and neither a page count both byte-scan
-signals report nor a single signal within the limit) is refused before upload
-with `pdf_page_count_unavailable` while
-imports use the LLM parser; under the default parser, which has no page limit,
-it is imported whole. Worker health reports `pdf_import` as
-`degraded` while either tool is missing.
-
-These worker routes take the same PDF pipeline: `annas_archive_import`;
-`rag_corpus import` of one GCS PDF object, which the worker reads to identify
-it and count its pages (the worker's service account needs
-`storage.objects.get` on it; an unreadable object answers 502
-`gcs_object_unreadable`, one over 100,000,000 bytes 413
-`file_size_limit_exceeded`; one that changes while it is read 409
-`gcs_object_changed`), with parts beside it as `<name>--partNofM.pdf`. Vertex
-reads the URI after the worker inspected it, so once the import settles the
-worker reads the object's generation again: if it changed, the record keeps the
-inspected sha256 but says `sha256_verified: false` with `source_check`, and the
-result reports `source_changed_during_import`. An import still running when
-the worker stops waiting is recorded the same way (`sha256_verified: false`,
-and `identity_verified: false` in the result), since Vertex may read the
-object after any check the worker could make, and so is one Vertex skipped as
-already in the corpus with no record of its bytes. An object a live source
-recorded as a different file (overwritten in place) is refused before import
-with 409 `gcs_object_replaced`, since Vertex would skip its URI and keep the old
-file: upload the new file under a new object name. A named `source_id` whose
-history records another file's sha256 is refused with
-`source_identity_conflict`, even after a re-add without a sha256. Identity is claimed only for
-bytes the registry proved: an object any of its source's records holds with
-`sha256_verified: false` (a hand split's parts, an object that changed during
-its import or whose import had not settled) is matched with `identity_verified: false` and cited with its
-`source_id` and `identity_verified: false`, its citation header ending
-`(source identity unverified)`;
-and `stage_import` and `web_import`, where a PDF already in the corpus, one to
-split or one refused leaves the batch. The plan's `pdf_routing` and the
-receipt's `pdf_sources` list each such PDF with its route (`present`, `split`,
-`refused`, or `duplicate` for a later file with the same bytes as an earlier
-one in the batch, reported `duplicate_in_batch` with `duplicate_of` and not
-imported; or `in_progress` when another operation on the same file still holds
-it past the response budget); `eligible_files` lists only what the batch stages, and a batch of
-refused PDFs answers `pdf_sources_refused`; one with any PDF still in progress
-(its split, or another operation holding the file) answers
-`pdf_sources_in_progress`. The 100 MiB batch cap counts only
-the files the batch stages; a routed PDF is bounded by the per-file limit alone
-(web_import's 100 MiB fetch budget still covers everything it fetches). Each staged file is
-addressed by its bytes, `staged/<domain>/<batch>/<first 32 hex of its
-sha256>/<file name>` (the receipt's `destination.object_naming`), and the batch
-imports exactly its own objects, named one by one, never a directory. An
-unchanged file keeps its URI, so a re-run of the batch is skipped by Vertex for
-it; a changed file gets a new URI and is imported; an object no run names any
-more is never imported again; and two runs of one `batch_id`, overlapping or
-not, cannot reach each other's objects. Nothing is deleted. A batch staged
-before this release, at `staged/<domain>/<batch>/<file name>`, imports each
-file once more under its new name on its first re-run. A changed file's
-previous version stays in the corpus as its own ragFile, the earlier version
-rather than a duplicate, and the batch's registry record names the new URI. A
-medium's transcript sits beside the medium, so a re-run keeps it instead of
-transcribing the same bytes again. The import goes in requests of at most 25
-URIs, files the LLM parser takes (PDFs) in requests of their own so other
-files never decide a PDF's parser. A request counts as imported only when
-every one of its files has an ACTIVE ragFile; otherwise it, and the batch, is
-`import_partial` (or `import_failed` when none is), the batch record giving
-each file's `state` and `status`, and a re-run imports only the files that are
-not in. The request size: `ImportRagFiles` documents no per-request maximum, so 25 is a cautious
-guess. Each request settles before the next is submitted (a corpus takes one
-import at a time), a busy corpus or quota refusal is waited out within the poll
-budget, and the requests share the Vertex RAG request pacing. From the first
-accepted request the batch record names every file with each request's
-operation (`rag_operation_names` once there are several), and the run ends
-with one terminal record; a receipt of several requests carries
-`submission_receipts`, `operations` and `import_outcome.requests`. A request
-still running when its budget ends stops the batch with the rest unsubmitted
-(`request_still_running`); re-running the batch finishes it, skipping what is
-already in. Parts go to `staged/<domain>/<batch>--parts/<first 32 hex of the
-PDF's sha256>/<name>--partNofM.pdf`, addressed by the PDF's bytes like a whole
-file so two PDFs of one name or two versions of one file never share a part
-name (parts recorded under the earlier `<batch>--parts/<name>--partNofM.pdf`
-names still resume from their recorded URIs), after the batch import, and a staged PDF that
-is the batch's only file is registered under the `source_id` the import names.
-A PDF imported by URI without `source_id` is registered under its sha256 as
-`<domain>-pdf-<sha prefix>` and answers within the response budget. A
-file is a PDF when its name ends in `.pdf` or, under any other name, when its
-first bytes carry the PDF header (`%PDF-1.x` or `%PDF-2.x` after nothing but
-whitespace, within the first 1024 bytes): a single GCS object is checked with a
-ranged read (an unreadable object answers 502 `gcs_object_unreadable`), a
-staged file from its first bytes when it is planned, before its extension or
-any size limit is judged, so one named `.bin` or with no extension is staged, and
-it takes the PDF limit (100,000,000 bytes) rather than the text one. A staged PDF so found that stays whole is staged
-under its name plus `.pdf`. Its record then says `content_type:
-application/pdf`, so it takes the LLM parser and its citations carry pages
-whatever its key. One operation at a time works on a file: every route that
-checks or imports a source (acquisition, `rag_corpus import`, staged routing
-and its deferred splits, `domain_source add` with a sha256) holds a lock on its
-sha256 from checking the holding until it has written the outcome or an
-in-progress record, and a split that outlives its request keeps the lock until
-its outcome is recorded. Another operation on the same file waits for it, then
-sees what it recorded; past the response budget it answers
-`import_in_progress` (`source_import_in_progress`, naming the holder and the
-source) instead. An import that names a `source_id` also locks that id, with
-all keys taken in one sorted order, so two imports naming one new source with
-different files cannot both claim it. A whole holding whose latest record is
-still `import_requested` (an import whose poll budget ran out) is checked
-against the recorded operations whose requests named it (the batch record
-lists each operation with its URIs as `rag_operations`; an object no submitted
-request named is imported normally): one still running answers
-`source_import_in_progress`, since a retry under another batch id stages
-another URI that Vertex would not skip; once they finished without the file in
-the corpus, the failure is recorded and the file is imported again; an
-operation that cannot be read answers `source_holding_unverified`. The lock lives in the worker process: running several worker
-processes against one registry would need a distributed lock. A `rag_corpus import` of a GCS directory
-(`gs://…/prefix/`) or a Drive file does not take the pipeline: it is imported as before, so a long PDF in it is not
-split. The library materializer imports each object whole and does not split:
-under the LLM parser its CLI counts each PDF's pages with `qpdf`, in a plan as
-in an execution, and rejects one over the limit (`pdf_exceeds_parser_page_limit`)
-or one it cannot count, including every PDF on a host without `qpdf`
-(`pdf_page_count_unavailable`), in the receipt's `rejectedImports`; import such
-a PDF through the worker instead. Registry rows written before this release
-name the split codes `annas_pdf_split_import_incomplete` and
-`annas_pdf_split_failed`; they are now `pdf_split_import_incomplete` and
-`pdf_split_failed`.
-
-Citations name the original source: a passage or citation from a registered
-object carries `source_id`, `source_part` for a split's part, and
-`original_pages` (`first_page`, `last_page`, `basis`). For a part the original
-pages are the part's first original page plus the chunk's page span within
-the part (`basis: chunk`), or the part's whole range when Vertex returns no
-span (`basis: part_range`); a whole PDF's span is already original. The
-passage header ends with the pages. An unregistered part claims no pages.
-
-Every source has one identity, the sha256 of the original file.
-Before anything is uploaded the worker looks it up in the domain's
-`references/source-registry.jsonl`: a source the registry records in the
-corpus, whole or as parts of any split, is reported present (when the ragFile
-listing fails, a part the registry already knows as imported stays imported),
-and nothing is uploaded or imported again, whatever the split size, parser or
-installed tools are now. A split records its progress in the registry after
-its uploads, at each part's submission and at each part's outcome; every part
-record carries the original sha256 and its page range in the original. A
-re-run, including one after a worker restart, imports only the parts not yet
-in the corpus, deleting a failed part's ERROR ragFile first so Vertex does not
-skip it. A holding made outside the worker (for example a book split by hand
-and imported straight into Vertex) is registered without importing anything:
-
-```json
-{"tool": "domain_source", "params": {"action": "add", "domain_id": "<domain>", "kind": "book",
-  "title": "<title>", "author": "<author>", "corpus_id": "<corpus>",
-  "sha256": "<sha256sum of the original file>",
-  "gcs_uris": ["gs://<bucket>/<dir>/<name>--part1of2.pdf", "gs://<bucket>/<dir>/<name>--part2of2.pdf"],
-  "dry_run": false}}
-```
-
-Each entry names an object, not a directory or bucket. The parts of a split are
-named `<name>--partNofM.pdf` for one M, N from 1 to M once each, and are ordered
-by N. The worker requires every object to have an ACTIVE ragFile matched by its
-exact source URI, counts each PDF's pages with `qpdf` to record each part's
-original page range, and writes one `imported` record
-(`acquisition: registered_holding`). A whole object must hash to the given
-sha256, but the worker did not import it and Vertex may hold an earlier
-version, and a split's parts cannot prove the sha256 at all, so every
-registered holding says `sha256_verified: false` and an import that matches it
-reports `identity_verified: false`. The same call again answers `already_registered`
-(with `identity_verified: false`) and writes nothing; a different holding for the same sha256, or the same one in
-another corpus, is refused with `source_identity_conflict`. A record written
-before sources carried a sha256 that holds the same objects is updated rather
-than duplicated. A book already imported whole before sources carried their
-sha256 is left whole, and a split recorded before parts carried page ranges
-gets its ranges back from the part names and the original's page count, so a
-re-run imports only the unfinished parts. Two imports of the same book at once
-are not locked against each other: Vertex skips the URI the other import holds
-and registry writes are serialized.
-
-Upgrading from a release with `EXPERT_AGENTS_DOMAIN_EXPERT_ANNAS_PDF_SPLIT_PAGES=0`:
-0 still disables splitting, and a PDF over 200 pages is then refused before
-upload; health reports `pdf_split_disabled`. After submission
-the worker polls the Vertex operation, starting at
-`EXPERT_AGENTS_DOMAIN_EXPERT_ANNAS_IMPORT_POLL_INTERVAL_MS` (default 5000) and
-growing ×1.5 per read up to 30 s while the import runs (each read counts
-against the 60/min VertexRagDataService regional quota), for up to `EXPERT_AGENTS_DOMAIN_EXPERT_ANNAS_IMPORT_POLL_TIMEOUT_MS` (default
-600000, shared with submission backoff) and reports `rag_ingest.status` as
-`imported`, `import_failed` (with Vertex's message), `import_empty` (finished
-with zero counts, the signature of an unparsed format), or `import_requested`
-only when the poll timed out (with `operation_name`). A busy corpus
-(`FAILED_PRECONDITION`, other operations running) or a 429 is retried with
-backoff inside that budget before reporting `blocked`.
-
-`rag_corpus` `stage_import`, `web_import`, `notion_import`, and `import` with
-`source_id` poll the same way, within the same interval and timeout, and
-write the outcome to the domain's `references/source-registry.jsonl`: an
-`import_requested` record with `rag_operation_name` when Vertex accepts the
-import, then `imported` (with `rag_file_name`, `gcs_uri`, `verification`),
-`import_failed` or `import_empty` (with `ingest_reason`) once it settles. The
-batch record and the source named by `source_id` are both updated; an unknown
-`source_id` is refused before anything is staged. The tool result keeps its
-submission `status` and adds `import_outcome` and `source_registry`.
-
-PDFs above 100,000,000 bytes are currently rejected. The accepted 1 GB original
-PDF target requires a durable background ingestion subsystem rather than a
-larger in-memory cap: stream the original into a content-addressed spool;
-checkpoint byte and hash progress for resume; split with a page-aware PDF tool
-into parts no larger than 100,000,000 bytes; record the original hash and exact
-original page range for every part; upload and submit parts independently; and
-persist per-part upload, Vertex operation, completion, and failure state in a
-queryable job receipt. The current synchronous `web_import` request and import
-submission receipt do not provide that spool, page-safe split, resume, or job
-status machinery, so this release does not claim 1 GB support.
-
-The 1 GB target is complete only when behavioral tests prove all of the
-following without paid or production calls:
-
-- a 1,000,000,000-byte original downloads with memory use bounded independently
-  of original size, and an interrupted download resumes from its verified
-  checkpoint;
-- every generated part is an independently valid PDF no larger than 100,000,000
-  bytes, and the part manifest covers every original page exactly once in order;
-- retrieval citations resolve each part back to the original source and original
-  page numbers;
-- a process restart preserves job progress, a failed part produces a visible
-  partial-failure state, and retry continues only unfinished or failed work; and
-- status reports downloaded, split, uploaded, submitted, completed, and failed
-  counts plus byte/page progress without exposing source bytes or credentials.
+`annas_archive_import` with `ingest: true` stores the original in the
+domain's library and queues a `library_ingest` job (PDF, EPUB, Markdown or
+text; other formats are refused with `page_ingest_format_unsupported`). A
+domain with no page library is refused with `page_library_not_configured`, and
+the download is kept on disk.
 
 After provisioning, verify metadata without reading the file contents:
 
@@ -489,15 +232,10 @@ must preserve task-scoped access and content-free receipts.
 
 | Caller identity | Environment field populated | Purpose |
 | --- | --- | --- |
-| `expert-agents.google.service-account-rag` | `EXPERT_AGENTS_DOMAIN_EXPERT_GOOGLE_SERVICE_ACCOUNT_JSON` | Google managed RAG, generation, transcription, and configured reranking |
+| `expert-agents.google.service-account-rag` | `EXPERT_AGENTS_DOMAIN_EXPERT_GOOGLE_SERVICE_ACCOUNT_JSON` | Library originals in Google Cloud Storage (optional) |
 | `expert-agents.notion.token` | `EXPERT_AGENTS_DOMAIN_EXPERT_NOTION_TOKEN` | Notion import |
 | `expert-agents.annas.api-key` | `EXPERT_AGENTS_DOMAIN_EXPERT_ANNAS_ARCHIVE_API_KEY` | Anna's Archive acquisition |
 | `expert-agents.worker.auth-token` | `EXPERT_AGENTS_DOMAIN_EXPERT_AUTH_TOKEN` | Worker HTTP bearer authentication |
-
-No Gemini API-key caller identity is proposed: the current
-`domainExpertGoogleConfigFromEnv` surface consumes no Gemini API-key environment
-variable. Generation and reranking therefore use the existing Google
-access-token or service-account credential paths rather than an invented field.
 
 ## Enable, start, and prove readiness
 
@@ -536,9 +274,7 @@ Both the boot-proof line and a successful `GET /v1/health` are required before
 the deployment is considered ready. With page-library domains, health must also
 report `page_library.status: "ready"`: every domain's catalog readable, its
 index reachable with no chunks pending embedding, the index writer configured,
-and both OCR lanes set. `page_library.issues` names anything missing. A
-deployment that still serves a legacy Vertex corpus must also report
-`configured.google: true` and `configuration_status.google: "ready"`.
+and both OCR lanes set. `page_library.issues` names anything missing.
 
 ## Stop or disable
 
@@ -612,8 +348,8 @@ Image facts a deployment may rely on:
   namespace the consumer joins (`--network=container:<worker>`). Do not bind
   it elsewhere for a consumer on the same box.
 - `EXPERT_AGENTS_DOMAIN_EXPERT_DATA_DIR` and `EXPERT_AGENTS_DATA_DIR` default to
-  `/var/lib/expert-agents/domain-expert`. Serving keeps only a corpus-mapping
-  cache and factory registrations there; it holds no customer data and no
+  `/var/lib/expert-agents/domain-expert`. Serving keeps only factory registrations
+  there; it holds no customer data and no
   durable state a deployment must back up. A tmpfs owned by `10001:10001`
   (mode `0700`) is sufficient for a serving-only deployment.
 - `HEALTHCHECK` runs `deploy/docker/healthcheck.js` inside the container with
@@ -622,28 +358,14 @@ Image facts a deployment may rely on:
 - On Google Compute Engine, set
   `EXPERT_AGENTS_DOMAIN_EXPERT_GOOGLE_METADATA_TOKEN=1` and provision no key:
   the worker takes access tokens from the instance metadata server (the VM's
-  attached service account). `EXPERT_AGENTS_GCP_PROJECT` names the project
-  that hosts the corpora, which may be a different project from the one
-  running the VM; that identity then needs retrieval-only access there.
-  Citation titles need one read beyond retrieval: the worker resolves each
-  canonical library object's title and creator from
-  `gs://<bucket>/<prefix>/manifest/master.json`, so grant the identity
-  `storage.objects.get` on that one object (a bucket-level
-  `roles/storage.objectViewer` binding with an IAM condition on
-  `resource.name` equal to
-  `projects/_/buckets/<bucket>/objects/<prefix>/manifest/master.json`).
-  Without it answers still serve, but passages carry the content-hash display
-  name instead of a title and `citation_diagnostics` says the manifest could
-  not be read.
-  `EXPERT_AGENTS_DOMAIN_EXPERT_RAG_LOCATION` names the corpus location when it
-  is not the default `us-central1`.
-- `summarize` is not installed: `rag_corpus web_import` fails closed with
+  attached service account). That identity needs read access to the shared
+  library's originals for `view_page`.
+- `summarize` is not installed: a YouTube `library_ingest` fails closed with
   `summarize_not_installed` in this image. Serving does not need it.
 
 `deploy/docker/domain-expert.container.env.example` is the environment shape
-for a public expert deployment: one domain routed to the shared corpus,
-`retrieval.multiQuery` and `retrieval.reranker` on, and
-`disclosure.excludedSources` empty so the whole corpus is served unless named
+for a public expert deployment: one domain routed to its page library, and
+`disclosure.excludedSources` empty so the whole library is served unless named
 works are withheld. Every field in it is documented in
 `deploy/systemd/domain-expert.env.example`; render the real values with the
 credential broker and pass the file with `docker run --env-file`.
