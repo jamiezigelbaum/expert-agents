@@ -61,6 +61,8 @@ describe('scoped worker client tokens', () => {
       .toThrow(/tokenSha256/);
     expect(() => workerClientGrantsFromEnv({ [CLIENT_TOKENS_ENV]: `{"x":{"tokenSha256":"${sha('t')}","domains":[],"tools":["t"]}}` }))
       .toThrow(/domains/);
+    expect(() => workerClientGrantsFromEnv({ [CLIENT_TOKENS_ENV]: '{}' })).toThrow(/names no clients/);
+    expect(() => warnIfWorkerAuthDisabled('test worker', undefined, '100.64.0.1', { [CLIENT_TOKENS_ENV]: '{}' })).toThrow();
     expect(() => workerClientGrantsFromEnv({ [CLIENT_TOKENS_ENV]: '@/nonexistent' }, () => { throw new Error('no'); }))
       .toThrow(/could not be read/);
   });
