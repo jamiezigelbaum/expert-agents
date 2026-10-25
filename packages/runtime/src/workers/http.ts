@@ -72,6 +72,8 @@ export function workerClientGrantsFromEnv(
       ...(actions ? { actions } : {}),
     };
   });
+  // Set but empty would leave no credential at all, and an unauthenticated worker serves every tool.
+  if (grants.length === 0) fail('it names no clients');
   if (new Set(grants.map((g) => g.tokenSha256.toString('hex'))).size !== grants.length) fail('two clients share a token');
   return grants;
 }
@@ -87,7 +89,8 @@ export function warnIfWorkerAuthDisabled(
   hostname: string,
   env: Record<string, string | undefined> = process.env,
 ): void {
-  if (token || env[CLIENT_TOKENS_ENV]?.trim()) return;
+  // Only validated grants count as authentication: the parser refuses an empty or malformed document.
+  if (token || workerClientGrantsFromEnv(env).length > 0) return;
   if (!['127.0.0.1', '::1', 'localhost'].includes(hostname)) {
     throw new Error(`${label} cannot bind to a non-loopback host without EXPERT_AGENTS_DOMAIN_EXPERT_AUTH_TOKEN.`);
   }
