@@ -11,6 +11,7 @@ import {
   warnIfWorkerAuthDisabled,
   withWorkerBearerAuth,
   workerAuthTokenFromEnv,
+  workerClientGrantsFromEnv,
 } from '../http.ts';
 
 export function resolveDomainExpertBindHostFromEnv(env: Record<string, string | undefined> = process.env): string {
@@ -21,6 +22,7 @@ function main(): void {
   const port = parsePort(process.env.EXPERT_AGENTS_DOMAIN_EXPERT_PORT ?? '8040');
   const hostname = resolveDomainExpertBindHostFromEnv(process.env);
   const authToken = workerAuthTokenFromEnv(process.env);
+  const clients = workerClientGrantsFromEnv(process.env);
   const roots = domainExpertRootsFromEnv(process.env);
   const agentRouting = agentRoutingConfigFromEnv(process.env);
   const worker = createDomainExpertWorker({
@@ -39,7 +41,7 @@ function main(): void {
   Bun.serve({
     hostname,
     port,
-    fetch: withWorkerBearerAuth(worker.fetch, { authToken }),
+    fetch: withWorkerBearerAuth(worker.fetch, { authToken, clients }),
   });
 
   console.log(`Expert Agents domain expert worker listening on http://${hostname}:${port}/v1`);
