@@ -466,13 +466,15 @@ export class PageIndex {
     for (const h of [...keyword].reverse()) bestChunk.set(h.slug, h.chunk);
     for (const h of vector) bestChunk.set(h.slug, h.chunk);
     const slugs = fused.map((f) => f.slug);
+    // Only each unit's best chunk, so a unit's body comes back once. Joining every chunk repeated
+    // the body per chunk: one 2.6M-character section of 1,342 chunks made a search hold ~7 GB.
     const rows = await this.sql`
-      SELECT u.slug, u.title, u.body, c.chunk, c.text FROM page_units u JOIN page_chunks c ON c.source = u.source AND c.slug = u.slug
-      WHERE u.source = ${source} AND u.slug = ANY(string_to_array(${csv(slugs)}, ','))` as Array<{ slug: string; title: string; body: string; chunk: number; text: string }>;
+      WITH p AS (SELECT * FROM unnest(string_to_array(${csv(slugs)}, ','), string_to_array(${slugs.map((s) => String(bestChunk.get(s) ?? 0)).join(',')}, ',')::int[]) AS p(slug, chunk))
+      SELECT u.slug, u.title, u.body, c.text FROM p
+      JOIN page_units u ON u.source = ${source} AND u.slug = p.slug
+      JOIN page_chunks c ON c.source = u.source AND c.slug = p.slug AND c.chunk = p.chunk` as Array<{ slug: string; title: string; body: string; text: string }>;
     const bySlug = new Map<string, { slug: string; title: string; body: string; passage: string }>();
-    for (const r of rows) {
-      if (r.chunk === bestChunk.get(r.slug)) bySlug.set(r.slug, { slug: r.slug, title: r.title, body: r.body, passage: r.text });
-    }
+    for (const r of rows) bySlug.set(r.slug, { slug: r.slug, title: r.title, body: r.body, passage: r.text });
     const pool = slugs.map((s) => bySlug.get(s)).filter((r): r is { slug: string; title: string; body: string; passage: string } => Boolean(r));
     const ranked = await this.voyage.rerank(q, pool.map((r) => unitDocument({ title: r.title, body: r.passage }, RERANK_DOC_CHARS)), Math.min(k, pool.length));
     this.tokens.rerank += ranked.tokens;
