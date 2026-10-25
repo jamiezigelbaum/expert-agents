@@ -94,7 +94,7 @@ export class LocalLibraryObjects implements LibraryObjectStore {
     return this.read(bucket, objectName, Number.MAX_SAFE_INTEGER, () => new Error('unreachable'));
   }
 
-  async listLibraryObjectNames(bucket: string, prefix: string): Promise<string[]> {
+  async listLibraryObjectNames(bucket: string, prefix: string, _timeoutMs?: number): Promise<string[]> {
     const bucketRoot = this.bucketRoot(bucket);
     // Like a GCS prefix, the last segment may end mid-name: walk its directory.
     const start = prefix.includes('/') ? prefix.slice(0, prefix.lastIndexOf('/')) : '';
@@ -115,12 +115,12 @@ export class LocalLibraryObjects implements LibraryObjectStore {
     return names;
   }
 
-  async downloadLibraryObject(bucket: string, objectName: string, maxBytes: number): Promise<Uint8Array | null> {
+  async downloadLibraryObject(bucket: string, objectName: string, maxBytes: number, _timeoutMs?: number): Promise<Uint8Array | null> {
     return this.read(bucket, objectName, maxBytes,
       () => new LibraryReadError('library_source_too_large', 'The source exceeds the direct-reading size limit.', 413));
   }
 
-  async downloadGcsText(bucket: string, objectName: string, maxBytes: number): Promise<string | null> {
+  async downloadGcsText(bucket: string, objectName: string, maxBytes: number, _timeoutMs?: number): Promise<string | null> {
     const bytes = await this.read(bucket, objectName, maxBytes, () => new Error('source text exceeds the completion read limit'));
     return bytes ? new TextDecoder('utf-8', { fatal: true }).decode(bytes) : null;
   }
