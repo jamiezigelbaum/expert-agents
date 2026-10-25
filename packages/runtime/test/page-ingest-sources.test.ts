@@ -73,21 +73,6 @@ function worker(fx: Fixture, options: { tree?: string; writer?: PageIndexWriter;
       fx.uploads.push(decodeURIComponent(/[?&]name=([^&]+)/.exec(url)![1]!));
       return Response.json({ name: 'ok', generation: '1' });
     }
-    if (url.startsWith('https://www.googleapis.com/drive/v3/files/doc-0123456789?fields=')) {
-      return Response.json({ id: 'doc-0123456789', name: 'Charter Draft', mimeType: 'application/vnd.google-apps.document', webViewLink: 'https://docs.google.com/document/d/doc-0123456789/edit' });
-    }
-    if (url.startsWith('https://www.googleapis.com/drive/v3/files/doc-0123456789/export?mimeType=application%2Fpdf')) {
-      return new Response(new Blob([pdf.slice().buffer as ArrayBuffer]));
-    }
-    if (url.startsWith('https://www.googleapis.com/drive/v3/files/txt-0123456789?fields=')) {
-      return Response.json({ id: 'txt-0123456789', name: 'minutes.txt', mimeType: 'text/plain' });
-    }
-    if (url.startsWith('https://www.googleapis.com/drive/v3/files/txt-0123456789?alt=media')) {
-      return new Response(`# Minutes\n\nThe council adopted the quorum rule.\n\n${words(150, 'minute')}`);
-    }
-    if (url.startsWith('https://www.googleapis.com/drive/v3/files/dir-0123456789?fields=')) {
-      return Response.json({ id: 'dir-0123456789', name: 'Folder', mimeType: 'application/vnd.google-apps.folder' });
-    }
     throw new Error(`unexpected request ${url}`);
   }) as typeof fetch;
   const router = (async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -128,7 +113,6 @@ function worker(fx: Fixture, options: { tree?: string; writer?: PageIndexWriter;
   } };
   const opts: DomainExpertWorkerOptions = {
     dataDir: join(dir, `data-${Math.random().toString(36).slice(2)}`),
-    gcpProject: 'neutral-project',
     roots: [{ rootId: 'expert_agents_workspace', path: workspace, maxWriteBytes: 20 * 1024 * 1024, allowOverwrite: false }],
     agentRouting: validateAgentRoutingConfig(routes),
     annas: { importGcsPrefix: 'gs://neutral-acquisitions/imports/' },
@@ -289,23 +273,6 @@ describe('library_ingest Notion', () => {
   });
 });
 
-describe('library_ingest Drive', () => {
-  test('a Google Doc is exported as PDF pages; a text file is read as sections; a folder is refused', async () => {
-    const fx = fixture();
-    const w = worker(fx, { tree: join(dir, 'tree-drive'), writer: recordingWriter().writer });
-    const job = await ingest(w, { drive_file_ids: ['https://docs.google.com/document/d/doc-0123456789/edit', 'txt-0123456789', 'dir-0123456789'] });
-    expect(job.state).toBe('done_with_failures');
-    const [doc, txt, folder] = job.sources;
-    expect(doc).toMatchObject({ state: 'parsed', kind: 'pages', title: 'Charter Draft', origin: 'drive:doc-0123456789', source_url: 'https://docs.google.com/document/d/doc-0123456789/edit' });
-    expect(fx.uploads).toEqual([expect.stringMatching(/^imports\/history\/originals\/[0-9a-f]{64}\.pdf$/)]);
-    expect(txt).toMatchObject({ state: 'parsed', kind: 'sections', title: 'minutes' });
-    expect(folder.state).toBe('failed');
-    expect(folder.error).toContain('folder');
-    const read = await call(w, 'domain_library', { action: 'read', slug: `books/${txt.book}/s0001` });
-    expect(read.body.text).toContain('quorum rule');
-  });
-});
-
 describe('library_ingest audio and video', () => {
   test('a recording is transcribed locally into time-ranged sections cited by timestamp', async () => {
     const fx = fixture();
@@ -342,7 +309,7 @@ describe('library_ingest audio and video', () => {
   test('without the router, a recording fails with the reason instead of being skipped', async () => {
     const fx = fixture();
     const w = createDomainExpertWorker({
-      dataDir: join(dir, 'data-no-router'), gcpProject: 'neutral-project',
+      dataDir: join(dir, 'data-no-router'),
       roots: [{ rootId: 'expert_agents_workspace', path: workspace, maxWriteBytes: 20 * 1024 * 1024, allowOverwrite: false }],
       agentRouting: validateAgentRoutingConfig({ history: { library: { bucket: 'neutral-library', prefix: 'factory/history' }, pageLibrary: { root: join(dir, 'tree-media-off'), sourceId: 'history' } } }),
       annas: { importGcsPrefix: 'gs://neutral-acquisitions/imports/' },

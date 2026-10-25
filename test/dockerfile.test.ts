@@ -70,7 +70,7 @@ describe('domain expert container image', () => {
     const routing = validateAgentRoutingConfig(JSON.parse(assignments.get('EXPERT_AGENTS_DOMAIN_EXPERT_AGENTS_JSON')!));
     const entries = Object.values(routing);
     expect(entries).toHaveLength(1);
-    expect(entries[0]!.retrieval).toEqual({ multiQuery: true, reranker: 'rank-service' });
+    expect(entries[0]!.pageLibrary.sourceId).toBeString();
     expect(entries[0]!.disclosure).toEqual({ excludedSources: [] });
   });
 

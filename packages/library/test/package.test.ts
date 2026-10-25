@@ -10,15 +10,15 @@ describe("@expert-agents/library package", () => {
       "canonicalJson", "canonicalObjectRelativePath", "computeMasterManifestHash",
       "contentIdFromBytes", "extensionForMediaType", "extractorEnvironment",
       "finalizeMasterManifest", "firstDiagnosticLine", "isolatedExtractorEnvironment", "libraryObjectUri",
-      "llmParserEligibleUris", "normalizeExtractedText", "parseLibraryObject",
+      "normalizeExtractedText", "parseLibraryObject",
       "parseMasterManifest", "parseScopeManifest", "planReconciliation",
-      "ragIngestionConfig", "readCorpusMappingLedger", "readSourceRegistryCandidates",
-      "resolveRagParserModel", "serializeLibraryObject", "serializeMasterManifest",
+      
+      "serializeLibraryObject", "serializeMasterManifest",
       "serializeReconciliationPlan", "serializeScopeManifest", "sha256",
-      "sourceLocatorCredential", "supportsLlmParser", "validateLibraryLocationConfig",
+      "sourceLocatorCredential", "validateLibraryLocationConfig",
       "validateLibraryObject", "validateMasterManifest", "validateMaterializationLedger",
-      "validateScopeManifest", "applyRetrievalPreferences", "parseRetrievalPreferenceProfile",
-      "validatedVertexOperationName",
+      "validateScopeManifest", 
+      
       "EbookConversionError", "convertEpubToMarkdown", "decodeXmlEntities", "plainTextToMarkdown",
       "resolveArchivePath", "xhtmlToMarkdown",
       "PdfSplitError", "pdfPageLimitSetting", "pdfPartStem", "pdfTextLayer", "planPdfParts", "qpdfPageCount", "splitPdf", "stripPdfPartSuffix",
@@ -31,13 +31,13 @@ describe("@expert-agents/library package", () => {
     ] as const;
     const numbers = [
       "EXTRACTION_MAX_OUTPUT_BYTES", "EXTRACTION_TIMEOUT_MS", "LIBRARY_SCHEMA_VERSION",
-      "MATERIALIZATION_LEDGER_SCHEMA_VERSION", "RAG_CHUNK_OVERLAP", "RAG_CHUNK_TOKENS",
+      "MATERIALIZATION_LEDGER_SCHEMA_VERSION", 
       "RECONCILIATION_PLAN_SCHEMA_VERSION", "SCOPE_SCHEMA_VERSION", "LLM_PARSER_MAX_PDF_PAGES",
       "OCR_MIN_CHARS", "PAGE_UNITS_SCHEMA_VERSION", "SECTION_TARGET_WORDS", "DENSE_PAGE_JPEG_BYTES", "MEDIA_SECTION_TARGET_WORDS",
     ] as const;
     const strings = [
-      "AGENT_REPO_GITIGNORE", "DEFAULT_RAG_PARSER_MODEL", "EXTRACTION_METHOD",
-      "RAG_PARSER_DEFAULT_VALUE", "SUMMARIZE_BINARY", "SUMMARIZE_INSTALL_COMMAND", "PDF_SPLIT_PAGES_ENV", "DEFAULT_QPDF_BIN",
+      "AGENT_REPO_GITIGNORE", "EXTRACTION_METHOD",
+      "SUMMARIZE_BINARY", "SUMMARIZE_INSTALL_COMMAND", "PDF_SPLIT_PAGES_ENV", "DEFAULT_QPDF_BIN",
       "OCR_PROFILE", "DEEP_PROFILE", "DEEPSEEK_OCR_PROMPT", "LANE_CACHE", "TRANSCRIPTION_PROFILE",
     ] as const;
 

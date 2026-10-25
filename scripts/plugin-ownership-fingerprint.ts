@@ -7,13 +7,8 @@ import type { DomainExpertTool } from '../packages/runtime/src/core/domain-exper
 // until the fingerprint covers it too.
 const GATEWAY_TOOLS = {
   domain_agent: true,
-  domain_ask: true,
-  domain_read: true,
   domain_library: true,
   library_ingest: true,
-  domain_source: true,
-  rag_corpus: true,
-  domain_doc: true,
   annas_archive_search: true,
   annas_archive_import: true,
 } as const satisfies Record<DomainExpertTool, true>;

@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { researchToolSchemas } from '../src/tool-schemas.ts';
@@ -11,18 +11,14 @@ import { validateAgentRoutingConfig } from '../packages/runtime/src/core/agent-r
 // default-domain compatibility. Checking only whether a schema exists would
 // let the previous empty object schema pass without teaching a model anything.
 const examples: Array<{ tool: DomainExpertTool; params: Record<string, unknown> }> = [
-  { tool: 'domain_read', params: { action: 'read', object_id: `sha256:${'a'.repeat(64)}`, text_revision: 'b'.repeat(64), section: 2, offset: 15000, limit: 12000 } },
   { tool: 'domain_library', params: { action: 'search', query: 'fixture topic', k: 10, book: 'fixture-book-abc123' } },
   { tool: 'domain_library', params: { action: 'grep', pattern: 'exact phrase', max_hits: 20 } },
   { tool: 'domain_library', params: { action: 'read_range', book: 'fixture-book-abc123', from_unit: 'p0012', to_unit: 'p0020' } },
   { tool: 'domain_library', params: { action: 'view_page', slug: 'books/fixture-book-abc123/p0012' } },
-  { tool: 'domain_agent', params: { action: 'register', domain_id: 'new-expert', display_name: 'New Expert', library: { bucket: 'fixture-library', prefix: 'shared/new-expert' }, target_corpus_display_name: 'new-expert-library', dry_run: true } },
-  { tool: 'domain_ask', params: { question: 'What evidence supports this claim?', corpora: ['research-library'], max_results: 12, retrieval_mode: 'history', output: 'passages', session_id: 'fixture-session' } },
-  { tool: 'domain_source', params: { action: 'add', domain_id: 'research', kind: 'pdf', title: 'Fixture Paper', relative_path: 'inbox/paper.pdf', copyright_posture: 'owner-provided', dry_run: true } },
-  { tool: 'rag_corpus', params: { action: 'ensure', domain_id: 'research', corpus_id: 'research-library', dry_run: true } },
-  { tool: 'rag_corpus', params: { action: 'stage_import', domain_id: 'research', workspace_relative_path: 'inbox/paper.pdf', batch_id: 'fixture-batch', approval_id: 'fixture-approval', dry_run: false } },
-  { tool: 'rag_corpus', params: { action: 'notion_import', domain_id: 'research', page_ids: ['fixture-page'], database_ids: ['fixture-database'], include_media: true, dry_run: true } },
-  { tool: 'domain_doc', params: { action: 'visual_replace', document_id: 'fixture-document', text: 'Replacement text', range_start: 1, range_end: 5, comment: 'Explanation', dry_run: true } },
+  { tool: 'domain_agent', params: { action: 'register', domain_id: 'new-expert', display_name: 'New Expert', library: { bucket: 'fixture-library', prefix: 'shared/new-expert' }, page_library: {}, dry_run: true } },
+  { tool: 'library_ingest', params: { action: 'start', domain_id: 'research', source_id: 'research', workspace_relative_path: 'inbox/paper.pdf', title: 'Fixture Paper', creator: 'Fixture Author', dry_run: true } },
+  { tool: 'library_ingest', params: { action: 'start', domain_id: 'research', source_id: 'research', urls: ['https://example.invalid/paper'], dry_run: true } },
+  { tool: 'library_ingest', params: { action: 'start', domain_id: 'research', source_id: 'research', notion: ['fixture-page'] } },
   { tool: 'annas_archive_search', params: { query: 'fixture research', top_n: 3, max_results: 10, format_preference: 'text_rag' } },
   { tool: 'annas_archive_import', params: { annas_archive_id: 'fixture-item', format: 'pdf', copyright_posture: 'public-domain', file_size_bytes: 2000, allow_short_artifact: true, ingest: false, dry_run: true } },
 ];
@@ -47,33 +43,41 @@ describe('research tool schema guidance', () => {
   });
 
   test('describes important conditional and runtime-only constraints', () => {
-    expect(researchToolSchemas.domain_source.description).toContain('does not ingest');
-    expect(researchToolSchemas.rag_corpus.description).toContain('stage_import needs workspace_relative_path');
-    expect(researchToolSchemas.rag_corpus.properties.transcript_mode!.description).toContain('does not change');
-    expect(researchToolSchemas.domain_doc.description).toContain('range_start and range_end');
-    expect(researchToolSchemas.domain_ask.properties.domain_id!.description).toContain('provides a default');
+    expect(researchToolSchemas.library_ingest.description).toContain('a live start needs approval_id');
+    expect(researchToolSchemas.library_ingest.properties.source_id!.description).toContain('there is no default');
+    expect(researchToolSchemas.domain_library.description).toContain('Refused for a domain without a page library');
     expect(researchToolSchemas.annas_archive_import.required).toContain('copyright_posture');
-    expect(researchToolSchemas.annas_archive_import.properties.corpus_id!.description).toContain('corpus_id_required');
-    expect(researchToolSchemas.rag_corpus.properties.corpus_id!.description).toContain('requires an explicit corpus');
+    expect(researchToolSchemas.annas_archive_import.properties.source_id!.description).toContain('more than one library');
   });
 
-  test('advertised registration, corpus, registry, document, and acquisition plans reach the worker', async () => {
+  test('no removed Vertex-era tool or parameter is advertised', () => {
+    expect(Object.keys(researchToolSchemas).sort()).toEqual([
+      'annas_archive_import', 'annas_archive_search', 'domain_agent', 'domain_library', 'library_ingest',
+    ]);
+    const advertised = JSON.stringify(researchToolSchemas);
+    for (const removed of ['corpus_id', 'target_corpus_display_name', 'domain_ask', 'domain_read', 'domain_source', 'rag_corpus']) {
+      expect(advertised, removed).not.toContain(removed);
+    }
+  });
+
+  test('advertised registration, ingest, and acquisition plans reach the worker', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'expert-tool-schemas-'));
     try {
+      await mkdir(join(directory, 'inbox'));
+      await writeFile(join(directory, 'inbox', 'paper.pdf'), '%PDF-1.4 fixture');
       const worker = createDomainExpertWorker({
         dataDir: directory,
-        gcpProject: 'fixture-project',
         agentRouting: validateAgentRoutingConfig({ research: {
           library: { bucket: 'fixture-library', prefix: 'shared' },
-          targetCorpusDisplayName: 'research-library',
+          pageLibrary: { sourceId: 'research' },
         } }),
         registrationLibrary: { bucket: 'fixture-library', prefix: 'shared' },
         roots: [{ rootId: 'expert_agents_workspace', path: directory, maxWriteBytes: 100_000, allowOverwrite: false }],
         fetchImpl: (async () => { throw new Error('Schema dry-run fixtures must never contact an upstream'); }) as unknown as typeof fetch,
       });
-      const plans = examples.filter(({ tool, params }) => params.dry_run === true &&
-        (tool !== 'rag_corpus' || params.action === 'ensure'));
-      expect(plans).toHaveLength(5);
+      // The Notion example is schema-only: its plan needs deployment credentials.
+      const plans = examples.filter(({ params }) => params.dry_run === true);
+      expect(plans).toHaveLength(4);
       for (const { tool, params } of plans) {
         const response = await worker.fetch(new Request('http://fixture.invalid/v1/domain', {
           method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ tool, params }),

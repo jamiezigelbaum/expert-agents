@@ -19,16 +19,11 @@ const USAGE = "Usage: bun run expert:release -- --dir <agent-repository> --tag <
  * corpus of the owner's own private holdings would ship unmarked. This summary
  * is the mitigation — visibility, never a gate. The release proceeds either
  * way; it just cannot happen silently.
- *
- * Where it cannot be precise it says so. Declared entries are keyed by corpus
- * id while the manifest's target corpus is a display name, so the two are not
- * reliably comparable; the summary states the target and lets the reader
- * judge rather than inventing a match.
  */
 export function formatDisclosureSummary(manifest: ServingManifest): string[] {
-  if (!manifest.targetCorpusDisplayName && manifest.corpora.length === 0) {
-    // A page-library agent has no corpus: what it may disclose is set by the
-    // disclosure policy on each deployment's worker route, not by this artifact.
+  if (manifest.corpora.length === 0) {
+    // What a page-library agent may disclose is set by the disclosure policy
+    // on each deployment's worker route, not by this artifact.
     return [
       "This agent reads a page library and declares no corpus.",
       "Each deployment's worker route sets its disclosure: a route without a",
@@ -37,20 +32,11 @@ export function formatDisclosureSummary(manifest: ServingManifest): string[] {
     ];
   }
   const lines = ["Corpora this artifact exposes:"];
-  if (manifest.corpora.length === 0) {
-    lines.push("  (none declared)");
-    lines.push(
-      "  WARNING: no corpus disclosure is declared, so every corpus this agent",
-      "  retrieves is exposed at the permissive default posture (full).",
-    );
-  } else {
-    for (const corpus of manifest.corpora) {
-      lines.push(`  ${corpus.disclosure.padEnd(8)} ${corpus.corpusId}`);
-    }
+  for (const corpus of manifest.corpora) {
+    lines.push(`  ${corpus.disclosure.padEnd(8)} ${corpus.corpusId}`);
   }
   lines.push(
     "",
-    `This agent's target corpus is ${manifest.targetCorpusDisplayName}.`,
     "Any corpus not named above is exposed at the permissive default (full).",
     "Confirm none of them holds private material before releasing.",
   );

@@ -249,23 +249,11 @@ export async function executeRetrievalEval(
 ): Promise<RetrievalEvalExecution> {
   const worker = normalizeWorkerTarget(options.worker);
   const fetchImpl = options.fetchImpl ?? fetch;
-  const nowMs = options.nowMs ?? Date.now;
   await assertWorkerHealthy(worker, fetchImpl);
-  if (await readsPageLibrary(evalSet.domainId, worker, fetchImpl)) {
-    throw new Error(
-      `Retrieval eval: ${evalSet.domainId} reads a page library, which the worker does not answer from. `
-      + 'Use a schema-2 eval set in passages mode; answers are evaluated through the agent.',
-    );
-  }
-
-  const questions: RetrievalEvalQuestionExecution[] = [];
-  for (const question of evalSet.questions) {
-    questions.push({
-      question,
-      result: await askRetrievalEvalQuestion(evalSet.domainId, question, worker, fetchImpl, nowMs),
-    });
-  }
-  return { questions };
+  throw new Error(
+    `Retrieval eval: a schema-1 eval set scores worker answers, and the worker no longer answers questions (${evalSet.domainId}). `
+    + 'Use a schema-2 eval set in passages mode; answers are evaluated through the agent.',
+  );
 }
 
 export function computeRetrievalEvalQuestionMetrics(
@@ -532,40 +520,9 @@ async function assertWorkerHealthy(
   }
 }
 
-async function askRetrievalEvalQuestion(
-  domainId: string,
-  question: RetrievalEvalQuestion,
-  worker: RetrievalEvalWorkerTarget,
-  fetchImpl: RetrievalEvalFetch,
-  nowMs: () => number,
-): Promise<RetrievalEvalQuestionResult> {
-  const raw = await postDomainAsk(domainId, question, undefined, worker, fetchImpl, nowMs);
-  if (raw.kind === 'error') return raw;
-  const answer = parseDomainAnswer(raw.body);
-  return answer
-    ? { kind: 'response', latency_ms: raw.latency_ms, answer }
-    : { kind: 'error', error: 'invalid_response', latency_ms: raw.latency_ms, http_status: raw.http_status };
-}
-
-type DomainAskRawResult =
+type WorkerRawResult =
   | { kind: 'body'; latency_ms: number; http_status: number; body: unknown }
   | RetrievalEvalErrorResult;
-
-async function postDomainAsk(
-  domainId: string,
-  question: { question: string; corpora?: string[] },
-  output: 'passages' | undefined,
-  worker: RetrievalEvalWorkerTarget,
-  fetchImpl: RetrievalEvalFetch,
-  nowMs: () => number,
-): Promise<DomainAskRawResult> {
-  return postWorkerTool('domain_ask', {
-    domain_id: domainId,
-    question: question.question,
-    ...(output === undefined ? {} : { output }),
-    ...(question.corpora === undefined ? {} : { corpora: question.corpora }),
-  }, worker, fetchImpl, nowMs);
-}
 
 async function postWorkerTool(
   tool: string,
@@ -573,7 +530,7 @@ async function postWorkerTool(
   worker: RetrievalEvalWorkerTarget,
   fetchImpl: RetrievalEvalFetch,
   nowMs: () => number,
-): Promise<DomainAskRawResult> {
+): Promise<WorkerRawResult> {
   const startedAt = nowMs();
   let response: Response;
   try {
@@ -604,37 +561,6 @@ async function postWorkerTool(
     };
   }
   return { kind: 'body', latency_ms, http_status: response.status, body };
-}
-
-function parseDomainAnswer(value: unknown): RetrievalEvalDomainAnswer | undefined {
-  const body = asRecord(value);
-  if (
-    body?.kind !== 'domain_answer'
-    || typeof body.status !== 'string'
-    || typeof body.answer !== 'string'
-    || !Array.isArray(body.citations)
-    || !Number.isInteger(body.retrieved_context_count)
-    || typeof body.retrieved_context_count !== 'number'
-    || body.retrieved_context_count < 0
-  ) {
-    return undefined;
-  }
-
-  const citations: RetrievalEvalCitation[] = [];
-  for (const value of body.citations) {
-    const citation = asRecord(value);
-    if (typeof citation?.citation_id !== 'string' || typeof citation.source_uri !== 'string') {
-      return undefined;
-    }
-    citations.push({ citation_id: citation.citation_id, source_uri: citation.source_uri });
-  }
-  return {
-    kind: 'domain_answer',
-    status: body.status,
-    answer: body.answer,
-    citations,
-    retrieved_context_count: body.retrieved_context_count,
-  };
 }
 
 function requestHeaders(token: string | undefined, json = false): HeadersInit {
@@ -770,7 +696,6 @@ export const PASSAGE_MATCH_RULE = 'ordered-word-coverage-0.8-window-v1';
 
 const QUOTE_MIN_WORDS = 6;
 const QUOTE_MAX_WORDS = 40;
-const SAFE_KEY_PATTERN = /^[a-z][a-z0-9_]{0,63}$/;
 const RECEIPT_CONTENT_MIN_LENGTH = 8;
 
 export interface RetrievalEvalEvidence {
@@ -1190,33 +1115,22 @@ export async function executeRetrievalEvalV2(
   const nowMs = options.nowMs ?? Date.now;
   const mode = options.mode ?? evalSet.mode;
   await assertWorkerHealthy(worker, fetchImpl);
-  const pageLibrary = await readsPageLibrary(evalSet.domainId, worker, fetchImpl);
-  if (pageLibrary && mode !== 'passages') {
+  if (mode !== 'passages') {
     throw new Error(
-      `Retrieval eval: ${evalSet.domainId} reads a page library, which the worker does not answer from. `
+      `Retrieval eval: the worker searches ${evalSet.domainId}'s page library but does not answer from it. `
       + 'Run it in passages mode (--mode passages); answers are evaluated through the agent.',
     );
+  }
+  if (!await readsPageLibrary(evalSet.domainId, worker, fetchImpl)) {
+    throw new Error(`Retrieval eval: ${evalSet.domainId} has no page library on this worker.`);
   }
 
   const questions: RetrievalEvalQuestionExecutionV2[] = [];
   for (const question of evalSet.questions) {
-    const execution: RetrievalEvalQuestionExecutionV2 = { question };
-    if (mode !== 'answer') {
-      if (pageLibrary) {
-        const raw = await postWorkerTool('domain_library', {
-          domain_id: evalSet.domainId, action: 'search', query: question.question, k: PAGE_SEARCH_EVAL_K,
-        }, worker, fetchImpl, nowMs);
-        execution.passages = raw.kind === 'error' ? raw : pageSearchResult(raw);
-      } else {
-        const raw = await postDomainAsk(evalSet.domainId, question, 'passages', worker, fetchImpl, nowMs);
-        execution.passages = raw.kind === 'error' ? raw : passagesResult(raw);
-      }
-    }
-    if (mode !== 'passages') {
-      const raw = await postDomainAsk(evalSet.domainId, question, undefined, worker, fetchImpl, nowMs);
-      execution.answer = raw.kind === 'error' ? raw : answerResultV2(raw);
-    }
-    questions.push(execution);
+    const raw = await postWorkerTool('domain_library', {
+      domain_id: evalSet.domainId, action: 'search', query: question.question, k: PAGE_SEARCH_EVAL_K,
+    }, worker, fetchImpl, nowMs);
+    questions.push({ question, passages: raw.kind === 'error' ? raw : pageSearchResult(raw) });
   }
   return { mode, questions };
 }
@@ -1224,10 +1138,7 @@ export async function executeRetrievalEvalV2(
 /** The most hits one page-library search returns, so recall is measured at every cut-off up to 20. */
 const PAGE_SEARCH_EVAL_K = 25;
 
-/**
- * Whether the domain's route reads a page library: only a catalog answer says so. Any refusal
- * (page_library_not_configured, or a worker without domain_library) leaves it on domain_ask.
- */
+/** Whether the domain's route reads a page library: only a catalog answer says so. */
 async function readsPageLibrary(
   domainId: string,
   worker: RetrievalEvalWorkerTarget,
@@ -1237,8 +1148,8 @@ async function readsPageLibrary(
   return raw.kind === 'body' && Array.isArray(asRecord(raw.body)?.books);
 }
 
-/** Page-library search hits as passages: each names its book's stored original, as domain_ask passages do. */
-function pageSearchResult(raw: Extract<DomainAskRawResult, { kind: 'body' }>): RetrievalEvalPassagesResult {
+/** Page-library search hits as passages: each names its book's stored original. */
+function pageSearchResult(raw: Extract<WorkerRawResult, { kind: 'body' }>): RetrievalEvalPassagesResult {
   const results = asRecord(raw.body)?.results;
   const passages: RetrievalEvalPassage[] = [];
   if (Array.isArray(results)) {
@@ -1251,64 +1162,6 @@ function pageSearchResult(raw: Extract<DomainAskRawResult, { kind: 'body' }>): R
   return Array.isArray(results) && passages.length === results.length
     ? { kind: 'response', latency_ms: raw.latency_ms, passages: { kind: 'domain_passages', status: passages.length ? 'retrieved' : 'no_results', passages, retrieved_context_count: passages.length } }
     : { kind: 'error', error: 'invalid_response', latency_ms: raw.latency_ms, http_status: raw.http_status };
-}
-
-function passagesResult(raw: Extract<DomainAskRawResult, { kind: 'body' }>): RetrievalEvalPassagesResult {
-  const passages = parseDomainPassages(raw.body);
-  return passages
-    ? { kind: 'response', latency_ms: raw.latency_ms, passages }
-    : { kind: 'error', error: 'invalid_response', latency_ms: raw.latency_ms, http_status: raw.http_status };
-}
-
-function answerResultV2(raw: Extract<DomainAskRawResult, { kind: 'body' }>): RetrievalEvalAnswerResultV2 {
-  const answer = parseDomainAnswer(raw.body);
-  if (!answer) {
-    return { kind: 'error', error: 'invalid_response', latency_ms: raw.latency_ms, http_status: raw.http_status };
-  }
-  const timings = parseTimings(asRecord(raw.body)?.timings);
-  return { kind: 'response', latency_ms: raw.latency_ms, answer, ...(timings ? { timings } : {}) };
-}
-
-function parseDomainPassages(value: unknown): RetrievalEvalDomainPassages | undefined {
-  const body = asRecord(value);
-  if (
-    body?.kind !== 'domain_passages'
-    || typeof body.status !== 'string'
-    || !Array.isArray(body.passages)
-  ) {
-    return undefined;
-  }
-  const passages: RetrievalEvalPassage[] = [];
-  for (const item of body.passages) {
-    const passage = asRecord(item);
-    if (typeof passage?.source_uri !== 'string' || typeof passage.text !== 'string') return undefined;
-    passages.push({ source_uri: passage.source_uri, text: passage.text });
-  }
-  const count = body.retrieved_context_count;
-  const timings = parseTimings(body.timings);
-  return {
-    kind: 'domain_passages',
-    status: body.status,
-    passages,
-    retrieved_context_count: typeof count === 'number' && Number.isInteger(count) && count >= 0
-      ? count
-      : passages.length,
-    ...(timings ? { timings } : {}),
-  };
-}
-
-/** Keeps only stage names that are plain identifiers with non-negative numeric values. */
-function parseTimings(value: unknown): RetrievalEvalTimings | undefined {
-  const record = asRecord(value);
-  if (!record) return undefined;
-  const timings: RetrievalEvalTimings = {};
-  for (const key of Object.keys(record).sort(compareStrings)) {
-    const stage = record[key];
-    if (SAFE_KEY_PATTERN.test(key) && typeof stage === 'number' && Number.isFinite(stage) && stage >= 0) {
-      timings[key] = stage;
-    }
-  }
-  return Object.keys(timings).length ? timings : undefined;
 }
 
 /**

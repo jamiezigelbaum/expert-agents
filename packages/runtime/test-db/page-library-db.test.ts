@@ -70,7 +70,6 @@ function worker(db: string, routes: Record<string, unknown>, downloads: string[]
   // Every worker gets its own data directory: nothing it serves may come from local files.
   const instance = createDomainExpertWorker({
     dataDir: join(dir, `data-${randomSuffix()}`),
-    gcpProject: 'neutral-project',
     roots: [{ rootId: 'expert_agents_workspace', path: join(dir, 'workspace'), maxWriteBytes: 20 * 1024 * 1024, allowOverwrite: false }],
     agentRouting: validateAgentRoutingConfig(routes) as AgentRoutingConfig,
     annas: { importGcsPrefix: 'gs://neutral-acquisitions/imports/' },
@@ -183,7 +182,7 @@ describe('a page library kept in the database', () => {
     expect(boundedRange.body.units).toHaveLength(BOUNDS.maxQuotesPerSource);
 
     const health = await (await createDomainExpertWorker({
-      dataDir: join(dir, `data-${randomSuffix()}`), gcpProject: 'neutral-project',
+      dataDir: join(dir, `data-${randomSuffix()}`),
       agentRouting: validateAgentRoutingConfig({ served: { library, pageLibrary: { sourceId: SOURCE } } }) as AgentRoutingConfig,
       pageIndexDatabaseUrl: databaseUrl(PUBLIC_DB), voyageApiKey: 'synthetic-key', voyageFetch,
       google: { accessToken: 'synthetic-token', fetchImpl: (async () => { throw new Error('no network'); }) as unknown as typeof fetch },
@@ -228,7 +227,7 @@ describe('one route reading two databases', () => {
     expect(found.body.results[0].slug).toBe('books/ledger-bbbbbb/s0001');
     expect((await call('governance', 'domain_library', { action: 'grep', pattern: 'treasury' })).body.hits.map((h: { slug: string }) => h.slug)).toEqual(['books/ledger-bbbbbb/s0001']);
     const health = await (await createDomainExpertWorker({
-      dataDir: join(dir, `data-${randomSuffix()}`), gcpProject: 'neutral-project',
+      dataDir: join(dir, `data-${randomSuffix()}`),
       agentRouting: validateAgentRoutingConfig(both) as AgentRoutingConfig,
       pageIndexDatabaseUrl: databaseUrl(PUBLIC_DB), ...named, voyageApiKey: 'synthetic-key', voyageFetch,
       google: { accessToken: 'synthetic-token', fetchImpl: (async () => { throw new Error('no network'); }) as unknown as typeof fetch },

@@ -13,7 +13,6 @@ export const BASE_MANIFEST = {
   agentId: "neutral-agent",
   displayName: "Neutral Agent",
   domainId: "neutral-domain",
-  targetCorpusDisplayName: "neutral-corpus",
 } as const;
 
 export const SERVING_INCLUDE = ["AGENTS.md", "SOUL.md", "IDENTITY.md", "TOOLS.md", "HEARTBEAT.md"];

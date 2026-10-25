@@ -36,7 +36,7 @@ configuration and credential process. Repository delivery does not enable them.
   `EXPERT_AGENTS_DOMAIN_EXPERT_PAGE_LIBRARY_ROOT` only to keep trees on local
   disk instead). The GCS library bucket
   already exists; the factory registers a per-agent prefix, where originals
-  land, not cloud billing/IAM or a new bucket. No Vertex corpus is created.
+  land, not cloud billing/IAM or a new bucket.
   The worker's workspace root (`EXPERT_AGENTS_DOMAIN_EXPERT_ROOTS_JSON`) must be
   configured with `allow_overwrite` false: the factory seeds each new domain's
   workspace there, and the worker's bootstrap rewrites existing seed files,
@@ -87,8 +87,7 @@ worker derives the tree (`<page-library-root>/<domain>`) and the index source
 (the domain id) itself, so a caller cannot name another domain's library. Dynamic registrations persist in
 the worker's private data directory; do not add them to Git. A new registration
 does not modify the static environment routing manifest.
-Legacy registrations that name a Vertex corpus use client import receipts and
-omit Vertex's optional GCS results sink.
+A legacy registration that names a Vertex corpus loads with that name ignored.
 The registration request does not accept an ingestion-policy override.
 
 The following is a configuration shape, not a command to edit live config. Verify
@@ -358,21 +357,6 @@ with `factory_busy` until the deployment owner confirms no factory process runs
 and removes it. A killed process can still leave a partially published
 scaffold; the owner must inspect it before recovery. Existing arbitrary directories and token files are
 never silently adopted.
-
-The rest of this section applies to legacy Vertex corpora only, pending their
-removal. Uncertain Vertex creation remains recorded and is not
-reissued; operator reconciliation may be required after an ambiguous submission.
-When Vertex returns a numeric project alias but Resource Manager lookup is
-unavailable, the worker retains the bounded operation reference privately and
-returns pending progress with the Telegram confirmation link. Resume retries
-project validation before polling; no unverified alias grants access to an
-operation. Restore project lookup access if the corpus is not yet discoverable
-as ACTIVE. Malformed references and confirmed project mismatches remain errors.
-For imports, a numeric project alias is verified by reading the operation under
-the configured project id and exact authorized corpus, then requiring the full
-returned name to match. A failed lookup retains a private candidate and requires
-reconciliation; it never triggers another import submission. Neither a completed
-operation nor its receipt proves that every imported file is ACTIVE.
 
 Agent repositories contain authored workspace files and an initial Git commit.
 Operation records contain private creation inputs and content-free progress,

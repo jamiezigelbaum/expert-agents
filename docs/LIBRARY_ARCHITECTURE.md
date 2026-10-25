@@ -1,8 +1,9 @@
 # Shared library architecture
 
-> **Legacy.** This describes the Vertex RAG path, which only domains not yet on
-> the [page library](page-library.md) still use. It is deleted after their
-> cutover (owner decision 2026-10-20). New experts read a page library.
+> **Legacy.** This describes the shared GCS library and the Vertex
+> materializer lane. The worker no longer reads Vertex corpora (removed
+> 2026-10-25); this page is deleted with the materializer. Every expert reads a
+> [page library](page-library.md).
 
 ## Owner ruling and boundary
 
@@ -172,21 +173,6 @@ A selected object is already materialized only when its ledger entry carries a
 `targetCorpusDisplayName` equal to the scope target. An entry for an earlier
 target, or a legacy entry without the optional field, is planned as an import.
 This prevents a corpus retarget from treating the old corpus as current.
-
-## Compatibility readers
-
-Two read-only helpers allow rehearsal against current local state without a
-migration:
-
-- `readSourceRegistryCandidates(jsonlText)` lifts valid source-registry records,
-  normalizes supported snake-case and camel-case fields, maps trust and
-  copyright posture, marks absent content hashes as `requires_hashing`, and
-  reports total, parsed, malformed, empty, and unhashed line counts.
-- `readCorpusMappingLedger(jsonText)` returns sorted display-name/resource-name
-  pairs and counts malformed entries or a malformed document.
-
-These helpers consume caller-provided text. They do not open, alter, or replace
-the registry, mapping cache, manifest, or any workspace file.
 
 ## Append-only materializer
 
@@ -388,15 +374,12 @@ redacted against the secrets the process holds).
 | Command | Worker tool |
 | --- | --- |
 | `health` | `GET /v1/health` |
-| `ask --domain <id> "<q>" [--passages] [--corpus <id>]` | `domain_ask` |
 | `search --domain <id> --query "<q>" [--author --title --language --top <n>] [--ingest-intent]` | `annas_archive_search` (table: rank, format, size, title, author, year, language, md5; libgen-fallback warnings) |
-| `acquire --domain <id> --md5 <md5> --format <f> --title --author [--year] --corpus <id> --copyright-posture <p> --approval-id <id> [--no-ingest] [--dry-run] [--no-wait]` | `annas_archive_import` with `dry_run: false` unless `--dry-run`; prints the full `rag_ingest` status and any error verbatim |
-| `source register --domain <id> --kind <k> --title --author --locator <url> [--trust-tier --copyright-posture --corpus]` | `domain_source` `add`, `dry_run: false` |
-| `status --domain <id> [--corpus <id>]` | `rag_corpus` `status` |
+| `acquire --domain <id> --md5 <md5> --format <f> --title --author [--year] --copyright-posture <p> --approval-id <id> [--no-ingest] [--dry-run] [--no-wait]` | `annas_archive_import` with `dry_run: false` unless `--dry-run`; prints the full `rag_ingest` status and any error verbatim |
 
 Worker errors are printed verbatim (HTTP status, code, message, suggestion)
-and exit 1. `acquire` treats a busy corpus (`FAILED_PRECONDITION` / "other
-operations running") and HTTP 429 as wait-and-retry: 30s, 90s, then tripling
+and exit 1. `acquire` treats a quota refusal (`RESOURCE_EXHAUSTED`) and HTTP 429 as
+wait-and-retry: 30s, 90s, then tripling
 to a 5-minute cap within a 15-minute budget, unless `--no-wait` is given. A
 retry after a completed download re-ingests the file already on disk.
 
@@ -471,15 +454,13 @@ default shown above. They are deliberately generous policy values and exist to
 be changed by a policy decision, which is why they live in configuration rather
 than at any call site. A corpus that declares no posture is `full`.
 
-With a posture declared, `domain_ask` requires a `session_id` so the cumulative
-per-source bound is meaningful across an engagement, a `derived` or `excluded`
-corpus is unreachable from every corpus-scoped surface before any Vertex call is
-made, each returned excerpt is bounded to `maxQuoteChars` with at most
+With a posture declared, `domain_library` requires a `session_id` so the
+cumulative per-source bound is meaningful across an engagement, each returned excerpt is bounded to `maxQuoteChars` with at most
 `maxQuotesPerSource` per source per response, an excerpt with no attributable
 source is withheld because citation is not configurable off, and crossing the
 cumulative bound refuses the request rather than trimming it. The refusal is
 typed and content-free: a code and a generic message, never the withheld text,
-the source, or a path. The answer carries a `disclosure` report of counts and
+the source, or a path. The response carries a `disclosure` report of counts and
 the bounds that were applied.
 
 **Absence of the block is the declaration that no posture applies.** A routing

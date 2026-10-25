@@ -32,7 +32,6 @@ EOF
 cat > "$work/worker.env" <<EOF
 EXPERT_AGENTS_DOMAIN_EXPERT_AUTH_TOKEN=$token
 EXPERT_AGENTS_DOMAIN_EXPERT_VOYAGE_API_KEY=smoke-unused
-EXPERT_AGENTS_GCP_PROJECT=smoke-project
 EXPERT_AGENTS_DOMAIN_EXPERT_GOOGLE_ACCESS_TOKEN=smoke-unused
 EXPERT_AGENTS_DOMAIN_EXPERT_AGENTS_JSON={"smoke-expert":{"library":{"bucket":"example-library","prefix":"v2/books"},"pageLibrary":{"sourceId":"smoke-books"}},"smoke-public":{"library":{"bucket":"example-library","prefix":"v2/books"},"pageLibrary":{"sourceId":"smoke-books"},"disclosure":{"bounds":{"maxQuoteChars":20,"maxSourceCoveragePerSession":0.5}}}}
 EOF

@@ -1,11 +1,9 @@
 import { inflateRawSync } from "node:zlib";
 
 /**
- * Dependency-free EPUB → Markdown conversion for RAG ingestion.
+ * Dependency-free EPUB → Markdown conversion.
  *
- * Vertex RAG Engine parses PDF, text, Markdown and HTML; it completes an
- * import of an EPUB with importedRagFilesCount=0 and no error (observed live
- * 2026-09-20 on 16 ebooks). An EPUB is a ZIP of XHTML documents, so the text
+ * An EPUB is a ZIP of XHTML documents, so the text
  * is recoverable without a library: read the central directory, inflate the
  * entries, follow META-INF/container.xml to the OPF, and walk the spine in
  * reading order. Each spine document becomes a section under its own heading

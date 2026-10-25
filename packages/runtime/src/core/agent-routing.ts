@@ -1,5 +1,4 @@
 import { readFileSync } from 'node:fs';
-import { isAbsolute } from 'node:path';
 import {
   validateLibraryLocationConfig,
   type LibraryLocationConfig,
@@ -11,60 +10,14 @@ import {
 
 export const AGENT_ROUTING_ENV_VAR = 'EXPERT_AGENTS_DOMAIN_EXPERT_AGENTS_JSON';
 
-export type AgentRoutingReranker = 'rank-service' | 'llm' | 'off';
-
-export interface AgentRoutingRetrievalConfig {
-  topK?: number;
-  contextLimit?: number;
-  reranker?: AgentRoutingReranker;
-  multiQuery?: boolean;
-  /** An operator-owned, atomically replaced profile. Not a model-supplied path. */
-  preferenceProfilePath?: string;
-  /**
-   * With a preference profile and several corpora: the fewest answer contexts
-   * the profile's corpus keeps when it holds passages at least as close as
-   * those already chosen. Pooled ranking otherwise lets a large shelf crowd an
-   * owner's own documents out before the profile ever sees them.
-   */
-  profileCorpusMinContexts?: number;
-}
-
-/** Acquisition operations a deployment can require to name their corpus explicitly. */
-export const EXPLICIT_CORPUS_OPERATIONS = ['annas_archive_import', 'web_import'] as const;
-export type ExplicitCorpusOperation = typeof EXPLICIT_CORPUS_OPERATIONS[number];
-
-export interface AgentRoutingIngestionConfig {
-  /** Optional provider-written result receipts. Client submission receipts are always retained. */
-  importResultSink?: 'client' | 'gcs';
-  /**
-   * Optional. Operations listed here are refused without an explicit corpus_id
-   * instead of defaulting to the domain's first configured corpus. Absent, every
-   * operation keeps defaulting as before.
-   */
-  explicitCorpusRequiredFor?: ExplicitCorpusOperation[];
-}
-
 export interface AgentRoutingEntry {
   domainId: string;
   displayName?: string;
-  /**
-   * Where the domain's originals live. Required for a Vertex route; optional
-   * for a page-library route, whose originals buckets pageLibrary names.
-   */
+  /** Where the domain's originals live. Optional when pageLibrary names its originals buckets. */
   library?: LibraryLocationConfig;
-  /** Existing source locations usable only for authorized RAG-file reads, never ingestion. */
+  /** Existing source locations whose originals may be read and ingested, never written. */
   readOnlySourceRoots?: LibraryLocationConfig[];
-  /** The Vertex corpus. Required unless the route declares pageLibrary. */
-  targetCorpusDisplayName?: string;
-  /**
-   * Optional. The corpora domain_ask searches, in order. Absent, it searches
-   * only targetCorpusDisplayName. A library that outgrows one corpus is split
-   * into shelves listed here and searched in parallel.
-   */
-  servingCorpusDisplayNames?: string[];
   scopeManifestPath?: string;
-  retrieval?: AgentRoutingRetrievalConfig;
-  ingestion?: AgentRoutingIngestionConfig;
   /**
    * Optional. Its absence is the declaration that no disclosure posture
    * applies, which is why every entry written before serving machinery
@@ -72,13 +25,12 @@ export interface AgentRoutingEntry {
    */
   disclosure?: AgentDisclosureConfig;
   /**
-   * Optional. The page library (docs/page-library.md): an assembled tree of
-   * page-addressed units on the worker host and the source id it was imported
-   * under in the page search index (the index's database URL and Voyage key
-   * are worker secrets, not routing). Absent, the domain_library tool refuses
-   * for this domain.
+   * The page library (docs/page-library.md): an assembled tree of page-addressed
+   * units on the worker host, or a library in the page library database, and the
+   * source id it was imported under in the page search index (the index's
+   * database URL and Voyage key are worker secrets, not routing).
    */
-  pageLibrary?: AgentPageLibraryConfig;
+  pageLibrary: AgentPageLibraryConfig;
 }
 
 export interface AgentPageLibraryConfig {
@@ -105,6 +57,13 @@ export interface AgentPageLibraryConfig {
    */
   originalBuckets?: string[];
 }
+
+/**
+ * Keys of the retired Vertex AI retrieval routes. Live routing files and persisted
+ * registrations written before 2026-10-25 still carry them, so they are accepted
+ * and dropped; they configure nothing.
+ */
+export const RETIRED_VERTEX_ROUTING_KEYS = ['targetCorpusDisplayName', 'servingCorpusDisplayNames', 'retrieval', 'ingestion'] as const;
 
 export type AgentRoutingConfig = Readonly<Record<string, Readonly<AgentRoutingEntry>>>;
 
@@ -160,14 +119,10 @@ function validateRoutingEntry(domainId: string, value: unknown): AgentRoutingEnt
   const entry = requireRecord(value, 'an entry must be an object');
   requireExactKeys(
     entry,
-    ['displayName', 'library', 'readOnlySourceRoots', 'targetCorpusDisplayName', 'servingCorpusDisplayNames', 'scopeManifestPath', 'retrieval', 'ingestion', 'disclosure', 'pageLibrary'],
+    ['displayName', 'library', 'readOnlySourceRoots', 'scopeManifestPath', 'disclosure', 'pageLibrary', ...RETIRED_VERTEX_ROUTING_KEYS],
     'an entry',
   );
-  // A page-library route needs neither a Vertex corpus nor a library
-  // location; every other route needs both.
-  if (entry.pageLibrary === undefined && (!('library' in entry) || !('targetCorpusDisplayName' in entry))) {
-    throw new AgentRoutingConfigError('an entry is missing a required field');
-  }
+  if (entry.pageLibrary === undefined) throw new AgentRoutingConfigError('an entry is missing pageLibrary');
 
   let library: LibraryLocationConfig | undefined;
   if (entry.library !== undefined) {
@@ -192,17 +147,6 @@ function validateRoutingEntry(domainId: string, value: unknown): AgentRoutingEnt
     Object.freeze(readOnlySourceRoots);
   }
   const scopeManifestPath = optionalNonEmptyString(entry.scopeManifestPath, 'an entry scopeManifestPath');
-  const targetCorpusDisplayName = optionalNonEmptyString(entry.targetCorpusDisplayName, 'an entry targetCorpusDisplayName');
-  if (servingCorpusOrVertexOnly(entry) && targetCorpusDisplayName === undefined) {
-    throw new AgentRoutingConfigError('an entry with Vertex retrieval settings needs targetCorpusDisplayName');
-  }
-  const servingCorpusDisplayNames = entry.servingCorpusDisplayNames === undefined
-    ? undefined
-    : validateServingCorpora(entry.servingCorpusDisplayNames);
-  const retrieval = entry.retrieval === undefined
-    ? undefined
-    : validateRetrieval(entry.retrieval);
-  const ingestion = entry.ingestion === undefined ? undefined : validateIngestion(entry.ingestion);
 
   let disclosure: AgentDisclosureConfig | undefined;
   if (entry.disclosure !== undefined) {
@@ -213,12 +157,12 @@ function validateRoutingEntry(domainId: string, value: unknown): AgentRoutingEnt
     }
   }
 
-  const pageLibrary = entry.pageLibrary === undefined ? undefined : validatePageLibrary(entry.pageLibrary);
+  const pageLibrary = validatePageLibrary(entry.pageLibrary);
   // A private library must never reach a public (disclosed) deployment.
-  if (pageLibrary && disclosure && (pageLibrary.database !== undefined || pageLibrary.also?.some((a) => a.database !== undefined))) {
+  if (disclosure && (pageLibrary.database !== undefined || pageLibrary.also?.some((a) => a.database !== undefined))) {
     throw new AgentRoutingConfigError('a route served under a disclosure policy cannot read a named (private) page library');
   }
-  if (pageLibrary && !pageLibrary.originalBuckets && !library && !readOnlySourceRoots) {
+  if (!pageLibrary.originalBuckets && !library && !readOnlySourceRoots) {
     throw new AgentRoutingConfigError('pageLibrary needs originalBuckets when the entry has no library');
   }
 
@@ -227,13 +171,9 @@ function validateRoutingEntry(domainId: string, value: unknown): AgentRoutingEnt
     ...(displayName ? { displayName } : {}),
     ...(library ? { library } : {}),
     ...(readOnlySourceRoots ? { readOnlySourceRoots } : {}),
-    ...(targetCorpusDisplayName ? { targetCorpusDisplayName } : {}),
-    ...(servingCorpusDisplayNames ? { servingCorpusDisplayNames } : {}),
     ...(scopeManifestPath ? { scopeManifestPath } : {}),
-    ...(retrieval ? { retrieval } : {}),
-    ...(ingestion ? { ingestion } : {}),
     ...(disclosure ? { disclosure } : {}),
-    ...(pageLibrary ? { pageLibrary } : {}),
+    pageLibrary,
   };
 }
 
@@ -293,91 +233,8 @@ export function pageLibraryMembers(config: Pick<AgentPageLibraryConfig, 'sourceI
 
 /** The buckets view_page may read originals from: explicit, else the route's library locations. */
 export function pageLibraryOriginalBuckets(route: Pick<AgentRoutingEntry, 'library' | 'readOnlySourceRoots' | 'pageLibrary'>): string[] {
-  if (route.pageLibrary?.originalBuckets) return [...route.pageLibrary.originalBuckets];
+  if (route.pageLibrary.originalBuckets) return [...route.pageLibrary.originalBuckets];
   return [...new Set([...(route.library ? [route.library] : []), ...(route.readOnlySourceRoots ?? [])].map((r) => r.bucket))];
-}
-
-// Settings that only mean something for a Vertex corpus.
-function servingCorpusOrVertexOnly(entry: Record<string, unknown>): boolean {
-  return entry.servingCorpusDisplayNames !== undefined || entry.scopeManifestPath !== undefined || entry.retrieval !== undefined;
-}
-
-function validateServingCorpora(value: unknown): string[] {
-  if (!Array.isArray(value) || value.length === 0 || value.length > 10) {
-    throw new AgentRoutingConfigError('an entry servingCorpusDisplayNames must list 1 to 10 corpora');
-  }
-  const names = value.map((name) => requireNonEmptyString(name, 'an entry servingCorpusDisplayNames item'));
-  if (new Set(names).size !== names.length) {
-    throw new AgentRoutingConfigError('an entry servingCorpusDisplayNames has duplicates');
-  }
-  return Object.freeze(names) as string[];
-}
-
-function validateRetrieval(value: unknown): AgentRoutingRetrievalConfig {
-  const retrieval = requireRecord(value, 'an entry retrieval must be an object');
-  requireExactKeys(retrieval, ['topK', 'contextLimit', 'reranker', 'multiQuery', 'preferenceProfilePath', 'profileCorpusMinContexts'], 'an entry retrieval');
-  const result: AgentRoutingRetrievalConfig = {};
-  if (retrieval.topK !== undefined) {
-    result.topK = requirePositiveInteger(retrieval.topK, 'an entry retrieval topK', 100);
-  }
-  if (retrieval.contextLimit !== undefined) {
-    result.contextLimit = requirePositiveInteger(retrieval.contextLimit, 'an entry retrieval contextLimit', 100);
-  }
-  if (retrieval.reranker !== undefined) {
-    if (retrieval.reranker !== 'rank-service' && retrieval.reranker !== 'llm' && retrieval.reranker !== 'off') {
-      throw new AgentRoutingConfigError('an entry retrieval reranker is unsupported');
-    }
-    result.reranker = retrieval.reranker;
-  }
-  if (retrieval.multiQuery !== undefined) {
-    if (typeof retrieval.multiQuery !== 'boolean') {
-      throw new AgentRoutingConfigError('an entry retrieval multiQuery must be a boolean');
-    }
-    result.multiQuery = retrieval.multiQuery;
-  }
-  if (retrieval.preferenceProfilePath !== undefined) {
-    const path = requireNonEmptyString(retrieval.preferenceProfilePath, 'an entry retrieval preferenceProfilePath');
-    if (!isAbsolute(path) || path.length > 4096 || /[\u0000-\u001f]/.test(path)) {
-      throw new AgentRoutingConfigError('an entry retrieval preferenceProfilePath must be an absolute file path');
-    }
-    result.preferenceProfilePath = path;
-  }
-  if (retrieval.profileCorpusMinContexts !== undefined) {
-    if (result.preferenceProfilePath === undefined) {
-      throw new AgentRoutingConfigError('an entry retrieval profileCorpusMinContexts requires preferenceProfilePath');
-    }
-    result.profileCorpusMinContexts = requirePositiveInteger(retrieval.profileCorpusMinContexts, 'an entry retrieval profileCorpusMinContexts', 100);
-  }
-  return Object.freeze(result);
-}
-
-function validateIngestion(value: unknown): AgentRoutingIngestionConfig {
-  const ingestion = requireRecord(value, 'an entry ingestion must be an object');
-  requireExactKeys(ingestion, ['importResultSink', 'explicitCorpusRequiredFor'], 'an entry ingestion');
-  if (ingestion.importResultSink !== undefined && ingestion.importResultSink !== 'client' && ingestion.importResultSink !== 'gcs') {
-    throw new AgentRoutingConfigError('an entry ingestion importResultSink must be client or gcs');
-  }
-  const explicitCorpusRequiredFor = ingestion.explicitCorpusRequiredFor === undefined
-    ? undefined
-    : validateExplicitCorpusOperations(ingestion.explicitCorpusRequiredFor);
-  return Object.freeze({
-    ...(ingestion.importResultSink === undefined ? {} : { importResultSink: ingestion.importResultSink }),
-    ...(explicitCorpusRequiredFor ? { explicitCorpusRequiredFor } : {}),
-  }) as AgentRoutingIngestionConfig;
-}
-
-function validateExplicitCorpusOperations(value: unknown): ExplicitCorpusOperation[] {
-  const allowed: readonly string[] = EXPLICIT_CORPUS_OPERATIONS;
-  if (!Array.isArray(value) || value.length === 0
-    || value.some((operation) => typeof operation !== 'string' || !allowed.includes(operation))) {
-    throw new AgentRoutingConfigError(
-      `an entry ingestion explicitCorpusRequiredFor must list one or more of: ${EXPLICIT_CORPUS_OPERATIONS.join(', ')}`,
-    );
-  }
-  if (new Set(value).size !== value.length) {
-    throw new AgentRoutingConfigError('an entry ingestion explicitCorpusRequiredFor has duplicates');
-  }
-  return Object.freeze([...value]) as ExplicitCorpusOperation[];
 }
 
 function requireRecord(value: unknown, message: string): Record<string, unknown> {
@@ -404,13 +261,6 @@ function requireNonEmptyString(value: unknown, name: string): string {
     throw new AgentRoutingConfigError(`${name} must be a non-empty string`);
   }
   return value.trim();
-}
-
-function requirePositiveInteger(value: unknown, name: string, maximum: number): number {
-  if (!Number.isInteger(value) || (value as number) <= 0 || (value as number) > maximum) {
-    throw new AgentRoutingConfigError(`${name} must be a positive integer no greater than ${maximum}`);
-  }
-  return value as number;
 }
 
 function isDomainId(value: string): boolean {

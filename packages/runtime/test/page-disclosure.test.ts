@@ -53,7 +53,7 @@ afterAll(async () => {
 function worker(disclosure: Record<string, unknown>) {
   const pdf = buildPdf(Array.from({ length: 10 }, (_, i) => ({ lines: [`Page ${i + 1}`] })));
   const instance = createDomainExpertWorker({
-    dataDir, gcpProject: 'neutral-project',
+    dataDir,
     agentRouting: validateAgentRoutingConfig({ history: {
       pageLibrary: { root: tree, sourceId: 'history', originalBuckets: ['originals-bucket'] },
       disclosure,
@@ -167,7 +167,7 @@ describe('page library under a disclosure policy', () => {
 
   test('without a disclosure policy the library is unbounded and needs no session', async () => {
     const instance = createDomainExpertWorker({
-      dataDir, gcpProject: 'neutral-project',
+      dataDir,
       agentRouting: validateAgentRoutingConfig({ history: { pageLibrary: { root: tree, sourceId: 'history', originalBuckets: ['originals-bucket'] } } }),
       pageSearch: async () => [],
       google: { accessToken: 'synthetic-token', fetchImpl: (async () => new Response('', { status: 404 })) as unknown as typeof fetch },

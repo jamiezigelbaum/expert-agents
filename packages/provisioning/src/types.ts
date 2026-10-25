@@ -46,11 +46,6 @@ export interface AgentManifest {
   agentId: string;
   displayName: string;
   domainId: string;
-  /**
-   * Legacy: the Vertex RAG corpus a pre-page-library agent retrieves from.
-   * New agents read their domain's page library and carry no corpus.
-   */
-  targetCorpusDisplayName?: string;
   emoji?: string;
   /**
    * Optional repo-relative path to the agent's avatar image. Contract-file
@@ -130,7 +125,6 @@ export interface BindingDescriptor {
   telegram?: TelegramBinding;
   routing: {
     domainId: string;
-    targetCorpusDisplayName?: string;
   };
 }
 
@@ -265,7 +259,6 @@ export interface ServingManifest {
   agentId: string;
   displayName: string;
   domainId: string;
-  targetCorpusDisplayName?: string;
   emoji?: string;
   /** Named only when the serving set actually materialized the image. */
   avatar?: string;

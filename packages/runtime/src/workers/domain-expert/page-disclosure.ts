@@ -1,4 +1,4 @@
-// Disclosure bounds for the page library: the domain_ask bounds
+// Disclosure bounds for the page library: the configured bounds
 // (core/disclosure.ts) applied to page units. Every passage that leaves the
 // worker is one excerpt of one book: search and grep hits are bounded and
 // counted, read and read_range are bounded and counted, and view_page counts

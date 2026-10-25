@@ -106,7 +106,7 @@ describe('domain_library over a route with several libraries', () => {
   afterAll(async () => { await rm(dataDir, { recursive: true, force: true }); });
   const make = (routes: Record<string, unknown>) => {
     const w = createDomainExpertWorker({
-      dataDir, gcpProject: 'neutral-project', agentRouting: validateAgentRoutingConfig(routes),
+      dataDir,agentRouting: validateAgentRoutingConfig(routes),
       pageStore: (sourceId, database) => (database === 'private' ? privateBooks : sourceId === 'history' ? publicBooks : fakeStore({})),
       pageSearch: async (_q, _k, sourceId, database) => {
         searched.push(`${database ?? 'default'}/${sourceId}`);
@@ -187,7 +187,7 @@ describe('library_ingest source_id on a route with several libraries', () => {
 
   function make(routes: Record<string, unknown>, writers: { default?: PageIndexWriter; private?: PageIndexWriter }) {
     const w = createDomainExpertWorker({
-      dataDir: join(dir, `data-${Math.random().toString(36).slice(2)}`), gcpProject: 'neutral-project',
+      dataDir: join(dir, `data-${Math.random().toString(36).slice(2)}`),
       roots: [{ rootId: 'expert_agents_workspace', path: workspace, maxWriteBytes: 20 * 1024 * 1024, allowOverwrite: false }],
       agentRouting: validateAgentRoutingConfig(routes),
       annas: { importGcsPrefix: 'gs://neutral-acquisitions/imports/' },
@@ -264,7 +264,7 @@ describe('library_ingest source_id on a route with several libraries', () => {
       // The Voyage key is the other half of "configured"; a writer URL alone is not enough.
       expect((await make(routes, { default: recording().writer })('library_ingest', dry)).body.index_writer_configured).toBe(false);
       const w = createDomainExpertWorker({
-        dataDir: join(dir, 'env'), gcpProject: 'neutral-project', voyageApiKey: 'synthetic-key',
+        dataDir: join(dir, 'env'),voyageApiKey: 'synthetic-key',
         roots: [{ rootId: 'expert_agents_workspace', path: workspace, maxWriteBytes: 20 * 1024 * 1024, allowOverwrite: false }],
         agentRouting: validateAgentRoutingConfig(routes), pageSearch: async () => [],
         google: { accessToken: 'synthetic-token', fetchImpl: (async () => { throw new Error('no network'); }) as unknown as typeof fetch },

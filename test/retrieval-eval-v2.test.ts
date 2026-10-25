@@ -12,6 +12,8 @@ import {
   parseRetrievalEvalSet,
   passageContainsQuote,
   retrievalEvalExitCode,
+  retrievalEvalV2ContentValues,
+  writeRetrievalEvalReceiptV2,
   runRetrievalEvalCli,
   type RetrievalEvalFetch,
   type RetrievalEvalQuestionExecutionV2,
@@ -136,48 +138,29 @@ describe('passage and source matching', () => {
 });
 
 describe('schema 2 execution and metrics', () => {
-  test('sends a passages request and an answer request per question in both mode', async () => {
+  test('answer and both modes are refused after the health check, with no question sent', async () => {
     const bodies: unknown[] = [];
     const fetchImpl: RetrievalEvalFetch = async (url, init = {}) => {
-      if (url.endsWith('/v1/health')) return jsonResponse({ healthy: true });
-      const body = JSON.parse(String(init.body));
-      if (body.tool === 'domain_library') return jsonResponse({ error: { code: 'page_library_not_configured' } }, 404);
-      bodies.push(body);
-      return jsonResponse(body.params.output === 'passages' ? passagesBody() : answerBody());
+      if (!url.endsWith('/v1/health')) bodies.push(JSON.parse(String(init.body)));
+      return jsonResponse({ healthy: true });
     };
-    const set = validSetV2();
-    set.questions = [set.questions[1]!];
-    const execution = await executeRetrievalEvalV2(set, {
-      worker: { baseUrl: 'https://worker.test' },
-      fetchImpl,
-      nowMs: clock([0, 40, 100, 350]),
-    });
-
-    expect(bodies).toEqual([
-      { tool: 'domain_ask', params: { domain_id: 'neutral-history', question: set.questions[0]!.question, output: 'passages', corpora: ['neutral-primary'] } },
-      { tool: 'domain_ask', params: { domain_id: 'neutral-history', question: set.questions[0]!.question, corpora: ['neutral-primary'] } },
-    ]);
-    expect(execution.questions[0]!.passages!.latency_ms).toBe(40);
-    expect(execution.questions[0]!.answer!.latency_ms).toBe(250);
+    for (const mode of ['answer', 'both'] as const) {
+      await expect(executeRetrievalEvalV2(validSetV2(), { worker: { baseUrl: 'https://worker.test' }, fetchImpl, mode, nowMs: () => 0 }))
+        .rejects.toThrow('does not answer from it');
+    }
+    expect(bodies).toEqual([]);
   });
 
-  test('passages mode sends no answer request', async () => {
-    let answerRequests = 0;
+  test('a domain with no page library is refused before any question is sent', async () => {
+    const bodies: Array<{ tool: string; params: Record<string, unknown> }> = [];
     const fetchImpl: RetrievalEvalFetch = async (url, init = {}) => {
       if (url.endsWith('/v1/health')) return jsonResponse({ healthy: true });
-      if (JSON.parse(String(init.body)).tool === 'domain_library') return jsonResponse({ error: { code: 'page_library_not_configured' } }, 404);
-      if (JSON.parse(String(init.body)).params.output !== 'passages') answerRequests += 1;
-      return jsonResponse(passagesBody());
+      bodies.push(JSON.parse(String(init.body)));
+      return jsonResponse({ error: { code: 'page_library_not_configured' } }, 404);
     };
-    const execution = await executeRetrievalEvalV2(validSetV2(), {
-      worker: { baseUrl: 'https://worker.test' },
-      fetchImpl,
-      mode: 'passages',
-      nowMs: () => 0,
-    });
-    expect(answerRequests).toBe(0);
-    expect(execution.mode).toBe('passages');
-    expect(execution.questions.every((question) => question.answer === undefined)).toBeTrue();
+    await expect(executeRetrievalEvalV2(validSetV2(), { worker: { baseUrl: 'https://worker.test' }, fetchImpl, mode: 'passages', nowMs: () => 0 }))
+      .rejects.toThrow('has no page library on this worker');
+    expect(bodies.map((body) => body.params.action)).toEqual(['catalog']);
   });
 
   test('a page-library domain is read through domain_library search, and only in passages mode', async () => {
@@ -352,19 +335,16 @@ describe('schema 2 receipt', () => {
     expect(receipt.worker).toBe('https://worker.test');
   });
 
-  test('writes a deterministic receipt free of question text, quotes, answers, paths and URIs', async () => {
+  test('writes a deterministic receipt free of question text, quotes, paths and URIs', async () => {
     const fixture = await createCliFixture(validSetV2());
     const passageText = `PRIVATE_PASSAGE_TEXT_SENTINEL ${QUOTE_A}`;
-    const answerText = 'PRIVATE_ANSWER_TEXT_SENTINEL [neutral-primary:1].';
     const token = 'PRIVATE_BEARER_TOKEN_SENTINEL';
-    const fetchImpl: RetrievalEvalFetch = async (url, init = {}) => {
-      if (url.endsWith('/v1/health')) return jsonResponse({ healthy: true });
-      return JSON.parse(String(init.body)).params.output === 'passages'
-        ? jsonResponse(passagesBody({ passages: [passage(URI_A, passageText), passage(URI_SPLIT_PART, QUOTE_SPLIT)] }))
-        : jsonResponse(answerBody({ answer: answerText, citations: [citation('neutral-primary:1', URI_A)] }));
-    };
+    const fetchImpl = pageLibraryFetch([
+      { slug: 'books/neutral-book/p0012', source_uri: URI_A, text: passageText },
+      { slug: 'books/neutral-book/p0013', source_uri: URI_SPLIT_PART, text: QUOTE_SPLIT },
+    ]);
     const run = (receiptPath: string) => runRetrievalEvalCli(
-      ['--worker', 'https://worker.test/runtime', '--questions', fixture.questionsPath, '--receipt', receiptPath],
+      ['--worker', 'https://worker.test/runtime', '--questions', fixture.questionsPath, '--receipt', receiptPath, '--mode', 'passages'],
       { fetchImpl, env: { EXPERT_AGENTS_PARITY_CANDIDATE_TOKEN: token }, nowMs: clock(Array.from({ length: 12 }, (_, i) => i * 10)) },
     );
 
@@ -375,12 +355,12 @@ describe('schema 2 receipt', () => {
     expect(await readFile(fixture.secondReceiptPath, 'utf8')).toBe(bytes);
     expect(receipt.schemaVersion).toBe(2);
     expect(receipt.summary.overall.passages!.passage_recall_at.at_5).toBe(1);
-    expect(retrievalEvalExitCode(receipt)).toBe(1);
+    expect(retrievalEvalExitCode(receipt)).toBe(0);
     const set = validSetV2();
     for (const forbidden of [
       ...set.questions.map((question) => question.question),
       QUOTE_A, QUOTE_SPLIT, SPLIT_PATH, 'plain-ledger', URI_A, URI_SPLIT_PART, HEX_A,
-      'PRIVATE_PASSAGE_TEXT_SENTINEL', 'PRIVATE_ANSWER_TEXT_SENTINEL', token,
+      'PRIVATE_PASSAGE_TEXT_SENTINEL', token,
       'Neutral reference answer', 'neutral private note', 'gs://',
     ]) {
       expect(bytes).not.toContain(forbidden);
@@ -391,26 +371,26 @@ describe('schema 2 receipt', () => {
   test('fails closed when eval content would reach the receipt', async () => {
     const set = validSetV2();
     const fixture = await createCliFixture(set);
-    const fetchImpl: RetrievalEvalFetch = async (url, init = {}) => {
-      if (url.endsWith('/v1/health')) return jsonResponse({ healthy: true });
-      const body = JSON.parse(String(init.body));
-      // A worker echoing the question into a verbatim status field.
-      return jsonResponse(body.params.output === 'passages'
-        ? passagesBody({ status: body.params.question })
-        : answerBody());
-    };
-    await expect(runRetrievalEvalCli(
-      ['--worker', 'https://worker.test', '--questions', fixture.questionsPath, '--receipt', fixture.receiptPath],
-      { fetchImpl, env: {}, nowMs: () => 0 },
-    )).rejects.toThrow('Refusing to write retrieval eval receipt because it contains eval-set content.');
+    // A worker echoing the question into a verbatim status field.
+    const receipt = createRetrievalEvalReceiptV2(
+      { evalSet: set, bytes: new TextEncoder().encode(JSON.stringify(set)) },
+      {
+        mode: 'passages',
+        questions: [{
+          question: set.questions[0]!,
+          passages: { kind: 'response', latency_ms: 5, passages: { kind: 'domain_passages', status: set.questions[0]!.question, passages: [], retrieved_context_count: 0 } },
+        }],
+      },
+      'https://worker.test',
+    );
+    await expect(writeRetrievalEvalReceiptV2(fixture.receiptPath, receipt, { content: retrievalEvalV2ContentValues(set) }))
+      .rejects.toThrow('Refusing to write retrieval eval receipt because it contains eval-set content.');
     await expect(readFile(fixture.receiptPath, 'utf8')).rejects.toThrow();
   });
 
   test('a --mode override runs one mode and skips thresholds that need the other', async () => {
     const fixture = await createCliFixture(validSetV2());
-    const fetchImpl: RetrievalEvalFetch = async (url) => (
-      url.endsWith('/v1/health') ? jsonResponse({ healthy: true }) : jsonResponse(passagesBody())
-    );
+    const fetchImpl = pageLibraryFetch([{ slug: 'books/neutral-book/p0012', source_uri: URI_A, text: QUOTE_A }]);
     const receipt = await runRetrievalEvalCli(
       ['--worker', 'https://worker.test', '--questions', fixture.questionsPath, '--receipt', fixture.receiptPath, '--mode', 'passages'],
       { fetchImpl, env: {}, nowMs: () => 0 },
@@ -419,6 +399,15 @@ describe('schema 2 receipt', () => {
     expect(receipt.summary.overall.answer).toBeNull();
     expect(receipt.verdict.skipped).toEqual(['min_recall', 'max_invalid_citation_rate', 'max_miss_rate', 'min_abstention_rate']);
     expect(Object.keys(receipt.verdict)).toEqual(['min_passage_recall_at', 'skipped', 'passed']);
+  });
+
+  test('a set whose mode is answer or both is refused unless --mode passages is given', async () => {
+    const fixture = await createCliFixture(validSetV2());
+    await expect(runRetrievalEvalCli(
+      ['--worker', 'https://worker.test', '--questions', fixture.questionsPath, '--receipt', fixture.receiptPath],
+      { fetchImpl: pageLibraryFetch([]), env: {}, nowMs: () => 0 },
+    )).rejects.toThrow('passages mode');
+    await expect(readFile(fixture.receiptPath, 'utf8')).rejects.toThrow();
   });
 
   test('--mode is refused for a schema-1 eval set and must be a known mode', async () => {
@@ -434,6 +423,15 @@ describe('schema 2 receipt', () => {
     await expect(runRetrievalEvalCli([...args, '--mode', 'prose'], { env: {} })).rejects.toThrow('Usage:');
   });
 });
+
+/** A worker with a page library whose search returns the same hits for every question. */
+function pageLibraryFetch(results: Array<Record<string, unknown>>): RetrievalEvalFetch {
+  return async (url, init = {}) => {
+    if (url.endsWith('/v1/health')) return jsonResponse({ healthy: true });
+    const body = JSON.parse(String(init.body));
+    return jsonResponse(body.params.action === 'catalog' ? { books: [], total: 0, complete: true } : { results });
+  };
+}
 
 function validSetV2(): RetrievalEvalSetV2 {
   return {

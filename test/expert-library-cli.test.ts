@@ -81,27 +81,16 @@ describe("expert:library argument parsing", () => {
   });
 
   test("parses every worker command with its required and optional flags", () => {
-    expect(parseExpertLibraryArguments(["ask", "--domain", "example", "What is dharma?", "--passages", "--corpus", "c1", "--worker", WORKER])).toEqual({
-      command: "ask", domainId: "example", question: "What is dharma?", passages: true, corpusId: "c1", worker: WORKER,
-    });
     expect(parseExpertLibraryArguments(["search", "--domain", "example", "--query", "yoga sutras", "--author", "Patanjali", "--top", "5", "--ingest-intent"])).toEqual({
       command: "search", domainId: "example", query: "yoga sutras", author: "Patanjali", top: 5, ingestIntent: true,
     });
     expect(parseExpertLibraryArguments([
       "acquire", "--domain", "example", "--md5", MD5.toUpperCase(), "--format", "pdf", "--title", "T", "--author", "A",
-      "--corpus", "example-shared-library", "--copyright-posture", "owner-acquired", "--approval-id", "msg-1", "--no-ingest", "--dry-run", "--no-wait",
+      "--copyright-posture", "owner-acquired", "--approval-id", "msg-1", "--no-ingest", "--dry-run", "--no-wait",
     ])).toEqual({
-      command: "acquire", domainId: "example", md5: MD5, format: "pdf", title: "T", author: "A", corpusId: "example-shared-library",
+      command: "acquire", domainId: "example", md5: MD5, format: "pdf", title: "T", author: "A",
       copyrightPosture: "owner-acquired", approvalId: "msg-1", ingest: false, dryRun: true, wait: false,
     });
-    expect(parseExpertLibraryArguments([
-      "source", "register", "--domain", "example", "--kind", "book", "--title", "T", "--author", "A", "--locator", "https://example.invalid/t",
-      "--trust-tier", "reviewed", "--copyright-posture", "owner-acquired", "--corpus", "c1", "--token-file", "/run/token",
-    ])).toEqual({
-      command: "source-register", domainId: "example", kind: "book", title: "T", author: "A", locator: "https://example.invalid/t",
-      trustTier: "reviewed", copyrightPosture: "owner-acquired", corpusId: "c1", tokenFile: "/run/token",
-    });
-    expect(parseExpertLibraryArguments(["status", "--domain", "example"])).toEqual({ command: "status", domainId: "example" });
     expect(parseExpertLibraryArguments(["health"])).toEqual({ command: "health" });
   });
 
@@ -118,13 +107,15 @@ describe("expert:library argument parsing", () => {
   test("refuses usage errors with the usage text and exit code 2", async () => {
     const cases: string[][] = [
       ["bogus"],
-      ["ask", "--domain", "example"],
-      ["ask", "--domain", "example", "q1", "q2"],
       ["search", "--domain", "example"],
       ["search", "--domain", "example", "--query", "q", "--top", "0"],
-      ["acquire", "--domain", "example", "--md5", "nothex", "--format", "pdf", "--title", "T", "--author", "A", "--corpus", "c", "--copyright-posture", "p", "--approval-id", "i"],
-      ["source", "list"],
-      ["status"],
+      ["acquire", "--domain", "example", "--md5", "nothex", "--format", "pdf", "--title", "T", "--author", "A", "--copyright-posture", "p", "--approval-id", "i"],
+      // Commands of the removed Vertex answer lane are now unknown commands.
+      ["ask", "--domain", "example", "question"],
+      ["read", "--domain", "example"],
+      ["source", "register"],
+      ["status", "--domain", "example"],
+      ["acquire", "--domain", "example", "--md5", "0123456789abcdef0123456789abcdef", "--format", "pdf", "--title", "T", "--author", "A", "--corpus", "c", "--copyright-posture", "p", "--approval-id", "i"],
       ["ingest", "--scope", "s", "--library", "l", "--bucket", "b", "--prefix", "p", "--receipts", "r"],
       ["ingest", "--scope", "s", "--library", "l", "--bucket", "b", "--prefix", "p", "--receipts", "r", "--title", "T", "a.pdf", "b.pdf"],
       ["ingest", "--scope", "s", "--library", "l", "--bucket", "b", "--prefix", "p", "--receipts", "r", "--title", "T", "--meta", "m.json", "a.pdf"],
@@ -174,7 +165,7 @@ describe("expert:library worker target and token handling", () => {
 
     expect(await runExpertLibraryCli(["health"], dependencies)).toBe(0);
     expect(captured.calls[0]).toEqual({ url: `${WORKER}/v1/health`, method: "GET", authorization: `Bearer ${TOKEN}` });
-    expect(await runExpertLibraryCli(["ask", "--domain", "example", "question"], dependencies)).toBe(1);
+    expect(await runExpertLibraryCli(["search", "--domain", "example", "--query", "question"], dependencies)).toBe(1);
     expect(captured.calls[1]!.authorization).toBe(`Bearer ${TOKEN}`);
     // Even a worker that echoes the token back is redacted before it reaches a terminal.
     expect(allOutput(captured)).not.toContain(TOKEN);
@@ -209,70 +200,6 @@ describe("expert:library worker commands", () => {
     const fetchImpl = fetchStub(captured, () => jsonResponse({ kind: "library_ingest_result", job: { job_id: "j1", state: "failed", error: "x" } }));
     expect(await runExpertLibraryCli(["library-ingest", "--domain", "example", "--worker", WORKER, "--action", "status", "--job", "j1"], workerDependencies(captured, fetchImpl))).toBe(1);
     expect(captured.calls[0]!.body).toEqual({ tool: "library_ingest", params: { domain_id: "example", action: "status", job_id: "j1" } });
-  });
-
-  test("read preserves source identity, revision and continuation fields", async () => {
-    const captured = capture();
-    const fetchImpl = fetchStub(captured, () => jsonResponse({ kind: "domain_read_result", text: "Reference", next_offset: 120, complete: false }));
-    const id = "sha256:" + "a".repeat(64);
-    const revision = "b".repeat(64);
-    expect(await runExpertLibraryCli(["read", "--domain", "example", "--worker", WORKER, "--action", "read", "--object", id, "--revision", revision, "--section", "3", "--offset", "100", "--limit", "20"], workerDependencies(captured, fetchImpl))).toBe(0);
-    expect(captured.calls[0]!.body).toEqual({ tool: "domain_read", params: { domain_id: "example", action: "read", object_id: id, text_revision: revision, section: 3, offset: 100, limit: 20 } });
-    expect(JSON.parse(captured.out[0]!)).toMatchObject({ text: "Reference", next_offset: 120, complete: false });
-  });
-  test("ask sends domain_ask and prints the cited answer", async () => {
-    const captured = capture();
-    const fetchImpl = fetchStub(captured, () => jsonResponse({
-      kind: "domain_answer",
-      status: "answered",
-      answer: "Neutral answer [n:1].",
-      citations: [{ citation_id: "n:1", source_display_name: "Neutral Source", source_uri: "gs://neutral/objects/x.md" }],
-      warnings: ["neutral warning"],
-    }));
-    expect(await runExpertLibraryCli(["ask", "--domain", "example", "--worker", WORKER, "What?", "--corpus", "c1"], workerDependencies(captured, fetchImpl))).toBe(0);
-    expect(captured.calls[0]).toMatchObject({
-      url: `${WORKER}/v1/domain`,
-      method: "POST",
-      body: { tool: "domain_ask", params: { domain_id: "example", question: "What?", corpus_id: "c1" } },
-    });
-    expect(captured.out).toEqual(["status: answered", "Neutral answer [n:1].", "", "citations:", "  [n:1] Neutral Source gs://neutral/objects/x.md"]);
-    expect(captured.err).toEqual(["warning: neutral warning"]);
-  });
-
-  test("ask --passages requests passages output and prints each passage", async () => {
-    const captured = capture();
-    const fetchImpl = fetchStub(captured, () => jsonResponse({
-      kind: "domain_passages",
-      status: "retrieved",
-      passages: [{ citation_id: "n:1", corpus_id: "c1", text: "Passage text.", source_display_name: "Neutral", source_uri: "gs://n/x.md", score: 0.5 }],
-    }));
-    expect(await runExpertLibraryCli(["ask", "--domain", "example", "--worker", WORKER, "What?", "--passages"], workerDependencies(captured, fetchImpl))).toBe(0);
-    expect((captured.calls[0]!.body as { params: Record<string, unknown> }).params.output).toBe("passages");
-    expect(captured.out).toContain("[n:1] Neutral (c1, score 0.5)");
-    expect(captured.out).toContain("  Passage text.");
-    expect(captured.out).toContain("1 passage(s)");
-  });
-
-  test("ask prints creator and title instead of the stored file name when the worker supplies them", async () => {
-    const captured = capture();
-    const fetchImpl = fetchStub(captured, () => jsonResponse({
-      kind: "domain_passages",
-      status: "retrieved",
-      passages: [
-        { citation_id: "n:1", corpus_id: "c1", text: "Titled.", title: "The Edge of Example", creator: "Casey Example", source_display_name: "a".repeat(64) + ".md", source_uri: "gs://n/a.md", score: 0.5 },
-        { citation_id: "n:2", corpus_id: "c1", text: "Untitled.", source_display_name: "legacy-name.pdf", source_uri: "gs://n/b.pdf" },
-      ],
-    }));
-    expect(await runExpertLibraryCli(["ask", "--domain", "example", "--worker", WORKER, "What?", "--passages"], workerDependencies(captured, fetchImpl))).toBe(0);
-    expect(captured.out).toContain("[n:1] Casey Example — The Edge of Example (c1, score 0.5)");
-    expect(captured.out).toContain("[n:2] legacy-name.pdf (c1)");
-    const answer = capture();
-    const answerFetch = fetchStub(answer, () => jsonResponse({
-      kind: "domain_answer", status: "answered", answer: "A [n:1].",
-      citations: [{ citation_id: "n:1", title: "A Title Alone", source_display_name: "b".repeat(64) + ".md", source_uri: "gs://n/c.md" }],
-    }));
-    expect(await runExpertLibraryCli(["ask", "--domain", "example", "--worker", WORKER, "What?"], workerDependencies(answer, answerFetch))).toBe(0);
-    expect(answer.out).toContain("  [n:1] A Title Alone gs://n/c.md");
   });
 
   test("search sends annas_archive_search and prints a ranked table with warnings", async () => {
@@ -328,32 +255,32 @@ describe("expert:library worker commands", () => {
     expect(captured.err[1]).toBe("worker_invalid_response: worker returned HTTP 502 without a JSON body.");
   });
 
-  test("acquire sends annas_archive_import with dry_run false and prints the full rag_ingest status", async () => {
+  test("acquire sends annas_archive_import with dry_run false and prints the full ingest status", async () => {
     const captured = capture();
     const fetchImpl = fetchStub(captured, () => jsonResponse({
       kind: "annas_archive_import_result",
       status: "downloaded",
       download: { status: "downloaded", path: "/books/a.pdf", bytes: 1024 },
-      rag_ingest: { status: "import_requested", target_corpus_id: "example-shared-library", gcs_uri: "gs://b/p/x.pdf", rag_import: { operation: { name: "op/1" } } },
+      rag_ingest: { status: "import_requested", job_id: "job-1", pages: 120 },
     }));
     expect(await runExpertLibraryCli([
       "acquire", "--domain", "example", "--worker", WORKER, "--md5", MD5, "--format", "pdf", "--title", "T", "--author", "A", "--year", "1990",
-      "--corpus", "example-shared-library", "--copyright-posture", "owner-acquired", "--approval-id", "msg-1",
+      "--copyright-posture", "owner-acquired", "--approval-id", "msg-1",
     ], workerDependencies(captured, fetchImpl))).toBe(0);
     expect(captured.calls[0]!.body).toEqual({
       tool: "annas_archive_import",
       params: {
         domain_id: "example", md5: MD5, annas_archive_id: MD5, format: "pdf", title: "T", author: "A", year: "1990",
-        corpus_id: "example-shared-library", copyright_posture: "owner-acquired", approval_id: "msg-1", ingest: true, dry_run: false,
+        copyright_posture: "owner-acquired", approval_id: "msg-1", ingest: true, dry_run: false,
       },
     });
     expect(captured.out[0]).toBe("status: downloaded");
     expect(captured.out[1]).toBe("download: downloaded /books/a.pdf (1.0 KiB)");
     expect(captured.out.join("\n")).toContain('"status": "import_requested"');
-    expect(captured.out.join("\n")).toContain('"gcs_uri": "gs://b/p/x.pdf"');
+    expect(captured.out.join("\n")).toContain('"job_id": "job-1"');
   });
 
-  test("acquire surfaces a blocked rag_ingest error message and exits 1", async () => {
+  test("acquire surfaces a blocked ingest error message and exits 1", async () => {
     const captured = capture();
     const fetchImpl = fetchStub(captured, () => jsonResponse({
       kind: "annas_archive_import_result",
@@ -363,7 +290,7 @@ describe("expert:library worker commands", () => {
     }));
     expect(await runExpertLibraryCli([
       "acquire", "--domain", "example", "--worker", WORKER, "--md5", MD5, "--format", "pdf", "--title", "T", "--author", "A",
-      "--corpus", "c", "--copyright-posture", "p", "--approval-id", "i", "--no-ingest", "--dry-run",
+      "--copyright-posture", "p", "--approval-id", "i", "--no-ingest", "--dry-run",
     ], workerDependencies(captured, fetchImpl))).toBe(1);
     const params = (captured.calls[0]!.body as { params: Record<string, unknown> }).params;
     expect(params.ingest).toBe(false);
@@ -374,11 +301,11 @@ describe("expert:library worker commands", () => {
     ]);
   });
 
-  test("acquire retries a busy corpus and a 429 with 30s then 90s backoff", async () => {
+  test("acquire retries a busy quota and a 429 with 30s then 90s backoff", async () => {
     const captured = capture();
     const sleeps: number[] = [];
     const responses = [
-      () => jsonResponse({ error: { code: "rag_import_failed", message: "FAILED_PRECONDITION: other operations running on corpus" } }, 400),
+      () => jsonResponse({ error: { code: "rate_limited", message: "RESOURCE_EXHAUSTED: quota exceeded" } }, 400),
       () => jsonResponse({ error: { code: "annas_archive_rate_limited", message: "slow down" } }, 429),
       () => jsonResponse({ kind: "annas_archive_import_result", status: "ingested_existing", rag_ingest: { status: "import_requested" } }),
     ];
@@ -386,30 +313,32 @@ describe("expert:library worker commands", () => {
     const dependencies = { ...workerDependencies(captured, fetchImpl), sleep: async (ms: number) => { sleeps.push(ms); } };
     expect(await runExpertLibraryCli([
       "acquire", "--domain", "example", "--worker", WORKER, "--md5", MD5, "--format", "pdf", "--title", "T", "--author", "A",
-      "--corpus", "c", "--copyright-posture", "p", "--approval-id", "i",
+      "--copyright-posture", "p", "--approval-id", "i",
     ], dependencies)).toBe(0);
     expect(captured.calls).toHaveLength(3);
     expect(sleeps).toEqual([ACQUIRE_RETRY_INITIAL_DELAY_MS, ACQUIRE_RETRY_SECOND_DELAY_MS]);
-    expect(captured.err[0]).toBe("corpus or quota busy (HTTP 400); attempt 1, retrying in 30s");
-    expect(captured.err[1]).toBe("corpus or quota busy (HTTP 429); attempt 2, retrying in 90s");
+    expect(captured.err[0]).toBe("quota busy (HTTP 400); attempt 1, retrying in 30s");
+    expect(captured.err[1]).toBe("quota busy (HTTP 429); attempt 2, retrying in 90s");
     expect(captured.out[0]).toBe("status: ingested_existing");
   });
 
-  test("acquire --no-wait refuses to retry a busy corpus, and a blocked-busy 200 counts as busy", async () => {
+  test("acquire --no-wait refuses to retry a busy quota, and a blocked-busy 200 counts as busy", async () => {
     const captured = capture();
     const fetchImpl = fetchStub(captured, () => jsonResponse({
       kind: "annas_archive_import_result",
       status: "downloaded_ingest_blocked",
-      rag_ingest: { status: "blocked", error: { code: "rag_import_failed", message: "9 FAILED_PRECONDITION: There are other operations running on the corpus." } },
+      rag_ingest: { status: "blocked", error: { code: "rag_import_failed", message: "8 RESOURCE_EXHAUSTED: Quota exceeded." } },
     }));
     expect(isBusyWorkerOutcome({ status: 429, ok: false, body: {} })).toBe(true);
+    // Only a quota signal is busy; a corpus-busy precondition error is an ordinary failure now.
+    expect(isBusyWorkerOutcome({ status: 400, ok: false, body: { error: { code: "rag_import_failed", message: "FAILED_PRECONDITION: other operations running" } } })).toBe(false);
     expect(isBusyWorkerOutcome({ status: 200, ok: true, body: { rag_ingest: { status: "import_requested" } } })).toBe(false);
     expect(await runExpertLibraryCli([
       "acquire", "--domain", "example", "--worker", WORKER, "--md5", MD5, "--format", "pdf", "--title", "T", "--author", "A",
-      "--corpus", "c", "--copyright-posture", "p", "--approval-id", "i", "--no-wait",
+      "--copyright-posture", "p", "--approval-id", "i", "--no-wait",
     ], workerDependencies(captured, fetchImpl))).toBe(1);
     expect(captured.calls).toHaveLength(1);
-    expect(captured.err[0]).toBe("worker_busy: corpus or quota busy (HTTP 200); --no-wait given, not retrying.");
+    expect(captured.err[0]).toBe("worker_busy: quota busy (HTTP 200); --no-wait given, not retrying.");
   });
 
   test("acquire gives up once the 15 minute budget is spent", async () => {
@@ -419,44 +348,13 @@ describe("expert:library worker commands", () => {
     const dependencies = { ...workerDependencies(captured, fetchImpl), sleep: async (ms: number) => { sleeps.push(ms); } };
     expect(await runExpertLibraryCli([
       "acquire", "--domain", "example", "--worker", WORKER, "--md5", MD5, "--format", "pdf", "--title", "T", "--author", "A",
-      "--corpus", "c", "--copyright-posture", "p", "--approval-id", "i",
+      "--copyright-posture", "p", "--approval-id", "i",
     ], dependencies)).toBe(1);
     expect(sleeps.reduce((total, value) => total + value, 0)).toBeLessThanOrEqual(15 * 60_000);
     expect(sleeps).toEqual([30_000, 90_000, 270_000, 300_000]);
-    expect(captured.err.at(-1)).toMatch(/^worker_busy: corpus or quota still busy after 690s across 5 attempts; giving up\.$/);
+    expect(captured.err.at(-1)).toMatch(/^worker_busy: quota still busy after 690s across 5 attempts; giving up\.$/);
   });
 
-  test("source register sends a non-dry-run domain_source add with the registry fields", async () => {
-    const captured = capture();
-    const fetchImpl = fetchStub(captured, () => jsonResponse({
-      kind: "domain_source_result", status: "registered", source_record: { source_id: "example:book:t", title: "T" },
-    }));
-    expect(await runExpertLibraryCli([
-      "source", "register", "--domain", "example", "--worker", WORKER, "--kind", "book", "--title", "T", "--author", "A",
-      "--locator", "https://example.invalid/t", "--trust-tier", "reviewed", "--copyright-posture", "owner-acquired", "--corpus", "c1",
-    ], workerDependencies(captured, fetchImpl))).toBe(0);
-    expect(captured.calls[0]!.body).toEqual({
-      tool: "domain_source",
-      params: {
-        action: "add", domain_id: "example", kind: "book", title: "T", author: "A", url: "https://example.invalid/t",
-        trust_posture: "reviewed", copyright_posture: "owner-acquired", corpus_id: "c1", dry_run: false,
-      },
-    });
-    expect(captured.out.slice(0, 2)).toEqual(["status: registered", "source_id: example:book:t"]);
-  });
-
-  test("status sends rag_corpus status and prints the resolved corpus", async () => {
-    const captured = capture();
-    const fetchImpl = fetchStub(captured, () => jsonResponse({
-      kind: "rag_corpus_status",
-      resolved_corpus: { corpus_id: "c1", resource_name: "projects/p/locations/l/ragCorpora/1" },
-      corpus: { displayName: "c1", state: "ACTIVE" },
-    }));
-    expect(await runExpertLibraryCli(["status", "--domain", "example", "--worker", WORKER, "--corpus", "c1"], workerDependencies(captured, fetchImpl))).toBe(0);
-    expect(captured.calls[0]!.body).toEqual({ tool: "rag_corpus", params: { action: "status", domain_id: "example", corpus_id: "c1" } });
-    expect(captured.out[0]).toBe("corpus: c1 (projects/p/locations/l/ragCorpora/1)");
-    expect(JSON.parse(captured.out.slice(1).join("\n"))).toEqual({ displayName: "c1", state: "ACTIVE" });
-  });
 });
 
 describe("expert:library owner lane", () => {

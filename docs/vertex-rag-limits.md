@@ -1,8 +1,8 @@
 # Vertex RAG Engine limits
 
-> **Legacy.** This describes the Vertex RAG path, which only domains not yet on
-> the [page library](page-library.md) still use. It is deleted after their
-> cutover (owner decision 2026-10-20). New experts read a page library.
+> **Legacy.** The worker no longer reads or imports into Vertex corpora
+> (removed 2026-10-25). This page remains for the library materializer and is
+> deleted with it. Every expert reads a [page library](page-library.md).
 
 Platform facts the worker's import code depends on, with how each was
 established. Code that enforces one of these limits links here; change the
@@ -56,11 +56,9 @@ What the worker does with it, while imports use the LLM parser:
   `pdf_page_count_unavailable`. Under Google's default parser, which has no
   page limit, such a PDF is imported whole.
 
-The worker applies this to acquisitions, to `rag_corpus import` of one GCS PDF
-object, and to the PDFs of `stage_import` and `web_import` batches. A
-`rag_corpus import` of a GCS directory or a Drive file is imported as before,
-without the check. The library materializer does not split; it rejects a
-longer PDF, or one it cannot count, before import.
+The worker's own Vertex import routes, which split long PDFs, were removed on
+2026-10-25. The library materializer does not split; it rejects a longer PDF,
+or one it cannot count, before import.
 
 Worker health reports `pdf_import.status: degraded` while the LLM parser is
 configured and `qpdf` or `pdftotext` is missing.

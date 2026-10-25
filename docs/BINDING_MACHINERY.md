@@ -72,8 +72,7 @@ bun run expert:bindings -- \
 The output directory receives:
 
 - `binding-descriptor.json`: agent identity, OpenClaw and optional Telegram
-  declarations, plus the routing linkage (`domainId` and
-  `targetCorpusDisplayName`);
+  declarations, plus the routing linkage (`domainId`);
 - `APPLICATION_CHECKLIST.md`: numbered operator actions; and
 - `BINDING_RECEIPT.json`: only artifact-relative paths, SHA-256 hashes, and byte
   counts.

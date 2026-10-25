@@ -79,8 +79,8 @@ export function workerClientGrantsFromEnv(
 }
 
 // Loopback is not a trust boundary. Every local process on the host can reach
-// a loopback port, and this worker's tool surface includes corpus mutation and
-// rag_corpus delete_file, so an unauthenticated worker grants those to anything
+// a loopback port, and this worker's tool surface includes library ingest and
+// acquisition, so an unauthenticated worker grants those to anything
 // running on the box. Absence of a token is therefore fatal by default; local
 // development opts out explicitly.
 export function warnIfWorkerAuthDisabled(

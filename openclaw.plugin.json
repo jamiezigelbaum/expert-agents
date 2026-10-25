@@ -3,7 +3,7 @@
   "name": "Expert Agents",
   "version": "0.1.0",
   "skills": ["./skills"],
-  "description": "Independent expert-agent planning, grounded research, managed corpus, document, and approved acquisition tools for OpenClaw.",
+  "description": "Independent expert-agent planning, page-library research and ingest, and approved acquisition tools for OpenClaw.",
   "activation": {
     "onStartup": true,
     "onCapabilities": ["tool"]
@@ -11,13 +11,8 @@
   "contracts": {
     "tools": [
       "domain_agent",
-      "domain_ask",
       "domain_library",
       "library_ingest",
-      "domain_read",
-      "domain_source",
-      "rag_corpus",
-      "domain_doc",
       "annas_archive_search",
       "annas_archive_import",
       "expert_factory"

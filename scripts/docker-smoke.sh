@@ -10,7 +10,7 @@ root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 image="${1:-expert-agents-domain-expert:smoke}"
 name="expert-agents-smoke-$(od -An -N6 -tx1 /dev/urandom | tr -d ' \n')"
 token="smoke-$(od -An -N24 -tx1 /dev/urandom | tr -d ' \n')"
-routing='{"public-expert":{"displayName":"Public Expert","library":{"bucket":"example-shared-library","prefix":"library/v1"},"targetCorpusDisplayName":"example-shared-corpus","retrieval":{"multiQuery":true,"reranker":"rank-service"},"disclosure":{"excludedSources":[]}}}'
+routing='{"public-expert":{"displayName":"Public Expert","library":{"bucket":"example-shared-library","prefix":"library/v1"},"pageLibrary":{"sourceId":"public-expert"},"disclosure":{"excludedSources":[]}}}'
 
 docker build --tag "$image" "$root"
 
@@ -22,7 +22,6 @@ docker run -d --name "$name" \
   --tmpfs /tmp:rw,noexec,nosuid,nodev,mode=1777 \
   --tmpfs /var/lib/expert-agents/domain-expert:rw,noexec,nosuid,nodev,uid=10001,gid=10001,mode=0700 \
   -e EXPERT_AGENTS_DOMAIN_EXPERT_AUTH_TOKEN="$token" \
-  -e EXPERT_AGENTS_GCP_PROJECT=smoke-project \
   -e EXPERT_AGENTS_DOMAIN_EXPERT_GOOGLE_METADATA_TOKEN=1 \
   -e EXPERT_AGENTS_DOMAIN_EXPERT_AGENTS_JSON="$routing" \
   "$image" >/dev/null
@@ -68,7 +67,7 @@ if (health.status !== 200) failures.push(`health status ${health.status}`);
 if (body.kind !== "domain_expert_health" || body.reachable !== true) failures.push("health document shape");
 if (body.configured.agent_routes !== 1) failures.push(`agent_routes ${body.configured.agent_routes}`);
 if (body.configured.google !== false) failures.push("google must not read as configured with networking disabled");
-if (body.configuration_status.google_credentials !== "unreadable") failures.push(`google_credentials ${body.configuration_status.google_credentials}`);
+if (body.configuration_status.google !== "unreadable") failures.push(`google ${body.configuration_status.google}`);
 const anonymous = await fetch(`${base}/health`);
 if (anonymous.status !== 401) failures.push(`unauthenticated health status ${anonymous.status}`);
 const wrong = await fetch(`${base}/health`, { headers: { authorization: "Bearer not-the-token" } });

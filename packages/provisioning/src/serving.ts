@@ -34,7 +34,6 @@ export const SERVING_RECEIPT_FILE = "SERVING_RECEIPT.json";
 export const SERVING_MANUAL_PRECONDITIONS: readonly string[] = [
   "Run soul lint against the tagged repository and record an owner-approved result.",
   "Run the retrieval evaluation for this tag and confirm it clears its declared thresholds.",
-  "Run the parity battery against the tagged configuration and confirm no regression.",
 ];
 
 export class ServingPackagingError extends Error {
@@ -154,7 +153,6 @@ export function createServingManifest(
     agentId: manifest.agentId,
     displayName: manifest.displayName,
     domainId: manifest.domainId,
-    ...(manifest.targetCorpusDisplayName === undefined ? {} : { targetCorpusDisplayName: manifest.targetCorpusDisplayName }),
     ...(manifest.emoji === undefined ? {} : { emoji: manifest.emoji }),
     // The avatar is public-safe, so it may ship — but it is named only when the
     // serving set actually materialized it, so the manifest never points a

@@ -227,17 +227,17 @@ describe('packaged expert factory', () => {
       plugin.register({ pluginConfig: { domainExpert: { enabled: true, defaultDomainId: 'legacy-domain' }, factory: { enabled, rootDir: root } },
         registerTool: (registration) => {
           const tool = typeof registration === 'function' ? registration({ agentId: 'example', workspaceDir: join(root, 'agents', 'example'), getRuntimeConfig: () => runtimeConfig }) : registration;
-          if (tool.name === 'domain_ask') ask = tool;
+          if (tool.name === 'domain_library') ask = tool;
         },
       });
-      expect((await ask!.execute('one', { question: 'What is in my library?' })).isError).toBeUndefined();
-      expect(requests).toEqual([{ tool: 'domain_ask', params: { question: 'What is in my library?', domain_id: 'example' } }]);
-      expect((await ask!.execute('two', { question: 'Other library?', domain_id: 'legacy-domain' })).isError).toBe(true);
+      expect((await ask!.execute('one', { action: 'search', query: 'What is in my library?' })).isError).toBeUndefined();
+      expect(requests).toEqual([{ tool: 'domain_library', params: { action: 'search', query: 'What is in my library?', domain_id: 'example' } }]);
+      expect((await ask!.execute('two', { action: 'search', query: 'Other library?', domain_id: 'legacy-domain' })).isError).toBe(true);
       expect(requests).toHaveLength(1);
       // A retained tool must stay bound even when refreshed config omits the
       // factory section (for example after provisioning is retired).
       runtimeConfig = { plugins: { entries: { 'expert-agents': { config: { domainExpert: { enabled: true, defaultDomainId: 'changed-domain' } } } } } };
-      expect((await ask!.execute('three', { question: 'Other library?', domain_id: 'changed-domain' })).isError).toBe(true);
+      expect((await ask!.execute('three', { action: 'search', query: 'Other library?', domain_id: 'changed-domain' })).isError).toBe(true);
       expect(requests).toHaveLength(1);
     } finally { globalThis.fetch = previous; }
   });

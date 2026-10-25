@@ -1,12 +1,8 @@
 import { describe, expect, test } from 'bun:test';
-import { mkdtempSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { createDomainExpertWorker, domainExpertGoogleConfigFromEnv } from '../src/workers/domain-expert/index.ts';
-import { TEST_AGENT_ROUTING } from './routing-fixture.ts';
+import { domainExpertGoogleConfigFromEnv } from '../src/workers/domain-expert/index.ts';
+import { googleUploadVehicle } from './google-vehicle.ts';
 
 const METADATA_TOKEN_URL = 'http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token';
-const CORPUS = 'projects/fixture-project/locations/us-central1/ragCorpora/1001';
 
 interface Call { url: string; headers: Record<string, string> }
 
@@ -20,86 +16,53 @@ function metadataFetch(calls: Call[], options: { metadataReachable: boolean }): 
       if (headers['metadata-flavor'] !== 'Google') return Response.json({ error: 'missing Metadata-Flavor' }, { status: 403 });
       return Response.json({ access_token: 'fixture-metadata-token', expires_in: 3599, token_type: 'Bearer' });
     }
-    if (url.endsWith(':retrieveContexts')) {
-      return Response.json({ contexts: { contexts: [{ id: 'c', text: 'fixture evidence', sourceUri: 'gs://fixture/source.pdf', sourceDisplayName: 'Fixture Source', score: 0.9 }] } });
-    }
-    if (new URL(url).pathname.endsWith('/ragCorpora')) {
-      return Response.json({ ragCorpora: [{ name: CORPUS, displayName: 'research-library' }] });
-    }
+    if (url.startsWith('https://storage.googleapis.com/upload/')) return Response.json({ name: 'ok', generation: '1' });
     return Response.json({ error: `unexpected fixture URL: ${url}` }, { status: 500 });
   }) as typeof fetch;
 }
 
-async function withWorker<T>(metadataReachable: boolean, body: (worker: ReturnType<typeof createDomainExpertWorker>, calls: Call[]) => Promise<T>): Promise<T> {
-  const dataDir = mkdtempSync(join(tmpdir(), 'google-metadata-identity-'));
-  const calls: Call[] = [];
-  try {
-    const worker = createDomainExpertWorker({
-      dataDir,
-      gcpProject: 'fixture-project',
-      agentRouting: TEST_AGENT_ROUTING,
-      google: { metadataServerToken: true, multiQuery: false, fetchImpl: metadataFetch(calls, { metadataReachable }) },
-    });
-    return await body(worker, calls);
-  } finally {
-    rmSync(dataDir, { recursive: true, force: true });
-  }
-}
-
-async function health(worker: ReturnType<typeof createDomainExpertWorker>): Promise<Record<string, any>> {
+async function health(worker: { fetch(request: Request): Promise<Response> }): Promise<Record<string, any>> {
   return await (await worker.fetch(new Request('http://worker.test/v1/health'))).json() as Record<string, any>;
 }
 
-async function ask(worker: ReturnType<typeof createDomainExpertWorker>): Promise<Response> {
-  return worker.fetch(new Request('http://worker.test/v1/domain', {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ tool: 'domain_ask', params: { domain_id: 'research', question: 'fixture question', output: 'passages' } }),
-  }));
-}
+const uploads = (calls: Call[]) => calls.filter((call) => call.url.startsWith('https://storage.googleapis.com/upload/'));
 
 describe('attached-identity (metadata server) Google credentials', () => {
-  test('health reports ready and Vertex calls carry the metadata token, fetched once', async () => {
-    await withWorker(true, async (worker, calls) => {
-      const status = await health(worker);
-      expect(status.configured.google).toBe(true);
-      expect(status.configuration_status).toEqual({ google: 'ready', google_credentials: 'ready', google_project: 'ready' });
+  test('health reports ready and Google calls carry the metadata token, fetched once', async () => {
+    const calls: Call[] = [];
+    const vehicle = googleUploadVehicle({ metadataServerToken: true, fetchImpl: metadataFetch(calls, { metadataReachable: true }) });
+    const status = await health(vehicle.worker);
+    expect(status.configured.google).toBe(true);
+    expect(status.configuration_status).toEqual({ google: 'ready' });
 
-      for (let i = 0; i < 2; i += 1) {
-        const response = await ask(worker);
-        expect(response.status).toBe(200);
-        expect(((await response.json()) as Record<string, any>).kind).toBe('domain_passages');
-      }
-      const vertex = calls.filter((call) => call.url.includes('aiplatform.googleapis.com'));
-      expect(vertex.length).toBeGreaterThan(0);
-      for (const call of vertex) expect(call.headers.authorization).toBe('Bearer fixture-metadata-token');
-      // The health probe is one metadata read; the two asks share one cached token.
-      expect(calls.filter((call) => call.url === METADATA_TOKEN_URL)).toHaveLength(2);
-      expect(calls.some((call) => call.url.startsWith('https://oauth2.googleapis.com'))).toBe(false);
-    });
+    for (let i = 0; i < 2; i += 1) {
+      const { body } = await vehicle.run();
+      expect(body.rag_ingest.error).toBeUndefined();
+    }
+    // Two acquisitions of the same original upload it twice-or-once; either way every upload carries the token.
+    expect(uploads(calls).length).toBeGreaterThan(0);
+    for (const call of uploads(calls)) expect(call.headers.authorization).toBe('Bearer fixture-metadata-token');
+    // The health probe is one metadata read; the uploads share one cached token.
+    expect(calls.filter((call) => call.url === METADATA_TOKEN_URL)).toHaveLength(2);
+    expect(calls.some((call) => call.url.startsWith('https://oauth2.googleapis.com'))).toBe(false);
   });
 
-  test('an unreachable metadata server is unreadable in health and fails the ask closed', async () => {
-    await withWorker(false, async (worker, calls) => {
-      const status = await health(worker);
-      expect(status.configured.google).toBe(false);
-      expect(status.configuration_status.google_credentials).toBe('unreadable');
+  test('an unreachable metadata server is unreadable in health and fails the upload closed', async () => {
+    const calls: Call[] = [];
+    const vehicle = googleUploadVehicle({ metadataServerToken: true, fetchImpl: metadataFetch(calls, { metadataReachable: false }) });
+    const status = await health(vehicle.worker);
+    expect(status.configured.google).toBe(false);
+    expect(status.configuration_status.google).toBe('unreadable');
 
-      const response = await ask(worker);
-      expect(response.status).toBe(503);
-      expect(((await response.json()) as Record<string, any>).error.code).toBe('google_auth_not_configured');
-      expect(calls.some((call) => call.url.includes('aiplatform.googleapis.com'))).toBe(false);
-    });
+    const { body } = await vehicle.run();
+    expect(body.rag_ingest).toMatchObject({ status: 'blocked', error: { code: 'google_auth_not_configured' } });
+    expect(uploads(calls)).toHaveLength(0);
   });
 
   test('service-account JSON keeps precedence over the metadata flag', async () => {
     const calls: Call[] = [];
-    const worker = createDomainExpertWorker({
-      gcpProject: 'fixture-project',
-      agentRouting: TEST_AGENT_ROUTING,
-      google: { metadataServerToken: true, serviceAccountJson: '{"client_email":"","private_key":""}', fetchImpl: metadataFetch(calls, { metadataReachable: true }) },
-    });
-    expect((await health(worker)).configuration_status.google_credentials).toBe('unreadable');
+    const vehicle = googleUploadVehicle({ metadataServerToken: true, serviceAccountJson: '{"client_email":"","private_key":""}', fetchImpl: metadataFetch(calls, { metadataReachable: true }) });
+    expect((await health(vehicle.worker)).configuration_status.google).toBe('unreadable');
     expect(calls).toHaveLength(0);
   });
 

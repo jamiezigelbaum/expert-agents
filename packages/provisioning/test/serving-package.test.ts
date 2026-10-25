@@ -193,7 +193,7 @@ describe("serving posture checklist", () => {
     expect(checklist).toContain("[MANUAL] Keep per-hire state outside the artifact and never commit it back");
     expect(checklist).toContain("[MANUAL] Run soul lint");
     expect(checklist).toContain("[MANUAL] Run the retrieval evaluation");
-    expect(checklist).toContain("[MANUAL] Run the parity battery");
+    expect(checklist).not.toContain("parity battery");
     expect(checklist).toContain("## ROLLBACK");
     for (const term of FORBIDDEN_SOURCE_TERMS) expect(checklist.toLowerCase()).not.toContain(term);
     expect(checklist).not.toContain("http");

@@ -12,20 +12,17 @@ afterEach(async () => { await Promise.all(roots.splice(0).map((path) => rm(path,
 async function worker(allowOverwrite: boolean) {
   const base = await mkdtemp(join(tmpdir(), 'factory-worker-contract-')); roots.push(base);
   const instance = createDomainExpertWorker({
-    dataDir: join(base, 'data'), gcpProject: 'neutral-project',
+    dataDir: join(base, 'data'),
     roots: [{ rootId: 'expert_agents_workspace', path: base, maxWriteBytes: 1_000_000, allowOverwrite }],
     registrationLibrary: { bucket: 'neutral-library', prefix: 'experts' },
-    google: { accessToken: 'synthetic-token', fetchImpl: (async (input: RequestInfo | URL) => {
-      if (String(input).endsWith('/ragCorpora')) return Response.json({ ragCorpora: [] });
-      throw new Error('unexpected upstream request');
-    }) as typeof fetch },
+    fetchImpl: (async () => { throw new Error('unexpected upstream request'); }) as unknown as typeof fetch,
   });
   const call = async (params: Record<string, unknown>) => (await (await instance.fetch(new Request('http://worker.test/v1/domain', {
     method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ tool: 'domain_agent', params: { domain_id: 'example', ...params } }),
   }))).json()) as Record<string, any>;
   const health = async () => (await (await instance.fetch(new Request('http://worker.test/v1/health'))).json()) as Record<string, any>;
   const register = (dryRun: boolean) => call({ action: 'register', library: { bucket: 'neutral-library', prefix: 'experts/example' },
-    target_corpus_display_name: 'expert-example', approval_id: 'factory-operation-1', dry_run: dryRun });
+    page_library: {}, approval_id: 'factory-operation-1', dry_run: dryRun });
   return { base, call, health, register };
 }
 
@@ -45,24 +42,25 @@ describe('factory workspace contract with the worker', () => {
     expect((await status()).exists).toBe(false);
     expect((await w.call({ action: 'bootstrap', dry_run: false })).status).toBe('workspace_bootstrapped');
     expect(await status()).toMatchObject({ exists: true, missing_requirements: [] });
-    // The owner records a source and deletes one template; the worker now recommends bootstrap.
-    const registry = join(w.base, 'experts', 'example', 'references', 'source-registry.jsonl');
-    const owned = '{"source_id":"owner-source"}\n';
-    await writeFile(registry, owned);
+    // The owner edits the reading map and deletes one template; the worker now recommends bootstrap.
+    const readingMap = join(w.base, 'experts', 'example', 'references', 'reading-map.md');
+    const owned = '# Owner reading map\n';
+    await writeFile(readingMap, owned);
     await unlink(join(w.base, 'experts', 'example', 'templates', 'source-card.md'));
     expect((await status()).missing_requirements).toHaveLength(1);
     expect((await w.call({ action: 'bootstrap', dry_run: false })).status).toBe('workspace_bootstrapped');
     expect(await status()).toMatchObject({ exists: true, missing_requirements: [] });
-    expect(await readFile(registry, 'utf8')).toBe(owned);
+    expect(await readFile(readingMap, 'utf8')).toBe(owned);
   });
 
-  test('negative control: on a root that allows overwrite, the same bootstrap empties the source registry, which is why the factory refuses it', async () => {
+  test('negative control: on a root that allows overwrite, the same bootstrap replaces the owner reading map with the seed, which is why the factory refuses it', async () => {
     const w = await worker(true);
     await w.register(false);
     await w.call({ action: 'bootstrap', dry_run: false });
-    const registry = join(w.base, 'experts', 'example', 'references', 'source-registry.jsonl');
-    await writeFile(registry, '{"source_id":"owner-source"}\n');
+    const readingMap = join(w.base, 'experts', 'example', 'references', 'reading-map.md');
+    await writeFile(readingMap, '# Owner reading map\n');
     await w.call({ action: 'bootstrap', dry_run: false });
-    expect(await readFile(registry, 'utf8')).toBe('');
+    expect(await readFile(readingMap, 'utf8')).toContain('Reading Map');
+    expect(await readFile(readingMap, 'utf8')).not.toContain('Owner reading map');
   });
 });

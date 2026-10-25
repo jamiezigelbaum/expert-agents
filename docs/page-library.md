@@ -9,10 +9,9 @@ that day's retrieval test). It has three pieces:
 - a six-tool belt that lets the agent search, verify, read whole ranges and
   look at pages.
 
-New experts get one from the factory. A domain still on a Vertex corpus
-switches by declaring a `pageLibrary` route (section 3); the Vertex path
-(`domain_ask`, `domain_read`, `rag_corpus`) stays only until those domains have
-moved, then is deleted.
+New experts get one from the factory, and every worker route declares a
+`pageLibrary` (section 3). The worker's Vertex retrieval path was removed on
+2026-10-25.
 
 ## 1. Parse once: page-addressed units
 
@@ -206,7 +205,7 @@ Slugs, book ids and unit numbers are internal addresses, never shown to readers.
 
 Under a disclosure policy (the route's `disclosure` block,
 [`AGENT_REPO_CONTRACT.md`](./AGENT_REPO_CONTRACT.md)) the tool serves the same
-bounds `domain_ask` does, with a book as the source: `session_id` is required;
+bounds as before, with a book as the source: `session_id` is required;
 every passage is cut to `maxQuoteChars`; each response carries at most
 `maxQuotesPerSource` passages per book (`read_range` returns that many units
 and resumes from the next); a session may see at most
@@ -234,7 +233,7 @@ the same name). It runs the same parse code as the operator CLI
 
 | action | parameters | returns |
 |---|---|---|
-| `start` | one of `workspace_relative_path`, `gcs_uri`, `urls`, `notion`, `drive_file_ids`; `title?`, `creator?` (one source); `dry_run` (default true); `approval_id` | `job_id`, the lanes in use, skipped files |
+| `start` | one of `workspace_relative_path`, `gcs_uri`, `urls`, `notion`; `title?`, `creator?` (one source); `dry_run` (default true); `approval_id` | `job_id`, the lanes in use, skipped files |
 | `status` | `job_id` | the job: state, and per source its book, units, parsers used, failed pages, empty pages, unresolved escalations, undescribed figure pages, refusals, and for a fetched source its URL, origin and retrieval time; then the index counts |
 | `list` | | recent jobs |
 
@@ -252,9 +251,6 @@ the same name). It runs the same parse code as the operator CLI
     `EXPERT_AGENTS_DOMAIN_EXPERT_NOTION_TOKEN`): one page is one book; its
     top-level blocks are paragraphs, cut into sections at headings. A database
     is expanded at `start` into one source per row page.
-  - `drive_file_ids` (1 to 50, ids or Drive/Docs URLs, read with the worker's
-    Google identity): Docs, Slides, Sheets and Drawings are exported as PDF
-    (Drive caps an export at 10 MB); other files are read as they are.
   - A fetched PDF is stored in the acquisition directory like a workspace file,
     so `view_page` can render it. Text is stored without its front matter, so a
     page fetched again unchanged is the same object and book.
@@ -267,7 +263,7 @@ the same name). It runs the same parse code as the operator CLI
   unit files are written into the domain's tree and its catalog entry is
   replaced. Re-ingesting an original replaces its earlier book, even under a
   new title. A fetched source has a stable origin (`url:<URL>`,
-  `notion:<page id>`, `drive:<file id>`): re-ingesting it replaces its earlier
+  `notion:<page id>`): re-ingesting it replaces its earlier
   book even when the content changed. For a database library the tree is a
   staging tree under the job's state, removed when the job ends.
 - **Per job:** the job's books are imported into the index (only those books
@@ -283,8 +279,8 @@ the same name). It runs the same parse code as the operator CLI
   transcription lane is stopped); there is no other lane to fall back to. A
   job with any failed page or source ends `done_with_failures`.
 - **Acquisitions.** `annas_archive_import` with `ingest: true` on a domain with
-  a page library queues a `library_ingest` job instead of a Vertex import, and
-  answers with its `job_id`. The book-scale floor still applies.
+  a page library queues a `library_ingest` job and answers with its `job_id`;
+  a domain without one is refused with `page_library_not_configured`. The book-scale floor still applies.
 
 The worker needs, besides the search settings in section 3:
 - `EXPERT_AGENTS_DOMAIN_EXPERT_PAGE_INDEX_WRITER_DATABASE_URL`, a role that

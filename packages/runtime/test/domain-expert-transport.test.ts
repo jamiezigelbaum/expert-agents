@@ -12,6 +12,7 @@ import {
   VertexPaginationError,
 } from '../../library-materializer/src/index.ts';
 import { TEST_AGENT_ROUTING } from './routing-fixture.ts';
+import { googleUploadVehicle } from './google-vehicle.ts';
 
 const ANNAS_API_KEY = 'fixture-annas-secret';
 const GOOGLE_ACCESS_TOKEN = 'fixture-google-secret';
@@ -77,29 +78,20 @@ describe('domain expert upstream response transport bounds', () => {
   test('caps streamed Google JSON before parsing and sends a deadline signal', async () => {
     let suppliedSignal: AbortSignal | null = null;
     let cancelled = false;
-    const worker = createDomainExpertWorker({
-      gcpProject: 'fixture-project',
-      google: {
-        accessToken: GOOGLE_ACCESS_TOKEN,
-        fetchImpl: (async (_input, init) => {
-          suppliedSignal = init?.signal as AbortSignal;
-          return new Response(streamedBody(8 * 1024 * 1024 + 1, () => { cancelled = true; }), {
-            headers: { 'content-type': 'application/json' },
-          });
-        }) as typeof fetch,
-      },
+    const vehicle = googleUploadVehicle({
+      accessToken: GOOGLE_ACCESS_TOKEN,
+      fetchImpl: (async (_input, init) => {
+        suppliedSignal = init?.signal as AbortSignal;
+        return new Response(streamedBody(8 * 1024 * 1024 + 1, () => { cancelled = true; }), {
+          headers: { 'content-type': 'application/json' },
+        });
+      }) as typeof fetch,
     });
 
-    const response = await postDomain(worker, 'domain_ask', {
-      domain_id: 'research',
-      question: 'Does the transport stay bounded?',
-      corpus_id: '1234567890123456789',
-    });
-    const body = await response.json() as Record<string, any>;
+    const { body } = await vehicle.run();
 
     expect(suppliedSignal).toBeInstanceOf(AbortSignal);
-    expect(response.status).toBe(502);
-    expect(body.error).toEqual({
+    expect(body.rag_ingest.error).toMatchObject({
       code: 'upstream_response_size_limit_exceeded',
       message: 'Upstream JSON response exceeded the 8388608 byte limit.',
     });
@@ -169,35 +161,7 @@ describe('Anna credentialed response disposal', () => {
   });
 });
 
-describe('Vertex pagination bounds', () => {
-  test('the runtime corpus resolver rejects a repeated nextPageToken', async () => {
-    let calls = 0;
-    const worker = createDomainExpertWorker({
-      gcpProject: 'fixture-project',
-      google: {
-        accessToken: GOOGLE_ACCESS_TOKEN,
-        fetchImpl: (async () => {
-          calls += 1;
-          return Response.json({ ragCorpora: [], nextPageToken: 'repeated-token' });
-        }) as unknown as typeof fetch,
-      },
-    });
-
-    const response = await postDomain(worker, 'domain_ask', {
-      domain_id: 'research',
-      question: 'Does pagination terminate?',
-      corpus_id: 'research-library',
-    });
-    const body = await response.json() as Record<string, any>;
-
-    expect(calls).toBe(2);
-    expect(response.status).toBe(502);
-    expect(body.error).toEqual({
-      code: 'google_api_error',
-      message: 'Vertex pagination violated the 100-page cap (repeated nextPageToken).',
-    });
-  });
-
+describe('Vertex adapter pagination bounds', () => {
   test('the materializer corpus loop rejects a repeated nextPageToken with a typed error', async () => {
     let calls = 0;
     const adapter = new GoogleVertexAdapter({
@@ -247,30 +211,20 @@ describe('Vertex pagination bounds', () => {
 
 describe('upstream-derived string sanitization', () => {
   test('bounds Google error serialization and removes the configured bearer value', async () => {
-    const worker = createDomainExpertWorker({
-      gcpProject: 'fixture-project',
-      google: {
-        accessToken: GOOGLE_ACCESS_TOKEN,
-        multiQuery: false,
-        fetchImpl: (async () => Response.json({
-          error: {
-            message: `reflected=${GOOGLE_ACCESS_TOKEN}:${'x'.repeat(5_000)}`,
-          },
-        }, { status: 403 })) as unknown as typeof fetch,
-      },
+    const vehicle = googleUploadVehicle({
+      accessToken: GOOGLE_ACCESS_TOKEN,
+      fetchImpl: (async () => Response.json({
+        error: {
+          message: `reflected=${GOOGLE_ACCESS_TOKEN}:${'x'.repeat(5_000)}`,
+        },
+      }, { status: 403 })) as unknown as typeof fetch,
     });
 
-    const response = await postDomain(worker, 'domain_ask', {
-      domain_id: 'research',
-      question: 'Is the error bounded?',
-      corpus_id: '1234567890123456789',
-    });
-    const body = await response.json() as Record<string, any>;
+    const { body } = await vehicle.run();
 
-    expect(response.status).toBe(403);
-    expect(body.error.code).toBe('google_api_error');
-    expect(body.error.message.length).toBe(2_000);
-    expect(body.error.message).toContain('reflected=redacted');
+    expect(body.rag_ingest.error.code).toBe('google_api_error');
+    expect(body.rag_ingest.error.message.length).toBe(2_000);
+    expect(body.rag_ingest.error.message).toContain('reflected=redacted');
     expect(JSON.stringify(body)).not.toContain(GOOGLE_ACCESS_TOKEN);
   });
 

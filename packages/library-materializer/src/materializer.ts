@@ -304,10 +304,10 @@ async function pdfImportRefusal(
   const bytes = candidateById.get(plannedImport.objectId)?.bytes ?? (await options.gcs.read(plannedImport.relativePath))?.bytes;
   const pages = bytes === undefined ? undefined : await options.pdfPageLimit.countPages(bytes).catch(() => undefined);
   if (pages === undefined) {
-    return `pdf_page_count_unavailable: the PDF's pages could not be counted (qpdf missing, or the file unreadable), and imports with the LLM parser take at most ${maxPages} pages per PDF. Install qpdf, or import it through the worker (rag_corpus import).`;
+    return `pdf_page_count_unavailable: the PDF's pages could not be counted (qpdf missing, or the file unreadable), and imports with the LLM parser take at most ${maxPages} pages per PDF. Install qpdf.`;
   }
   if (pages <= maxPages) return undefined;
-  return `pdf_exceeds_parser_page_limit: measured ${pages} pages; imports with the LLM parser take at most ${maxPages} pages per PDF, and the materializer does not split PDFs. Import it through the worker (rag_corpus import), which splits it into parts.`;
+  return `pdf_exceeds_parser_page_limit: measured ${pages} pages; imports with the LLM parser take at most ${maxPages} pages per PDF, and the materializer does not split PDFs. Split it before staging, or ingest it into a page library instead.`;
 }
 
 async function prepareCandidates(candidates: readonly MaterializerCandidate[]): Promise<PreparedCandidate[]> {
