@@ -65,7 +65,7 @@ afterAll(async () => { await rm(dir, { recursive: true, force: true }); });
 
 interface Fixture { page: string; uploads: string[]; transcriptions: string[] }
 
-function worker(fx: Fixture, options: { tree?: string; writer?: PageIndexWriter; routes?: Record<string, unknown>; notion?: boolean; private?: PageIndexWriter } = {}) {
+function worker(fx: Fixture, options: { tree?: string; writer?: PageIndexWriter; routes?: Record<string, unknown>; notion?: boolean; private?: PageIndexWriter; objectsRoot?: string } = {}) {
   const pdf = scanAndFigurePdf();
   const google = (async (input: RequestInfo | URL) => {
     const url = String(input);
@@ -135,6 +135,7 @@ function worker(fx: Fixture, options: { tree?: string; writer?: PageIndexWriter;
     ocrLanes: { routerUrl: 'http://router.invalid/v1', fetch: router, deep: false },
     ...(options.writer ? { pageIndexWriter: options.writer } : {}),
     ...(options.private ? { pageIndexWriters: { private: options.private } } : {}),
+    ...(options.objectsRoot ? { libraryObjectsRoot: options.objectsRoot } : {}),
     pageSearch: async () => [],
     google: { accessToken: 'synthetic-token', fetchImpl: google },
     resolveHostImpl: async () => ['93.184.216.34'],
@@ -224,6 +225,25 @@ describe('library_ingest web pages', () => {
     const job = await ingest(w, { urls: ['https://example.org/papers/charter.pdf'], title: 'The Charter', creator: 'A. Drafter' });
     expect(job.sources[0]).toMatchObject({ state: 'parsed', kind: 'pages', title: 'The Charter', source_url: 'https://example.org/papers/charter.pdf' });
     expect(fx.uploads).toEqual([expect.stringMatching(/^imports\/history\/originals\/[0-9a-f]{64}\.pdf$/)]);
+  });
+
+  test('with a local object root, the original is kept on disk and view_page renders it without Cloud Storage', async () => {
+    const fx = fixture();
+    const objects = join(dir, 'objects-local');
+    const w = worker(fx, { tree: join(dir, 'tree-web-local'), writer: recordingWriter().writer, objectsRoot: objects });
+    const job = await ingest(w, { urls: ['https://example.org/papers/charter.pdf'], title: 'The Charter', creator: 'A. Drafter' });
+    expect(job.sources[0]).toMatchObject({ state: 'parsed', kind: 'pages' });
+    expect(fx.uploads).toEqual([]);
+    const stored = await readdir(join(objects, 'neutral-acquisitions', 'imports', 'history', 'originals'));
+    expect(stored).toEqual([expect.stringMatching(/^[0-9a-f]{64}\.pdf$/)]);
+
+    const view = await call(w, 'domain_library', { action: 'view_page', slug: `books/${job.sources[0].book}/p0001` });
+    expect(view.body.error).toBeUndefined();
+    expect(view.body.image).toMatchObject({ mime_type: 'image/jpeg' });
+    expect(Buffer.from(view.body.image.data, 'base64').subarray(0, 2)).toEqual(Buffer.from([0xff, 0xd8]));
+
+    const health = await (await w.fetch(new Request('http://worker.test/v1/health'))).json() as Record<string, any>;
+    expect(health.page_library.configured.originals).toBe('local');
   });
 
   test('refuses plain http and Notion URLs at start', async () => {

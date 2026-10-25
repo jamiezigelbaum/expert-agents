@@ -117,6 +117,7 @@ import {
 } from '../../core/disclosure.ts';
 import { completePassageSentences, completionSourceObject, SourceTextCache } from './passage-completion.ts';
 import { LibraryReader, LibraryReadError, parseLibraryReadParams, type LibraryReadRoute } from './library-reader.ts';
+import { LibraryObjectExistsError, libraryObjectsRootFromEnv, LocalLibraryObjects, type LibraryObjectStore } from './library-objects.ts';
 import { PageIndex, voyageClient, type VoyageClient } from './page-index.ts';
 import { MultiPageStore, type PageLibraryMember } from './page-libraries.ts';
 import { PageDisclosureRefusal, runDisclosedPageLibrary } from './page-disclosure.ts';
@@ -255,6 +256,10 @@ export interface DomainExpertWorkerOptions {
   agentRouting?: AgentRoutingConfig;
   gcpProject?: string;
   google?: DomainExpertGoogleConfig;
+  /** Where originals and other library objects live; defaults to a local root when one is set, else Google Cloud Storage. */
+  libraryObjects?: LibraryObjectStore;
+  /** A local directory holding library objects as `<bucket>/<name>` (EXPERT_AGENTS_DOMAIN_EXPERT_LIBRARY_OBJECTS_ROOT). */
+  libraryObjectsRoot?: string;
   annas?: DomainExpertAnnasConfig;
   notion?: DomainExpertNotionConfig;
   dataDir?: string;
@@ -816,6 +821,7 @@ export class DomainExpertService {
   private corpusEnsureQueue: Promise<unknown> = Promise.resolve();
   private gcpProject: string;
   private google: GoogleRuntimeClient;
+  private objects: LibraryObjectStore;
   private libraryReader: LibraryReader;
   private pageLibraries = new Map<string, PageLibrary>();
   private pageIndexDatabaseUrl: string | undefined;
@@ -884,9 +890,11 @@ export class DomainExpertService {
       ...(options.google ?? {}),
       fetchImpl: options.google?.fetchImpl ?? options.fetchImpl ?? fetch,
     });
+    const objectsRoot = options.libraryObjectsRoot ?? libraryObjectsRootFromEnv();
+    this.objects = options.libraryObjects ?? (objectsRoot ? new LocalLibraryObjects(objectsRoot) : this.google);
     this.libraryReader = new LibraryReader({
-      download: (bucket, name, maxBytes, timeoutMs) => this.google.downloadLibraryObject(bucket, name, maxBytes, timeoutMs),
-      list: (bucket, prefix, timeoutMs) => this.google.listLibraryObjectNames(bucket, prefix, timeoutMs),
+      download: (bucket, name, maxBytes, timeoutMs) => this.objects.downloadLibraryObject(bucket, name, maxBytes, timeoutMs),
+      list: (bucket, prefix, timeoutMs) => this.objects.listLibraryObjectNames(bucket, prefix, timeoutMs),
     });
     this.pageIndexDatabaseUrl = options.pageIndexDatabaseUrl ?? process.env.EXPERT_AGENTS_DOMAIN_EXPERT_PAGE_INDEX_DATABASE_URL;
     this.voyageApiKey = options.voyageApiKey ?? process.env.EXPERT_AGENTS_DOMAIN_EXPERT_VOYAGE_API_KEY;
@@ -982,12 +990,16 @@ export class DomainExpertService {
       writer: this.pageIngestWriterConfigured(),
       ocr_lane: lanes.deepseek_ocr,
       vision_lane: lanes.vision,
+      originals: this.objects instanceof LocalLibraryObjects ? 'local' : 'google',
     };
     if (routes.length === 0) return { status: 'not_configured', domains: [], configured };
     const issues: Array<{ code: string; domain_id?: string; message: string }> = [];
     if (!index) issues.push({ code: 'page_search_not_configured', message: 'The page index URL or the Voyage key is not set: domain_library search fails.' });
     if (!configured.writer) issues.push({ code: 'page_ingest_writer_not_configured', message: 'The index writer URL is not set: library_ingest cannot start.' });
     if (!configured.ocr_lane) issues.push({ code: 'ocr_not_configured', message: 'No OCR lane (EXPERT_AGENTS_DOMAIN_EXPERT_OCR_ROUTER_URL): pages without a text layer are listed as failed.' });
+    if (this.objects instanceof LocalLibraryObjects && !(await stat(this.objects.root).then((info) => info.isDirectory(), () => false))) {
+      issues.push({ code: 'library_objects_unavailable', message: 'The local library-object root is not a readable directory: originals cannot be stored or opened.' });
+    }
     if (!configured.vision_lane) issues.push({ code: 'vision_not_configured', message: 'The deep vision profile is off: hard pages keep their OCR reading and figures stay undescribed; both are listed.' });
     const statusFor = (database?: string) => this.pageIndexStatus ?? (this.voyageApiKey && this.pageIndexUrl(database)
       ? (sourceId: string, _database?: string) => this.pageIndexFor(database).sourceStatus(sourceId)
@@ -1214,7 +1226,7 @@ export class DomainExpertService {
           {
             search: multi ? (query, k) => multi.search(query, k) : (query, k) => parts[0]!.search(query, k),
             store: multi ?? parts[0]!.store,
-            download: (bucket, name, maxBytes, timeoutMs) => this.google.downloadLibraryObject(bucket, name, maxBytes, timeoutMs),
+            download: (bucket, name, maxBytes, timeoutMs) => this.objects.downloadLibraryObject(bucket, name, maxBytes, timeoutMs),
           },
         );
         this.pageLibraries.set(key, library);
@@ -1410,7 +1422,7 @@ export class DomainExpertService {
       const m = /^gs:\/\/([^/]+)\/(.+)$/.exec(gcsUri!);
       if (!m) throw new DomainExpertWorkerError(400, 'invalid_params', 'gcs_uri must be gs://<bucket>/<object>.');
       candidates.push({ name: basename(m[2]!), bytes: 0, uri: gcsUri!, read: async () => {
-        const bytes = await this.google.downloadLibraryObject(m[1]!, m[2]!, PAGE_INGEST_MAX_BYTES, 120_000);
+        const bytes = await this.objects.downloadLibraryObject(m[1]!, m[2]!, PAGE_INGEST_MAX_BYTES, 120_000);
         if (!bytes) throw new DomainExpertWorkerError(404, 'gcs_source_not_found', 'The gcs_uri object does not exist.');
         return bytes;
       } });
@@ -1499,10 +1511,10 @@ export class DomainExpertService {
     const objectName = `${acquisitions.prefix}/originals/${hex}${ext}`;
     const uri = `gs://${acquisitions.bucket}/${objectName}`;
     assertAllowedGcsDestination(uri, manifest.allowed_gcs_prefixes);
-    try { await this.google.uploadGcsObject(acquisitions.bucket, objectName, bytes, { ifGenerationMatch: '0' }); }
+    try { await this.objects.uploadGcsObject(acquisitions.bucket, objectName, bytes, { ifGenerationMatch: '0' }); }
     catch (error) {
       // 412: the same content-addressed original is already stored.
-      if (!(error instanceof DomainExpertWorkerError && error.status === 412)) throw error;
+      if (!isCreateOnlyConflict(error)) throw error;
     }
     return uri;
   }
@@ -1794,13 +1806,13 @@ export class DomainExpertService {
     try {
       const scopeText = await readFile(scopeManifestPath, 'utf8');
       const scope = parseScopeManifest(scopeText);
-      const manifestBytes = await this.google.downloadGcsObject(
+      const manifestBytes = await this.objects.downloadGcsObject(
         library.bucket,
         `${library.prefix}/manifest/master.json`,
       );
       if (manifestBytes === null) throw new Error('master manifest missing');
       const master = parseMasterManifest(decodeUtf8Bytes(manifestBytes));
-      const ledgerBytes = await this.google.downloadGcsObject(
+      const ledgerBytes = await this.objects.downloadGcsObject(
         library.bucket,
         `${library.prefix}/ledgers/${scope.agentId}.json`,
       );
@@ -2691,7 +2703,7 @@ export class DomainExpertService {
       const { bucket, prefix } = parseGcsPrefix(uri);
       let bytes: Uint8Array | null;
       try {
-        bytes = await this.google.downloadLibraryObject(bucket, prefix.replace(/\/$/, ''), PDF_PROCESSING_MAX_BYTES, GOOGLE_LONG_GENERATION_TIMEOUT_MS);
+        bytes = await this.objects.downloadLibraryObject(bucket, prefix.replace(/\/$/, ''), PDF_PROCESSING_MAX_BYTES, GOOGLE_LONG_GENERATION_TIMEOUT_MS);
       } catch (error) {
         throw new DomainExpertWorkerError(502, 'gcs_object_unreadable', `${uri} could not be read (${error instanceof Error ? error.message : String(error)}). Nothing was registered.`);
       }
@@ -3124,10 +3136,10 @@ export class DomainExpertService {
     const gcsUri = requireString(params.gcsUri, 'gcs_uri');
     const { bucket, prefix } = parseGcsPrefix(gcsUri);
     const objectName = prefix.replace(/\/$/, '');
-    const inspected = await this.google.getGcsObjectMetadata(bucket, objectName);
+    const inspected = await this.objects.getGcsObjectMetadata(bucket, objectName);
     let bytes: Uint8Array | null;
     try {
-      bytes = await this.google.downloadLibraryObject(bucket, objectName, PDF_PROCESSING_MAX_BYTES, GOOGLE_LONG_GENERATION_TIMEOUT_MS);
+      bytes = await this.objects.downloadLibraryObject(bucket, objectName, PDF_PROCESSING_MAX_BYTES, GOOGLE_LONG_GENERATION_TIMEOUT_MS);
     } catch (error) {
       if (error instanceof LibraryReadError && error.code === 'library_source_too_large') {
         throw new DomainExpertWorkerError(413, 'file_size_limit_exceeded', `${gcsUri} is larger than the ${PDF_PROCESSING_MAX_BYTES}-byte PDF limit. Nothing was imported.`);
@@ -4202,7 +4214,7 @@ export class DomainExpertService {
         || (file.sha256 !== undefined && sha256(bytes) !== file.sha256)) {
         throw new DomainExpertWorkerError(409, 'stage_import_file_changed', `${file.workspaceRelativePath} changed during staging.`);
       }
-      await this.google.uploadGcsObject(stage.destination.bucket, file.objectName, bytes);
+      await this.objects.uploadGcsObject(stage.destination.bucket, file.objectName, bytes);
       const stagedFile = {
         workspace_relative_path: file.workspaceRelativePath,
         upload_relative_path: file.uploadRelativePath,
@@ -4218,7 +4230,7 @@ export class DomainExpertService {
         const transcriptObjectName = `${file.objectName.slice(0, file.objectName.length - file.uploadRelativePath.length)}${safeGcsRelativePath(`${file.uploadRelativePath}.transcript.md`)}`;
         try {
           // One that cannot be read is simply made again.
-          const kept = await this.google.downloadLibraryObject(stage.destination.bucket, transcriptObjectName, STAGE_IMPORT_MAX_FILE_BYTES, GOOGLE_API_REQUEST_TIMEOUT_MS).catch(() => null);
+          const kept = await this.objects.downloadLibraryObject(stage.destination.bucket, transcriptObjectName, STAGE_IMPORT_MAX_FILE_BYTES, GOOGLE_API_REQUEST_TIMEOUT_MS).catch(() => null);
           const transcript = kept ? { bytes: kept } : await transcribeMediaFromGcs({
             project: stage.manifest.gcp_project,
             location: stage.manifest.rag_location,
@@ -4236,7 +4248,7 @@ export class DomainExpertService {
               ...input,
             }),
           });
-          if (!kept) await this.google.uploadGcsObject(stage.destination.bucket, transcriptObjectName, transcript.bytes);
+          if (!kept) await this.objects.uploadGcsObject(stage.destination.bucket, transcriptObjectName, transcript.bytes);
           stagedFiles.push({
             workspace_relative_path: `${file.workspaceRelativePath}.transcript.md`,
             upload_relative_path: `${file.uploadRelativePath}.transcript.md`,
@@ -4553,7 +4565,7 @@ export class DomainExpertService {
     const { bucket, prefix } = parseGcsPrefix(gcsUri);
     let head: Uint8Array | null;
     try {
-      head = await this.google.readGcsObjectHead(bucket, prefix.replace(/\/$/, ''), PDF_SNIFF_BYTES);
+      head = await this.objects.readGcsObjectHead(bucket, prefix.replace(/\/$/, ''), PDF_SNIFF_BYTES);
     } catch {
       throw new DomainExpertWorkerError(502, 'gcs_object_unreadable', `${gcsUri} could not be read to tell whether it is a PDF. Nothing was imported.`);
     }
@@ -4622,7 +4634,7 @@ export class DomainExpertService {
       unsettled = 'Vertex skipped the object as already in the corpus, so the bytes it holds cannot be tied to the ones inspected';
       detail = { ...detail, identity_verified: false, source_check: unsettled };
     } else if (input.pinned) {
-      const after = await this.google.getGcsObjectMetadata(input.pinned.bucket, input.pinned.objectName).catch(() => undefined);
+      const after = await this.objects.getGcsObjectMetadata(input.pinned.bucket, input.pinned.objectName).catch(() => undefined);
       if (after === undefined) changed = 'the object could not be read back after the import';
       else if (after?.generation !== input.pinned.generation) changed = `the object changed during the import (generation ${String(input.pinned.generation)} inspected, ${after ? String(after.generation) : 'deleted'} now)`;
       if (changed) detail = { ...detail, source_changed_during_import: true, source_check: changed };
@@ -5773,7 +5785,7 @@ export class DomainExpertService {
     for (const candidate of candidates) {
       const objectName = `${directory}${candidate}.pdf`;
       try {
-        const existing = await this.google.getGcsObjectMetadata(bucket, objectName);
+        const existing = await this.objects.getGcsObjectMetadata(bucket, objectName);
         if (existing && gcsObjectHoldsBytes(existing, bytes)) found.push(`gs://${bucket}/${objectName}`);
       } catch (error) {
         // An unreadable name could hold the whole copy; unknown, like a failed listing.
@@ -6308,14 +6320,14 @@ export class DomainExpertService {
       const priorName = `${directory}${prior}.${format}`;
       const priorUri = `gs://${bucket}/${priorName}`;
       assertAllowedGcsDestination(priorUri, manifest.allowed_gcs_prefixes);
-      const existing = await this.google.getGcsObjectMetadata(bucket, priorName);
+      const existing = await this.objects.getGcsObjectMetadata(bucket, priorName);
       if (existing && gcsObjectHoldsBytes(existing, bytes)) return priorUri;
     }
     const contentHash = createHash('sha256').update(bytes).digest('hex').slice(0, 12);
     for (const objectName of [`${base}.${format}`, `${base}--${contentHash}.${format}`]) {
       const gcsUri = `gs://${bucket}/${objectName}`;
       assertAllowedGcsDestination(gcsUri, manifest.allowed_gcs_prefixes);
-      const existing = await this.google.getGcsObjectMetadata(bucket, objectName);
+      const existing = await this.objects.getGcsObjectMetadata(bucket, objectName);
       if (existing) {
         if (gcsObjectHoldsBytes(existing, bytes)) return gcsUri;
         continue;
@@ -6323,11 +6335,11 @@ export class DomainExpertService {
       try {
         // Generation 0: create only. A concurrent writer that got there first
         // fails this upload instead of being overwritten.
-        await this.google.uploadGcsObject(bucket, objectName, bytes, { ifGenerationMatch: '0' });
+        await this.objects.uploadGcsObject(bucket, objectName, bytes, { ifGenerationMatch: '0' });
         return gcsUri;
       } catch (error) {
-        if (!(error instanceof DomainExpertWorkerError && error.status === 412)) throw error;
-        const raced = await this.google.getGcsObjectMetadata(bucket, objectName);
+        if (!isCreateOnlyConflict(error)) throw error;
+        const raced = await this.objects.getGcsObjectMetadata(bucket, objectName);
         if (raced && gcsObjectHoldsBytes(raced, bytes)) return gcsUri;
       }
     }
@@ -6826,7 +6838,7 @@ export class DomainExpertService {
     if (cached !== undefined) return cached;
     if (this.sourceTexts.recentlyMissed(uri, target.bucket)) return undefined;
     try {
-      const text = await this.google.downloadGcsText(
+      const text = await this.objects.downloadGcsText(
         target.bucket, target.objectName, PASSAGE_SOURCE_MAX_BYTES, PASSAGE_SOURCE_READ_TIMEOUT_MS);
       if (text === null) {
         this.sourceTexts.miss(uri);
@@ -6933,7 +6945,7 @@ export class DomainExpertService {
     const key = `${bucket}/${prefix}`;
     let index: LibraryManifestIndex;
     try {
-      const bytes = await this.google.downloadGcsObject(bucket, libraryManifestObjectName(prefix));
+      const bytes = await this.objects.downloadGcsObject(bucket, libraryManifestObjectName(prefix));
       if (bytes === null) throw new Error('master manifest missing');
       index = {
         loadedAt: Date.now(),
@@ -9830,6 +9842,11 @@ async function readCappedUpstreamText(
 
 function googleRequestTimeoutError(): DomainExpertWorkerError {
   return new DomainExpertWorkerError(504, 'google_api_error', 'Google API request timed out.');
+}
+
+// GCS answers 412 to a create-only write over an existing object; the local store throws its own error.
+function isCreateOnlyConflict(error: unknown): boolean {
+  return error instanceof LibraryObjectExistsError || (error instanceof DomainExpertWorkerError && error.status === 412);
 }
 
 function googleError(response: Response, body: unknown): DomainExpertWorkerError {
