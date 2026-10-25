@@ -277,6 +277,19 @@ describe('the database page store', () => {
     await index.close();
   });
 
+  test('a long section of many chunks comes back once, whole, from the chunk that matched', async () => {
+    const index = new PageIndex(databaseUrl(PUBLIC_DB), voyageClient('synthetic-key', { fetch: voyageFetch }));
+    const filler = Array.from({ length: 4000 }, (_, i) => `filler${String.fromCharCode(97 + (i % 26))}`).join(' ');
+    const body = `${filler} the lantern keeper walks the harbour wall at dusk ${filler}`;
+    await index.importUnits('long-src', [{ slug: 'books/long-eeeeee/s0001', book: 'long-eeeeee', unit: 's0001', title: 'Long', body }]);
+    const [{ chunks }] = await index.sql`SELECT count(*)::int AS chunks FROM page_chunks WHERE source = 'long-src'` as Array<{ chunks: number }>;
+    expect(chunks).toBeGreaterThan(10);
+    const hits = await index.search('long-src', 'lantern keeper harbour', 5);
+    expect(hits.map((h) => h.slug)).toEqual(['books/long-eeeeee/s0001']);
+    expect(hits[0]!.text).toBe(body);
+    await index.close();
+  });
+
   test('JavaScript word boundaries become Postgres ones; escaped backslashes are left alone', () => {
     expect(postgresLinePattern('\\bword\\B')).toBe('(?n)\\yword\\Y');
     expect(postgresLinePattern('a\\\\b')).toBe('(?n)a\\\\b');
