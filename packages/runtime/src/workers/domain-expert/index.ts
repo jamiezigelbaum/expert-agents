@@ -4199,7 +4199,8 @@ export class DomainExpertService {
   }
 
   // Uploads the batch's files to their content-addressed names (and a transcript of each
-  // medium); importStagedBatch then imports exactly those objects.
+  // medium); importStagedBatch then imports exactly those objects. Vertex reads them from Cloud
+  // Storage, so they are staged there even when originals live on local disk.
   private async executeStageImport(stage: {
     destination: StageDestination;
     eligible: StageImportEligibleFile[];
@@ -4214,7 +4215,7 @@ export class DomainExpertService {
         || (file.sha256 !== undefined && sha256(bytes) !== file.sha256)) {
         throw new DomainExpertWorkerError(409, 'stage_import_file_changed', `${file.workspaceRelativePath} changed during staging.`);
       }
-      await this.objects.uploadGcsObject(stage.destination.bucket, file.objectName, bytes);
+      await this.google.uploadGcsObject(stage.destination.bucket, file.objectName, bytes);
       const stagedFile = {
         workspace_relative_path: file.workspaceRelativePath,
         upload_relative_path: file.uploadRelativePath,
@@ -4230,7 +4231,7 @@ export class DomainExpertService {
         const transcriptObjectName = `${file.objectName.slice(0, file.objectName.length - file.uploadRelativePath.length)}${safeGcsRelativePath(`${file.uploadRelativePath}.transcript.md`)}`;
         try {
           // One that cannot be read is simply made again.
-          const kept = await this.objects.downloadLibraryObject(stage.destination.bucket, transcriptObjectName, STAGE_IMPORT_MAX_FILE_BYTES, GOOGLE_API_REQUEST_TIMEOUT_MS).catch(() => null);
+          const kept = await this.google.downloadLibraryObject(stage.destination.bucket, transcriptObjectName, STAGE_IMPORT_MAX_FILE_BYTES, GOOGLE_API_REQUEST_TIMEOUT_MS).catch(() => null);
           const transcript = kept ? { bytes: kept } : await transcribeMediaFromGcs({
             project: stage.manifest.gcp_project,
             location: stage.manifest.rag_location,
@@ -4248,7 +4249,7 @@ export class DomainExpertService {
               ...input,
             }),
           });
-          if (!kept) await this.objects.uploadGcsObject(stage.destination.bucket, transcriptObjectName, transcript.bytes);
+          if (!kept) await this.google.uploadGcsObject(stage.destination.bucket, transcriptObjectName, transcript.bytes);
           stagedFiles.push({
             workspace_relative_path: `${file.workspaceRelativePath}.transcript.md`,
             upload_relative_path: `${file.uploadRelativePath}.transcript.md`,
