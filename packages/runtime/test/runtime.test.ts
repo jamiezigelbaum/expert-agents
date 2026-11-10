@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promis
 import { tmpdir } from 'node:os';
 import { extname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { AGENT_REPO_GITIGNORE, serializeScopeManifest } from '@expert-agents/library';
+import { AGENT_REPO_GITIGNORE } from '@expert-agents/library';
 import { DirectHttpDomainExpertTransport, DomainExpertClient } from '../src/core/domain-expert-client.ts';
 import {
   domainManifest,
@@ -182,27 +182,14 @@ describe('ingest target planning follows the domain page library', () => {
 });
 
 describe('bounded worker and client', () => {
-  test('domain_agent status inspects workspace files and the scope manifest offline', async () => {
+  test('domain_agent status inspects workspace files offline', async () => {
     const fixture = await mkdtemp(join(tmpdir(), 'expert-agents-status-'));
     const dataDir = join(fixture, 'data');
     const workspace = join(fixture, 'experts', 'history');
-    const scopeManifestPath = join(fixture, 'scope.json');
     try {
       await mkdir(join(workspace, 'references'), { recursive: true });
       await mkdir(dataDir, { recursive: true });
       await writeFile(join(workspace, 'PROPOSAL.md'), '# History\n');
-      await writeFile(scopeManifestPath, serializeScopeManifest({
-        agentId: 'history',
-        schemaVersion: 1,
-        selection: {
-          objectIds: [
-            `sha256:${'1'.repeat(64)}`,
-            `sha256:${'2'.repeat(64)}`,
-          ],
-        },
-        targetCorpusDisplayName: 'history-library',
-        masterRevision: 3,
-      }));
       let fetchCalls = 0;
       const worker = createDomainExpertWorker({
         agentRouting: validateAgentRoutingConfig({
@@ -210,7 +197,6 @@ describe('bounded worker and client', () => {
             displayName: TEST_AGENT_ROUTING.history!.displayName,
             library: TEST_AGENT_ROUTING.history!.library,
             pageLibrary: TEST_AGENT_ROUTING.history!.pageLibrary,
-            scopeManifestPath,
           },
         }),
         roots: [{ rootId: 'expert_agents_workspace', path: fixture, maxWriteBytes: 1024 * 1024, allowOverwrite: false }],
@@ -254,14 +240,8 @@ describe('bounded worker and client', () => {
             },
           },
         },
-        scope_manifest: {
-          configured: true,
-          present: true,
-          parseable: true,
-          agent_id: 'history',
-          selected_object_count: 2,
-        },
       });
+      expect(result).not.toHaveProperty('scope_manifest');
       expect(result.workspace.seeded_files).toContainEqual({
         relative_path: 'experts/history/PROPOSAL.md',
         kind: 'operating_doctrine',
@@ -314,46 +294,6 @@ describe('bounded worker and client', () => {
         },
       });
       expect(fetchCalls).toBe(0);
-    } finally {
-      await rm(fixture, { recursive: true, force: true });
-    }
-  });
-
-  test('domain_agent status reports malformed configured scope files without exposing content', async () => {
-    const fixture = await mkdtemp(join(tmpdir(), 'expert-agents-scope-status-'));
-    const scopeManifestPath = join(fixture, 'scope.json');
-    try {
-      await writeFile(scopeManifestPath, 'private malformed fixture content');
-      const worker = createDomainExpertWorker({
-        roots: [{ rootId: 'expert_agents_workspace', path: fixture, maxWriteBytes: 1024, allowOverwrite: false }],
-        agentRouting: validateAgentRoutingConfig({
-          history: {
-            displayName: TEST_AGENT_ROUTING.history!.displayName,
-            library: TEST_AGENT_ROUTING.history!.library,
-            pageLibrary: TEST_AGENT_ROUTING.history!.pageLibrary,
-            scopeManifestPath,
-          },
-        }),
-      });
-
-      const response = await worker.fetch(new Request('http://localhost/v1/domain', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ tool: 'domain_agent', params: { action: 'status', domain_id: 'history' } }),
-      }));
-      expect(response.status).toBe(200);
-      const body = await response.json() as Record<string, any>;
-      expect(body).toMatchObject({
-        status: 'completed',
-        health: 'degraded',
-        health_issues: [
-          expect.objectContaining({ code: 'workspace_missing' }),
-          expect.objectContaining({ code: 'workspace_seed_incomplete' }),
-          expect.objectContaining({ code: 'scope_manifest_unparseable' }),
-        ],
-      });
-      expect(body.scope_manifest).toEqual({ configured: true, present: true, parseable: false });
-      expect(JSON.stringify(body)).not.toContain('private malformed fixture content');
     } finally {
       await rm(fixture, { recursive: true, force: true });
     }

@@ -52,7 +52,6 @@ USER.md
 HEARTBEAT.md
 references/
 library/
-  scope-manifest.json (optional, legacy; read by nothing but status)
   eval-questions.json
 derived/ (optional)
   <artifact-id>/
@@ -124,11 +123,7 @@ class of content that may never ship. Format and size are creation-time rules
 rather than manifest rules, so a repository whose avatar predates them stays
 valid.
 
-The manifest is consistent only when:
-
-- when `library/scope-manifest.json` is present, its `agentId` equals the
-  manifest's; and
-- `domainId` equals `library/eval-questions.json`'s `domainId`.
+The manifest's `domainId` must equal `library/eval-questions.json`'s `domainId`.
 
 ## Deployment posture and the serving set
 
@@ -382,11 +377,8 @@ verification workflow.
 
 ## Library files
 
-An optional `library/scope-manifest.json` (a legacy of the removed Vertex materializer;
-`domain_agent status` only checks that it parses) is an agent-owned
-[`ScopeManifest`](./LIBRARY_ARCHITECTURE.md) validated by
-`@expert-agents/library`. It never moves into this machinery repository or the
-shared-library bucket.
+Agent repositories may delete `library/scope-manifest.json`. This retired Vertex
+artifact is ignored by runtime and repository status checks.
 
 `library/eval-questions.json` follows the strict schema in
 [`RETRIEVAL_EVAL.md`](./RETRIEVAL_EVAL.md). The retrieval gate requires at least

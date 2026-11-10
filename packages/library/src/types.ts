@@ -1,5 +1,4 @@
 export const LIBRARY_SCHEMA_VERSION = 1 as const;
-export const SCOPE_SCHEMA_VERSION = 1 as const;
 
 export type Sha256Id = `sha256:${string}`;
 
@@ -49,21 +48,4 @@ export interface MasterManifest {
   objects: LibraryObject[];
   tombstones: ManifestTombstone[];
   manifestHash: Sha256Id;
-}
-
-export interface ScopeIncludeFilters {
-  trustTiers?: string[];
-  kinds?: string[];
-  locatorPrefixes?: string[];
-}
-
-export interface ScopeManifest {
-  agentId: string;
-  schemaVersion: typeof SCOPE_SCHEMA_VERSION;
-  selection: {
-    objectIds: Sha256Id[];
-    includeFilters?: ScopeIncludeFilters;
-  };
-  targetCorpusDisplayName: string;
-  masterRevision: number;
 }

@@ -1,6 +1,5 @@
 import { readdir, readFile, stat } from "node:fs/promises";
 import { join, resolve } from "node:path";
-import { validateScopeManifest, type ScopeManifest } from "../../library/src/index.ts";
 import { parseRetrievalEvalSet, type AnyRetrievalEvalSet } from "../../../scripts/retrieval-eval.ts";
 import {
   DERIVED_ARTIFACT_CONTENT_FILE,
@@ -47,8 +46,6 @@ export async function expertStatus(
   const findings: ContractFinding[] = [];
 
   const agentText = await inspectFile(root, "agent.json", fs, items, findings, true);
-  // An optional library selection; a page-library agent needs none.
-  const scopeText = await inspectOptionalFile(root, "library/scope-manifest.json", fs, items, findings);
   const evalText = await inspectFile(
     root,
     "library/eval-questions.json",
@@ -76,14 +73,6 @@ export async function expertStatus(
     items,
     findings,
   );
-  const scope = parseValidated(
-    scopeText,
-    "library/scope-manifest.json",
-    "scope",
-    validateScopeManifest,
-    items,
-    findings,
-  );
   const evalSet = parseEval(evalText, items, findings);
   const binding = parseValidated(
     bindingText,
@@ -93,14 +82,6 @@ export async function expertStatus(
     items,
     findings,
   );
-  if (agent !== undefined && scope !== undefined) {
-    addConsistencyFinding(
-      agent.agentId === scope.agentId,
-      "agent.json",
-      "consistency.agent_id",
-      findings,
-    );
-  }
   if (agent !== undefined && evalSet !== undefined) {
     addConsistencyFinding(
       agent.domainId === evalSet.domainId,

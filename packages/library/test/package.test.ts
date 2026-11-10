@@ -11,14 +11,13 @@ describe("@expert-agents/library package", () => {
       "contentIdFromBytes", "extensionForMediaType", "extractorEnvironment",
       "finalizeMasterManifest", "firstDiagnosticLine", "isolatedExtractorEnvironment", "libraryObjectUri",
       "normalizeExtractedText", "parseLibraryObject",
-      "parseMasterManifest", "parseScopeManifest",
+      "parseMasterManifest",
       
       "serializeLibraryObject", "serializeMasterManifest",
-      "serializeScopeManifest", "sha256",
+      "sha256",
       "sourceLocatorCredential", "validateLibraryLocationConfig",
       "looksLikeWatchPageScript", "parseYoutubeTranscriptExtraction",
       "validateLibraryObject", "validateMasterManifest",
-      "validateScopeManifest", 
       
       "EbookConversionError", "convertEpubToMarkdown", "decodeXmlEntities", "plainTextToMarkdown",
       "resolveArchivePath", "xhtmlToMarkdown",
@@ -32,7 +31,6 @@ describe("@expert-agents/library package", () => {
     const numbers = [
       "EXTRACTION_MAX_OUTPUT_BYTES", "EXTRACTION_TIMEOUT_MS", "LIBRARY_SCHEMA_VERSION",
       
-      "SCOPE_SCHEMA_VERSION",
       "OCR_MIN_CHARS", "PAGE_UNITS_SCHEMA_VERSION", "SECTION_TARGET_WORDS", "DENSE_PAGE_JPEG_BYTES", "MEDIA_SECTION_TARGET_WORDS",
     ] as const;
     const strings = [

@@ -314,6 +314,19 @@ describe("expert status CLI", () => {
     expect(expertStatusExitCode(report)).toBe(0);
   });
 
+  test("returns exit code zero with a stale scope manifest", async () => {
+    const root = await temporaryDirectory();
+    const target = join(root, "agent-repository");
+    await runExpertCreateCli([...createArgs(target, join(root, "creation.json")), "--no-git"]);
+    await writeFile(join(target, "library/scope-manifest.json"), 'stale, invalid JSON');
+
+    const report = await runExpertStatusCli(["--dir", target]);
+    expect(report.valid).toBe(true);
+    expect(report.findings).toEqual([]);
+    expect(expertStatusExitCode(report)).toBe(0);
+    expect(report.items.map((item) => item.path)).not.toContain("library/scope-manifest.json");
+  });
+
   test("--require-sync rejects behind, dirty, no-upstream, and non-repo states", () => {
     const clean = gitStatus();
     expect(expertStatusExitCode(statusReport(clean), true)).toBe(0);

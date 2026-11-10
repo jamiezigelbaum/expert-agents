@@ -15,7 +15,6 @@ describe('agent routing config', () => {
       history: {
         displayName: 'History Research',
         library: { bucket: 'shared-library-fixture', prefix: 'v1' },
-        scopeManifestPath: '/agent/library/scope.json',
         pageLibrary: { sourceId: 'history' },
       },
     } as const;
@@ -30,6 +29,23 @@ describe('agent routing config', () => {
         return JSON.stringify(value);
       },
     )).toEqual({ history: { domainId: 'history', ...value.history } });
+  });
+
+  test('loads a routing file with a retired scopeManifestPath and drops the field', () => {
+    const routes = agentRoutingConfigFromEnv(
+      { [ROUTING_ENV]: '@/config/agents.json' },
+      () => JSON.stringify({ history: {
+        library: { bucket: 'fixture-bucket', prefix: 'v1' },
+        pageLibrary: { sourceId: 'history' },
+        scopeManifestPath: '/agent/library/scope-manifest.json',
+      } }),
+    );
+    expect(routes).toEqual({ history: {
+      domainId: 'history',
+      library: { bucket: 'fixture-bucket', prefix: 'v1' },
+      pageLibrary: { sourceId: 'history' },
+    } });
+    expect(routes.history).not.toHaveProperty('scopeManifestPath');
   });
 
   test('accepts a page library block and refuses unsafe ones', () => {
@@ -52,12 +68,13 @@ describe('agent routing config', () => {
     const entry = {
       library,
       pageLibrary: { sourceId: 'history' },
+      scopeManifestPath: { obsolete: 'ignored without validation' },
       targetCorpusDisplayName: 'history-primary',
       servingCorpusDisplayNames: ['history-primary', 'public-shelf'],
       retrieval: { topK: 24, contextLimit: 8, reranker: 'llm', multiQuery: false },
       ingestion: { importResultSink: 'client', explicitCorpusRequiredFor: ['web_import'] },
     };
-    expect([...RETIRED_VERTEX_ROUTING_KEYS].sort()).toEqual(['ingestion', 'retrieval', 'servingCorpusDisplayNames', 'targetCorpusDisplayName']);
+    expect([...RETIRED_VERTEX_ROUTING_KEYS].sort()).toEqual(['ingestion', 'retrieval', 'scopeManifestPath', 'servingCorpusDisplayNames', 'targetCorpusDisplayName']);
     const route = validateAgentRoutingConfig({ history: entry }).history!;
     expect(route).toEqual({ domainId: 'history', library, pageLibrary: { sourceId: 'history' } });
     for (const key of RETIRED_VERTEX_ROUTING_KEYS) expect(Object.keys(route)).not.toContain(key);

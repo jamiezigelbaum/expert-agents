@@ -71,7 +71,7 @@ import {
 } from './worker-request.ts';
 import {
   checkedRootPath, collectStageImportFiles, resolveInside, isJunkStageImportPath, resolveWritePathInside,
-  writeWorkspaceSeedFiles, audit, exists, inspectConfiguredScopeManifest,
+  writeWorkspaceSeedFiles, audit, exists,
 } from './workspace-seed.ts';
 import { type AnnasArtifactScale, annasArtifactScale } from './artifact-scale.ts';
 import { responseTextOrJson } from './upstream.ts';
@@ -918,9 +918,6 @@ export class DomainExpertService {
         exists: await exists(resolveInside(rootPath, relativePath)),
       };
     }));
-    const scopeManifest = manifest.routing.scope_manifest_path
-      ? await inspectConfiguredScopeManifest(manifest.routing.scope_manifest_path)
-      : undefined;
     const missingRequirements = seededFiles
       .filter((file) => !file.exists)
       .map(({ relative_path, kind }) => ({ relative_path, kind }));
@@ -936,17 +933,6 @@ export class DomainExpertService {
         code: 'workspace_seed_incomplete',
         message: `The domain workspace is missing ${missingRequirements.length} of ${seededFiles.length} required seed files.`,
         missing_requirement_count: missingRequirements.length,
-      });
-    }
-    if (scopeManifest && scopeManifest.present !== true) {
-      healthIssues.push({
-        code: 'scope_manifest_missing',
-        message: 'The configured scope manifest is missing.',
-      });
-    } else if (scopeManifest && scopeManifest.parseable !== true) {
-      healthIssues.push({
-        code: 'scope_manifest_unparseable',
-        message: 'The configured scope manifest is not parseable.',
       });
     }
     const recommendedRecovery = missingRequirements.length > 0
@@ -979,7 +965,6 @@ export class DomainExpertService {
         missing_requirements: missingRequirements,
         ...(recommendedRecovery ? { recommended_recovery: recommendedRecovery } : {}),
       },
-      ...(scopeManifest ? { scope_manifest: scopeManifest } : {}),
       policy: domainPolicy(),
     };
   }

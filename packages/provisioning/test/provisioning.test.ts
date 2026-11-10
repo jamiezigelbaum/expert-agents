@@ -65,15 +65,6 @@ describe("agent repository contract", () => {
     });
   });
 
-  test("a legacy corpus agent no longer needs its scope manifest", async () => {
-    const directory = await legacyCorpusFixture();
-    expect((await expertStatus(directory)).valid).toBe(true);
-    await unlink(join(directory, "library/scope-manifest.json"));
-    const report = await expertStatus(directory);
-    expect(report.valid).toBe(true);
-    expect(report.findings.filter((finding) => finding.file === "library/scope-manifest.json")).toEqual([]);
-  });
-
   test("agent.json still accepts a retired targetCorpusDisplayName but drops it", () => {
     const value = {
       schemaVersion: 1,
@@ -86,38 +77,20 @@ describe("agent repository contract", () => {
     expect(Object.keys(validated)).not.toContain("targetCorpusDisplayName");
   });
 
-  test("rejects agent and scope identity mismatches", async () => {
-    const directory = await legacyCorpusFixture();
-    const path = join(directory, "library/scope-manifest.json");
-    const scope = JSON.parse(await readFile(path, "utf8")) as Record<string, unknown>;
-    scope.agentId = "other-agent";
-    scope.targetCorpusDisplayName = "other-corpus";
-    await writeFile(path, `${JSON.stringify(scope, null, 2)}\n`);
-
+  test.each([
+    'not valid JSON',
+    '{"schemaVersion":1,"invalid":true}',
+    '{"agentId":"other-agent","schemaVersion":1,"selection":{"objectIds":[]},"targetCorpusDisplayName":"other-corpus","masterRevision":0}',
+  ])("ignores a stale scope manifest: %s", async (staleManifest) => {
+    const directory = await scaffoldFixture();
+    await writeFile(join(directory, "library/scope-manifest.json"), staleManifest);
     const report = await expertStatus(directory);
-    expect(report.valid).toBe(false);
-    expect(report.findings).toContainEqual({
-      file: "agent.json",
-      ruleId: "consistency.agent_id",
-      severity: "error",
-    });
-    // The target corpus is retired: a differing scope corpus is no longer a finding.
-    expect(report.findings.map((finding) => finding.ruleId)).not.toContain("consistency.target_corpus");
+    expect(report.valid).toBe(true);
+    expect(report.findings).toEqual([]);
+    expect(report.items.map((item) => item.path)).not.toContain("library/scope-manifest.json");
   });
 
-  test("rejects invalid scope and retrieval eval documents", async () => {
-    const scopeDirectory = await legacyCorpusFixture();
-    await writeFile(
-      join(scopeDirectory, "library/scope-manifest.json"),
-      '{"schemaVersion":1,"invalid":true}\n',
-    );
-    const scopeReport = await expertStatus(scopeDirectory);
-    expect(scopeReport.findings).toContainEqual({
-      file: "library/scope-manifest.json",
-      ruleId: "scope.schema",
-      severity: "error",
-    });
-
+  test("rejects invalid retrieval eval documents", async () => {
     const evalDirectory = await scaffoldFixture();
     await writeFile(
       join(evalDirectory, "library/eval-questions.json"),
@@ -832,18 +805,6 @@ async function temporaryDirectory(): Promise<string> {
 /** A 1x1 PNG carried as text, so no binary fixture file enters this repository. */
 function tinyPngBytes(): Uint8Array<ArrayBuffer> {
   return Uint8Array.from(Buffer.from(TINY_PNG_BASE64, "base64"));
-}
-
-/** A scaffold made into a pre-page-library agent: a corpus in agent.json and its scope manifest. */
-async function legacyCorpusFixture(): Promise<string> {
-  const directory = await scaffoldFixture();
-  const agentPath = join(directory, "agent.json");
-  const agent = JSON.parse(await readFile(agentPath, "utf8")) as Record<string, unknown>;
-  await writeFile(agentPath, `${JSON.stringify({ ...agent, targetCorpusDisplayName: "neutral-corpus" }, null, 2)}\n`);
-  await writeFile(join(directory, "library/scope-manifest.json"), `${JSON.stringify({
-    agentId: "neutral-agent", schemaVersion: 1, selection: { objectIds: [] }, targetCorpusDisplayName: "neutral-corpus", masterRevision: 0,
-  }, null, 2)}\n`);
-  return directory;
 }
 
 function scaffoldOptions(targetDir: string): ExpertScaffoldOptions {
