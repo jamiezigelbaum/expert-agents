@@ -9,6 +9,7 @@ import {
   type DomainAgentParams,
 } from '../../core/domain-expert.ts';
 import { AgentRegistrationStore, pageLibraryRootFromEnv, registrationLibraryFromEnv } from '../../core/agent-registration.ts';
+import { isEngagementHeldPath } from '@expert-agents/provisioning';
 import { OperationError } from '../../core/operation-error.ts';
 import {
   SUMMARIZE_BINARY, type ReferenceExtractor, type LibraryLocationConfig, MEDIA_EXTENSIONS, splitFrontmatter,
@@ -584,7 +585,14 @@ export class DomainExpertService {
     const skipped: Array<{ path: string; reason: string }> = [];
     if (workspacePath) {
       const rootPath = await checkedRootPath(this.rootFor(manifest.workspace_root_id));
-      for (const file of await collectStageImportFiles(rootPath, resolveInside(rootPath, workspacePath))) {
+      const sourcePath = resolveInside(rootPath, workspacePath);
+      if (await isEngagementHeldPath(sourcePath)) {
+        throw new DomainExpertWorkerError(403, 'page_ingest_engagement_held', 'Engagement-held sources cannot be ingested into the shared library.');
+      }
+      for (const file of await collectStageImportFiles(rootPath, sourcePath)) {
+        if (await isEngagementHeldPath(file.absolutePath)) {
+          throw new DomainExpertWorkerError(403, 'page_ingest_engagement_held', 'Engagement-held sources cannot be ingested into the shared library.');
+        }
         const ext = extname(file.absolutePath).toLowerCase();
         if (isJunkStageImportPath(file.workspaceRelativePath)) continue;
         if (!PAGE_INGEST_EXTENSIONS.has(ext)) { skipped.push({ path: file.workspaceRelativePath, reason: 'unsupported_type' }); continue; }

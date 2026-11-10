@@ -1,5 +1,6 @@
-import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
+import { afterAll, beforeAll, describe, expect, spyOn, test } from 'bun:test';
 import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import * as fsPromises from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { validateAgentRoutingConfig } from '../src/core/agent-routing.ts';
@@ -94,6 +95,36 @@ async function finished(w: ReturnType<typeof worker>, jobId: string) {
 }
 
 describe('library_ingest', () => {
+  for (const [name, requestedPath] of [
+    ['refuses a held top-level source before reading', 'held-source/engagement/material.txt'],
+    ['refuses a held file collected from an allowed directory before reading any source', 'held-source'],
+  ] as const) {
+    test(name, async () => {
+      const sourceDirectory = join(workspace, 'held-source');
+      const heldDirectory = join(sourceDirectory, 'engagement');
+      const allowedSource = join(sourceDirectory, 'allowed.txt');
+      const heldSource = join(heldDirectory, 'material.txt');
+      await mkdir(heldDirectory, { recursive: true });
+      await writeFile(join(heldDirectory, 'engagement.json'), JSON.stringify({ kind: 'expert_engagement_record' }));
+      await writeFile(allowedSource, 'Synthetic allowed source.');
+      await writeFile(heldSource, 'Synthetic held source.');
+      const w = worker({ writer: recordingWriter().writer });
+      const readSpy = spyOn(fsPromises, 'readFile');
+      try {
+        const refused = await call(w, 'library_ingest', {
+          action: 'start', workspace_relative_path: requestedPath, dry_run: false, approval_id: 'owner-1',
+        });
+        if (refused.body.job) await finished(w, refused.body.job.job_id);
+        expect(readSpy.mock.calls.filter(([path]) => path === allowedSource || path === heldSource)).toHaveLength(0);
+        expect(refused.status).toBe(403);
+        expect(refused.body.error).toMatchObject({ code: 'page_ingest_engagement_held' });
+      } finally {
+        readSpy.mockRestore();
+        await rm(sourceDirectory, { recursive: true, force: true });
+      }
+    });
+  }
+
   test('a workspace PDF with a scan and a figure becomes cited, viewable pages', async () => {
     const { imports, writer } = recordingWriter();
     const uploads: string[] = [];
