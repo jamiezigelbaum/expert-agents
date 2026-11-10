@@ -16,7 +16,8 @@
     "test:db": "bun test ./test-db/"
   },
   "dependencies": {
-    "@expert-agents/library": "workspace:*"
+    "@expert-agents/library": "workspace:*",
+    "@expert-agents/provisioning": "workspace:*"
   },
   "devDependencies": {
     "@types/bun": "^1.3.14",

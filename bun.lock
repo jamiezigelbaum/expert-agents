@@ -38,6 +38,7 @@
       "version": "0.1.0",
       "dependencies": {
         "@expert-agents/library": "workspace:*",
+        "@expert-agents/provisioning": "workspace:*",
       },
       "devDependencies": {
         "@types/bun": "^1.3.14",
