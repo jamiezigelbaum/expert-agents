@@ -4,7 +4,7 @@
 // A single-library route does not come through here.
 import { parseUnitSlug } from '@expert-agents/library';
 import type { PageCatalogBook, PageStore, PageStoreUnit } from './page-store.ts';
-import type { PageSearchHit } from './page-library.ts';
+import type { PageSearchHit, PageSearchScope } from './page-library.ts';
 
 // Matches the page library's own catalog cache: books ingested elsewhere appear within this long.
 const OWNERS_TTL_MS = 60_000;
@@ -14,7 +14,7 @@ export interface PageLibraryMember {
   /** Named database, absent for the default one. */
   database?: string;
   store: PageStore;
-  search(query: string, k: number): Promise<PageSearchHit[]>;
+  search(query: string, k: number, scope?: PageSearchScope): Promise<PageSearchHit[]>;
 }
 
 export class MultiPageStore implements PageStore {
@@ -63,10 +63,15 @@ export class MultiPageStore implements PageStore {
     }
   }
 
-  /** Hits from every library, best score first; a hit on a book another library owns is dropped. */
-  async search(query: string, k: number): Promise<PageSearchHit[]> {
-    if (!this.owners || Date.now() - this.owners.at > OWNERS_TTL_MS) await this.catalog();
-    const lists = await Promise.all(this.members.map((m) => m.search(query, k)));
+  /**
+   * Hits from every library, best score first; a hit on a book another library owns is dropped.
+   * Inside one book only the library that owns it is asked.
+   */
+  async search(query: string, k: number, scope: PageSearchScope = {}): Promise<PageSearchHit[]> {
+    if (!this.owners || Date.now() - this.owners.at > OWNERS_TTL_MS || (scope.book !== undefined && !this.owners.byBook.has(scope.book))) await this.catalog();
+    const owner = scope.book === undefined ? undefined : this.owners!.byBook.get(scope.book);
+    if (scope.book !== undefined && owner === undefined) return [];
+    const lists = await Promise.all(this.members.map((m, i) => (owner === undefined || owner === i ? m.search(query, k, scope) : Promise.resolve([]))));
     const merged: Array<{ hit: PageSearchHit; at: number }> = [];
     lists.forEach((hits, i) => {
       for (const hit of hits) {

@@ -135,6 +135,13 @@ reranked by Voyage.
     set it put the right page in the top 5 for 5% of questions; IDF scoring
     for 44%.
   - Vector arm: nearest neighbours over HNSW.
+  - Inside one book (`search` with `book`), both arms keep only that book's
+    chunks in SQL (slug prefix `books/<book>/`, indexed), so a book the
+    library-wide ranking buries is still found. The vector arm scans the
+    book's chunks exactly instead of walking the shared HNSW graph, which
+    would return the library's nearest chunks and drop most of the book's.
+    Keyword statistics (IDF, the one-fifth cut) stay library-wide. On a route
+    with several libraries only the library that owns the book is asked.
 
 `scripts/page-index.ts` is the operator CLI (`bun run library:index`; the
 deploy package and image carry it as `packages/runtime/dist/page-index.js`):

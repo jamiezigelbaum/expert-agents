@@ -76,7 +76,7 @@ import { LibraryObjectExistsError, LibraryReadError, libraryObjectsRootFromEnv, 
 import { PageIndex, voyageClient, type VoyageClient } from './page-index.ts';
 import { MultiPageStore, type PageLibraryMember } from './page-libraries.ts';
 import { PageDisclosureRefusal, runDisclosedPageLibrary } from './page-disclosure.ts';
-import { PageLibrary, PageLibraryError, parsePageLibraryParams, type PageSearchHit } from './page-library.ts';
+import { PageLibrary, PageLibraryError, parsePageLibraryParams, type PageSearchHit, type PageSearchScope } from './page-library.ts';
 import { DatabasePageStore, TreePageStore, type PageStore } from './page-store.ts';
 import { PageIngestError, PageIngestQueue, type IngestSourceInput, type IngestSourceRef, type MaterializedSource, type PageIndexWriter } from './page-ingest.ts';
 
@@ -180,7 +180,7 @@ export interface DomainExpertWorkerOptions {
   /** The same for ingest: ..._PAGE_LIBRARY_WRITER_DATABASE_URL_<NAME>. */
   pageLibraryWriterDatabaseUrls?: Record<string, string>;
   /** Test seam: replaces the page index search; `database` names the route library's database. */
-  pageSearch?: (query: string, k: number, sourceId: string, database?: string) => Promise<PageSearchHit[]>;
+  pageSearch?: (query: string, k: number, sourceId: string, database?: string, scope?: PageSearchScope) => Promise<PageSearchHit[]>;
   /** Test seam: replaces the page index's per-source status in health. */
   pageIndexStatus?: (sourceId: string, database?: string) => Promise<{ units: number; chunks: number; pending_embeddings: number }>;
   /** Test seam: the store of a page library kept in the database (a route without `root`). */
@@ -752,7 +752,7 @@ export class DomainExpertService {
           // The domain's acquisition directory holds originals library_ingest stored for it.
           { sourceId: config.sourceId, originalBuckets: [...new Set([...pageLibraryOriginalBuckets(route), ...(this.acquisitionDirectory(manifest.domain_id) ? [this.acquisitionDirectory(manifest.domain_id)!.bucket] : [])])] },
           {
-            search: multi ? (query, k) => multi.search(query, k) : (query, k) => parts[0]!.search(query, k),
+            search: multi ? (query, k, _source, scope) => multi.search(query, k, scope) : (query, k, _source, scope) => parts[0]!.search(query, k, scope),
             store: multi ?? parts[0]!.store,
             download: (bucket, name, maxBytes, timeoutMs) => this.objects.downloadLibraryObject(bucket, name, maxBytes, timeoutMs),
           },
@@ -797,15 +797,15 @@ export class DomainExpertService {
     return index;
   }
 
-  private pageSearchFor(database: string | undefined, sourceId: string): (query: string, k: number) => Promise<PageSearchHit[]> {
+  private pageSearchFor(database: string | undefined, sourceId: string): (query: string, k: number, scope?: PageSearchScope) => Promise<PageSearchHit[]> {
     const seam = this.pageSearch;
-    if (seam) return (query, k) => seam(query, k, sourceId, database);
+    if (seam) return (query, k, scope) => seam(query, k, sourceId, database, scope);
     if (!this.pageIndexUrl(database) || !this.voyageApiKey) {
       throw new PageLibraryError('page_search_not_configured', 'The page search index is not configured.', 503);
     }
     const index = this.pageIndexFor(database);
-    return async (query, k) => {
-      try { return await index.search(sourceId, query, k); }
+    return async (query, k, scope) => {
+      try { return await index.search(sourceId, query, k, scope); }
       catch (error) {
         if (error instanceof PageLibraryError) throw error;
         throw new PageLibraryError('page_search_unavailable', 'The page search index could not run the query.', 503);
