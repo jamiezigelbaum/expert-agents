@@ -268,4 +268,26 @@ describe('health reports page-library readiness', () => {
     const none = createDomainExpertWorker({ dataDir,agentRouting: validateAgentRoutingConfig({}) });
     expect((await healthOf(none)).page_library.status).toBe('not_configured');
   });
+
+  test('a search that ran without Voyage is flagged to the caller and shows in health', async () => {
+    const worker = createDomainExpertWorker({
+      dataDir,
+      agentRouting: validateAgentRoutingConfig({ history: { pageLibrary: { root: tree, sourceId: 'history', originalBuckets: ['originals-bucket'] } } }),
+      pageSearch: async () => ({ hits: [{ slug: 'books/sample-book-aaaaaa/p0001', text: 'Page 1 text.' }], degraded: 'keyword_only' as const }),
+      pageIndexStatus: async () => ({ units: 1, chunks: 1, pending_embeddings: 0 }),
+      google: { accessToken: 'synthetic-token', fetchImpl: (async () => { throw new Error('no network'); }) as unknown as typeof fetch },
+    });
+    expect((await healthOf(worker)).page_library.degraded_searches).toBeUndefined();
+    const response = await worker.fetch(new Request('http://worker.test/v1/domain', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ tool: 'domain_library', params: { domain_id: 'history', action: 'search', query: 'page' } }),
+    }));
+    const body = await response.json() as Record<string, any>;
+    expect(response.status).toBe(200);
+    expect(body.degraded).toBe('keyword_only');
+    expect(body.results.map((r: { slug: string }) => r.slug)).toEqual(['books/sample-book-aaaaaa/p0001']);
+    const health = await healthOf(worker);
+    expect(health.page_library.degraded_searches).toMatchObject({ keyword_only: 1, unranked: 0 });
+    expect(health.page_library.issues.map((issue: { code: string }) => issue.code)).toContain('page_search_degraded');
+  });
 });

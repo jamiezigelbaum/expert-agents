@@ -90,8 +90,8 @@ describe('MultiPageStore', () => {
     const scanned: string[] = [];
     for await (const u of multi.scan(['notes-cccccc', 'shared-bbbbbb'], 'x', 10)) scanned.push(`${u.book}:${u.body}`);
     expect(scanned.sort()).toEqual(['notes-cccccc:private notes text', 'shared-bbbbbb:public copy']);
-    expect((await multi.search('q', 10)).map((h) => h.slug)).toEqual(['books/shared-bbbbbb/p0001', 'books/notes-cccccc/p0001', 'books/history-aaaaaa/p0001']);
-    expect(await multi.search('q', 2)).toHaveLength(2);
+    expect((await multi.search('q', 10)).hits.map((h) => h.slug)).toEqual(['books/shared-bbbbbb/p0001', 'books/notes-cccccc/p0001', 'books/history-aaaaaa/p0001']);
+    expect((await multi.search('q', 2)).hits).toHaveLength(2);
   });
 
   test('a search inside one book asks only the library that owns it, and passes the book on', async () => {
@@ -100,8 +100,18 @@ describe('MultiPageStore', () => {
     await scoped.search('q', 5, { book: 'notes-cccccc' });
     expect(asked).toEqual([['private-notes', 'notes-cccccc']]);
     asked.length = 0;
-    expect(await scoped.search('q', 5, { book: 'missing-dddddd' })).toEqual([]);
+    expect(await scoped.search('q', 5, { book: 'missing-dddddd' })).toEqual({ hits: [] });
     expect(asked).toEqual([]);
+  });
+
+  test('a merge is as degraded as its worst library', async () => {
+    const withModes = (a?: 'keyword_only' | 'unranked', b?: 'keyword_only' | 'unranked') => new MultiPageStore([
+      { ...members[0]!, search: async () => ({ hits: [hit('history-aaaaaa', 0.4)], ...(a ? { degraded: a } : {}) }) },
+      { ...members[1]!, search: async () => ({ hits: [hit('notes-cccccc', 0.8)], ...(b ? { degraded: b } : {}) }) },
+    ]);
+    expect((await withModes().search('q', 5)).degraded).toBeUndefined();
+    expect((await withModes('unranked').search('q', 5)).degraded).toBe('unranked');
+    expect((await withModes('unranked', 'keyword_only').search('q', 5)).degraded).toBe('keyword_only');
   });
 });
 

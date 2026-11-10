@@ -142,6 +142,17 @@ reranked by Voyage.
     would return the library's nearest chunks and drop most of the book's.
     Keyword statistics (IDF, the one-fifth cut) stay library-wide. On a route
     with several libraries only the library that owns the book is asked.
+- **When Voyage fails** a search still answers from Postgres. Without a
+  query vector it returns the keyword arm's ranking (`degraded:
+  "keyword_only"`); without a rerank, the fused order (`degraded:
+  "unranked"`). Degraded hits carry no `score`, the `search` result carries
+  `degraded`, and the worker logs one line per degraded search
+  (`page_search_degraded`: source, mode, error code; never the query). Health
+  counts them under `page_library.degraded_searches` and reports
+  `page_search_degraded` for 15 minutes after the last one. Each Voyage call
+  inside a search, retries included, gets 4 seconds
+  (`SEARCH_VOYAGE_BUDGET_MS`); ingest keeps the long backoff. Postgres failing
+  still fails the search (`page_search_unavailable`).
 
 `scripts/page-index.ts` is the operator CLI (`bun run library:index`; the
 deploy package and image carry it as `packages/runtime/dist/page-index.js`):

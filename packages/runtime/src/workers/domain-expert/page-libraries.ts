@@ -4,7 +4,7 @@
 // A single-library route does not come through here.
 import { parseUnitSlug } from '@expert-agents/library';
 import type { PageCatalogBook, PageStore, PageStoreUnit } from './page-store.ts';
-import type { PageSearchHit, PageSearchScope } from './page-library.ts';
+import { pageSearchResult, type PageSearchHit, type PageSearchResult, type PageSearchScope } from './page-library.ts';
 
 // Matches the page library's own catalog cache: books ingested elsewhere appear within this long.
 const OWNERS_TTL_MS = 60_000;
@@ -14,7 +14,7 @@ export interface PageLibraryMember {
   /** Named database, absent for the default one. */
   database?: string;
   store: PageStore;
-  search(query: string, k: number, scope?: PageSearchScope): Promise<PageSearchHit[]>;
+  search(query: string, k: number, scope?: PageSearchScope): Promise<PageSearchHit[] | PageSearchResult>;
 }
 
 export class MultiPageStore implements PageStore {
@@ -67,13 +67,13 @@ export class MultiPageStore implements PageStore {
    * Hits from every library, best score first; a hit on a book another library owns is dropped.
    * Inside one book only the library that owns it is asked.
    */
-  async search(query: string, k: number, scope: PageSearchScope = {}): Promise<PageSearchHit[]> {
+  async search(query: string, k: number, scope: PageSearchScope = {}): Promise<PageSearchResult> {
     if (!this.owners || Date.now() - this.owners.at > OWNERS_TTL_MS || (scope.book !== undefined && !this.owners.byBook.has(scope.book))) await this.catalog();
     const owner = scope.book === undefined ? undefined : this.owners!.byBook.get(scope.book);
-    if (scope.book !== undefined && owner === undefined) return [];
-    const lists = await Promise.all(this.members.map((m, i) => (owner === undefined || owner === i ? m.search(query, k, scope) : Promise.resolve([]))));
+    if (scope.book !== undefined && owner === undefined) return { hits: [] };
+    const results = await Promise.all(this.members.map(async (m, i) => pageSearchResult(owner === undefined || owner === i ? await m.search(query, k, scope) : { hits: [] })));
     const merged: Array<{ hit: PageSearchHit; at: number }> = [];
-    lists.forEach((hits, i) => {
+    results.forEach(({ hits }, i) => {
       for (const hit of hits) {
         const book = parseUnitSlug(hit.slug)?.book;
         const owner = book === undefined ? undefined : this.owners!.byBook.get(book);
@@ -82,6 +82,9 @@ export class MultiPageStore implements PageStore {
       }
     });
     merged.sort((a, b) => (b.hit.score ?? -Infinity) - (a.hit.score ?? -Infinity) || a.at - b.at);
-    return merged.slice(0, k).map((x) => x.hit);
+    // The merge is as degraded as its worst library.
+    const modes = results.map((r) => r.degraded);
+    const degraded = modes.includes('keyword_only') ? 'keyword_only' : modes.includes('unranked') ? 'unranked' : undefined;
+    return { hits: merged.slice(0, k).map((x) => x.hit), ...(degraded ? { degraded } : {}) };
   }
 }
