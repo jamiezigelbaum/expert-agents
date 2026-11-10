@@ -169,10 +169,8 @@ domain as unconfigured; a cloud-touching request is refused with
 `agent_not_configured`. The worker needs a Google credential only when library
 originals live in Cloud Storage; with
 `EXPERT_AGENTS_DOMAIN_EXPERT_LIBRARY_OBJECTS_ROOT` set they live on local disk
-and no Google call is made. A
-configured `scopeManifestPath` is read only by `domain_agent status`, which
-reports whether it parses; it remains owned by the agent repository and is
-never copied or mutated by this deployment.
+and no Google call is made. Legacy routing entries may still contain
+`scopeManifestPath`; the value is ignored and omitted from the loaded route.
 
 `domain_agent status` separates inspection execution from the inspected service
 health. A completed read-only inspection returns `status: "completed"` even

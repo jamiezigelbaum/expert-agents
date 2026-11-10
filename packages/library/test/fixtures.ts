@@ -1,10 +1,8 @@
 import {
   LIBRARY_SCHEMA_VERSION,
-  SCOPE_SCHEMA_VERSION,
   canonicalObjectRelativePath,
   type LibraryObject,
   type MasterManifest,
-  type ScopeManifest,
   type Sha256Id,
 } from "../src/index.ts";
 
@@ -44,17 +42,6 @@ export function masterManifest(overrides: Partial<MasterManifest> = {}): MasterM
     objects: [],
     tombstones: [],
     manifestHash: `sha256:${"0".repeat(64)}`,
-    ...overrides,
-  };
-}
-
-export function scopeManifest(overrides: Partial<ScopeManifest> = {}): ScopeManifest {
-  return {
-    agentId: "example-agent",
-    schemaVersion: SCOPE_SCHEMA_VERSION,
-    selection: { objectIds: [OBJECT_ID_A] },
-    targetCorpusDisplayName: "example-agent-library",
-    masterRevision: 0,
     ...overrides,
   };
 }

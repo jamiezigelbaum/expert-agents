@@ -1,19 +1,15 @@
 import {
   LIBRARY_SCHEMA_VERSION,
-  SCOPE_SCHEMA_VERSION,
   type LibraryLocationConfig,
   type LibraryObject,
   type LibraryProvenance,
   type ManifestTombstone,
   type MasterManifest,
-  type ScopeIncludeFilters,
-  type ScopeManifest,
   type Sha256Id,
   type VersionLineage,
 } from "./types.ts";
 
 const SHA256_ID_PATTERN = /^sha256:[a-f0-9]{64}$/;
-const AGENT_ID_PATTERN = /^[a-z0-9](?:[a-z0-9._-]{0,126}[a-z0-9])?$/;
 const BUCKET_PATTERN = /^[a-z0-9][a-z0-9._-]{1,221}[a-z0-9]$/;
 
 export class LibraryValidationError extends Error {
@@ -162,34 +158,6 @@ export function validateMasterManifest(value: unknown): MasterManifest {
   };
 }
 
-export function validateScopeManifest(value: unknown): ScopeManifest {
-  const record = requireRecord(value, "scope manifest");
-  requireExactKeys(record, ["agentId", "schemaVersion", "selection", "targetCorpusDisplayName", "masterRevision"], "scope manifest");
-  const agentId = requireNonEmptyString(record.agentId, "scope manifest agent id");
-  if (!AGENT_ID_PATTERN.test(agentId)) {
-    throw new LibraryValidationError("scope manifest agent id is invalid");
-  }
-  if (record.schemaVersion !== SCOPE_SCHEMA_VERSION) {
-    throw new LibraryValidationError("scope manifest schema version is unsupported");
-  }
-  const selectionRecord = requireRecord(record.selection, "scope manifest selection");
-  requireExactKeys(selectionRecord, ["objectIds", "includeFilters"], "scope manifest selection", true);
-  const objectIds = requireSortedUniqueSha256Ids(selectionRecord.objectIds, "scope manifest object ids");
-  const includeFilters = selectionRecord.includeFilters === undefined
-    ? undefined
-    : validateIncludeFilters(selectionRecord.includeFilters);
-  const targetCorpusDisplayName = requireNonEmptyString(record.targetCorpusDisplayName, "scope manifest target corpus display name");
-  const masterRevision = requireNonNegativeInteger(record.masterRevision, "scope manifest master revision");
-
-  return {
-    agentId,
-    schemaVersion: SCOPE_SCHEMA_VERSION,
-    selection: includeFilters === undefined ? { objectIds } : { objectIds, includeFilters },
-    targetCorpusDisplayName,
-    masterRevision,
-  };
-}
-
 function validateProvenance(value: unknown): LibraryProvenance {
   const record = requireRecord(value, "library object provenance");
   requireExactKeys(record, ["acquiredBy", "acquiredAt", "acquisitionMethod"], "library object provenance");
@@ -229,25 +197,6 @@ function validateTombstone(value: unknown, manifestRevision: number): ManifestTo
   };
 }
 
-function validateIncludeFilters(value: unknown): ScopeIncludeFilters {
-  const record = requireRecord(value, "scope manifest include filters");
-  requireExactKeys(record, ["trustTiers", "kinds", "locatorPrefixes"], "scope manifest include filters", true);
-  const filters: ScopeIncludeFilters = {};
-  if (record.trustTiers !== undefined) {
-    filters.trustTiers = requireSortedUniqueStrings(record.trustTiers, "scope manifest trust tiers", true);
-  }
-  if (record.kinds !== undefined) {
-    filters.kinds = requireSortedUniqueStrings(record.kinds, "scope manifest kinds", true);
-  }
-  if (record.locatorPrefixes !== undefined) {
-    filters.locatorPrefixes = requireSortedUniqueStrings(record.locatorPrefixes, "scope manifest locator prefixes", true);
-  }
-  if (Object.keys(filters).length === 0) {
-    throw new LibraryValidationError("scope manifest include filters are empty");
-  }
-  return filters;
-}
-
 function requireRecord(value: unknown, name: string): Record<string, unknown> {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     throw new LibraryValidationError(`${name} must be an object`);
@@ -255,19 +204,13 @@ function requireRecord(value: unknown, name: string): Record<string, unknown> {
   return value as Record<string, unknown>;
 }
 
-function requireExactKeys(record: Record<string, unknown>, allowed: string[], name: string, optionalAllowed = false): void {
+function requireExactKeys(record: Record<string, unknown>, allowed: string[], name: string): void {
   const allowedSet = new Set(allowed);
   if (Object.keys(record).some((key) => !allowedSet.has(key))) {
     throw new LibraryValidationError(`${name} contains an unknown field`);
   }
-  if (!optionalAllowed && allowed.some((key) => !(key in record))) {
+  if (allowed.some((key) => !(key in record))) {
     throw new LibraryValidationError(`${name} is missing a required field`);
-  }
-  if (optionalAllowed) {
-    const required = name === "scope manifest selection" ? ["objectIds"] : [];
-    if (required.some((key) => !(key in record))) {
-      throw new LibraryValidationError(`${name} is missing a required field`);
-    }
   }
 }
 

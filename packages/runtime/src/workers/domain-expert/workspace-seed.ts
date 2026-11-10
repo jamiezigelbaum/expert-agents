@@ -2,7 +2,7 @@
 import { appendFile, lstat, mkdir, open, readFile, readdir, realpath, stat, writeFile } from 'node:fs/promises';
 import { basename, dirname, join, relative, resolve, sep } from 'node:path';
 import type { domainManifest } from '../../core/domain-expert.ts';
-import { AGENT_REPO_GITIGNORE, parseScopeManifest } from '@expert-agents/library';
+import { AGENT_REPO_GITIGNORE } from '@expert-agents/library';
 import type { DomainExpertWorkspaceRootPolicy } from './worker-config.ts';
 import { DomainExpertWorkerError } from './worker-errors.ts';
 import { sha256 } from './worker-util.ts';
@@ -170,37 +170,6 @@ export async function audit(root: DomainExpertWorkspaceRootPolicy, record: Recor
   if (!root.auditPath) return;
   await mkdir(dirname(root.auditPath), { recursive: true });
   await appendFile(root.auditPath, `${JSON.stringify(record)}\n`, 'utf8');
-}
-
-export async function inspectConfiguredScopeManifest(path: string): Promise<Record<string, unknown>> {
-  let text: string;
-  try {
-    text = await readFile(path, 'utf8');
-  } catch (error) {
-    const missing = error && typeof error === 'object' && 'code' in error && error.code === 'ENOENT';
-    return {
-      configured: true,
-      present: !missing,
-      parseable: false,
-    };
-  }
-
-  try {
-    const scope = parseScopeManifest(text);
-    return {
-      configured: true,
-      present: true,
-      parseable: true,
-      agent_id: scope.agentId,
-      selected_object_count: scope.selection.objectIds.length,
-    };
-  } catch {
-    return {
-      configured: true,
-      present: true,
-      parseable: false,
-    };
-  }
 }
 
 export function isJunkStageImportPath(workspaceRelativePath: string): boolean {

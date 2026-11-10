@@ -5,9 +5,8 @@ import {
   validateLibraryLocationConfig,
   validateLibraryObject,
   validateMasterManifest,
-  validateScopeManifest,
 } from "../src/index.ts";
-import { OBJECT_ID_A, OBJECT_ID_B, libraryObject, masterManifest, scopeManifest } from "./fixtures.ts";
+import { OBJECT_ID_A, OBJECT_ID_B, libraryObject, masterManifest } from "./fixtures.ts";
 
 describe("library contract schema validation", () => {
   test("accepts a canonical library object and configured shared-library URI", () => {
@@ -42,23 +41,6 @@ describe("library contract schema validation", () => {
       objects: [first],
       tombstones: [{ objectId: OBJECT_ID_A, revision: 1, reason: "withdrawn" }],
     }))).toThrow("both a live object and tombstone");
-  });
-
-  test("accepts explicit and filter scope selection and rejects noncanonical scope input", () => {
-    const scope = scopeManifest({
-      selection: {
-        objectIds: [OBJECT_ID_A],
-        includeFilters: {
-          kinds: ["text/plain"],
-          locatorPrefixes: ["https://example.invalid/library/"],
-          trustTiers: ["reviewed"],
-        },
-      },
-    });
-    expect(validateScopeManifest(scope)).toEqual(scope);
-    expect(() => validateScopeManifest(scopeManifest({ agentId: "Example Agent" }))).toThrow("agent id is invalid");
-    expect(() => validateScopeManifest(scopeManifest({ selection: { objectIds: [OBJECT_ID_B, OBJECT_ID_A] } }))).toThrow("sorted and unique");
-    expect(() => validateScopeManifest(scopeManifest({ selection: { objectIds: [], includeFilters: {} } }))).toThrow("include filters are empty");
   });
 
   test("rejects storage configuration that is not a single explicit bucket and prefix", () => {

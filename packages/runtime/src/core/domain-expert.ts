@@ -41,7 +41,6 @@ export interface DomainManifest {
     source_env: typeof AGENT_ROUTING_ENV_VAR;
     library?: { bucket: string; prefix: string; uri: string };
     page_library?: { source_id: string };
-    scope_manifest_path?: string;
   };
   trust_posture: 'cloud_eligible_with_source_review';
   resource_wiki_namespace: string;
@@ -169,7 +168,6 @@ export function domainManifest(
           source_env: AGENT_ROUTING_ENV_VAR,
           ...(routing.library ? { library: { ...routing.library, uri: libraryUri! } } : {}),
           ...(routing.pageLibrary ? { page_library: { source_id: routing.pageLibrary.sourceId } } : {}),
-          ...(routing.scopeManifestPath ? { scope_manifest_path: routing.scopeManifestPath } : {}),
         }
       : { configured: false, source_env: AGENT_ROUTING_ENV_VAR },
     trust_posture: 'cloud_eligible_with_source_review',

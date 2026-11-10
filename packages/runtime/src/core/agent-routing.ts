@@ -17,7 +17,6 @@ export interface AgentRoutingEntry {
   library?: LibraryLocationConfig;
   /** Existing source locations whose originals may be read and ingested, never written. */
   readOnlySourceRoots?: LibraryLocationConfig[];
-  scopeManifestPath?: string;
   /**
    * Optional. Its absence is the declaration that no disclosure posture
    * applies, which is why every entry written before serving machinery
@@ -63,7 +62,7 @@ export interface AgentPageLibraryConfig {
  * registrations written before 2026-10-25 still carry them, so they are accepted
  * and dropped; they configure nothing.
  */
-export const RETIRED_VERTEX_ROUTING_KEYS = ['targetCorpusDisplayName', 'servingCorpusDisplayNames', 'retrieval', 'ingestion'] as const;
+export const RETIRED_VERTEX_ROUTING_KEYS = ['targetCorpusDisplayName', 'servingCorpusDisplayNames', 'retrieval', 'ingestion', 'scopeManifestPath'] as const;
 
 export type AgentRoutingConfig = Readonly<Record<string, Readonly<AgentRoutingEntry>>>;
 
@@ -119,7 +118,7 @@ function validateRoutingEntry(domainId: string, value: unknown): AgentRoutingEnt
   const entry = requireRecord(value, 'an entry must be an object');
   requireExactKeys(
     entry,
-    ['displayName', 'library', 'readOnlySourceRoots', 'scopeManifestPath', 'disclosure', 'pageLibrary', ...RETIRED_VERTEX_ROUTING_KEYS],
+    ['displayName', 'library', 'readOnlySourceRoots', 'disclosure', 'pageLibrary', ...RETIRED_VERTEX_ROUTING_KEYS],
     'an entry',
   );
   if (entry.pageLibrary === undefined) throw new AgentRoutingConfigError('an entry is missing pageLibrary');
@@ -146,7 +145,6 @@ function validateRoutingEntry(domainId: string, value: unknown): AgentRoutingEnt
     }
     Object.freeze(readOnlySourceRoots);
   }
-  const scopeManifestPath = optionalNonEmptyString(entry.scopeManifestPath, 'an entry scopeManifestPath');
 
   let disclosure: AgentDisclosureConfig | undefined;
   if (entry.disclosure !== undefined) {
@@ -171,7 +169,6 @@ function validateRoutingEntry(domainId: string, value: unknown): AgentRoutingEnt
     ...(displayName ? { displayName } : {}),
     ...(library ? { library } : {}),
     ...(readOnlySourceRoots ? { readOnlySourceRoots } : {}),
-    ...(scopeManifestPath ? { scopeManifestPath } : {}),
     ...(disclosure ? { disclosure } : {}),
     pageLibrary,
   };

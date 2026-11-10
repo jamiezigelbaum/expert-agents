@@ -1,10 +1,9 @@
 import { createHash } from "node:crypto";
-import type { LibraryObject, MasterManifest, ScopeManifest, Sha256Id } from "./types.ts";
+import type { LibraryObject, MasterManifest, Sha256Id } from "./types.ts";
 import {
   LibraryValidationError,
   validateLibraryObject,
   validateMasterManifest,
-  validateScopeManifest,
 } from "./validation.ts";
 
 type UnhashedMasterManifest = Omit<MasterManifest, "manifestHash">;
@@ -59,20 +58,12 @@ export function serializeMasterManifest(value: MasterManifest): string {
   return canonicalJson(assertMasterManifestHash(value));
 }
 
-export function serializeScopeManifest(value: ScopeManifest): string {
-  return canonicalJson(validateScopeManifest(value));
-}
-
 export function parseLibraryObject(text: string): LibraryObject {
   return parseCanonicalDocument(text, validateLibraryObject, serializeLibraryObject);
 }
 
 export function parseMasterManifest(text: string): MasterManifest {
   return parseCanonicalDocument(text, assertMasterManifestHash, serializeMasterManifest);
-}
-
-export function parseScopeManifest(text: string): ScopeManifest {
-  return parseCanonicalDocument(text, validateScopeManifest, serializeScopeManifest);
 }
 
 function withoutManifestHash(manifest: MasterManifest): UnhashedMasterManifest {

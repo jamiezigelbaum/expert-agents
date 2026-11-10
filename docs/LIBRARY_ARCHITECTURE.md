@@ -127,28 +127,6 @@ annotations document, applies the annotation operation under a GCS generation co
 deterministic content-free receipt containing only counts, object IDs, applied
 field names, revision movement, and CAS-conflict counts.
 
-## Agent-owned scope manifests
-
-A `ScopeManifest` is a legacy of the Vertex lane: it selected the objects
-imported into an agent's corpus. Nothing reads it for retrieval or ingest any
-more; when a route names a `scopeManifestPath`, `domain_agent status` only
-reports whether it is present and parses. It belongs in the repository of the
-agent that owns it. Scope manifests do not live in this machinery repository or
-the shared library bucket. Each contains:
-
-- `agentId` and `schemaVersion` (`1`);
-- `selection.objectIds`, a sorted, unique explicit ID list;
-- optional `selection.includeFilters` containing one or more sorted, non-empty
-  lists of `trustTiers`, `kinds`, or `locatorPrefixes`;
-- `targetCorpusDisplayName`; and
-- `masterRevision`, the master revision against which the scope was authored.
-
-Explicit IDs are unioned with the filter result. Within one filter dimension,
-values are ORed; populated dimensions are ANDed. `kinds` can match either an
-object's `mediaType` or non-null `derivativeKind`. An older authored revision is
-valid for planning against a newer master; a future authored revision is
-rejected.
-
 ## Operator CLI
 
 `bun run expert:library -- <command>` is the documented surface for library
@@ -182,7 +160,7 @@ retry after a completed download re-ingests the file already on disk.
 The active runtime consumes `EXPERT_AGENTS_DOMAIN_EXPERT_AGENTS_JSON` as strict
 inline JSON or an `@`-file reference. Each domain entry declares a
 `pageLibrary`, the shared-library `bucket` and `prefix` its originals live in,
-and optional display name, scope-manifest path and disclosure posture; the
+and optional display name and disclosure posture; the
 field list is in the [deployment guide](../deploy/README.md). This routing
 configuration is the only source of runtime cloud destinations.
 
