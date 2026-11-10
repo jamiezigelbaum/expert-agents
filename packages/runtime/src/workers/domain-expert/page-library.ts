@@ -29,6 +29,8 @@ export const READ_MAX_CHARS = 12_000;
 export const RANGE_MAX_UNITS = 25;
 export const RANGE_MAX_CHARS = 60_000;
 export const SEARCH_MAX_K = 25;
+// A hit is the chunk that matched: a page of up to ~480 words whole, or a ~380-word window of a long section.
+export const SEARCH_HIT_MAX_CHARS = 4_000;
 export const GREP_MAX_HITS = 50;
 const GREP_PATTERN_MAX = 200;
 const PDF_MAX_BYTES = 100_000_000;
@@ -203,7 +205,7 @@ export class PageLibrary {
       if (!parsed || (book && parsed.book !== book)) continue;
       // source_uri names the stored original, so evaluations can match evidence.
       const source = (await this.bookIdentity(parsed.book).catch(() => undefined))?.sources[0];
-      out.push({ slug: h.slug, cite: await this.cite(parsed.book, parsed.unit), ...(source ? { source_uri: source } : {}), text: h.text.slice(0, 700) });
+      out.push({ slug: h.slug, cite: await this.cite(parsed.book, parsed.unit), ...(source ? { source_uri: source } : {}), text: wholeSentences(h.text, SEARCH_HIT_MAX_CHARS) });
       if (out.length >= k) break;
     }
     return { results: out };
@@ -318,6 +320,24 @@ export class PageLibrary {
 export function readerTitle(title: string | undefined): string {
   const raw = (title ?? '').trim();
   return raw.replace(/\s*\[[^\]]*\]/g, '').replace(/\s{2,}/g, ' ').trim() || raw;
+}
+
+/**
+ * At most `maxChars` of `text`, cut after the last whole sentence that fits. When no sentence
+ * ends in the back half of the bound, it is cut at the last space instead; a surrogate pair is
+ * never split.
+ */
+export function wholeSentences(text: string, maxChars: number): string {
+  if (text.length <= maxChars) return text;
+  const head = text.slice(0, maxChars + 1);
+  let end = -1;
+  for (const m of head.matchAll(/[.!?]["'”’)\]]*(?=\s)/g)) if (m.index + m[0].length <= maxChars) end = m.index + m[0].length;
+  if (end >= maxChars / 2) return text.slice(0, end);
+  const space = head.lastIndexOf(' ', maxChars);
+  if (space >= maxChars / 2) return text.slice(0, space).trimEnd();
+  const sliced = text.slice(0, maxChars);
+  const last = sliced.charCodeAt(sliced.length - 1);
+  return last >= 0xd800 && last <= 0xdbff ? sliced.slice(0, -1) : sliced;
 }
 
 async function renderWithPdftoppm(pdf: Uint8Array, page: number): Promise<Uint8Array> {

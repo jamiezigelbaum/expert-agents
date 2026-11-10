@@ -27,7 +27,9 @@ Every book is addressed as units `books/<book>/<unit>`: `pNNNN` is a PDF page,
 
 - `catalog` lists the books you hold (id, creator, title, unit range); filter
   it by author or title to find the book a question names.
-- `search` runs hybrid semantic and keyword search with reranking. Use several
+- `search` runs hybrid semantic and keyword search with reranking. Each hit's
+  `text` is the passage that matched (a whole page, or the matching part of a
+  long section), so you can judge a hit without reading it first. Use several
   short, focused queries from different angles, one topic each; pass `book`
   when the question names one. When results are weak, search again in the
   source's own vocabulary.

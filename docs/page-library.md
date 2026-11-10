@@ -109,7 +109,8 @@ reranked by Voyage.
   with a content hash, plus its search chunks. A unit of up to ~480 words (a
   typical page) is one chunk; a longer one is cut into ~380-word windows that
   overlap by 60 words. One vector per long section missed passages buried
-  inside it; hits and citations are still whole units.
+  inside it; hits and citations are still whole units, and each hit's text is
+  the chunk that matched (see `search` in section 3).
 - **The database is the library.** Each unit row also keeps its front matter
   (`meta`: the original and its page, which `view_page` renders), and
   `page_books` holds one catalog entry per book. A worker needs nothing on
@@ -191,11 +192,18 @@ Postgres cannot read is scanned unfiltered instead of refused.
 | action | parameters | returns |
 |---|---|---|
 | `catalog` | `query?` | books: id, author, title, unit range, figure count |
-| `search` | `query`, `k?` (≤25), `book?` | reranked hits with slug, citation, text |
+| `search` | `query`, `k?` (≤25), `book?` | reranked hits with slug, citation, and the passage that matched |
 | `grep` | `pattern` (regex, ≤200 chars), `book?`, `max_hits?` (≤50) | matching lines with slug and citation |
 | `read` | `slug` | one unit (≤12,000 characters) |
 | `read_range` | `book`, `from_unit`, `to_unit` | ≤25 consecutive units, `next_unit` to continue |
 | `view_page` | `slug` | the JPEG of that PDF page, rendered from the original |
+
+A search hit's `text` is the unit's best-matching chunk: a page of up to
+about 480 words comes back whole, a long section its best ~380-word window.
+It is at most 4,000 characters, and a bound that cuts it (that cap, or a
+disclosure quote bound) cuts after the last whole sentence that fits. A
+consumer allowed only `search` can answer from the hits; `read` gives the
+whole unit.
 
 Slugs are `books/<book>/<unit>`. Every hit carries `cite`, the reference a
 reader is given: `Author, Title, p.N`, a timestamp for audio and video, or

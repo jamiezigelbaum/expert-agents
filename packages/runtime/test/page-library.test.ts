@@ -9,6 +9,8 @@ import {
   parsePageLibraryParams,
   type PageSearchHit,
   readerTitle,
+  SEARCH_HIT_MAX_CHARS,
+  wholeSentences,
 } from '../src/workers/domain-expert/page-library.ts';
 
 let root: string;
@@ -64,6 +66,29 @@ describe('page library tools', () => {
     const r = await library([{ slug: 'books/sample-book-aaaaaa/p0012', text: 'The Witness' }, { slug: '../../etc/passwd', text: 'x' }]).search('witness', 5);
     expect(searches.at(-1)).toEqual(['witness', 5, 'research']);
     expect(r.results).toEqual([{ slug: 'books/sample-book-aaaaaa/p0012', cite: 'A. Author, Sample Book, p.12', text: 'The Witness' }]);
+  });
+
+  test('a hit carries the passage that matched, past the top of a long section, cut only at whole sentences', async () => {
+    // The index hands back a long section's best window; its match lies well past the first 700 characters.
+    const lead = Array.from({ length: 30 }, (_, i) => `Opening sentence number ${i} says nothing much at all.`).join(' ');
+    const passage = `${lead} The lantern keeper walks the harbour wall at dusk. A closing line follows.`;
+    expect(passage.indexOf('lantern keeper')).toBeGreaterThan(1200);
+    const r = await library([{ slug: 'books/sample-book-aaaaaa/p0012', text: passage }]).search('lantern keeper', 5);
+    expect((r.results as Array<{ text: string }>)[0]!.text).toBe(passage);
+
+    const long = Array.from({ length: 200 }, (_, i) => `Sentence ${i} of an oversized unit ends here.`).join(' ');
+    const cut = ((await library([{ slug: 'books/sample-book-aaaaaa/p0012', text: long }]).search('oversized', 5)).results as Array<{ text: string }>)[0]!.text;
+    expect(cut.length).toBeLessThanOrEqual(SEARCH_HIT_MAX_CHARS);
+    expect(cut.endsWith('ends here.')).toBe(true);
+    expect(long.startsWith(cut)).toBe(true);
+  });
+
+  test('wholeSentences keeps whole sentences, falls back to a word boundary, and never splits a surrogate pair', () => {
+    expect(wholeSentences('Short.', 100)).toBe('Short.');
+    expect(wholeSentences('One two. Three four. Five six seven.', 22)).toBe('One two. Three four.');
+    // No sentence end in the back half of the bound: cut at the last space instead.
+    expect(wholeSentences('alpha beta gamma delta epsilon', 14)).toBe('alpha beta');
+    expect(wholeSentences(`${'x'.repeat(9)}😀`, 10)).toBe('x'.repeat(9));
   });
 
   test('grep finds every book, or one book, and caps its hits', async () => {

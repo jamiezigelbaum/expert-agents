@@ -18,7 +18,8 @@
 //            nearest vectors. Each arm keeps a unit's best chunk; `rerank-2.5`
 //            orders the vector arm's top 200 and the keyword arm's top 50 by
 //            that chunk.
-//            Hits are units, so citations stay page- and section-addressed.
+//            Hits are units, so citations stay page- and section-addressed;
+//            each hit's text is that best chunk, the passage that matched.
 //
 // Secrets (the database URL and the Voyage key) come from the caller and are
 // never part of an error.
@@ -466,18 +467,16 @@ export class PageIndex {
     for (const h of [...keyword].reverse()) bestChunk.set(h.slug, h.chunk);
     for (const h of vector) bestChunk.set(h.slug, h.chunk);
     const slugs = fused.map((f) => f.slug);
-    // Only each unit's best chunk, so a unit's body comes back once. Joining every chunk repeated
-    // the body per chunk: one 2.6M-character section of 1,342 chunks made a search hold ~7 GB.
+    // Only each unit's best chunk: it is what the unit is reranked by and what the hit carries,
+    // so a reader sees the passage that matched, not the top of the page or section.
     const rows = await this.sql`
       WITH p AS (SELECT * FROM unnest(string_to_array(${csv(slugs)}, ','), string_to_array(${slugs.map((s) => String(bestChunk.get(s) ?? 0)).join(',')}, ',')::int[]) AS p(slug, chunk))
-      SELECT u.slug, u.title, u.body, c.text FROM p
-      JOIN page_units u ON u.source = ${source} AND u.slug = p.slug
-      JOIN page_chunks c ON c.source = u.source AND c.slug = p.slug AND c.chunk = p.chunk` as Array<{ slug: string; title: string; body: string; text: string }>;
-    const bySlug = new Map<string, { slug: string; title: string; body: string; passage: string }>();
-    for (const r of rows) bySlug.set(r.slug, { slug: r.slug, title: r.title, body: r.body, passage: r.text });
-    const pool = slugs.map((s) => bySlug.get(s)).filter((r): r is { slug: string; title: string; body: string; passage: string } => Boolean(r));
-    const ranked = await this.voyage.rerank(q, pool.map((r) => unitDocument({ title: r.title, body: r.passage }, RERANK_DOC_CHARS)), Math.min(k, pool.length));
+      SELECT c.slug, c.title, c.text FROM p
+      JOIN page_chunks c ON c.source = ${source} AND c.slug = p.slug AND c.chunk = p.chunk` as Array<{ slug: string; title: string; text: string }>;
+    const bySlug = new Map(rows.map((r) => [r.slug, r]));
+    const pool = slugs.map((s) => bySlug.get(s)).filter((r): r is { slug: string; title: string; text: string } => Boolean(r));
+    const ranked = await this.voyage.rerank(q, pool.map((r) => unitDocument({ title: r.title, body: r.text }, RERANK_DOC_CHARS)), Math.min(k, pool.length));
     this.tokens.rerank += ranked.tokens;
-    return ranked.order.map(({ index, score }) => ({ slug: pool[index]!.slug, text: pool[index]!.body, score }));
+    return ranked.order.map(({ index, score }) => ({ slug: pool[index]!.slug, text: pool[index]!.text, score }));
   }
 }
