@@ -24,12 +24,12 @@ describe('package script verifier', () => {
     });
   }
 
-  test.skipIf(bunPath === null)('accepts all four repository packages', async () => {
+  test.skipIf(bunPath === null)('accepts all three repository packages', async () => {
     const result = await runVerifier('scripts/verify-package-scripts.ts', repositoryRoot);
 
     expect(result).toEqual({
       code: 0,
-      stdout: 'verified required scripts for 4 packages\n',
+      stdout: 'verified required scripts for 3 packages\n',
       stderr: '',
     });
   });

@@ -37,8 +37,8 @@ function schema(description: string, properties: ToolParameterSchema['properties
 // authoritative for action-dependent requirements, routing, filesystem custody,
 // and approval checks. Extra fields remain compatible with evolving deployments.
 export const researchToolSchemas: Record<DomainExpertTool, ToolParameterSchema> = {
-  domain_agent: schema('Inspect or plan an expert workspace, inspect its catalog, or register an independent expert with the worker. Use the factory tool to create and connect a complete new agent.', {
-    action: choice(DOMAIN_AGENT_ACTIONS, 'bootstrap plans/seeds a legacy worker workspace; status inspects it; catalog inspects selected library objects; register installs a domain route.'),
+  domain_agent: schema('Inspect or plan an expert workspace, or register an independent expert with the worker. Use the factory tool to create and connect a complete new agent.', {
+    action: choice(DOMAIN_AGENT_ACTIONS, 'bootstrap plans/seeds a legacy worker workspace; status inspects it; register installs a domain route.'),
     domain_id: domainId,
     display_name: text('Human-readable expert name.'),
     dry_run: dryRun,

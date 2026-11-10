@@ -5,10 +5,8 @@ Current reference:
 - [Page library](page-library.md): every expert's library — page-addressed units,
   local OCR, the search index, `domain_library` and `library_ingest`.
 
-Legacy, for the Vertex materializer lane (deleted with it):
-
-- [Vertex RAG limits](vertex-rag-limits.md), [library architecture](LIBRARY_ARCHITECTURE.md)
-  and [prepared text intake](prepared-text-intake.md).
+- [Shared library](LIBRARY_ARCHITECTURE.md): the originals' bucket, the master
+  manifest, `library:annotate`, the `expert:library` operator CLI and routing.
 
 - [Factory](FACTORY.md) — creating an expert from a conversation.
 - [Agent repository contract](AGENT_REPO_CONTRACT.md) — what an expert's own repository must contain.

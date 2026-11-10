@@ -1,5 +1,4 @@
 import { describe, expect, test } from 'bun:test';
-import { createHash } from 'node:crypto';
 import {
   existsSync,
   mkdirSync,
@@ -12,15 +11,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { deflateSync } from 'node:zlib';
 import {
-  LIBRARY_SCHEMA_VERSION,
-  SCOPE_SCHEMA_VERSION,
-  canonicalJson,
   canonicalObjectRelativePath,
-  finalizeMasterManifest,
-  serializeMasterManifest,
-  serializeScopeManifest,
-  type LibraryObject,
-  type Sha256Id,
 } from '@expert-agents/library';
 import { validateAgentRoutingConfig } from '../src/core/agent-routing.ts';
 import {
@@ -34,7 +25,6 @@ import {
   type DomainExpertWorkerOptions,
   parseLibgenSearchHtml,
 } from '../src/workers/domain-expert/index.ts';
-import { pdfPartStem, planPdfParts, qpdfPageCount, splitPdf, stripPdfPartSuffix } from '@expert-agents/library';
 import type { PageStore } from '../src/workers/domain-expert/page-store.ts';
 import { TEST_AGENT_ROUTING } from './routing-fixture.ts';
 import { buildEpub } from '../../library/test/epub-fixture.ts';
@@ -1283,158 +1273,10 @@ describe('error contract regressions', () => {
 });
 
 describe('domain_agent catalog', () => {
-  test('returns selected holdings sorted by display with title fallback and ledger-keyed materialization', async () => {
-    const fixture = workspaceFixture();
-    const scopePath = join(fixture.base, 'scope.json');
-    const objectIdA = `sha256:${'a'.repeat(64)}` as Sha256Id;
-    const objectIdB = `sha256:${'b'.repeat(64)}` as Sha256Id;
-    const objectA = catalogObject(objectIdA, {
-      sourceLocators: ['https://example.invalid/library/alpha-notes.txt'],
-      byteSize: 101,
-      trustTier: 'reviewed-a',
-    });
-    const objectB = catalogObject(objectIdB, {
-      title: 'Zulu Work',
-      creator: 'Neutral Creator',
-      sourceLocators: ['https://example.invalid/library/unshown-slug.txt'],
-      byteSize: 202,
-      trustTier: 'reviewed-b',
-    });
-    const master = finalizeMasterManifest({
-      schemaVersion: LIBRARY_SCHEMA_VERSION,
-      revision: 3,
-      ingestionCursor: null,
-      objects: [objectA, objectB],
-      tombstones: [],
-    });
-    writeFileSync(scopePath, serializeScopeManifest({
-      agentId: 'neutral-agent',
-      schemaVersion: SCOPE_SCHEMA_VERSION,
-      selection: { objectIds: [objectIdA, objectIdB] },
-      targetCorpusDisplayName: 'neutral-catalog',
-      masterRevision: 3,
-    }));
-    const ledger = canonicalJson({
-      schemaVersion: 1,
-      revision: 1,
-      entries: [{
-        objectId: objectIdB,
-        ragFileId: 'rag-files/zulu',
-        targetCorpusDisplayName: 'neutral-catalog',
-        corpusResourceName: 'projects/fixture/locations/us-central1/ragCorpora/1',
-        importedAtRevision: 3,
-      }],
-    });
-    const calls: CapturedCall[] = [];
-    const worker = createRawDomainExpertWorker({
-      agentRouting: validateAgentRoutingConfig({
-        neutral: {
-          library: { bucket: 'neutral-bucket', prefix: 'shared/library' },
-          pageLibrary: { sourceId: 'neutral' },
-          scopeManifestPath: scopePath,
-        },
-      }),
-      google: {
-        accessToken: 'fixture-google-token',
-        fetchImpl: fakeGoogleFetch(calls, {
-          gcsObjects: {
-            'shared/library/manifest/master.json': serializeMasterManifest(master),
-            'shared/library/ledgers/neutral-agent.json': ledger,
-          },
-        }),
-      },
-    });
-
-    try {
-      const result = await postDomain(worker, 'domain_agent', { action: 'catalog', domain_id: 'neutral' });
-      expect(result).toMatchObject({
-        kind: 'domain_agent_catalog',
-        domainId: 'neutral',
-        targetCorpusDisplayName: 'neutral-catalog',
-        objects: [
-          {
-            objectId: objectIdA,
-            display: 'Alpha Notes',
-            byteSize: 101,
-            trustTier: 'reviewed-a',
-            materialized: false,
-          },
-          {
-            objectId: objectIdB,
-            display: 'Zulu Work',
-            creator: 'Neutral Creator',
-            byteSize: 202,
-            trustTier: 'reviewed-b',
-            materialized: true,
-          },
-        ],
-        summary: {
-          libraryRevision: 3,
-          totalObjects: 2,
-          tombstones: 0,
-          selected: 2,
-          materialized: 1,
-          unmaterializedIds: [objectIdA],
-        },
-      });
-      expect(JSON.stringify(result)).not.toContain('example.invalid');
-      expect(calls).toHaveLength(2);
-      expect(calls.every((call) => call.method === 'GET')).toBeTrue();
-    } finally {
-      fixture.cleanup();
-    }
-  });
-
-  test('refuses catalog reads for an unconfigured domain with agent_not_configured', async () => {
-    const worker = createRawDomainExpertWorker({ agentRouting: {} });
-    const response = await postDomainResponse(worker, 'domain_agent', {
-      action: 'catalog',
-      domain_id: 'neutral',
-    });
-
-    expect(response.status).toBe(503);
-    expect(await response.json()).toMatchObject({ error: { code: 'agent_not_configured' } });
-  });
-
-  test('returns a typed content-free error for an unreadable master manifest', async () => {
-    const fixture = workspaceFixture();
-    const scopePath = join(fixture.base, 'scope.json');
-    writeFileSync(scopePath, serializeScopeManifest({
-      agentId: 'neutral-agent',
-      schemaVersion: SCOPE_SCHEMA_VERSION,
-      selection: { objectIds: [] },
-      targetCorpusDisplayName: 'neutral-catalog',
-      masterRevision: 0,
-    }));
-    const sensitiveFixture = 'private-source-text-must-not-escape';
-    const worker = createRawDomainExpertWorker({
-      agentRouting: validateAgentRoutingConfig({
-        neutral: {
-          library: { bucket: 'neutral-bucket', prefix: 'shared/library' },
-          pageLibrary: { sourceId: 'neutral' },
-          scopeManifestPath: scopePath,
-        },
-      }),
-      google: {
-        accessToken: 'fixture-google-token',
-        fetchImpl: fakeGoogleFetch([], {
-          gcsObjects: { 'shared/library/manifest/master.json': sensitiveFixture },
-        }),
-      },
-    });
-
-    try {
-      const response = await postDomainResponse(worker, 'domain_agent', {
-        action: 'catalog',
-        domain_id: 'neutral',
-      });
-      const bodyText = await response.text();
-      expect(response.status).toBe(502);
-      expect(JSON.parse(bodyText)).toMatchObject({ error: { code: 'library_catalog_unreadable' } });
-      expect(bodyText).not.toContain(sensitiveFixture);
-    } finally {
-      fixture.cleanup();
-    }
+  test('is no longer an action: the Vertex materialization view was retired', async () => {
+    const response = await postDomainResponse(createDomainExpertWorker(), 'domain_agent', { action: 'catalog', domain_id: 'neutral' });
+    expect(response.status).toBe(400);
+    expect(JSON.stringify(await response.json())).toContain('action');
   });
 });
 
@@ -1615,55 +1457,6 @@ async function getHealth(
   const response = await worker.fetch(new Request('http://worker.test/v1/health'));
   expect(response.status).toBe(200);
   return response.json() as Promise<Record<string, any>>;
-}
-
-function fakeGoogleFetch(
-  calls: CapturedCall[],
-  options: { gcsObjects?: Record<string, string> } = {},
-): typeof fetch {
-  return (async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
-    const url = input instanceof Request ? input.url : String(input);
-    const method = init?.method ?? (input instanceof Request ? input.method : 'GET');
-    const body = init?.body ? await new Response(init.body as BodyInit).text() : '';
-    const headers = headersRecord(init?.headers ?? (input instanceof Request ? input.headers : undefined));
-    calls.push({ url, method, body, headers });
-
-    if (method === 'GET' && new URL(url).pathname.includes('/storage/v1/b/')) {
-      const encodedName = new URL(url).pathname.split('/o/')[1];
-      const objectName = encodedName === undefined ? '' : decodeURIComponent(encodedName);
-      const value = options.gcsObjects?.[objectName];
-      if (value === undefined) return jsonResponse({ error: 'fixture object not found' }, 404);
-      // A metadata read answers as GCS does; any other read answers the object.
-      if (new URL(url).searchParams.get('fields')?.includes('md5Hash')) {
-        return jsonResponse({ generation: '1', size: String(Buffer.byteLength(value)), md5Hash: createHash('md5').update(value).digest('base64') });
-      }
-      return new Response(value);
-    }
-    return jsonResponse({ error: `unexpected Google fixture URL: ${url}` }, 500);
-  }) as typeof fetch;
-}
-
-function catalogObject(id: Sha256Id, overrides: Partial<LibraryObject> = {}): LibraryObject {
-  const mediaType = overrides.mediaType ?? 'text/plain';
-  return {
-    id,
-    sourceLocators: ['https://example.invalid/library/neutral-object.txt'],
-    mediaType,
-    derivativeKind: null,
-    byteSize: 10,
-    provenance: {
-      acquiredBy: 'neutral-fixture',
-      acquiredAt: '2026-01-02T03:04:05.000Z',
-      acquisitionMethod: 'offline-fixture',
-    },
-    trustTier: 'reviewed',
-    copyrightPosture: 'fixture-only',
-    lineage: { supersedes: [], supersededBy: [] },
-    createdAt: '2026-01-02T03:04:05.000Z',
-    updatedAt: '2026-01-02T03:04:05.000Z',
-    relativePath: canonicalObjectRelativePath(id, mediaType),
-    ...overrides,
-  };
 }
 
 function fakeAcquisitionFetch(calls: CapturedCall[]): typeof fetch {
@@ -2011,70 +1804,4 @@ describe('worker authentication posture', () => {
   });
 });
 
-function textPdfBytes(pages: number, blankPages: ReadonlySet<number> = new Set()): Uint8Array {
-  const kids = Array.from({ length: pages }, (_, index) => `${4 + 2 * index} 0 R`).join(' ');
-  const body = Array.from({ length: pages }, (_, index) => {
-    const stream = blankPages.has(index + 1) ? '' : `BT /F1 12 Tf 72 720 Td (Fixture page ${index + 1}) Tj ET`;
-    return `${4 + 2 * index} 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R >> >> /Contents ${5 + 2 * index} 0 R >>\nendobj\n`
-      + `${5 + 2 * index} 0 obj\n<< /Length ${stream.length} >>\nstream\n${stream}\nendstream\nendobj\n`;
-  }).join('');
-  return new TextEncoder().encode([
-    '%PDF-1.7\n',
-    '1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n',
-    `2 0 obj\n<< /Type /Pages /Count ${pages} /Kids [${kids}] >>\nendobj\n`,
-    '3 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n',
-    body,
-    'trailer\n<< /Root 1 0 R >>\n%%EOF\n',
-  ].join(''));
-}
 
-function sha256Hex(bytes: Uint8Array): string {
-  return createHash('sha256').update(bytes).digest('hex');
-}
-
-describe('PDF part planning', () => {
-  test('parts are balanced, contiguous, at most the split size, and cover every page once', () => {
-    expect(planPdfParts(508, 200).map((part) => [part.firstPage, part.lastPage])).toEqual([[1, 170], [171, 339], [340, 508]]);
-    expect(planPdfParts(334, 200).map((part) => part.pages)).toEqual([167, 167]);
-    expect(planPdfParts(201, 200).map((part) => part.pages)).toEqual([101, 100]);
-    expect(planPdfParts(200, 200)).toEqual([{ index: 1, of: 1, firstPage: 1, lastPage: 200, pages: 200 }]);
-    for (const pages of [201, 399, 400, 401, 1234]) {
-      const plan = planPdfParts(pages, 200);
-      expect(plan.every((part) => part.pages <= 200 && part.of === plan.length)).toBe(true);
-      expect(plan.reduce((total, part) => total + part.pages, 0)).toBe(pages);
-      plan.forEach((part, index) => expect(part.firstPage).toBe(index === 0 ? 1 : plan[index - 1]!.lastPage + 1));
-    }
-    expect(() => planPdfParts(0, 200)).toThrow();
-    expect(() => planPdfParts(10, 0)).toThrow();
-  });
-
-  test('part names follow <stem>--partNofM and strip back to the book stem', () => {
-    expect(pdfPartStem('riker - liberalism (1982)', { index: 2, of: 3 })).toBe('riker - liberalism (1982)--part2of3');
-    expect(stripPdfPartSuffix('riker - liberalism (1982)--part2of3')).toBe('riker - liberalism (1982)');
-    expect(stripPdfPartSuffix('riker - liberalism (1982)')).toBe('riker - liberalism (1982)');
-  });
-
-  test('qpdf splits a PDF into parts holding exactly the planned pages, identically on every run', async () => {
-    const qpdf = Bun.which('qpdf');
-    expect(qpdf, 'qpdf must be installed for the PDF split tests').toBeTruthy();
-    const bytes = textPdfBytes(9);
-    expect(await qpdfPageCount(qpdf!, bytes)).toBe(9);
-    const plan = planPdfParts(9, 4);
-    const parts = await splitPdf(qpdf!, bytes, plan);
-    expect(await Promise.all(parts.map((part) => qpdfPageCount(qpdf!, part.bytes)))).toEqual([3, 3, 3]);
-    const again = await splitPdf(qpdf!, bytes, plan);
-    expect(again.map((part) => sha256Hex(part.bytes))).toEqual(parts.map((part) => sha256Hex(part.bytes)));
-  });
-});
-
-test('qpdf finishing with warnings (exit 3) still yields the parts', async () => {
-  const qpdf = Bun.which('qpdf');
-  expect(qpdf, 'qpdf must be installed for the PDF split tests').toBeTruthy();
-  const directory = mkdtempSync(join(tmpdir(), 'expert-qpdf-warn-'));
-  try {
-    const shim = join(directory, 'qpdf-warns');
-    writeFileSync(shim, `#!/bin/sh\n"${qpdf}" "$@"\nstatus=$?\n[ $status -eq 0 ] && { echo "WARNING: fixture warning" >&2; exit 3; }\nexit $status\n`, { mode: 0o755 });
-    const parts = await splitPdf(shim, textPdfBytes(6), planPdfParts(6, 4));
-    expect(parts.map((part) => part.pages)).toEqual([3, 3]);
-  } finally { rmSync(directory, { recursive: true, force: true }); }
-});

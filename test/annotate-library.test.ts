@@ -12,7 +12,7 @@ import {
   type MasterManifest,
   type Sha256Id,
 } from "../packages/library/src/index.ts";
-import { InMemoryGcsAdapter } from "../packages/library-materializer/src/index.ts";
+import { InMemoryGcsAdapter } from "../scripts/library-gcs.ts";
 import {
   assertAnnotationReceiptContainsNoSecrets,
   deriveAnnotationFromLocator,

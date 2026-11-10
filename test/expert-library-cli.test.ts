@@ -1,30 +1,23 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { canonicalJson, contentIdFromBytes, parseScopeManifest, type Sha256Id } from "../packages/library/src/index.ts";
 import {
   ACQUIRE_RETRY_INITIAL_DELAY_MS,
   ACQUIRE_RETRY_SECOND_DELAY_MS,
   EXPERT_LIBRARY_USAGE,
   ExpertLibraryError,
-  GCLOUD_ADC_ARGV,
-  GOOGLE_ACCESS_TOKEN_ENV,
   isBusyWorkerOutcome,
   parseExpertLibraryArguments,
-  resolveGoogleEnv,
   resolveWorkerTarget,
   runExpertLibraryCli,
   type ExpertLibraryCliDependencies,
   type ExpertLibraryFetch,
 } from "../scripts/expert-library.ts";
-import { runExpertIngestCli } from "../scripts/expert-ingest.ts";
 
 const WORKER = "https://worker.test/runtime";
 const TOKEN = "synthetic-worker-token-9f1c";
-const GOOGLE_TOKEN = "ya29.synthetic-google-token";
 const MD5 = "0123456789abcdef0123456789abcdef";
-const OBJECT_A = `sha256:${"a".repeat(64)}` as Sha256Id;
 const temporaryRoots: string[] = [];
 
 afterEach(async () => {
@@ -94,23 +87,13 @@ describe("expert:library argument parsing", () => {
     expect(parseExpertLibraryArguments(["health"])).toEqual({ command: "health" });
   });
 
-  test("parses the owner lane ingest command with positional sources", () => {
-    expect(parseExpertLibraryArguments([
-      "ingest", "--scope", "/agent/library/scope-manifest.json", "--library", "/cand", "--bucket", "b", "--prefix", "v2",
-      "--receipts", "/r", "--title", "T", "--creator", "C", "https://example.invalid/paper.pdf",
-    ])).toEqual({
-      command: "ingest", scopePath: "/agent/library/scope-manifest.json", libraryDirectory: "/cand", bucket: "b", prefix: "v2",
-      receiptsDirectory: "/r", title: "T", creator: "C", sources: ["https://example.invalid/paper.pdf"],
-    });
-  });
-
   test("refuses usage errors with the usage text and exit code 2", async () => {
     const cases: string[][] = [
       ["bogus"],
       ["search", "--domain", "example"],
       ["search", "--domain", "example", "--query", "q", "--top", "0"],
       ["acquire", "--domain", "example", "--md5", "nothex", "--format", "pdf", "--title", "T", "--author", "A", "--copyright-posture", "p", "--approval-id", "i"],
-      // Commands of the removed Vertex answer lane are now unknown commands.
+      // Commands of the removed Vertex answer and import lanes are now unknown commands.
       ["ask", "--domain", "example", "question"],
       ["read", "--domain", "example"],
       ["source", "register"],
@@ -356,232 +339,6 @@ describe("expert:library worker commands", () => {
   });
 
 });
-
-describe("expert:library owner lane", () => {
-  test("mints the Google token with gcloud only when no runtime credential is set", async () => {
-    const spawned: string[][] = [];
-    const spawn = async (argv: string[]) => { spawned.push(argv); return { exitCode: 0, stdout: `${GOOGLE_TOKEN}\n`, stderr: "" }; };
-    const minted = await resolveGoogleEnv({ EXPERT_AGENTS_GCP_PROJECT: "p" }, spawn);
-    expect(minted[GOOGLE_ACCESS_TOKEN_ENV]).toBe(GOOGLE_TOKEN);
-    expect(spawned).toEqual([[...GCLOUD_ADC_ARGV]]);
-
-    const preset = { [GOOGLE_ACCESS_TOKEN_ENV]: "preset" };
-    expect(await resolveGoogleEnv(preset, spawn)).toBe(preset);
-    expect(spawned).toHaveLength(1);
-
-    const failing = async () => ({ exitCode: 1, stdout: "", stderr: "Reauthentication required." });
-    await expect(resolveGoogleEnv({}, failing)).rejects.toThrow("print-access-token failed (exit 1)");
-  });
-
-  test("ingest stages, extends the scope, plans then executes, annotates, and writes a receipt", async () => {
-    const root = await temporaryRoot();
-    const fixture = await ingestFixture(root);
-    const captured = capture();
-    const materializeCalls: string[][] = [];
-    const annotateCalls: string[][] = [];
-    const ingestCalls: string[][] = [];
-    const seenEnv: Array<Record<string, string | undefined> | undefined> = [];
-    const paperBytes = new TextEncoder().encode("# Paper\n\nExtracted paragraph.\n");
-    const paperId = contentIdFromBytes(paperBytes);
-    const dependencies: ExpertLibraryCliDependencies = {
-      env: { EXPERT_AGENTS_GCP_PROJECT: "neutral-project" },
-      stdout: (line) => captured.out.push(line),
-      stderr: (line) => captured.err.push(line),
-      now: () => "2026-01-02T03:04:05.000Z",
-      spawn: async (argv) => (argv[0] === "gcloud"
-        ? { exitCode: 0, stdout: `${GOOGLE_TOKEN}\n`, stderr: "" }
-        : { exitCode: 1, stdout: "", stderr: "unexpected spawn" }),
-      which: () => null,
-      ingest: async (argv, ingestDependencies) => {
-        ingestCalls.push(argv);
-        seenEnv.push(ingestDependencies?.env);
-        // The prepared note is staged for real through expert:ingest so the
-        // candidate carries title/creator via the validator; the URL is faked.
-        if (argv.includes("--prepared")) return runExpertIngestCli(argv, { ...ingestDependencies, now: () => "2026-01-02T03:04:05.000Z" });
-        return {
-          objectId: paperId, relativePath: `objects/sha256/${paperId.slice(7, 9)}/${paperId.slice(7)}.md`, byteSize: paperBytes.byteLength,
-          objectPath: "/x", descriptorPath: "/x/candidates.json", trustTier: "public-unrestricted", copyrightPosture: "public-unrestricted",
-          title: "Paper Title", creator: "Paper Author", alreadyStaged: false,
-        };
-      },
-      materialize: async (argv, materializeDependencies) => {
-        materializeCalls.push(argv);
-        seenEnv.push(materializeDependencies?.env);
-        const execute = argv.includes("--execute");
-        const receipt = {
-          mode: execute ? "execute" : "plan_only",
-          masterRevision: { before: 4, after: execute ? 5 : 5 },
-          ledgerRevision: { before: 2, after: execute ? 3 : 2 },
-          candidates: { dedupedObjectIds: [fixture.noteId] },
-          materialization: { rejectedImports: [], unresolvableSelections: [] },
-          summary: { candidates: 2, addedObjects: 1, dedupedObjects: 1, uploadedObjects: execute ? 1 : 0, plannedUploads: 1, importedObjects: execute ? 1 : 0, rejectedImports: 0, alreadyMaterialized: 0, unresolvableSelections: 0 },
-        };
-        const receiptBytes = new TextEncoder().encode(JSON.stringify(receipt));
-        const receiptPath = argv[argv.indexOf("--receipt") + 1]!;
-        await writeFile(receiptPath, receiptBytes);
-        return { receiptPath, receiptBytes };
-      },
-      annotate: async (argv, annotateDependencies) => {
-        annotateCalls.push(argv);
-        seenEnv.push(annotateDependencies?.env);
-        const receiptPath = argv[argv.indexOf("--receipt") + 1]!;
-        return { mode: "execute" as const, outputPath: receiptPath, outputBytes: new Uint8Array() };
-      },
-    };
-
-    const code = await runExpertLibraryCli([
-      "ingest", "--scope", fixture.scopePath, "--library", fixture.library, "--bucket", "neutral-bucket", "--prefix", "v2",
-      "--receipts", fixture.receipts, "--meta", fixture.metaPath, "https://example.invalid/paper.pdf", fixture.notePath,
-    ], dependencies);
-
-    expect(captured.err).toEqual([]);
-    expect(code).toBe(0);
-    expect(ingestCalls[0]).toEqual([
-      "--source", "https://example.invalid/paper.pdf", "--library", fixture.library, "--title", "Paper Title", "--creator", "Paper Author",
-    ]);
-    expect(ingestCalls[1]).toEqual(["--source", fixture.notePath, "--library", fixture.library, "--prepared", "--title", "Note Title", "--creator", "Note Author"]);
-    // The staged candidate carries title and creator (validated through the library object contract).
-    const descriptor = JSON.parse(await readFile(join(fixture.library, "candidates.json"), "utf8")) as { candidates: Array<{ metadata: Record<string, unknown> }> };
-    expect(descriptor.candidates[0]!.metadata.title).toBe("Note Title");
-    expect(descriptor.candidates[0]!.metadata.creator).toBe("Note Author");
-
-    const scope = parseScopeManifest(await readFile(fixture.scopePath, "utf8"));
-    expect(scope.selection.objectIds).toEqual([OBJECT_A, fixture.noteId, paperId].sort());
-
-    expect(materializeCalls).toHaveLength(2);
-    expect(materializeCalls[0]!.slice(0, 8)).toEqual(["--bucket", "neutral-bucket", "--prefix", "v2", "--scope", fixture.scopePath, "--candidates", fixture.library]);
-    expect(materializeCalls[0]).not.toContain("--execute");
-    expect(materializeCalls[1]).toContain("--execute");
-    for (const env of seenEnv.slice(2)) expect(env?.[GOOGLE_ACCESS_TOKEN_ENV]).toBe(GOOGLE_TOKEN);
-
-    // Only the already-live note is annotated; the paper carried its title on the candidate.
-    expect(annotateCalls).toHaveLength(1);
-    const annotations = JSON.parse(await readFile(annotateCalls[0]![annotateCalls[0]!.indexOf("--annotations") + 1]!, "utf8")) as Record<string, unknown>;
-    expect(annotations).toEqual({
-      schemaVersion: 1,
-      expectedRevision: 5,
-      annotations: [{ objectId: fixture.noteId, title: "Note Title", creator: "Note Author", updatedAt: "2026-01-02T03:04:05.000Z" }],
-    });
-
-    expect(captured.out[0]).toBe(`staged ${paperId} ${paperBytes.byteLength} bytes Paper Title <- https://example.invalid/paper.pdf`);
-    expect(captured.out[1]).toMatch(new RegExp(`^staged ${fixture.noteId} \\d+ bytes Note Title <- `));
-    expect(captured.out[2]).toBe(`scope ${fixture.scopePath}: +2 object id(s), 3 total`);
-    expect(captured.out[3]).toBe("plan: plan_only candidates=2 added=1 deduped=1 uploads=0 imports=0 rejected=0 alreadyMaterialized=0 unresolvable=0");
-    expect(captured.out[4]).toBe("execute: execute candidates=2 added=1 deduped=1 uploads=1 imports=1 rejected=0 alreadyMaterialized=0 unresolvable=0");
-    expect(captured.out[5]).toBe("master revision 4 -> 5; ledger 2 -> 3");
-    expect(captured.out[6]).toBe("annotated 1 already-live object(s)");
-    const receiptPath = captured.out[7]!.replace("receipt: ", "");
-    const receiptText = await readFile(receiptPath, "utf8");
-    expect(receiptText).not.toContain(GOOGLE_TOKEN);
-    const receipt = JSON.parse(receiptText) as Record<string, unknown>;
-    expect(receipt.kind).toBe("expert_library_ingest_receipt");
-    expect((receipt.sources as unknown[]).length).toBe(2);
-    expect(receipt.scope).toEqual({ path: fixture.scopePath, addedObjectIds: [fixture.noteId, paperId].sort(), totalObjectIds: 3 });
-    expect(allOutput(captured)).not.toContain(GOOGLE_TOKEN);
-  });
-
-  test("ingest converts an ebook with ebook-convert before staging and refuses without a converter", async () => {
-    const root = await temporaryRoot();
-    const fixture = await ingestFixture(root);
-    const epubPath = join(root, "book.epub");
-    await writeFile(epubPath, "not really an epub");
-    const spawned: string[][] = [];
-    const ingestCalls: string[][] = [];
-    const base: ExpertLibraryCliDependencies = {
-      env: { EXPERT_AGENTS_GCP_PROJECT: "p", [GOOGLE_ACCESS_TOKEN_ENV]: GOOGLE_TOKEN },
-      stdout: () => {},
-      stderr: () => {},
-      ingest: async (argv) => {
-        ingestCalls.push(argv);
-        return {
-          objectId: OBJECT_A, relativePath: "objects/sha256/aa/a.txt", byteSize: 5, objectPath: "/x", descriptorPath: "/x/c.json",
-          trustTier: "t", copyrightPosture: "p", alreadyStaged: true,
-        };
-      },
-      materialize: async (argv) => {
-        const receiptBytes = new TextEncoder().encode(JSON.stringify({ mode: "execute", masterRevision: { before: 1, after: 1 }, ledgerRevision: { before: 1, after: 1 }, candidates: { dedupedObjectIds: [] }, materialization: { rejectedImports: [], unresolvableSelections: [] }, summary: {} }));
-        return { receiptPath: argv[argv.indexOf("--receipt") + 1]!, receiptBytes };
-      },
-      annotate: async () => { throw new Error("annotate must not run"); },
-    };
-    const argv = ["ingest", "--scope", fixture.scopePath, "--library", fixture.library, "--bucket", "b", "--prefix", "v2", "--receipts", fixture.receipts, epubPath];
-
-    const captured = capture();
-    expect(await runExpertLibraryCli(argv, { ...base, stderr: (line) => captured.err.push(line), which: () => null })).toBe(1);
-    expect(captured.err[0]).toBe("ebook_conversion_unavailable: .epub sources need ebook-convert (calibre) or pandoc on PATH; neither was found.");
-    expect(ingestCalls).toHaveLength(0);
-
-    const which = (binary: string) => (binary === "ebook-convert" ? "/opt/calibre/ebook-convert" : null);
-    const spawn = async (spawnArgv: string[]) => {
-      spawned.push(spawnArgv);
-      await writeFile(spawnArgv[2]!, "converted text\n");
-      return { exitCode: 0, stdout: "", stderr: "" };
-    };
-    expect(await runExpertLibraryCli(argv, { ...base, which, spawn })).toBe(0);
-    expect(spawned[0]![0]).toBe("/opt/calibre/ebook-convert");
-    expect(spawned[0]![1]).toBe(epubPath);
-    expect(spawned[0]![2]).toMatch(/book\.txt$/);
-    expect(ingestCalls[0]!.slice(0, 5)).toEqual(["--source", spawned[0]![2]!, "--library", fixture.library, "--prepared"]);
-
-    const failingSpawn = async () => ({ exitCode: 2, stdout: "", stderr: "Conversion error: bad container\nmore" });
-    const failed = capture();
-    expect(await runExpertLibraryCli(argv, { ...base, which, spawn: failingSpawn, stderr: (line) => failed.err.push(line) })).toBe(1);
-    expect(failed.err[0]).toBe("ebook_conversion_failed: ebook-convert exited with code 2: Conversion error: bad container");
-  });
-
-  test("ingest fails fast without a project, and refuses a malformed --meta document", async () => {
-    const root = await temporaryRoot();
-    const fixture = await ingestFixture(root);
-    const captured = capture();
-    const argv = ["ingest", "--scope", fixture.scopePath, "--library", fixture.library, "--bucket", "b", "--prefix", "v2", "--receipts", fixture.receipts, fixture.notePath];
-    expect(await runExpertLibraryCli(argv, { env: {}, stdout: () => {}, stderr: (line) => captured.err.push(line) })).toBe(1);
-    expect(captured.err[0]).toBe("google_project_not_configured: EXPERT_AGENTS_GCP_PROJECT is required for the owner lane.");
-
-    const badMeta = join(root, "bad-meta.json");
-    await writeFile(badMeta, JSON.stringify({ "https://example.invalid/other.pdf": { title: "Other" } }));
-    const metaCaptured = capture();
-    expect(await runExpertLibraryCli([...argv, "--meta", badMeta], {
-      env: { EXPERT_AGENTS_GCP_PROJECT: "p", [GOOGLE_ACCESS_TOKEN_ENV]: GOOGLE_TOKEN },
-      stdout: () => {},
-      stderr: (line) => metaCaptured.err.push(line),
-      ingest: async () => { throw new Error("ingest must not run"); },
-    })).toBe(1);
-    expect(metaCaptured.err[0]).toBe("meta_invalid: --meta names a source that is not being ingested: https://example.invalid/other.pdf");
-  });
-});
-
-interface IngestFixture {
-  scopePath: string;
-  library: string;
-  receipts: string;
-  notePath: string;
-  noteId: Sha256Id;
-  metaPath: string;
-}
-
-async function ingestFixture(root: string): Promise<IngestFixture> {
-  const library = join(root, "candidates");
-  const receipts = join(root, "receipts");
-  await mkdir(library, { recursive: true });
-  const notePath = join(root, "note.md");
-  const noteText = "# Note\n\nReviewed prepared text.\n";
-  await writeFile(notePath, noteText);
-  const scopePath = join(root, "agent", "library", "scope-manifest.json");
-  await mkdir(join(root, "agent", "library"), { recursive: true });
-  await writeFile(scopePath, canonicalJson({
-    agentId: "neutral-agent",
-    schemaVersion: 1,
-    selection: { objectIds: [OBJECT_A] },
-    targetCorpusDisplayName: "neutral-corpus",
-    masterRevision: 4,
-  }));
-  const metaPath = join(root, "meta.json");
-  await writeFile(metaPath, JSON.stringify({
-    "https://example.invalid/paper.pdf": { title: "Paper Title", creator: "Paper Author" },
-    [notePath]: { title: "Note Title", creator: "Note Author" },
-  }));
-  return { scopePath, library, receipts, notePath, noteId: contentIdFromBytes(new TextEncoder().encode(noteText)), metaPath };
-}
 
 async function temporaryRoot(): Promise<string> {
   const root = await mkdtemp(join(tmpdir(), "expert-library-cli-test-"));

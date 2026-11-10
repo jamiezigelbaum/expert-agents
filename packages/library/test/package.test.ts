@@ -5,24 +5,23 @@ describe("@expert-agents/library package", () => {
     const library = await import("../src/index.ts");
 
     const functions = [
-      "LibraryValidationError", "ManifestUpdateError", "ReconciliationPlannerError",
+      "LibraryValidationError", "ManifestUpdateError",
       "allowlistedExtractionEnv", "applyManifestUpdate", "assertMasterManifestHash",
       "canonicalJson", "canonicalObjectRelativePath", "computeMasterManifestHash",
       "contentIdFromBytes", "extensionForMediaType", "extractorEnvironment",
       "finalizeMasterManifest", "firstDiagnosticLine", "isolatedExtractorEnvironment", "libraryObjectUri",
       "normalizeExtractedText", "parseLibraryObject",
-      "parseMasterManifest", "parseScopeManifest", "planReconciliation",
+      "parseMasterManifest", "parseScopeManifest",
       
       "serializeLibraryObject", "serializeMasterManifest",
-      "serializeReconciliationPlan", "serializeScopeManifest", "sha256",
+      "serializeScopeManifest", "sha256",
       "sourceLocatorCredential", "validateLibraryLocationConfig",
       "looksLikeWatchPageScript", "parseYoutubeTranscriptExtraction",
-      "validateLibraryObject", "validateMasterManifest", "validateMaterializationLedger",
+      "validateLibraryObject", "validateMasterManifest",
       "validateScopeManifest", 
       
       "EbookConversionError", "convertEpubToMarkdown", "decodeXmlEntities", "plainTextToMarkdown",
       "resolveArchivePath", "xhtmlToMarkdown",
-      "PdfSplitError", "pdfPageLimitSetting", "pdfPartStem", "pdfTextLayer", "planPdfParts", "qpdfPageCount", "splitPdf", "stripPdfPartSuffix",
       "bookId", "offsetUnits", "pageDerivativePrefix", "pageNeedsOcr", "parseUnitSlug", "partOf", "renderUnitMarkdown",
       "sectionText", "slugify", "splitPdfText", "unitBody", "unitFrontmatter", "unitName", "unitNumber", "unitSlug",
       "deepLane", "describeFigures", "escalatePage", "figurePagesFromImageList", "hasFigureCaption", "looksLikeRefusal", "ocrEscalationReason", "ocrPage",
@@ -32,13 +31,13 @@ describe("@expert-agents/library package", () => {
     ] as const;
     const numbers = [
       "EXTRACTION_MAX_OUTPUT_BYTES", "EXTRACTION_TIMEOUT_MS", "LIBRARY_SCHEMA_VERSION",
-      "MATERIALIZATION_LEDGER_SCHEMA_VERSION", 
-      "RECONCILIATION_PLAN_SCHEMA_VERSION", "SCOPE_SCHEMA_VERSION", "LLM_PARSER_MAX_PDF_PAGES",
+      
+      "SCOPE_SCHEMA_VERSION",
       "OCR_MIN_CHARS", "PAGE_UNITS_SCHEMA_VERSION", "SECTION_TARGET_WORDS", "DENSE_PAGE_JPEG_BYTES", "MEDIA_SECTION_TARGET_WORDS",
     ] as const;
     const strings = [
       "AGENT_REPO_GITIGNORE", "EXTRACTION_METHOD",
-      "SUMMARIZE_BINARY", "SUMMARIZE_INSTALL_COMMAND", "PDF_SPLIT_PAGES_ENV", "DEFAULT_QPDF_BIN",
+      "SUMMARIZE_BINARY", "SUMMARIZE_INSTALL_COMMAND",
       "OCR_PROFILE", "DEEP_PROFILE", "DEEPSEEK_OCR_PROMPT", "LANE_CACHE", "TRANSCRIPTION_PROFILE",
     ] as const;
 

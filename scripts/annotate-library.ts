@@ -9,13 +9,13 @@ import {
   type MasterManifest,
   type Sha256Id,
 } from "../packages/library/src/index.ts";
+import { accessTokenProviderFromEnv } from "./google-auth.ts";
 import {
   GcsCasConflictError,
   GoogleGcsAdapter,
-  accessTokenProviderFromEnv,
   type GcsAdapter,
   type GcsGeneration,
-} from "../packages/library-materializer/src/index.ts";
+} from "./library-gcs.ts";
 
 const MASTER_MANIFEST_PATH = "manifest/master.json";
 const USAGE = `Usage:

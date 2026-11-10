@@ -1,10 +1,9 @@
 /**
  * The ruled extraction engine, shared by every caller that turns a source
- * locator into text. Both live callers in this repository — the library ingest
- * CLI (`scripts/expert-ingest.ts`) and the domain-expert worker's `web_import`
- * path — spawn the same binary with the same extraction-only arguments and the
- * same credential-stripped environment, so neither lane can drift into a
- * second acquisition engine or into a paid extraction fallback.
+ * locator into text. The domain-expert worker's web import path (used by
+ * `library_ingest` for URLs) spawns this binary with these extraction-only
+ * arguments and this credential-stripped environment, so no caller can drift
+ * into a second acquisition engine or into a paid extraction fallback.
  */
 
 export const SUMMARIZE_BINARY = "summarize";
