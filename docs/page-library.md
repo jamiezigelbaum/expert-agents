@@ -111,6 +111,15 @@ reranked by Voyage.
   overlap by 60 words. One vector per long section missed passages buried
   inside it; hits and citations are still whole units, and each hit's text is
   the chunk that matched (see `search` in section 3).
+- **One vector index for every source.** All libraries in a database share one
+  HNSW index, and the source filter applies after it. A plain HNSW scan
+  returns at most `ef_search` (400) rows across all sources, so a source
+  sharing the index with a larger one came back short (measured on 2026-11-10:
+  governance, 38% of the chunks, got 366 and 371 of 400 on two of three
+  probes). The vector arm therefore runs an iterative scan
+  (`hnsw.iterative_scan = relaxed_order`, up to 200,000 tuples) and puts the
+  rows back in distance order, which needs **pgvector 0.8 or newer**. Searches
+  inside one book skip the index and scan that book's chunks exactly.
 - **The database is the library.** Each unit row also keeps its front matter
   (`meta`: the original and its page, which `view_page` renders), and
   `page_books` holds one catalog entry per book. A worker needs nothing on

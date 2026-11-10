@@ -102,7 +102,7 @@ flowchart LR
 
 **Requirements:** [Bun](https://bun.sh) 1.3+ to build. To run an expert you also
 need an OpenClaw installation, a GCS bucket for originals, Postgres with
-pgvector for the page index (`deploy/page-library/compose.yaml`), a Voyage API
+pgvector 0.8 or newer for the page index (`deploy/page-library/compose.yaml`), a Voyage API
 key, and a local model router serving DeepSeek-OCR and a vision profile.
 
 ```sh
