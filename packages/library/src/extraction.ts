@@ -171,3 +171,78 @@ export function firstDiagnosticLine(stderr: string): string {
   const line = stderr.split("\n").map((value) => value.trim()).find((value) => value.length > 0);
   return line === undefined ? "no diagnostic output" : line.slice(0, 200);
 }
+
+// A YouTube URL is extracted with --json so the caller can see where the text
+// came from. In plain mode the extractor exits 0 and prints the video's
+// description when no transcript exists, which reads like a transcript; the
+// JSON record names its transcript source instead (`captionTracks`,
+// `youtubei`, `yt-dlp`, ... or `unavailable`). Checked against summarize 0.21.7.
+export const YOUTUBE_EXTRACTION_ARGUMENTS: readonly string[] = [...EXTRACTION_ARGUMENTS, "--json"];
+
+// Markers of a YouTube watch page's own script and player bootstrap. None of
+// them occurs in spoken captions, so text carrying one is page code, not a
+// transcript, whatever the extractor reported about it.
+const WATCH_PAGE_SCRIPT_MARKERS: readonly RegExp[] = [
+  /\bytcfg\.set\s*\(/,
+  /\bytInitialPlayerResponse\s*=/,
+  /\bytInitialData\s*=/,
+  /\bwindow\.ytplayer\b/,
+  /\bytplayer\.(?:config|web_player_context_config)\b/,
+  /\byt\.setConfig\s*\(/,
+];
+
+export function looksLikeWatchPageScript(text: string): boolean {
+  return WATCH_PAGE_SCRIPT_MARKERS.some((marker) => marker.test(text));
+}
+
+export type YoutubeTranscriptExtraction =
+  | { ok: true; text: string; transcriptSource: string; title?: string }
+  | {
+    ok: false;
+    code: "youtube_extraction_unreadable" | "youtube_transcript_unavailable" | "youtube_transcript_page_script";
+    reason: string;
+  };
+
+/**
+ * Reads the extractor's --json record for a YouTube URL and keeps the text only
+ * when it is a transcript: a named transcript source, transcript characters,
+ * and none of the watch page's script. Reasons carry no extracted content.
+ */
+export function parseYoutubeTranscriptExtraction(stdout: string): YoutubeTranscriptExtraction {
+  let record: unknown;
+  try {
+    record = JSON.parse(stdout);
+  } catch {
+    return { ok: false, code: "youtube_extraction_unreadable", reason: "the extractor did not return its JSON record" };
+  }
+  const extracted = isPlainRecord(record) && isPlainRecord(record.extracted) ? record.extracted : undefined;
+  if (!extracted) {
+    return { ok: false, code: "youtube_extraction_unreadable", reason: "the extractor's JSON record has no extracted content" };
+  }
+  const source = typeof extracted.transcriptSource === "string" ? extracted.transcriptSource.trim() : "";
+  const transcriptCharacters = typeof extracted.transcriptCharacters === "number" ? extracted.transcriptCharacters : 0;
+  if (source === "" || source === "unavailable" || transcriptCharacters <= 0) {
+    const metadata = isPlainRecord(extracted.transcriptMetadata) ? extracted.transcriptMetadata : undefined;
+    const why = typeof metadata?.reason === "string" && /^[a-z0-9_]{1,64}$/i.test(metadata.reason)
+      ? metadata.reason
+      : "no transcript source";
+    return { ok: false, code: "youtube_transcript_unavailable", reason: `no transcript was obtained (${why})` };
+  }
+  const text = normalizeExtractedText(typeof extracted.content === "string" ? extracted.content : "");
+  if (text.length === 0) {
+    return { ok: false, code: "youtube_transcript_unavailable", reason: `the ${source} transcript was empty` };
+  }
+  if (looksLikeWatchPageScript(text)) {
+    return {
+      ok: false,
+      code: "youtube_transcript_page_script",
+      reason: `the text reported as a ${source} transcript is YouTube watch-page script`,
+    };
+  }
+  const title = typeof extracted.title === "string" && extracted.title.trim() !== "" ? extracted.title.trim() : undefined;
+  return { ok: true, text, transcriptSource: source, ...(title ? { title } : {}) };
+}
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
