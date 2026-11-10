@@ -170,9 +170,9 @@ domain as unconfigured; a cloud-touching request is refused with
 originals live in Cloud Storage; with
 `EXPERT_AGENTS_DOMAIN_EXPERT_LIBRARY_OBJECTS_ROOT` set they live on local disk
 and no Google call is made. A
-configured `scopeManifestPath` is read only by `domain_agent status` and the
-read-only `domain_agent catalog` action for configured domains; it remains owned
-by the agent repository and is never copied or mutated by this deployment.
+configured `scopeManifestPath` is read only by `domain_agent status`, which
+reports whether it parses; it remains owned by the agent repository and is
+never copied or mutated by this deployment.
 
 `domain_agent status` separates inspection execution from the inspected service
 health. A completed read-only inspection returns `status: "completed"` even

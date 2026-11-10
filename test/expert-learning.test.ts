@@ -8,7 +8,6 @@ import {
   parseExpertLearningArguments,
   runExpertLearningCli,
 } from "../scripts/expert-learning.ts";
-import { runExpertIngestCli, type ExtractionRequest, type ExtractionResult } from "../scripts/expert-ingest.ts";
 
 const ENGAGEMENT_ID = "engagement-neutral-0001";
 const AGENT_ID = "neutral-agent";
@@ -170,44 +169,3 @@ describe("expert:learning extraction", () => {
   });
 });
 
-describe("library ingestion refuses engagement-held paths", () => {
-  test("refuses a source held in per-engagement storage before extraction runs", async () => {
-    const fixture = await learningFixture();
-    const held = join(fixture.engagementRoot, "client-content", "client-item-0001");
-    const attempts: ExtractionRequest[] = [];
-
-    const promise = runExpertIngestCli(["--source", held, "--library", fixture.libraryDirectory], {
-      summarizePath: "/neutral/bin/summarize",
-      extract: async (request: ExtractionRequest): Promise<ExtractionResult> => {
-        attempts.push(request);
-        return { exitCode: 0, stdout: CLIENT_CONTENT, stderr: "" };
-      },
-      env: {},
-      now: () => ACCEPTED_AT,
-    });
-
-    await expect(promise).rejects.toMatchObject({ code: "engagement_held_path" });
-    expect(attempts).toHaveLength(0);
-  });
-
-  test("refuses a library rooted inside per-engagement storage", async () => {
-    const fixture = await learningFixture();
-    const attempts: ExtractionRequest[] = [];
-
-    const promise = runExpertIngestCli([
-      "--source", "https://example.invalid/reference/neutral-talk",
-      "--library", join(fixture.engagementRoot, "library"),
-    ], {
-      summarizePath: "/neutral/bin/summarize",
-      extract: async (request: ExtractionRequest): Promise<ExtractionResult> => {
-        attempts.push(request);
-        return { exitCode: 0, stdout: "# Neutral\n", stderr: "" };
-      },
-      env: {},
-      now: () => ACCEPTED_AT,
-    });
-
-    await expect(promise).rejects.toMatchObject({ code: "engagement_held_path" });
-    expect(attempts).toHaveLength(0);
-  });
-});

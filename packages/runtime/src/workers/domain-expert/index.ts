@@ -34,24 +34,18 @@ import {
   EXTRACTION_MAX_OUTPUT_BYTES,
   EXTRACTION_METHOD,
   EXTRACTION_TIMEOUT_MS,
-  MATERIALIZATION_LEDGER_SCHEMA_VERSION,
   SUMMARIZE_BINARY,
   SUMMARIZE_INSTALL_COMMAND,
   allowlistedExtractionEnv,
-  canonicalJson,
   firstDiagnosticLine,
   isolatedExtractorEnvironment,
   normalizeExtractedText,
   parseYoutubeTranscriptExtraction,
   YOUTUBE_EXTRACTION_ARGUMENTS,
-  parseMasterManifest,
   parseScopeManifest,
-  planReconciliation,
   type ExtractionRequest,
   type ExtractionResult,
-  type MaterializationLedger,
   type ReferenceExtractor,
-  type Sha256Id,
   type LibraryLocationConfig,
   MEDIA_EXTENSIONS,
   splitFrontmatter,
@@ -1219,10 +1213,6 @@ export class DomainExpertService {
       const rootPath = await checkedRootPath(root);
       return this.domainAgentStatus(manifest, root, rootPath);
     }
-    if (params.action === 'catalog') {
-      requireConfiguredAgent(manifest, 'domain_agent catalog');
-      return this.domainAgentCatalog(manifest);
-    }
 
     const dryRun = params.dryRun ?? true;
     const plan = planDomainAgent({ ...params, dryRun: true }, manifest);
@@ -1265,81 +1255,6 @@ export class DomainExpertService {
       })),
       policy: domainPolicy(),
     };
-  }
-
-  private async domainAgentCatalog(
-    manifest: ReturnType<typeof domainManifest>,
-  ): Promise<Record<string, unknown>> {
-    const library = manifest.routing.library;
-    const scopeManifestPath = manifest.routing.scope_manifest_path;
-    if (!library || !scopeManifestPath) {
-      throw new DomainExpertWorkerError(
-        503,
-        'library_catalog_not_configured',
-        'domain_agent catalog requires a configured scope manifest path.',
-      );
-    }
-
-    try {
-      const scopeText = await readFile(scopeManifestPath, 'utf8');
-      const scope = parseScopeManifest(scopeText);
-      const manifestBytes = await this.objects.downloadGcsObject(
-        library.bucket,
-        `${library.prefix}/manifest/master.json`,
-      );
-      if (manifestBytes === null) throw new Error('master manifest missing');
-      const master = parseMasterManifest(decodeUtf8Bytes(manifestBytes));
-      const ledgerBytes = await this.objects.downloadGcsObject(
-        library.bucket,
-        `${library.prefix}/ledgers/${scope.agentId}.json`,
-      );
-      const ledger = ledgerBytes === null
-        ? { schemaVersion: MATERIALIZATION_LEDGER_SCHEMA_VERSION, entries: [] }
-        : catalogPlannerLedger(decodeUtf8Bytes(ledgerBytes));
-      const plan = planReconciliation(master, scope, ledger);
-      const selectedIds = new Set([
-        ...plan.imports.map((entry) => entry.objectId),
-        ...plan.alreadyMaterialized.map((entry) => entry.objectId),
-      ]);
-      const materializedIds = new Set(plan.alreadyMaterialized.map((entry) => entry.objectId));
-      const objects = master.objects
-        .filter((object) => selectedIds.has(object.id))
-        .map((object) => ({
-          objectId: object.id,
-          display: object.title ?? humanizeSourceLocatorBasename(object.sourceLocators[0]!),
-          ...(object.creator === undefined ? {} : { creator: object.creator }),
-          byteSize: object.byteSize,
-          trustTier: object.trustTier,
-          materialized: materializedIds.has(object.id),
-        }))
-        .sort((left, right) => compareStrings(left.display, right.display)
-          || compareStrings(left.objectId, right.objectId));
-      const unmaterializedIds = objects
-        .filter((object) => !object.materialized)
-        .map((object) => object.objectId)
-        .sort(compareStrings);
-
-      return {
-        kind: 'domain_agent_catalog',
-        domainId: manifest.domain_id,
-        targetCorpusDisplayName: scope.targetCorpusDisplayName,
-        objects,
-        summary: {
-          libraryRevision: master.revision,
-          totalObjects: master.objects.length,
-          tombstones: master.tombstones.length,
-          selected: objects.length,
-          materialized: objects.length - unmaterializedIds.length,
-          unmaterializedIds,
-        },
-      };
-    } catch {
-      throw new DomainExpertWorkerError(
-        502,
-        'library_catalog_unreadable',
-        'Library catalog state could not be read or validated.',
-      );
-    }
   }
 
   private async domainAgentStatus(
@@ -5543,95 +5458,7 @@ function decodeUtf8Bytes(bytes: Uint8Array): string {
   return new TextDecoder('utf-8', { fatal: true }).decode(bytes);
 }
 
-function catalogPlannerLedger(text: string): MaterializationLedger {
-  const value = JSON.parse(text) as unknown;
-  if (canonicalJson(value) !== text) throw new Error('catalog ledger is not canonical');
-  const record = catalogRecord(value);
-  if (record.schemaVersion !== MATERIALIZATION_LEDGER_SCHEMA_VERSION
-    || !Number.isSafeInteger(record.revision)
-    || (record.revision as number) < 0
-    || !Array.isArray(record.entries)) {
-    throw new Error('catalog ledger header is invalid');
-  }
-  const entries = record.entries.map((value) => {
-    const entry = catalogRecord(value);
-    const allowed = new Set([
-      'objectId',
-      'ragFileId',
-      'targetCorpusDisplayName',
-      'corpusResourceName',
-      'importedAtRevision',
-    ]);
-    if (['objectId', 'ragFileId', 'corpusResourceName', 'importedAtRevision'].some((key) => !(key in entry))
-      || Object.keys(entry).some((key) => !allowed.has(key))
-      || typeof entry.objectId !== 'string'
-      || !/^sha256:[a-f0-9]{64}$/.test(entry.objectId)
-      || !catalogNonEmptyString(entry.ragFileId)
-      || !catalogNonEmptyString(entry.corpusResourceName)
-      || !Number.isSafeInteger(entry.importedAtRevision)
-      || (entry.importedAtRevision as number) < 0
-      || (entry.targetCorpusDisplayName !== undefined && !catalogNonEmptyString(entry.targetCorpusDisplayName))) {
-      throw new Error('catalog ledger entry is invalid');
-    }
-    return {
-      objectId: entry.objectId as Sha256Id,
-      ragFileId: entry.ragFileId as string,
-      ...(entry.targetCorpusDisplayName === undefined
-        ? {}
-        : { targetCorpusDisplayName: entry.targetCorpusDisplayName as string }),
-    };
-  });
-  for (let index = 1; index < entries.length; index += 1) {
-    if (entries[index - 1]!.objectId >= entries[index]!.objectId) {
-      throw new Error('catalog ledger entries are not sorted and unique');
-    }
-  }
-  if (new Set(entries.map((entry) => entry.ragFileId)).size !== entries.length) {
-    throw new Error('catalog ledger RAG file ids are not unique');
-  }
-  return { schemaVersion: MATERIALIZATION_LEDGER_SCHEMA_VERSION, entries };
-}
 
-function catalogRecord(value: unknown): Record<string, unknown> {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) {
-    throw new Error('catalog state is not an object');
-  }
-  return value as Record<string, unknown>;
-}
-
-function catalogNonEmptyString(value: unknown): value is string {
-  return typeof value === 'string' && value.length > 0 && value.trim() === value;
-}
-
-function humanizeSourceLocatorBasename(locator: string): string {
-  let path = locator.split(/[?#]/, 1)[0] ?? locator;
-  try {
-    path = new URL(locator).pathname;
-  } catch {
-    // Non-URL locators still have portable slash-delimited basenames.
-  }
-  let slug = basename(path) || path;
-  try {
-    slug = decodeURIComponent(slug);
-  } catch {
-    // Preserve malformed percent encodings as literal slug text.
-  }
-  const extension = extname(slug);
-  if (extension) slug = slug.slice(0, -extension.length);
-  const humanized = slug
-    .replace(/[-_]+/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim()
-    .split(' ')
-    .filter(Boolean)
-    .map((token) => `${token.charAt(0).toUpperCase()}${token.slice(1)}`)
-    .join(' ');
-  return humanized || 'Untitled Object';
-}
-
-function compareStrings(left: string, right: string): number {
-  return left < right ? -1 : left > right ? 1 : 0;
-}
 
 function collapseWhitespace(value: string): string {
   return value.replace(/\s+/g, ' ').trim();

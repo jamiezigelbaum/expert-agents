@@ -6,7 +6,7 @@ import {
   type AgentRoutingConfig,
 } from './agent-routing.ts';
 
-export const DOMAIN_AGENT_ACTIONS = ['bootstrap', 'status', 'catalog', 'register'] as const;
+export const DOMAIN_AGENT_ACTIONS = ['bootstrap', 'status', 'register'] as const;
 export type DomainAgentAction = typeof DOMAIN_AGENT_ACTIONS[number];
 
 export const WEB_IMPORT_TRANSCRIPT_MODES = ['auto', 'captions', 'asr'] as const;

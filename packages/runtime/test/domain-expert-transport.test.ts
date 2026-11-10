@@ -6,11 +6,6 @@ import {
   createDomainExpertWorker as createRawDomainExpertWorker,
   type DomainExpertWorkerOptions,
 } from '../src/workers/domain-expert/index.ts';
-import {
-  GoogleVertexAdapter,
-  StaticAccessTokenProvider,
-  VertexPaginationError,
-} from '../../library-materializer/src/index.ts';
 import { TEST_AGENT_ROUTING } from './routing-fixture.ts';
 import { googleUploadVehicle } from './google-vehicle.ts';
 
@@ -158,54 +153,6 @@ describe('Anna credentialed response disposal', () => {
       message: 'Anna Archive download failed.',
     });
     expect(errorCancelled).toBe(true);
-  });
-});
-
-describe('Vertex adapter pagination bounds', () => {
-  test('the materializer corpus loop rejects a repeated nextPageToken with a typed error', async () => {
-    let calls = 0;
-    const adapter = new GoogleVertexAdapter({
-      project: 'fixture-project',
-      location: 'us-central1',
-      tokenProvider: new StaticAccessTokenProvider(GOOGLE_ACCESS_TOKEN),
-      fetchImpl: async () => {
-        calls += 1;
-        return Response.json({ ragCorpora: [], nextPageToken: 'repeated-token' });
-      },
-    });
-
-    try {
-      await adapter.ensureCorpus('fixture-corpus');
-      throw new Error('expected pagination to fail');
-    } catch (error) {
-      expect(error).toBeInstanceOf(VertexPaginationError);
-      expect((error as VertexPaginationError).maxPages).toBe(100);
-      expect((error as Error).message).toContain('100-page cap (repeated nextPageToken)');
-    }
-    expect(calls).toBe(2);
-  });
-
-  test('the materializer file loop stops at the named page cap', async () => {
-    let calls = 0;
-    const adapter = new GoogleVertexAdapter({
-      project: 'fixture-project',
-      location: 'us-central1',
-      tokenProvider: new StaticAccessTokenProvider(GOOGLE_ACCESS_TOKEN),
-      fetchImpl: async () => {
-        calls += 1;
-        return Response.json({ ragFiles: [], nextPageToken: `page-${calls}` });
-      },
-    });
-
-    try {
-      await adapter.listFiles('projects/fixture-project/locations/us-central1/ragCorpora/123');
-      throw new Error('expected pagination to fail');
-    } catch (error) {
-      expect(error).toBeInstanceOf(VertexPaginationError);
-      expect((error as VertexPaginationError).maxPages).toBe(100);
-      expect((error as Error).message).toContain('100-page cap (page cap reached)');
-    }
-    expect(calls).toBe(100);
   });
 });
 

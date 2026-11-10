@@ -52,7 +52,7 @@ USER.md
 HEARTBEAT.md
 references/
 library/
-  scope-manifest.json (optional, legacy materializer lane)
+  scope-manifest.json (optional, legacy; read by nothing but status)
   eval-questions.json
 derived/ (optional)
   <artifact-id>/
@@ -268,9 +268,7 @@ refused, so two clients of the same expert cannot be pointed at shared state.
 
 The store's surface is write-and-delete. Nothing exported returns client
 content, so a caller has nothing to hand to a library object, and the module
-imports no library path at all. `expert:ingest` refuses a source — or a library
-root — held inside per-engagement storage, which is the same rule enforced at
-the library's own entrance. `closeEngagement` deletes every stored item at
+imports no library path at all. `closeEngagement` deletes every stored item at
 engagement end and returns counts, never names, paths, or content.
 
 Learning returns only as an accepted derived artifact of kind `doctrine`, never
@@ -384,7 +382,8 @@ verification workflow.
 
 ## Library files
 
-An optional `library/scope-manifest.json` (the legacy materializer lane) is an agent-owned
+An optional `library/scope-manifest.json` (a legacy of the removed Vertex materializer;
+`domain_agent status` only checks that it parses) is an agent-owned
 [`ScopeManifest`](./LIBRARY_ARCHITECTURE.md) validated by
 `@expert-agents/library`. It never moves into this machinery repository or the
 shared-library bucket.
