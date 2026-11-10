@@ -1,6 +1,13 @@
 import { describe, expect, test } from "bun:test";
 
 describe("@expert-agents/provisioning package", () => {
+  test("exposes the same held-path check through the engagement subpath", async () => {
+    const { isEngagementHeldPath } = await import("@expert-agents/provisioning/engagement");
+    const provisioning = await import("../src/index.ts");
+
+    expect(isEngagementHeldPath).toBe(provisioning.isEngagementHeldPath);
+  });
+
   test("loads as an isolated workspace package", async () => {
     const provisioning = await import("../src/index.ts");
 
