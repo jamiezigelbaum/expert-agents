@@ -9,6 +9,8 @@ import { PageIndex, readTreeCatalog, readTreeUnits, voyageClient } from "../pack
  *                                                make the library match the tree (idempotent):
  *                                                units, front matter and catalog; with --books,
  *                                                only those books, the rest of the library untouched
+ *   remove  --source <id> --books a,b            delete those books (catalog, units, chunks) in
+ *                                                one transaction; all must be in the catalog
  *   embed   --source <id> [--max-tokens N]       embed chunks without a vector
  *   search  --source <id> --query <text> [--k 10]
  *
@@ -49,6 +51,9 @@ export async function main(argv: string[]): Promise<void> {
       // Units first, then the catalog that lists them.
       const c = await index.replaceBooks(source, catalog, books ? { books } : {});
       console.log(JSON.stringify({ ...r, catalog: c, pendingEmbeddings: await index.pendingEmbeddings(source), seconds: Math.round((Date.now() - t) / 1000) }));
+    } else if (command === "remove") {
+      const books = need(rest, "books").split(",").filter(Boolean);
+      console.log(JSON.stringify(await index.removeBooks(need(rest, "source"), books)));
     } else if (command === "embed") {
       if (!process.env.VOYAGE_API_KEY) throw new Error("VOYAGE_API_KEY is not set");
       const max = flag(rest, "max-tokens");
@@ -63,7 +68,7 @@ export async function main(argv: string[]): Promise<void> {
       if (degraded) console.error(`[search] degraded: ${degraded}`);
       for (const h of hits) console.log(`${h.score?.toFixed(3)}  ${h.slug}  ${h.text.slice(0, 100).replace(/\s+/g, " ")}`);
     } else {
-      console.log("usage: bun scripts/page-index.ts migrate [--reader <role>] [--writer <role>] | import --source <id> --tree <dir> [--books a,b] | embed --source <id> [--max-tokens N] | search --source <id> --query <text> [--k 10]");
+      console.log("usage: bun scripts/page-index.ts migrate [--reader <role>] [--writer <role>] | import --source <id> --tree <dir> [--books a,b] | remove --source <id> --books a,b | embed --source <id> [--max-tokens N] | search --source <id> --query <text> [--k 10]");
     }
   } finally {
     await index.close();

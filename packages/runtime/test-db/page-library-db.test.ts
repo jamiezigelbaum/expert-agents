@@ -276,6 +276,28 @@ describe('the database page store', () => {
     await index.close();
   });
 
+  test('removing a duplicate book drops its catalog row, units and chunks, and leaves every other book alone', async () => {
+    const index = new PageIndex(databaseUrl(PUBLIC_DB), voyageClient('synthetic-key', { fetch: voyageFetch }));
+    const src = 'remove-src';
+    const unit = (book: string, n: number) => ({ slug: `books/${book}/s000${n}`, book, unit: `s000${n}`, title: book, body: `Shared essay text, section ${n}.` });
+    const entry = (b: string) => ({ book: b, title: 'Essay', creator: '', kind: 'sections' as const, units: 2, first_unit: 's0001', last_unit: 's0002', figures: 0, objects: [], sources: [] });
+    await index.importUnits(src, [unit('essay-aaaaaa', 1), unit('essay-aaaaaa', 2), unit('essay-bbbbbb', 1), unit('essay-bbbbbb', 2)]);
+    await index.replaceBooks(src, [entry('essay-aaaaaa'), entry('essay-bbbbbb')]);
+
+    // A name outside the catalog removes nothing, not even the books that are there.
+    await expect(index.removeBooks(src, ['essay-aaaaaa', 'essay-zzzzzz'])).rejects.toThrow('essay-zzzzzz');
+    expect((await index.catalog(src)).length).toBe(2);
+
+    expect(await index.removeBooks(src, ['essay-aaaaaa'])).toEqual({ books: 1, units: 2, chunks: 2 });
+    expect((await index.catalog(src)).map((b) => b.book)).toEqual(['essay-bbbbbb']);
+    const left = await index.sql`SELECT
+      (SELECT count(*)::int FROM page_units WHERE source = ${src} AND book = 'essay-aaaaaa') AS gone_units,
+      (SELECT count(*)::int FROM page_chunks WHERE source = ${src} AND slug LIKE 'books/essay-aaaaaa/%') AS gone_chunks,
+      (SELECT count(*)::int FROM page_chunks WHERE source = ${src} AND slug LIKE 'books/essay-bbbbbb/%') AS kept_chunks` as Array<Record<string, number>>;
+    expect(left[0]).toEqual({ gone_units: 0, gone_chunks: 0, kept_chunks: 2 });
+    await index.close();
+  });
+
   test('a long section of many chunks comes back once, as the chunk that matched', async () => {
     const index = new PageIndex(databaseUrl(PUBLIC_DB), voyageClient('synthetic-key', { fetch: voyageFetch }));
     const filler = Array.from({ length: 4000 }, (_, i) => `filler${String.fromCharCode(97 + (i % 26))}`).join(' ');
