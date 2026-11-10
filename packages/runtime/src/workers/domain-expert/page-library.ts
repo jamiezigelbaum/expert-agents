@@ -53,11 +53,24 @@ export interface PageLibraryConfig {
 
 export interface PageSearchHit { slug: string; text: string; score?: number }
 
+/**
+ * How a search ran short when Voyage failed: `keyword_only` without a query vector (the keyword
+ * arm's ranking), `unranked` without a rerank (the fused order). Absent, the search ran whole.
+ */
+export type PageSearchDegraded = 'keyword_only' | 'unranked';
+
+export interface PageSearchResult { hits: PageSearchHit[]; degraded?: PageSearchDegraded }
+
+/** A search seam may answer with bare hits (never degraded) or a full result. */
+export function pageSearchResult(r: PageSearchHit[] | PageSearchResult): PageSearchResult {
+  return Array.isArray(r) ? { hits: r } : r;
+}
+
 /** What narrows a search: `book` keeps it inside that one book. */
 export interface PageSearchScope { book?: string }
 
 export interface PageLibraryDependencies {
-  search(query: string, k: number, sourceId: string, scope?: PageSearchScope): Promise<PageSearchHit[]>;
+  search(query: string, k: number, sourceId: string, scope?: PageSearchScope): Promise<PageSearchHit[] | PageSearchResult>;
   download(bucket: string, name: string, maxBytes: number, timeoutMs: number): Promise<Uint8Array | null>;
   /** JPEG bytes of one page; defaults to pdftoppm. */
   renderPage?: (pdf: Uint8Array, page: number) => Promise<Uint8Array>;
@@ -201,7 +214,7 @@ export class PageLibrary {
   async search(query: string, k: number, book?: string): Promise<Record<string, unknown>> {
     if (book) await this.requireBook(book);
     // The index ranks inside the book, so a book the library-wide ranking buries is still found.
-    const hits = await this.deps.search(query, k, this.config.sourceId, book ? { book } : {});
+    const { hits, degraded } = pageSearchResult(await this.deps.search(query, k, this.config.sourceId, book ? { book } : {}));
     const out = [];
     for (const h of hits) {
       const parsed = parseUnitSlug(h.slug);
@@ -211,7 +224,7 @@ export class PageLibrary {
       out.push({ slug: h.slug, cite: await this.cite(parsed.book, parsed.unit), ...(source ? { source_uri: source } : {}), text: wholeSentences(h.text, SEARCH_HIT_MAX_CHARS) });
       if (out.length >= k) break;
     }
-    return { results: out };
+    return { results: out, ...(degraded ? { degraded } : {}) };
   }
 
   async grep(pattern: string, book: string | undefined, maxHits: number): Promise<Record<string, unknown>> {

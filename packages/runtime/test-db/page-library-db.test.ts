@@ -9,8 +9,8 @@ import { join } from 'node:path';
 import { SQL } from 'bun';
 import { validateAgentRoutingConfig, type AgentRoutingConfig } from '../src/core/agent-routing.ts';
 import { createDomainExpertWorker } from '../src/workers/domain-expert/index.ts';
-import { PageIndex, PAGE_INDEX_DIMENSIONS, voyageClient } from '../src/workers/domain-expert/page-index.ts';
-import { PageLibrary } from '../src/workers/domain-expert/page-library.ts';
+import { PageIndex, PAGE_INDEX_DIMENSIONS, voyageClient, type VoyageClient } from '../src/workers/domain-expert/page-index.ts';
+import { PageLibrary, PageLibraryError } from '../src/workers/domain-expert/page-library.ts';
 import { DatabasePageStore, postgresLinePattern } from '../src/workers/domain-expert/page-store.ts';
 import { renderUnitMarkdown, upsertCatalog } from '@expert-agents/library';
 import { scanAndFigurePdf } from '../../library/test/pdf-fixture.ts';
@@ -283,7 +283,7 @@ describe('the database page store', () => {
     await index.importUnits('long-src', [{ slug: 'books/long-eeeeee/s0001', book: 'long-eeeeee', unit: 's0001', title: 'Long', body }]);
     const [{ chunks }] = await index.sql`SELECT count(*)::int AS chunks FROM page_chunks WHERE source = 'long-src'` as Array<{ chunks: number }>;
     expect(chunks).toBeGreaterThan(10);
-    const hits = await index.search('long-src', 'lantern keeper harbour', 5);
+    const { hits } = await index.search('long-src', 'lantern keeper harbour', 5);
     expect(hits.map((h) => h.slug)).toEqual(['books/long-eeeeee/s0001']);
     // The hit is the matching window, not the top of the section.
     expect(hits[0]!.text).toContain('the lantern keeper walks the harbour wall at dusk');
@@ -356,7 +356,7 @@ describe('search inside one book', () => {
     });
     try {
       // Library-wide, the crowd holds the whole top 50.
-      const wide = await index.search(src, 'lantern keeper tide', 50);
+      const { hits: wide } = await index.search(src, 'lantern keeper tide', 50);
       expect(wide.every((h) => h.slug.startsWith(`books/${crowd}/`))).toBe(true);
       const scoped = (await lib.search('lantern keeper tide', 5, target)).results as Array<{ slug: string; text: string }>;
       expect(scoped.map((h) => h.slug)).toEqual([`books/${target}/p0001`]);
@@ -364,5 +364,59 @@ describe('search inside one book', () => {
     } finally {
       await index.close();
     }
+  });
+});
+
+describe('search when Voyage fails', () => {
+  const src = 'degraded-src';
+  const book = 'degraded-dddddd';
+  const working = voyageClient('synthetic-key', { fetch: voyageFetch });
+  const down = () => Promise.reject(new PageLibraryError('page_search_unavailable', 'Voyage embeddings is unreachable', 503));
+  // Query embeddings fail (stored chunk vectors were made while Voyage was up), or only the rerank does.
+  const failing = (what: 'embed' | 'rerank'): VoyageClient => ({
+    embed: (texts, inputType, opts) => (what === 'embed' && inputType === 'query' ? down() : working.embed(texts, inputType, opts)),
+    rerank: (query, documents, topK, opts) => (what === 'rerank' ? down() : working.rerank(query, documents, topK, opts)),
+  });
+  // The query's words stay under a fifth of the chunks, so the keyword arm keeps them.
+  const bodies = ['The lantern keeper notes the tide.', 'The lantern hangs by the door.',
+    ...['orchard', 'barley', 'millstone', 'granary', 'rain', 'fields', 'hedgerow', 'meadow', 'thresher', 'wagon'].map((w) => `A page about the ${w}.`)];
+
+  beforeAll(async () => {
+    const index = new PageIndex(databaseUrl(PUBLIC_DB), working);
+    await index.importUnits(src, bodies.map((body, i) => {
+      const unit = `p${String(i + 1).padStart(4, '0')}`;
+      return { slug: `books/${book}/${unit}`, book, unit, title: 'Degraded', body };
+    }));
+    await index.embedPending(src);
+    await index.close();
+  });
+
+  const searchWith = async (what: 'embed' | 'rerank', query: string) => {
+    const lines: string[] = [];
+    const index = new PageIndex(databaseUrl(PUBLIC_DB), failing(what), { log: (line) => lines.push(line) });
+    try { return { result: await index.search(src, query, 5), lines }; } finally { await index.close(); }
+  };
+
+  test('without a query vector the keyword arm answers, flagged keyword_only, with one log line', async () => {
+    const { result, lines } = await searchWith('embed', 'lantern keeper');
+    expect(result.degraded).toBe('keyword_only');
+    expect(result.hits.map((h) => h.slug)).toEqual([`books/${book}/p0001`, `books/${book}/p0002`]);
+    expect(result.hits.every((h) => h.score === undefined)).toBe(true);
+    expect(lines).toHaveLength(1);
+    expect(JSON.parse(lines[0]!)).toEqual({ event: 'page_search_degraded', source: src, degraded: 'keyword_only', error: 'page_search_unavailable' });
+    expect(lines[0]).not.toContain('lantern');
+  });
+
+  test('without a rerank the fused order answers, flagged unranked', async () => {
+    const { result, lines } = await searchWith('rerank', 'lantern keeper');
+    expect(result.degraded).toBe('unranked');
+    expect(result.hits[0]!.slug).toBe(`books/${book}/p0001`);
+    expect(result.hits.length).toBeLessThanOrEqual(5);
+    expect(lines.map((l) => JSON.parse(l).degraded)).toEqual(['unranked']);
+  });
+
+  test('with both arms empty the search is empty, not an error', async () => {
+    const { result } = await searchWith('embed', 'zzyzx qwvx');
+    expect(result).toEqual({ hits: [], degraded: 'keyword_only' });
   });
 });

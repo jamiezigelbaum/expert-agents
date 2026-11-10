@@ -59,7 +59,8 @@ export async function main(argv: string[]): Promise<void> {
       console.log(JSON.stringify({ ...r, pending: await index.pendingEmbeddings(need(rest, "source")) }));
     } else if (command === "search") {
       if (!process.env.VOYAGE_API_KEY) throw new Error("VOYAGE_API_KEY is not set");
-      const hits = await index.search(need(rest, "source"), need(rest, "query"), Number(flag(rest, "k") ?? 10));
+      const { hits, degraded } = await index.search(need(rest, "source"), need(rest, "query"), Number(flag(rest, "k") ?? 10));
+      if (degraded) console.error(`[search] degraded: ${degraded}`);
       for (const h of hits) console.log(`${h.score?.toFixed(3)}  ${h.slug}  ${h.text.slice(0, 100).replace(/\s+/g, " ")}`);
     } else {
       console.log("usage: bun scripts/page-index.ts migrate [--reader <role>] [--writer <role>] | import --source <id> --tree <dir> [--books a,b] | embed --source <id> [--max-tokens N] | search --source <id> --query <text> [--k 10]");

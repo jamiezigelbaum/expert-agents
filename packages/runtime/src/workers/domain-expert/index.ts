@@ -76,7 +76,7 @@ import { LibraryObjectExistsError, LibraryReadError, libraryObjectsRootFromEnv, 
 import { PageIndex, voyageClient, type VoyageClient } from './page-index.ts';
 import { MultiPageStore, type PageLibraryMember } from './page-libraries.ts';
 import { PageDisclosureRefusal, runDisclosedPageLibrary } from './page-disclosure.ts';
-import { PageLibrary, PageLibraryError, parsePageLibraryParams, type PageSearchHit, type PageSearchScope } from './page-library.ts';
+import { PageLibrary, PageLibraryError, pageSearchResult, parsePageLibraryParams, type PageSearchHit, type PageSearchResult, type PageSearchScope } from './page-library.ts';
 import { DatabasePageStore, TreePageStore, type PageStore } from './page-store.ts';
 import { PageIngestError, PageIngestQueue, type IngestSourceInput, type IngestSourceRef, type MaterializedSource, type PageIndexWriter } from './page-ingest.ts';
 
@@ -180,7 +180,7 @@ export interface DomainExpertWorkerOptions {
   /** The same for ingest: ..._PAGE_LIBRARY_WRITER_DATABASE_URL_<NAME>. */
   pageLibraryWriterDatabaseUrls?: Record<string, string>;
   /** Test seam: replaces the page index search; `database` names the route library's database. */
-  pageSearch?: (query: string, k: number, sourceId: string, database?: string, scope?: PageSearchScope) => Promise<PageSearchHit[]>;
+  pageSearch?: (query: string, k: number, sourceId: string, database?: string, scope?: PageSearchScope) => Promise<PageSearchHit[] | PageSearchResult>;
   /** Test seam: replaces the page index's per-source status in health. */
   pageIndexStatus?: (sourceId: string, database?: string) => Promise<{ units: number; chunks: number; pending_embeddings: number }>;
   /** Test seam: the store of a page library kept in the database (a route without `root`). */
@@ -492,6 +492,8 @@ export class DomainExpertService {
   private namedPageIndexes = new Map<string, PageIndex>();
   private pageLibraryDatabaseUrls: Record<string, string>;
   private pageSearch: DomainExpertWorkerOptions['pageSearch'];
+  /** Searches that ran without Voyage since this worker started, for health. */
+  private readonly degradedSearches: { keyword_only: number; unranked: number; last_at?: string } = { keyword_only: 0, unranked: 0 };
   private pageIndexStatus: DomainExpertWorkerOptions['pageIndexStatus'];
   private pageStoreOverride: DomainExpertWorkerOptions['pageStore'];
   private voyageFetch: typeof fetch | undefined;
@@ -658,7 +660,15 @@ export class DomainExpertService {
       }
       domains.push({ domain_id: domainId, source_id: config.sourceId, store: config.root ? 'tree' : 'database', catalog: primary.catalog, books: primary.books, index: primary.indexStatus, disclosure: Boolean(route.disclosure), libraries });
     }
-    return { status: issues.length ? 'degraded' : 'ready', configured, domains, ...(issues.length ? { issues } : {}) };
+    const degraded = this.degradedSearches;
+    if (degraded.last_at && Date.now() - Date.parse(degraded.last_at) < DEGRADED_SEARCH_RECENT_MS) {
+      issues.push({ code: 'page_search_degraded', message: 'A recent search ran without Voyage (no query vector or no rerank): results came back keyword-only or unranked.' });
+    }
+    return {
+      status: issues.length ? 'degraded' : 'ready', configured, domains,
+      ...(degraded.last_at ? { degraded_searches: { ...degraded } } : {}),
+      ...(issues.length ? { issues } : {}),
+    };
   }
 
   private manifest(domainId?: string, displayName?: string): ReturnType<typeof domainManifest> {
@@ -797,15 +807,23 @@ export class DomainExpertService {
     return index;
   }
 
-  private pageSearchFor(database: string | undefined, sourceId: string): (query: string, k: number, scope?: PageSearchScope) => Promise<PageSearchHit[]> {
+  private pageSearchFor(database: string | undefined, sourceId: string): (query: string, k: number, scope?: PageSearchScope) => Promise<PageSearchResult> {
+    // Every degraded search is counted, so health shows Voyage failing before a reader reports it.
+    const counted = (result: PageSearchResult) => {
+      if (result.degraded) {
+        this.degradedSearches[result.degraded]++;
+        this.degradedSearches.last_at = new Date().toISOString();
+      }
+      return result;
+    };
     const seam = this.pageSearch;
-    if (seam) return (query, k, scope) => seam(query, k, sourceId, database, scope);
+    if (seam) return async (query, k, scope) => counted(pageSearchResult(await seam(query, k, sourceId, database, scope)));
     if (!this.pageIndexUrl(database) || !this.voyageApiKey) {
       throw new PageLibraryError('page_search_not_configured', 'The page search index is not configured.', 503);
     }
     const index = this.pageIndexFor(database);
     return async (query, k, scope) => {
-      try { return await index.search(sourceId, query, k, scope); }
+      try { return counted(await index.search(sourceId, query, k, scope)); }
       catch (error) {
         if (error instanceof PageLibraryError) throw error;
         throw new PageLibraryError('page_search_unavailable', 'The page search index could not run the query.', 503);
@@ -2788,6 +2806,8 @@ const PAGE_INGEST_MAX_REFS = 50;
 const PAGE_INGEST_MAX_BYTES = 300_000_000;
 // Health counts each page-library source's index rows; an index that does not answer in this long is unreachable.
 const PAGE_INDEX_HEALTH_TIMEOUT_MS = 3_000;
+// Health reports Voyage trouble while a degraded search is this recent.
+const DEGRADED_SEARCH_RECENT_MS = 15 * 60_000;
 
 // Spelled out whole so the deploy-env test sees each prefix the env example documents.
 const PAGE_LIBRARY_ENV_PREFIX = {

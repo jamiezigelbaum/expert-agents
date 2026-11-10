@@ -87,4 +87,17 @@ describe('Voyage client', () => {
     expect(error).toBeInstanceOf(PageLibraryError);
     expect(String((error as Error).message)).not.toContain('secret-key');
   });
+
+  test('a call with a budget gives up within it instead of backing off for ingest', async () => {
+    for (const fail of [async () => { throw new Error('unreachable'); }, async () => new Response('busy', { status: 503 })]) {
+      let calls = 0;
+      const v = voyageClient('secret-key', { fetch: (async () => { calls++; return fail(); }) as unknown as typeof fetch });
+      const started = Date.now();
+      const error = await v.embed(['a'], 'query', { budgetMs: 300 }).catch((e) => e as PageLibraryError);
+      expect(Date.now() - started).toBeLessThan(1_000);
+      expect(error).toBeInstanceOf(PageLibraryError);
+      expect((error as PageLibraryError).code).toBe('page_search_unavailable');
+      expect(calls).toBe(1);
+    }
+  });
 });

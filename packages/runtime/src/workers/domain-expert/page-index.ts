@@ -28,7 +28,7 @@ import { readdir, readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { SQL } from 'bun';
 import { parseUnitSlug, unitBody, unitFrontmatter, type CatalogEntry } from '@expert-agents/library';
-import { PageLibraryError, type PageSearchHit, type PageSearchScope } from './page-library.ts';
+import { PageLibraryError, type PageSearchDegraded, type PageSearchResult, type PageSearchScope } from './page-library.ts';
 
 export const PAGE_INDEX_EMBED_MODEL = 'voyage-4';
 export const PAGE_INDEX_DIMENSIONS = 1024;
@@ -51,6 +51,9 @@ const STATS_TTL_MS = 5 * 60_000;
 const EMBED_DOC_CHARS = 24_000;
 const RERANK_DOC_CHARS = 4_000;
 const VOYAGE_URL = 'https://api.voyageai.com/v1';
+// A reader is waiting on a search: each Voyage call in it, retries included, gets this long.
+// Ingest keeps the long backoff.
+export const SEARCH_VOYAGE_BUDGET_MS = 4_000;
 
 export interface PageIndexUnit {
   slug: string; book: string; unit: string; title: string; body: string;
@@ -124,43 +127,52 @@ export async function readTreeCatalog(root: string, only?: readonly string[]): P
   return books.filter((b) => !only || only.includes(b.book));
 }
 
+/** `budgetMs` bounds one call's total time, attempts and backoff included. */
+export interface VoyageCallOptions { budgetMs?: number }
+
 export interface VoyageClient {
-  embed(texts: string[], inputType: 'document' | 'query'): Promise<{ vectors: number[][]; tokens: number }>;
-  rerank(query: string, documents: string[], topK: number): Promise<{ order: Array<{ index: number; score: number }>; tokens: number }>;
+  embed(texts: string[], inputType: 'document' | 'query', opts?: VoyageCallOptions): Promise<{ vectors: number[][]; tokens: number }>;
+  rerank(query: string, documents: string[], topK: number, opts?: VoyageCallOptions): Promise<{ order: Array<{ index: number; score: number }>; tokens: number }>;
 }
 
 export function voyageClient(apiKey: string, opts: { embedModel?: string; rerankModel?: string; fetch?: typeof fetch } = {}): VoyageClient {
   const f = opts.fetch ?? fetch;
-  async function call<T>(path: string, body: unknown): Promise<T> {
+  async function call<T>(path: string, body: unknown, callOpts: VoyageCallOptions = {}): Promise<T> {
+    const deadline = callOpts.budgetMs === undefined ? Infinity : Date.now() + callOpts.budgetMs;
+    const outOfTime = () => new PageLibraryError('page_search_unavailable', `Voyage ${path} did not answer in time`, 503);
+    // Back off before the next attempt, unless that would run past the budget.
+    const backoff = async (ms: number) => { if (Date.now() + ms >= deadline) throw outOfTime(); await Bun.sleep(ms); };
     for (let attempt = 0; ; attempt++) {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) throw outOfTime();
       let res: Response;
       try {
         res = await f(`${VOYAGE_URL}/${path}`, {
           method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
-          body: JSON.stringify(body), signal: AbortSignal.timeout(120_000),
+          body: JSON.stringify(body), signal: AbortSignal.timeout(Math.min(120_000, remaining)),
         });
       } catch {
-        if (attempt < 4) { await Bun.sleep(2000 * (attempt + 1)); continue; }
+        if (attempt < 4) { await backoff(2000 * (attempt + 1)); continue; }
         throw new PageLibraryError('page_search_unavailable', `Voyage ${path} is unreachable`, 503);
       }
-      if ((res.status === 429 || res.status >= 500) && attempt < 6) { await Bun.sleep(3000 * (attempt + 1)); continue; }
+      if ((res.status === 429 || res.status >= 500) && attempt < 6) { await backoff(3000 * (attempt + 1)); continue; }
       if (!res.ok) throw new PageLibraryError('page_search_failed', `Voyage ${path} answered ${res.status}`, 502);
       return await res.json() as T;
     }
   }
   return {
-    async embed(texts, inputType) {
+    async embed(texts, inputType, callOpts) {
       const r = await call<{ data: Array<{ index: number; embedding: number[] }>; usage?: { total_tokens?: number } }>('embeddings', {
         input: texts, model: opts.embedModel ?? PAGE_INDEX_EMBED_MODEL, input_type: inputType, output_dimension: PAGE_INDEX_DIMENSIONS,
-      });
+      }, callOpts);
       const vectors: number[][] = [];
       for (const d of r.data) vectors[d.index] = d.embedding;
       return { vectors, tokens: r.usage?.total_tokens ?? 0 };
     },
-    async rerank(query, documents, topK) {
+    async rerank(query, documents, topK, callOpts) {
       const r = await call<{ data: Array<{ index: number; relevance_score: number }>; usage?: { total_tokens?: number } }>('rerank', {
         query, documents, model: opts.rerankModel ?? PAGE_INDEX_RERANK_MODEL, top_k: topK, truncation: true,
-      });
+      }, callOpts);
       return { order: r.data.map((d) => ({ index: d.index, score: d.relevance_score })), tokens: r.usage?.total_tokens ?? 0 };
     },
   };
@@ -191,9 +203,12 @@ export class PageIndex {
   /** Tokens sent to Voyage by this instance, for spend receipts. */
   readonly tokens = { embed: 0, rerank: 0 };
 
-  constructor(databaseUrl: string, private readonly voyage: VoyageClient, opts: { embedModel?: string; maxConnections?: number } = {}) {
+  private readonly log: (line: string) => void;
+
+  constructor(databaseUrl: string, private readonly voyage: VoyageClient, opts: { embedModel?: string; maxConnections?: number; log?: (line: string) => void } = {}) {
     this.sql = new SQL({ url: databaseUrl, max: opts.maxConnections ?? 8 });
     this.model = opts.embedModel ?? PAGE_INDEX_EMBED_MODEL;
+    this.log = opts.log ?? ((line) => console.warn(line));
   }
 
   async close(): Promise<void> { await this.sql.close(); }
@@ -470,20 +485,36 @@ export class PageIndex {
     return [...best.values()].slice(0, limit);
   }
 
-  async search(source: string, query: string, k: number, scope: PageSearchScope = {}): Promise<PageSearchHit[]> {
+  /**
+   * Hybrid search over one source, or one book of it. Voyage failing does not fail the search:
+   * without a query vector the keyword arm's ranking comes back (`keyword_only`), and without a
+   * rerank the fused order (`unranked`), each logged once. Postgres failing still throws.
+   */
+  async search(source: string, query: string, k: number, scope: PageSearchScope = {}): Promise<PageSearchResult> {
     const q = query.trim();
-    if (!q) return [];
-    const [keyword, embedded] = await Promise.all([this.keywordArm(source, q, KEYWORD_POOL, scope), this.voyage.embed([q], 'query')]);
-    this.tokens.embed += embedded.tokens;
-    const vector = await this.vectorArm(source, embedded.vectors[0]!, VECTOR_POOL, scope);
+    if (!q) return { hits: [] };
+    const budget = { budgetMs: SEARCH_VOYAGE_BUDGET_MS };
+    const [keyword, embedded] = await Promise.all([
+      this.keywordArm(source, q, KEYWORD_POOL, scope),
+      this.voyage.embed([q], 'query', budget).catch((error: unknown) => ({ error })),
+    ]);
+    let degraded: PageSearchDegraded | undefined;
+    let vector: ArmHit[] = [];
+    if ('error' in embedded) {
+      degraded = this.degrade(source, 'keyword_only', embedded.error);
+    } else {
+      this.tokens.embed += embedded.tokens;
+      vector = await this.vectorArm(source, embedded.vectors[0]!, VECTOR_POOL, scope);
+    }
     const pooled = new Set([...vector.slice(0, VECTOR_POOL), ...keyword.slice(0, KEYWORD_POOL)].map((h) => h.slug));
     const fused = reciprocalRankFusion([keyword.map((h) => h.slug), vector.map((h) => h.slug)]).filter((f) => pooled.has(f.slug));
-    if (!fused.length) return [];
+    if (!fused.length) return { hits: [], ...(degraded ? { degraded } : {}) };
     // Each unit is reranked by its best chunk: the vector arm's when it has one, else the keyword arm's.
     const bestChunk = new Map<string, number>();
     for (const h of [...keyword].reverse()) bestChunk.set(h.slug, h.chunk);
     for (const h of vector) bestChunk.set(h.slug, h.chunk);
-    const slugs = fused.map((f) => f.slug);
+    // Unreranked, only the top k are fetched.
+    const slugs = fused.map((f) => f.slug).slice(0, degraded ? k : undefined);
     // Only each unit's best chunk: it is what the unit is reranked by and what the hit carries,
     // so a reader sees the passage that matched, not the top of the page or section.
     const rows = await this.sql`
@@ -492,8 +523,23 @@ export class PageIndex {
       JOIN page_chunks c ON c.source = ${source} AND c.slug = p.slug AND c.chunk = p.chunk` as Array<{ slug: string; title: string; text: string }>;
     const bySlug = new Map(rows.map((r) => [r.slug, r]));
     const pool = slugs.map((s) => bySlug.get(s)).filter((r): r is { slug: string; title: string; text: string } => Boolean(r));
-    const ranked = await this.voyage.rerank(q, pool.map((r) => unitDocument({ title: r.title, body: r.text }, RERANK_DOC_CHARS)), Math.min(k, pool.length));
+    // A degraded hit has no score: it was never reranked, so it is not comparable with one that was.
+    const unscored = () => pool.slice(0, k).map((r) => ({ slug: r.slug, text: r.text }));
+    if (degraded) return { hits: unscored(), degraded };
+    let ranked: Awaited<ReturnType<VoyageClient['rerank']>>;
+    try {
+      ranked = await this.voyage.rerank(q, pool.map((r) => unitDocument({ title: r.title, body: r.text }, RERANK_DOC_CHARS)), Math.min(k, pool.length), budget);
+    } catch (error) {
+      return { hits: unscored(), degraded: this.degrade(source, 'unranked', error) };
+    }
     this.tokens.rerank += ranked.tokens;
-    return ranked.order.map(({ index, score }) => ({ slug: pool[index]!.slug, text: pool[index]!.text, score }));
+    return { hits: ranked.order.map(({ index, score }) => ({ slug: pool[index]!.slug, text: pool[index]!.text, score })) };
+  }
+
+  /** One log line per degraded search: the source, the mode and the error code, never the query or a secret. */
+  private degrade(source: string, mode: PageSearchDegraded, error: unknown): PageSearchDegraded {
+    const code = error instanceof PageLibraryError ? error.code : 'voyage_error';
+    this.log(JSON.stringify({ event: 'page_search_degraded', source, degraded: mode, error: code }));
+    return mode;
   }
 }

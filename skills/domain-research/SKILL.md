@@ -32,7 +32,9 @@ Every book is addressed as units `books/<book>/<unit>`: `pNNNN` is a PDF page,
   long section), so you can judge a hit without reading it first. Use several
   short, focused queries from different angles, one topic each; pass `book`
   when the question names one. When results are weak, search again in the
-  source's own vocabulary.
+  source's own vocabulary. A result marked `degraded` ran without semantic
+  search or reranking: lean on exact words and `grep`, and say so if the
+  answer rests on it.
 - `grep` finds an exact word or phrase (a case-insensitive regex) — to verify a
   quote, or to find every occurrence of a term in one book or all of them.
 - `read` returns one unit; `read_range` returns consecutive units of one book
