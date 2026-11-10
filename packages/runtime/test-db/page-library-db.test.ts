@@ -328,3 +328,41 @@ describe('the database page store', () => {
     }
   });
 });
+
+describe('search inside one book', () => {
+  test('finds the book\'s matching unit when other books fill the library-wide top 50', async () => {
+    const index = new PageIndex(databaseUrl(PUBLIC_DB), voyageClient('synthetic-key', { fetch: voyageFetch }));
+    const src = 'in-book-src';
+    const target = 'target-aaaaaa', crowd = 'crowd-bbbbbb', filler = 'filler-cccccc';
+    const unit = (book: string, n: number, title: string, body: string) => {
+      const name = `p${String(n).padStart(4, '0')}`;
+      return { slug: `books/${book}/${name}`, book, unit: name, title, body };
+    };
+    // The crowd says the query's words twice per page, so it outranks the target everywhere;
+    // the filler keeps those words under a fifth of the chunks, so the keyword arm still runs.
+    const units = [
+      unit(target, 1, 'Target', 'The lantern keeper notes the tide.'),
+      ...Array.from({ length: 60 }, (_, i) => unit(crowd, i + 1, 'Crowd', `lantern keeper tide lantern keeper tide page ${i + 1}`)),
+      ...Array.from({ length: 250 }, (_, i) => unit(filler, i + 1, 'Filler', `orchard barley millstone granary page ${i + 1}`)),
+    ];
+    await index.importUnits(src, units);
+    await index.embedPending(src);
+    const entry = (book: string, n: number) => ({ book, title: book, creator: '', kind: 'pages' as const, units: n, first_unit: 'p0001', last_unit: `p${String(n).padStart(4, '0')}`, figures: 0, objects: [], sources: [] });
+    await index.replaceBooks(src, [entry(target, 1), entry(crowd, 60), entry(filler, 250)]);
+    const lib = new PageLibrary({ sourceId: src, originalBuckets: [] }, {
+      store: new DatabasePageStore(index.sql, src),
+      search: (q, k, s) => index.search(s, q, k),
+      download: async () => null,
+    });
+    try {
+      // Library-wide, the crowd holds the whole top 50.
+      const wide = await index.search(src, 'lantern keeper tide', 50);
+      expect(wide.every((h) => h.slug.startsWith(`books/${crowd}/`))).toBe(true);
+      const scoped = (await lib.search('lantern keeper tide', 5, target)).results as Array<{ slug: string; text: string }>;
+      expect(scoped.map((h) => h.slug)).toEqual([`books/${target}/p0001`]);
+      expect(scoped[0]!.text).toContain('lantern keeper');
+    } finally {
+      await index.close();
+    }
+  });
+});
