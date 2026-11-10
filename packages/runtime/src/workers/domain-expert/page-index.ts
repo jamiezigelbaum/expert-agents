@@ -40,6 +40,8 @@ export const CHUNK_OVERLAP_WORDS = 60;
 const CHUNK_SPLIT_WORDS = 480;
 const ARM_LIMIT = 100;
 const ARM_CHUNKS = 400;
+/** Upper bound on index tuples one iterative vector scan may visit (pgvector's default is 20,000). */
+const HNSW_MAX_SCAN_TUPLES = 200_000;
 // The rerank pool is the vector arm's top 200 and the keyword arm's top 50, deduplicated.
 const VECTOR_POOL = 200;
 const KEYWORD_POOL = 50;
@@ -476,9 +478,16 @@ export class PageIndex {
         WHERE source = ${source} AND slug LIKE ${bookPrefix(scope.book)} AND embedding IS NOT NULL)
       SELECT slug, chunk FROM c ORDER BY distance, slug, chunk LIMIT ${ARM_CHUNKS}` as ArmHit[]
       : await this.sql.begin(async (tx) => {
+        // Every source shares one HNSW index and the source filter applies after it, so a plain scan
+        // returns at most ef_search rows across all sources and a smaller source comes back short.
+        // An iterative scan (pgvector >= 0.8) keeps walking until the limit is met; relaxed order is
+        // put back in distance order below.
         await tx.unsafe(`SET LOCAL hnsw.ef_search = ${ARM_CHUNKS}`);
-        return await tx`SELECT slug, chunk FROM page_chunks WHERE source = ${source} AND embedding IS NOT NULL
-          ORDER BY embedding <=> ${v}::vector LIMIT ${ARM_CHUNKS}`;
+        await tx.unsafe('SET LOCAL hnsw.iterative_scan = relaxed_order');
+        await tx.unsafe(`SET LOCAL hnsw.max_scan_tuples = ${HNSW_MAX_SCAN_TUPLES}`);
+        return await tx`WITH c AS MATERIALIZED (SELECT slug, chunk, embedding <=> ${v}::vector AS distance FROM page_chunks
+            WHERE source = ${source} AND embedding IS NOT NULL ORDER BY distance LIMIT ${ARM_CHUNKS})
+          SELECT slug, chunk FROM c ORDER BY distance, slug, chunk`;
       }) as ArmHit[];
     const best = new Map<string, ArmHit>();
     for (const r of rows) if (!best.has(r.slug)) best.set(r.slug, r);

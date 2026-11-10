@@ -292,6 +292,45 @@ describe('the database page store', () => {
     await index.close();
   });
 
+  test('a source sharing the vector index with a larger one still gets its nearest chunks', async () => {
+    // Its own database, with sorting priced out so Postgres takes the index-ordered plan it picks for a
+    // large source in production. The query sits among the big source's chunks; the small source's
+    // chunks are all farther away, so a single HNSW pass (ef_search rows) holds none of them.
+    const db = `pl_ann_${run}`;
+    await admin.unsafe(`CREATE DATABASE ${db}`);
+    await admin.unsafe(`ALTER DATABASE ${db} SET enable_sort = off`);
+    const index = new PageIndex(databaseUrl(db), voyageClient('synthetic-key', { fetch: voyageFetch }));
+    try {
+      await index.migrate();
+      // Distinct vectors around one axis per source: a fixed pseudo-random spread over 64 dimensions.
+      let seed = 7;
+      const rand = () => ((seed = (seed * 1103515245 + 12345) % 2147483648) / 2147483648) - 0.5;
+      const axis = (main: number) => {
+        const v = new Array<number>(PAGE_INDEX_DIMENSIONS).fill(0);
+        v[main] = 1;
+        for (let d = 2; d < 66; d++) v[d] = rand() * 0.6;
+        return `[${v.join(',')}]`;
+      };
+      for (const [source, count, main] of [['big-src', 1500, 0], ['small-src', 120, 1]] as const) {
+        const rows = Array.from({ length: count }, (_, i) => ({ slug: `books/${source}-aaaaaa/s${String(i).padStart(4, '0')}`, v: axis(main) }));
+        const units = JSON.stringify(rows.map((r) => ({ slug: r.slug })));
+        await index.sql`INSERT INTO page_units (source, slug, book, unit, title, body, content_hash)
+          SELECT ${source}, x.slug, ${`${source}-aaaaaa`}, split_part(x.slug, '/', 3), 'T', 'b', 'h' FROM jsonb_to_recordset(${units}::text::jsonb) AS x(slug text)`;
+        const chunks = JSON.stringify(rows);
+        await index.sql`INSERT INTO page_chunks (source, slug, chunk, title, text, embed_key, embedding)
+          SELECT ${source}, x.slug, 0, 'T', 'b', 'k', x.v::vector FROM jsonb_to_recordset(${chunks}::text::jsonb) AS x(slug text, v text)`;
+      }
+      await index.sql`ANALYZE page_chunks`;
+      const query = new Array<number>(PAGE_INDEX_DIMENSIONS).fill(0);
+      query[0] = 1;
+      // Without an iterative scan this comes back empty: the 400 rows HNSW visits all belong to big-src.
+      expect((await index.vectorArm('small-src', query, 400)).length).toBe(120);
+    } finally {
+      await index.close();
+      await admin.unsafe(`DROP DATABASE IF EXISTS ${db} WITH (FORCE)`);
+    }
+  });
+
   test('JavaScript word boundaries become Postgres ones; escaped backslashes are left alone', () => {
     expect(postgresLinePattern('\\bword\\B')).toBe('(?n)\\yword\\Y');
     expect(postgresLinePattern('a\\\\b')).toBe('(?n)a\\\\b');
