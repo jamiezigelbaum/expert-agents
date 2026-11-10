@@ -53,8 +53,11 @@ export interface PageLibraryConfig {
 
 export interface PageSearchHit { slug: string; text: string; score?: number }
 
+/** What narrows a search: `book` keeps it inside that one book. */
+export interface PageSearchScope { book?: string }
+
 export interface PageLibraryDependencies {
-  search(query: string, k: number, sourceId: string): Promise<PageSearchHit[]>;
+  search(query: string, k: number, sourceId: string, scope?: PageSearchScope): Promise<PageSearchHit[]>;
   download(bucket: string, name: string, maxBytes: number, timeoutMs: number): Promise<Uint8Array | null>;
   /** JPEG bytes of one page; defaults to pdftoppm. */
   renderPage?: (pdf: Uint8Array, page: number) => Promise<Uint8Array>;
@@ -197,8 +200,8 @@ export class PageLibrary {
 
   async search(query: string, k: number, book?: string): Promise<Record<string, unknown>> {
     if (book) await this.requireBook(book);
-    // A book filter is applied after ranking, so ask for more and cut.
-    const hits = await this.deps.search(query, book ? SEARCH_MAX_K * 2 : k, this.config.sourceId);
+    // The index ranks inside the book, so a book the library-wide ranking buries is still found.
+    const hits = await this.deps.search(query, k, this.config.sourceId, book ? { book } : {});
     const out = [];
     for (const h of hits) {
       const parsed = parseUnitSlug(h.slug);

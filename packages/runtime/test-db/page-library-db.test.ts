@@ -351,7 +351,7 @@ describe('search inside one book', () => {
     await index.replaceBooks(src, [entry(target, 1), entry(crowd, 60), entry(filler, 250)]);
     const lib = new PageLibrary({ sourceId: src, originalBuckets: [] }, {
       store: new DatabasePageStore(index.sql, src),
-      search: (q, k, s) => index.search(s, q, k),
+      search: (q, k, s, scope) => index.search(s, q, k, scope),
       download: async () => null,
     });
     try {

@@ -93,6 +93,16 @@ describe('MultiPageStore', () => {
     expect((await multi.search('q', 10)).map((h) => h.slug)).toEqual(['books/shared-bbbbbb/p0001', 'books/notes-cccccc/p0001', 'books/history-aaaaaa/p0001']);
     expect(await multi.search('q', 2)).toHaveLength(2);
   });
+
+  test('a search inside one book asks only the library that owns it, and passes the book on', async () => {
+    const asked: Array<[string, string | undefined]> = [];
+    const scoped = new MultiPageStore(members.map((m) => ({ ...m, search: async (_q: string, _k: number, scope?: { book?: string }) => { asked.push([m.sourceId, scope?.book]); return []; } })));
+    await scoped.search('q', 5, { book: 'notes-cccccc' });
+    expect(asked).toEqual([['private-notes', 'notes-cccccc']]);
+    asked.length = 0;
+    expect(await scoped.search('q', 5, { book: 'missing-dddddd' })).toEqual([]);
+    expect(asked).toEqual([]);
+  });
 });
 
 describe('domain_library over a route with several libraries', () => {

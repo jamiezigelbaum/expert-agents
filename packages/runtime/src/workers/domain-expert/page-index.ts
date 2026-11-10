@@ -28,7 +28,7 @@ import { readdir, readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { SQL } from 'bun';
 import { parseUnitSlug, unitBody, unitFrontmatter, type CatalogEntry } from '@expert-agents/library';
-import { PageLibraryError, type PageSearchHit } from './page-library.ts';
+import { PageLibraryError, type PageSearchHit, type PageSearchScope } from './page-library.ts';
 
 export const PAGE_INDEX_EMBED_MODEL = 'voyage-4';
 export const PAGE_INDEX_DIMENSIONS = 1024;
@@ -176,6 +176,13 @@ function csv(values: readonly string[]): string {
 /** One arm's hit: a unit and the chunk of it that matched best. */
 export interface ArmHit { slug: string; chunk: number }
 
+// The LIKE pattern for one book's slugs; a book id is [a-z0-9-], so it holds no LIKE wildcard.
+function bookPrefix(book: string | undefined): string {
+  if (book === undefined) return '%';
+  if (!/^[a-z0-9][a-z0-9-]{0,63}$/.test(book)) throw new PageLibraryError('invalid_request', 'book must be a catalog book id.');
+  return `books/${book}/%`;
+}
+
 export interface ImportResult { units: number; inserted: number; updated: number; unchanged: number; deleted: number; chunks: number; reusedVectors: number }
 
 export class PageIndex {
@@ -222,6 +229,8 @@ export class PageIndex {
       );
       CREATE INDEX IF NOT EXISTS page_chunks_tsv ON page_chunks USING gin (tsv);
       CREATE INDEX IF NOT EXISTS page_chunks_embedding ON page_chunks USING hnsw (embedding vector_cosine_ops);
+      -- A search inside one book selects its chunks by slug prefix (books/<book>/).
+      CREATE INDEX IF NOT EXISTS page_chunks_slug_prefix ON page_chunks (source, slug text_pattern_ops);
       CREATE TABLE IF NOT EXISTS page_embeddings (
         embed_key text PRIMARY KEY,
         embedding vector(${PAGE_INDEX_DIMENSIONS}) NOT NULL
@@ -410,7 +419,8 @@ export class PageIndex {
    * common words. Each chunk instead scores the summed IDF of the query words it holds (BM25's
    * weight without length normalisation); words in over a fifth of the chunks are dropped.
    */
-  async keywordArm(source: string, query: string, limit = ARM_LIMIT): Promise<ArmHit[]> {
+  async keywordArm(source: string, query: string, limit = ARM_LIMIT, scope: PageSearchScope = {}): Promise<ArmHit[]> {
+    const prefix = bookPrefix(scope.book);
     const lexemes = await this.sql`SELECT unnest(tsvector_to_array(to_tsvector('english', ${query}))) AS t` as Array<{ t: string }>;
     const terms = [...new Set(lexemes.map((r) => r.t))].filter((t) => /^[\p{L}\p{N}]+$/u.test(t));
     if (!terms.length) return [];
@@ -434,31 +444,38 @@ export class PageIndex {
     if (!weighted.length) return [];
     return await this.sql`
       WITH w AS (SELECT t, idf::float8 AS idf FROM unnest(string_to_array(${csv(weighted.map((x) => x.t))}, ','), string_to_array(${weighted.map((x) => x.idf.toFixed(6)).join(',')}, ',')) AS x(t, idf)),
-      cand AS (SELECT slug, chunk, tsv FROM page_chunks WHERE source = ${source} AND tsv @@ to_tsquery('simple', ${weighted.map((x) => x.t).join(' | ')})),
+      cand AS (SELECT slug, chunk, tsv FROM page_chunks WHERE source = ${source} AND slug LIKE ${prefix} AND tsv @@ to_tsquery('simple', ${weighted.map((x) => x.t).join(' | ')})),
       scored AS (SELECT c.slug, c.chunk, sum(w.idf) AS score FROM cand c JOIN w ON c.tsv @@ to_tsquery('simple', w.t) GROUP BY c.slug, c.chunk)
       SELECT slug, chunk FROM (SELECT DISTINCT ON (slug) slug, chunk, score FROM scored ORDER BY slug, score DESC, chunk) best
       ORDER BY score DESC, slug LIMIT ${limit}` as ArmHit[];
   }
 
-  /** Units whose chunks lie nearest the query vector, best chunk first. */
-  async vectorArm(source: string, vector: readonly number[], limit = ARM_LIMIT): Promise<ArmHit[]> {
+  /**
+   * Units whose chunks lie nearest the query vector, best chunk first. Inside one book the scan is
+   * exact: the shared HNSW index walks the whole library and would drop most of the book's chunks.
+   */
+  async vectorArm(source: string, vector: readonly number[], limit = ARM_LIMIT, scope: PageSearchScope = {}): Promise<ArmHit[]> {
     const v = vectorLiteral(vector);
-    const rows = await this.sql.begin(async (tx) => {
-      await tx.unsafe(`SET LOCAL hnsw.ef_search = ${ARM_CHUNKS}`);
-      return await tx`SELECT slug, chunk FROM page_chunks WHERE source = ${source} AND embedding IS NOT NULL
-        ORDER BY embedding <=> ${v}::vector LIMIT ${ARM_CHUNKS}`;
-    }) as ArmHit[];
+    const rows = scope.book !== undefined ? await this.sql`
+      WITH c AS MATERIALIZED (SELECT slug, chunk, embedding <=> ${v}::vector AS distance FROM page_chunks
+        WHERE source = ${source} AND slug LIKE ${bookPrefix(scope.book)} AND embedding IS NOT NULL)
+      SELECT slug, chunk FROM c ORDER BY distance, slug, chunk LIMIT ${ARM_CHUNKS}` as ArmHit[]
+      : await this.sql.begin(async (tx) => {
+        await tx.unsafe(`SET LOCAL hnsw.ef_search = ${ARM_CHUNKS}`);
+        return await tx`SELECT slug, chunk FROM page_chunks WHERE source = ${source} AND embedding IS NOT NULL
+          ORDER BY embedding <=> ${v}::vector LIMIT ${ARM_CHUNKS}`;
+      }) as ArmHit[];
     const best = new Map<string, ArmHit>();
     for (const r of rows) if (!best.has(r.slug)) best.set(r.slug, r);
     return [...best.values()].slice(0, limit);
   }
 
-  async search(source: string, query: string, k: number): Promise<PageSearchHit[]> {
+  async search(source: string, query: string, k: number, scope: PageSearchScope = {}): Promise<PageSearchHit[]> {
     const q = query.trim();
     if (!q) return [];
-    const [keyword, embedded] = await Promise.all([this.keywordArm(source, q, KEYWORD_POOL), this.voyage.embed([q], 'query')]);
+    const [keyword, embedded] = await Promise.all([this.keywordArm(source, q, KEYWORD_POOL, scope), this.voyage.embed([q], 'query')]);
     this.tokens.embed += embedded.tokens;
-    const vector = await this.vectorArm(source, embedded.vectors[0]!, VECTOR_POOL);
+    const vector = await this.vectorArm(source, embedded.vectors[0]!, VECTOR_POOL, scope);
     const pooled = new Set([...vector.slice(0, VECTOR_POOL), ...keyword.slice(0, KEYWORD_POOL)].map((h) => h.slug));
     const fused = reciprocalRankFusion([keyword.map((h) => h.slug), vector.map((h) => h.slug)]).filter((f) => pooled.has(f.slug));
     if (!fused.length) return [];
