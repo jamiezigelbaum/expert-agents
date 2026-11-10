@@ -16,7 +16,7 @@ import {
   type DisclosureSummary,
 } from '../../core/disclosure.ts';
 import { parseUnitSlug } from '@expert-agents/library';
-import type { PageExcerpt, PageLibrary, PageLibraryParams } from './page-library.ts';
+import { wholeSentences, type PageExcerpt, type PageLibrary, type PageLibraryParams } from './page-library.ts';
 
 export class PageDisclosureRefusal extends Error {
   constructor(readonly refusal: DisclosureRefusal) { super(refusal.message); }
@@ -96,7 +96,10 @@ export async function runDisclosedPageLibrary(
       const { decisions, summary } = await bound(rows.map((r) => ({ slug: r.slug, cite: r.cite, text: r[field] ?? '' })));
       const kept = rows.flatMap((row, i) => {
         const d = decisions[i]!;
-        return d.kind === 'disclosed' ? [{ ...row, [field]: d.text, ...(d.truncated ? { excerpt_truncated: true } : {}) }] : [];
+        if (d.kind !== 'disclosed') return [];
+        // A search hit cut by the quote bound ends on a whole sentence (a prefix of what was charged).
+        const text = search && d.truncated ? wholeSentences(row[field] ?? '', d.text.length) : d.text;
+        return [{ ...row, [field]: text, ...(d.truncated ? { excerpt_truncated: true } : {}) }];
       });
       return { ...result, [search ? 'results' : 'hits']: kept, ...report(summary) };
     }

@@ -276,7 +276,7 @@ describe('the database page store', () => {
     await index.close();
   });
 
-  test('a long section of many chunks comes back once, whole, from the chunk that matched', async () => {
+  test('a long section of many chunks comes back once, as the chunk that matched', async () => {
     const index = new PageIndex(databaseUrl(PUBLIC_DB), voyageClient('synthetic-key', { fetch: voyageFetch }));
     const filler = Array.from({ length: 4000 }, (_, i) => `filler${String.fromCharCode(97 + (i % 26))}`).join(' ');
     const body = `${filler} the lantern keeper walks the harbour wall at dusk ${filler}`;
@@ -285,7 +285,10 @@ describe('the database page store', () => {
     expect(chunks).toBeGreaterThan(10);
     const hits = await index.search('long-src', 'lantern keeper harbour', 5);
     expect(hits.map((h) => h.slug)).toEqual(['books/long-eeeeee/s0001']);
-    expect(hits[0]!.text).toBe(body);
+    // The hit is the matching window, not the top of the section.
+    expect(hits[0]!.text).toContain('the lantern keeper walks the harbour wall at dusk');
+    expect(hits[0]!.text.length).toBeLessThan(4000);
+    expect(body.includes(hits[0]!.text)).toBe(true);
     await index.close();
   });
 

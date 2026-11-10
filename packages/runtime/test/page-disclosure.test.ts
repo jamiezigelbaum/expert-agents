@@ -102,6 +102,8 @@ describe('page library under a disclosure policy', () => {
     expect(search.status).toBe(200);
     expect(search.body.results.map((r: { slug: string }) => r.slug)).toEqual([`books/${BOUNDED}/p0001`, `books/${BOUNDED}/p0002`]);
     expect(search.body.results.every((r: { text: string }) => r.text.length <= BOUNDS.maxQuoteChars)).toBe(true);
+    // A hit the quote bound cuts ends on a whole word, never part of one.
+    expect(search.body.results.every((r: { text: string; excerpt_truncated?: boolean }) => r.excerpt_truncated && r.text.endsWith(' evidence'))).toBe(true);
     expect(search.body.disclosure).toMatchObject({ excerpts_disclosed: 2, excerpts_withheld: 2 });
   });
 
