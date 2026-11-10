@@ -31,7 +31,6 @@ import { AgentRegistrationStore, pageLibraryRootFromEnv, registrationLibraryFrom
 import { OperationError } from '../../core/operation-error.ts';
 import {
   AGENT_REPO_GITIGNORE,
-  EXTRACTION_ARGUMENTS,
   EXTRACTION_MAX_OUTPUT_BYTES,
   EXTRACTION_METHOD,
   EXTRACTION_TIMEOUT_MS,
@@ -43,6 +42,8 @@ import {
   firstDiagnosticLine,
   isolatedExtractorEnvironment,
   normalizeExtractedText,
+  parseYoutubeTranscriptExtraction,
+  YOUTUBE_EXTRACTION_ARGUMENTS,
   parseMasterManifest,
   parseScopeManifest,
   planReconciliation,
@@ -4699,8 +4700,8 @@ async function deriveSummarizeExtraction(context: WebImportHandlerContext): Prom
   const extractionInput: SummarizeExtractionInput = youtube
     ? { mode: 'youtube_url', source: context.finalUrl, fetchPerformedBy: SUMMARIZE_BINARY }
     : { mode: 'local_input', source: context.response.bytes, fetchPerformedBy: WEB_IMPORT_WORKER_FETCHER };
-  const page = extractionInput.mode === 'youtube_url'
-    ? { text: await runSummarizeExtraction(context.extraction, extractionInput.source) }
+  const page: { text: string; title?: string; author?: string; transcriptSource?: string } = extractionInput.mode === 'youtube_url'
+    ? await youtubeTranscriptExtraction(context.extraction, extractionInput.source)
     : localHtmlExtraction(extractionInput.source);
   const extracted = page.text;
   const extractor = extractionInput.mode === 'youtube_url' ? EXTRACTION_METHOD : WEB_IMPORT_LOCAL_HTML_EXTRACTOR;
@@ -4719,6 +4720,7 @@ async function deriveSummarizeExtraction(context: WebImportHandlerContext): Prom
     title,
     ...(page.author ? { author: page.author } : {}),
     extractor,
+    ...(page.transcriptSource ? { transcript_source: page.transcriptSource } : {}),
   })}${heading}${extracted}`;
   return {
     files: [{
@@ -4766,13 +4768,40 @@ function localHtmlExtraction(bytes: Uint8Array): { text: string; title?: string;
   return { text: extracted, ...(page.title ? { title: page.title } : {}), ...(page.author ? { author: page.author } : {}) };
 }
 
-async function runSummarizeExtraction(extraction: ExtractionRuntimeContext, source: string): Promise<string> {
+/**
+ * A YouTube URL is imported only as a transcript. When the extractor obtained
+ * none (it then exits 0 with the video's description) or what it calls a
+ * transcript is the watch page's own script, the URL fails with a reason
+ * instead of being indexed.
+ */
+async function youtubeTranscriptExtraction(
+  extraction: ExtractionRuntimeContext,
+  source: string,
+): Promise<{ text: string; title?: string; transcriptSource: string }> {
+  const parsed = parseYoutubeTranscriptExtraction(
+    await runSummarizeExtraction(extraction, source, YOUTUBE_EXTRACTION_ARGUMENTS),
+  );
+  if (!parsed.ok) {
+    throw new DomainExpertWorkerError(
+      parsed.code === 'youtube_extraction_unreadable' ? 502 : 422,
+      parsed.code,
+      `${EXTRACTION_METHOD}: ${parsed.reason}; nothing was indexed for this URL.`,
+    );
+  }
+  return { text: parsed.text, transcriptSource: parsed.transcriptSource, ...(parsed.title ? { title: parsed.title } : {}) };
+}
+
+async function runSummarizeExtraction(
+  extraction: ExtractionRuntimeContext,
+  source: string,
+  args: readonly string[],
+): Promise<string> {
   const extractionRoot = await mkdtemp(join(resolve(extraction.dataDir), '.extraction-runtime-'));
   const directories = ensurePrivateExtractionDirectories(extractionRoot);
   const request: ExtractionRequest = {
     binaryPath: extractionBinaryForPrivateCwd(extraction.binaryPath),
     source: extractionSourceForPrivateCwd(source),
-    args: EXTRACTION_ARGUMENTS,
+    args,
     env: isolatedExtractorEnvironment(extraction.env, directories),
     workingDirectory: extractionRoot,
     timeoutMs: extraction.timeoutMs,

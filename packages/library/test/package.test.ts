@@ -16,6 +16,7 @@ describe("@expert-agents/library package", () => {
       "serializeLibraryObject", "serializeMasterManifest",
       "serializeReconciliationPlan", "serializeScopeManifest", "sha256",
       "sourceLocatorCredential", "validateLibraryLocationConfig",
+      "looksLikeWatchPageScript", "parseYoutubeTranscriptExtraction",
       "validateLibraryObject", "validateMasterManifest", "validateMaterializationLedger",
       "validateScopeManifest", 
       
@@ -42,7 +43,7 @@ describe("@expert-agents/library package", () => {
     ] as const;
 
     expect(Object.keys(library).sort()).toEqual([...functions, ...numbers, ...strings,
-      "EXTRACTION_ARGUMENTS", "EXTRACTION_ENV_ALLOWLIST", "MEDIA_EXTENSIONS"].sort());
+      "EXTRACTION_ARGUMENTS", "EXTRACTION_ENV_ALLOWLIST", "MEDIA_EXTENSIONS", "YOUTUBE_EXTRACTION_ARGUMENTS"].sort());
     expect(library.MEDIA_EXTENSIONS.has(".mp3")).toBe(true);
     for (const name of functions) expect(typeof library[name]).toBe("function");
     for (const name of numbers) expect(typeof library[name]).toBe("number");

@@ -251,7 +251,11 @@ the same name). It runs the same parse code as the operator CLI
     redirect bounds): a page's main text is extracted locally
     (`html-to-markdown`); a direct PDF, text, audio or video link is read as
     that file; a YouTube video gives its captions (the `summarize` extractor,
-    with no credential that could reach a model). The book keeps the URL and
+    with no credential that could reach a model, read through its `--json`
+    record). A video with no transcript, or output that is the watch page's
+    own script, fails that URL with a reason (`youtube_transcript_unavailable`,
+    `youtube_transcript_page_script`) and nothing is indexed; a kept
+    transcript records its `transcript_source`. The book keeps the URL and
     retrieval time (`source_url`, `retrieved_at` in its catalog entry and unit
     front matter). Notion URLs are refused here: their pages are
     client-rendered.

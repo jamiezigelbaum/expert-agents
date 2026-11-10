@@ -36,9 +36,10 @@ describe('library_ingest URL extraction inputs', () => {
     writeFileSync(join(fixture.base, '.env'), 'OPENAI_API_KEY=sentinel-must-not-load\n');
     writeFileSync(
       extractor,
-      `#!/bin/sh\nif [ -f .env ]; then echo loaded-caller-dotenv >&2; exit 91; fi\ncase "$HOME" in /*) ;; *) echo relative-home >&2; exit 92;; esac\n[ -d "$HOME" ] || exit 93\nmkdir -p "$HOME/.summarize" || exit 94\nprintf cache > "$HOME/.summarize/cache.sqlite" || exit 95\nprintf "# Private cwd extraction\\n\\nNo caller dotenv loaded. ${'filler '.repeat(120)}\\n"\n`,
+      `#!/bin/sh\nif [ -f .env ]; then echo loaded-caller-dotenv >&2; exit 91; fi\ncase "$HOME" in /*) ;; *) echo relative-home >&2; exit 92;; esac\n[ -d "$HOME" ] || exit 93\nmkdir -p "$HOME/.summarize" || exit 94\nprintf cache > "$HOME/.summarize/cache.sqlite" || exit 95\ncat "$(dirname "$0")/record.json"\n`,
       { mode: 0o755 },
     );
+    writeFileSync(join(fixture.base, 'record.json'), transcriptRecord(`# Private cwd extraction\n\nNo caller dotenv loaded. ${'filler '.repeat(120)}\n`));
     try {
       process.chdir(fixture.base);
       process.env.HOME = inheritedHome;
@@ -179,13 +180,14 @@ describe('library_ingest URL extraction inputs', () => {
       const worker = extractionWorker(fixture, {
         summarizeExtract: async (value) => {
           request = value;
-          return { exitCode: 0, stdout: EXTRACTED_MARKDOWN, stderr: '' };
+          return { exitCode: 0, stdout: transcriptRecord(EXTRACTED_MARKDOWN), stderr: '' };
         },
       });
 
       const job = await ingestUrl(worker, YOUTUBE_URL);
 
       expect(request?.source).toBe(YOUTUBE_URL);
+      expect(request?.args).toContain('--json');
       expect(request!.env.HOME).toStartWith(`${fixture.dataDir}${sep}.extraction-runtime-`);
       expect(request!.env.HOME).not.toBe(process.env.HOME);
       expect(request!.env.XDG_CACHE_HOME).toBe(join(dirname(request!.env.HOME), 'cache'));
@@ -245,7 +247,98 @@ describe('library_ingest URL extraction inputs', () => {
       fixture.cleanup();
     }
   });
+
+  // The extractor exits 0 with the video's description when a video has no
+  // transcript (summarize 0.21.7, checked against a captionless video).
+  test('a YouTube video with no transcript fails with a reason instead of indexing the page text', async () => {
+    const fixture = extractionFixture();
+    const description = `Fixture video description. ${'filler '.repeat(80)}`;
+    try {
+      const worker = extractionWorker(fixture, {
+        summarizeExtract: async () => ({
+          exitCode: 0,
+          stdout: youtubeRecord({
+            title: 'Fixture video',
+            content: description,
+            transcriptSource: 'unavailable',
+            transcriptCharacters: null,
+            transcriptMetadata: { provider: 'youtube', reason: 'no_transcript_available' },
+          }),
+          stderr: '',
+        }),
+      });
+
+      const job = await ingestUrl(worker, YOUTUBE_URL);
+
+      expect(job.state).toBe('done_with_failures');
+      expect(job.sources[0]).toMatchObject({
+        state: 'failed',
+        error: expect.stringContaining('no transcript was obtained (no_transcript_available)'),
+      });
+      expect(job.sources[0].book).toBeUndefined();
+      expect(JSON.stringify(job)).not.toContain('Fixture video description.');
+      expect(temporaryExtractionDirectories(fixture.dataDir)).toEqual([]);
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  test('watch-page script reported as a caption transcript fails instead of being indexed', async () => {
+    const fixture = extractionFixture();
+    const pageScript = [
+      '(function() {window.ytplayer={};',
+      'ytcfg.set({"CLIENT_CANARY_STATE":"none","DEVICE":"cbr\\u003dChrome","HL":"pt-PT"});',
+      'window.ytcfg.obfuscatedData_ = [];var setMessage=function(msg){if(window.yt&&yt.setMsg)yt.setMsg(msg);};',
+      `${'player bootstrap '.repeat(40)}`,
+    ].join('\n');
+    try {
+      const worker = extractionWorker(fixture, {
+        summarizeExtract: async () => ({ exitCode: 0, stdout: transcriptRecord(pageScript), stderr: '' }),
+      });
+
+      const job = await ingestUrl(worker, YOUTUBE_URL);
+
+      expect(job.state).toBe('done_with_failures');
+      expect(job.sources[0]).toMatchObject({
+        state: 'failed',
+        error: expect.stringContaining('watch-page script'),
+      });
+      expect(job.sources[0].book).toBeUndefined();
+      expect(JSON.stringify(job)).not.toContain('CLIENT_CANARY_STATE');
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  test('plain, non-JSON extractor output for a YouTube URL is refused', async () => {
+    const fixture = extractionFixture();
+    try {
+      const worker = extractionWorker(fixture, {
+        summarizeExtract: async () => ({ exitCode: 0, stdout: EXTRACTED_MARKDOWN, stderr: '' }),
+      });
+
+      const job = await ingestUrl(worker, YOUTUBE_URL);
+
+      expect(job.sources[0]).toMatchObject({ state: 'failed', error: expect.stringContaining('did not return its JSON record') });
+    } finally {
+      fixture.cleanup();
+    }
+  });
 });
+
+/** The extractor's --json record for a YouTube URL, reduced to what the worker reads. */
+function youtubeRecord(extracted: Record<string, unknown>): string {
+  return JSON.stringify({ input: { url: YOUTUBE_URL }, extracted: { url: YOUTUBE_URL, siteName: 'YouTube', ...extracted }, llm: null, summary: null });
+}
+
+function transcriptRecord(content: string): string {
+  return youtubeRecord({
+    title: 'Fixture video',
+    content,
+    transcriptSource: 'captionTracks',
+    transcriptCharacters: content.length,
+  });
+}
 
 function extractionFixture(): {
   base: string;
