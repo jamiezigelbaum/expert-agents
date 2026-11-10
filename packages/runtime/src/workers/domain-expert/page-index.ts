@@ -305,6 +305,28 @@ export class PageIndex {
   }
 
   /**
+   * Remove whole books from `source` in one transaction: catalog rows, units and (by cascade)
+   * their chunks. Cached vectors stay, keyed by text, so re-importing a removed book is free.
+   * Every named book must be in the catalog; otherwise nothing is removed.
+   */
+  async removeBooks(source: string, books: readonly string[]): Promise<{ books: number; units: number; chunks: number }> {
+    if (!books.length) throw new Error('name at least one book to remove');
+    for (const book of books) bookPrefix(book);
+    if (new Set(books).size !== books.length) throw new Error('a book is named twice');
+    return await this.sql.begin(async (tx) => {
+      const list = csv(books);
+      const listed = await tx`SELECT book FROM page_books WHERE source = ${source} AND book = ANY(string_to_array(${list}, ','))` as Array<{ book: string }>;
+      const missing = books.filter((b) => !listed.some((r) => r.book === b));
+      if (missing.length) throw new Error(`not in ${source}'s catalog: ${missing.join(', ')}`);
+      const [{ chunks }] = await tx`SELECT count(*)::int AS chunks FROM page_chunks c JOIN page_units u USING (source, slug)
+        WHERE u.source = ${source} AND u.book = ANY(string_to_array(${list}, ','))` as Array<{ chunks: number }>;
+      const units = await tx`DELETE FROM page_units WHERE source = ${source} AND book = ANY(string_to_array(${list}, ',')) RETURNING slug`;
+      await tx`DELETE FROM page_books WHERE source = ${source} AND book = ANY(string_to_array(${list}, ','))`;
+      return { books: books.length, units: units.length, chunks: chunks! };
+    });
+  }
+
+  /**
    * Make the index for `source` match `units` exactly. Vectors survive for unchanged text.
    * With `books`, only those books are compared: their units not in `units` are deleted and
    * every other book of the source is left alone (one book's ingest).

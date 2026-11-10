@@ -321,7 +321,10 @@ The worker needs, besides the search settings in section 3:
   pages and figures listed instead of sending them to the deep profile.
 
 The operator CLIs are `bun run library:pages` (parse, upload, assemble a
-whole library) and `bun run library:index` (migrate, import, embed, search).
+whole library) and `bun run library:index` (migrate, import, remove, embed,
+search). `library:index remove --source <id> --books a,b` takes whole books out
+of a library, for example a copy imported twice: their catalog rows, units and
+chunks go in one transaction, and a name outside the catalog removes nothing.
 
 ## 5. Hosting: one library, any host
 
