@@ -9,7 +9,7 @@ import {
   type DomainAgentParams,
 } from '../../core/domain-expert.ts';
 import { AgentRegistrationStore, pageLibraryRootFromEnv, registrationLibraryFromEnv } from '../../core/agent-registration.ts';
-import { isEngagementHeldPath } from '@expert-agents/provisioning';
+import { isEngagementHeldPath } from '@expert-agents/provisioning/engagement';
 import { OperationError } from '../../core/operation-error.ts';
 import {
   SUMMARIZE_BINARY, type ReferenceExtractor, type LibraryLocationConfig, MEDIA_EXTENSIONS, splitFrontmatter,
