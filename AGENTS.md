@@ -21,6 +21,7 @@ errors or receipts.
 
 `bun run verify` is the full gate: all Bun tests, TypeScript checks, builds,
 boundary scans, and plugin packaging without skip-on-missing behavior. Run
-focused checks locally; the full verify and required CI must be green before
-merge, and `main` requires a pull request and a green check. Preserve
-unrelated work and stage files intentionally.
+focused checks for what you changed, and the full verify for broad or risky
+changes. Owner commits go straight to `main`; CI runs verify on every push, and
+a red run is fixed forward. Preserve unrelated work and stage files
+intentionally.
